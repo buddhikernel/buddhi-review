@@ -1,0 +1,29 @@
+{
+  "name": "operator_stop_on_failed_fix",
+  "description": "A real bug is flagged, but the automated fix fails after the bounded retry. Free escalates rather than retrying on another model; the operator chooses Stop and the run halts.",
+  "pr": "111",
+  "repo": "example-org/widget",
+  "auto_merge": false,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "operator-stop",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "this off-by-one drops the last page of results when total is an exact multiple of page_size",
+        "path": "app/paginate.py",
+        "created_at": "2026-01-14T15:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "{\"label\": \"SUBSTANTIVE\", \"bot\": \"claude\", \"model\": \"sonnet\", \"effort\": \"high\", \"severity\": \"high\", \"reason\": \"off-by-one drops the final page on exact multiples\"}",
+        "fix_outcome": "transient-failed"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "SUBSTANTIVE"},
+    "terminal_disposition": "stop",
+    "per_comment": {"c1": "escalated"},
+    "auto_actions": []
+  }
+}

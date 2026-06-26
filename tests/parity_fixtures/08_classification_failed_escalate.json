@@ -1,0 +1,28 @@
+{
+  "name": "classification_failed_escalate",
+  "description": "The classifier never produces a usable label (garbage on every attempt). CLASSIFICATION_FAILED counts as a real finding — it escalates, never polish-only. The ask goes unanswered, so the loop hands the PR back.",
+  "pr": "108",
+  "repo": "example-org/widget",
+  "auto_merge": false,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "unanswered",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "the batching here interacts with the new backpressure path in a way worth a closer look",
+        "path": "app/queue.py",
+        "created_at": "2026-01-11T16:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "I looked at the comment against the file but could only return prose; there is no usable triage decision here."
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "CLASSIFICATION_FAILED"},
+    "terminal_disposition": "escalate-to-human",
+    "per_comment": {"c1": "escalated"},
+    "auto_actions": []
+  }
+}

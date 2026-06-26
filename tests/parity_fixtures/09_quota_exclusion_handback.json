@@ -1,0 +1,26 @@
+{
+  "name": "quota_exclusion_handback",
+  "description": "The only reviewer hits a rate limit on round 1 — permanently excluded for the run. Nothing is actionable, so the loop exits clean; with auto-merge off it hands the PR back for the human to merge. Exercises the exclusion auto-action.",
+  "pr": "109",
+  "repo": "example-org/widget",
+  "auto_merge": false,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "Rate limit exceeded for this model — try again later.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-12T12:00:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {},
+    "terminal_disposition": "escalate-to-human",
+    "per_comment": {},
+    "auto_actions": [["exclusion", "skip"], ["squash-merge", "skip"]]
+  }
+}

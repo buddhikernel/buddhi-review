@@ -1,0 +1,39 @@
+{
+  "name": "substantive_fix_merge",
+  "description": "A real bug (no retry on a throwing call) is flagged, fixed, and the next round is clean — the loop merges. Classifier response is fenced JSON.",
+  "pr": "102",
+  "repo": "example-org/widget",
+  "auto_merge": true,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "this upload() call can raise on a network hiccup, but there is no retry or error handling around it",
+        "path": "app/uploader.py",
+        "diff_hunk": "@@ -10,3 +10,5 @@ def push(file):\n+    upload(file)\n+    return True",
+        "created_at": "2026-01-05T11:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "```json\n{\"label\": \"SUBSTANTIVE\", \"bot\": \"claude\", \"model\": \"sonnet\", \"effort\": \"high\", \"severity\": \"high\", \"reason\": \"upload() can raise; no retry or error handling\"}\n```",
+        "fix_outcome": "applied"
+      }
+    ],
+    [
+      {
+        "id": "c2",
+        "login": "claude[bot]",
+        "body": "No issues found.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-05T11:20:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "SUBSTANTIVE"},
+    "terminal_disposition": "merge",
+    "per_comment": {"c1": "fixed"},
+    "auto_actions": [["squash-merge", "do"], ["squash-merge", "done"]]
+  }
+}

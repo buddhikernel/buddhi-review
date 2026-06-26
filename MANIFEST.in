@@ -1,0 +1,8 @@
+# sdist contents for buddhi-review.
+#
+# The test tree is development-only: it ships in neither the wheel nor a normal
+# install, and its `conftest.py` (the gh/model seam shims) is not packaged, so a
+# bundled `pytest` could not run anyway. Prune it from the sdist so the published
+# tarball matches the already-clean wheel (one source surface for users, no stray
+# fixture files). Run the suite from a clone: `pip install -e ".[test]"`.
+prune tests

@@ -1,0 +1,38 @@
+{
+  "name": "cosmetic_fix_merge",
+  "description": "A naming nit (code readability, not a taste call about user-facing content) is fixed; the next round is clean and the loop merges. Classifier response is plain JSON.",
+  "pr": "103",
+  "repo": "example-org/widget",
+  "auto_merge": true,
+  "config": {"active_reviewers": ["gemini"], "auto_on_open": {"gemini": true}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "gemini-code-assist[bot]",
+        "body": "the local variable `tmp` would read more clearly as `retry_count`",
+        "path": "app/uploader.py",
+        "created_at": "2026-01-06T09:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "{\"label\": \"COSMETIC\", \"bot\": \"gemini\", \"model\": \"sonnet\", \"effort\": \"low\", \"severity\": \"low\", \"reason\": \"rename tmp to retry_count for readability\"}",
+        "fix_outcome": "applied"
+      }
+    ],
+    [
+      {
+        "id": "c2",
+        "login": "gemini-code-assist[bot]",
+        "body": "There are no review comments to address.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-06T09:25:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "COSMETIC"},
+    "terminal_disposition": "merge",
+    "per_comment": {"c1": "fixed"},
+    "auto_actions": [["squash-merge", "do"], ["squash-merge", "done"]]
+  }
+}

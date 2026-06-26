@@ -1,0 +1,37 @@
+{
+  "name": "outdated_skip_merge",
+  "description": "The comment points at a line a later commit already removed — OUTDATED, discarded without a fix. The next round is clean and the loop merges.",
+  "pr": "106",
+  "repo": "example-org/widget",
+  "auto_merge": true,
+  "config": {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": true}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "copilot[bot]",
+        "body": "this nested loop reparses the payload on every iteration; hoist the parse above the loop",
+        "path": "app/render.py",
+        "created_at": "2026-01-09T13:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "{\"label\": \"OUTDATED\", \"bot\": \"copilot\", \"model\": \"sonnet\", \"effort\": \"low\", \"severity\": \"low\", \"reason\": \"the referenced loop was removed in a later commit on this branch\"}"
+      }
+    ],
+    [
+      {
+        "id": "c2",
+        "login": "copilot[bot]",
+        "body": "I have no additional feedback to provide.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-09T13:25:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "OUTDATED"},
+    "terminal_disposition": "merge",
+    "per_comment": {"c1": "skipped-invalid"},
+    "auto_actions": [["squash-merge", "do"], ["squash-merge", "done"]]
+  }
+}

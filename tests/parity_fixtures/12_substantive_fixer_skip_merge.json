@@ -1,0 +1,38 @@
+{
+  "name": "substantive_fixer_skip_merge",
+  "description": "The kernel routes a SUBSTANTIVE comment to the fixer, but the fixer's own empirical check contradicts the claim and it self-SKIPs — reaching skipped-invalid via the FIXER path (not a kernel discard). The next round is clean and the loop merges.",
+  "pr": "112",
+  "repo": "example-org/widget",
+  "auto_merge": true,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "this comparison should use `is` instead of `==` for the None check",
+        "path": "app/state.py",
+        "created_at": "2026-01-15T10:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "{\"label\": \"SUBSTANTIVE\", \"bot\": \"claude\", \"model\": \"sonnet\", \"effort\": \"high\", \"severity\": \"medium\", \"reason\": \"prefer identity check for None\"}",
+        "fix_outcome": "skipped"
+      }
+    ],
+    [
+      {
+        "id": "c2",
+        "login": "claude[bot]",
+        "body": "No issues found.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-15T10:25:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "SUBSTANTIVE"},
+    "terminal_disposition": "merge",
+    "per_comment": {"c1": "skipped-invalid"},
+    "auto_actions": [["squash-merge", "do"], ["squash-merge", "done"]]
+  }
+}

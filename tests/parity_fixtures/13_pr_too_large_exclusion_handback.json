@@ -1,0 +1,26 @@
+{
+  "name": "pr_too_large_exclusion_handback",
+  "description": "The reviewer reports the PR is too large to review — permanently excluded for the run (the other permanent exclusion cause besides quota). Nothing is actionable; with auto-merge off the loop hands the PR back. Exercises the PR-too-large exclusion auto-action.",
+  "pr": "113",
+  "repo": "example-org/widget",
+  "auto_merge": false,
+  "config": {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": true}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "copilot[bot]",
+        "body": "This pull request is too large to review; please split it into smaller changes.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-16T09:00:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {},
+    "terminal_disposition": "escalate-to-human",
+    "per_comment": {},
+    "auto_actions": [["exclusion", "skip"], ["squash-merge", "skip"]]
+  }
+}

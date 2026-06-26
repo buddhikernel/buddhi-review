@@ -1,0 +1,74 @@
+# Packaging + test configuration for buddhi-review (the free Buddhi PR-review
+# skill for Claude Code).
+#
+# `pip install -e .` installs the `buddhi_review` package and the `buddhi-review`
+# console entry point. The package is built on the public Buddhi kernel
+# (PyPI: `buddhikernel`, import name `buddhi`). Notifications go to the console, so
+# there is no certifi/TLS dependency.
+# The `skills/` tree (Claude Code slash-command skills) and `launch-review.sh` are
+# declared as package data so they are included in the sdist and wheel.
+
+[build-system]
+requires = ["setuptools>=62.3", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "buddhi-review"
+version = "0.1.0"
+description = "Free PR review-and-fix loop for Claude Code: fans out review bots, classifies each comment, applies fixes, and merges on a clean pass (opt-in)."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "The Buddhi authors" }]
+keywords = [
+    "code-review",
+    "pull-request",
+    "claude-code",
+    "cognitive-budget",
+    "human-in-the-loop",
+    "agents",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Quality Assurance",
+]
+dependencies = [
+    "buddhikernel>=0.1",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+buddhi-review = "buddhi_review.cli:main"
+
+# Review-loop backends are discovered through this generic entry-points group; the
+# front-door dispatcher runs the highest-priority active one (else the free engine).
+# The skill ships only the free backend. A separately-installed package may register
+# its own backend under the same group to take over /review-pr and /create-pr.
+[project.entry-points."buddhi_review.backends"]
+free = "buddhi_review.backends:FreeBackend"
+
+[project.urls]
+Homepage = "https://github.com/buddhikernel/buddhi-review"
+Source = "https://github.com/buddhikernel/buddhi-review"
+"Bug Tracker" = "https://github.com/buddhikernel/buddhi-review/issues"
+Kernel = "https://github.com/buddhikernel/buddhi"
+
+[tool.setuptools]
+packages = ["buddhi_review"]
+
+[tool.setuptools.package-data]
+buddhi_review = ["skills/**/*", "launch-review.sh", "launch-setup.sh", "plan_profiles.yml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

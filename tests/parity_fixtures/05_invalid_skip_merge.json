@@ -1,0 +1,37 @@
+{
+  "name": "invalid_skip_merge",
+  "description": "The bot cites a flag that does not exist — an INVALID claim the kernel discards without a fix. The next round is clean and the loop merges. Classifier response is the legacy pipe form.",
+  "pr": "105",
+  "repo": "example-org/widget",
+  "auto_merge": true,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "pass the `--safe` flag here so the writer cannot clobber existing files",
+        "path": "app/writer.py",
+        "created_at": "2026-01-08T08:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "INVALID|claude|sonnet|low|the cited --safe flag does not exist in this CLI"
+      }
+    ],
+    [
+      {
+        "id": "c2",
+        "login": "claude[bot]",
+        "body": "No issues found.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-08T08:25:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "INVALID"},
+    "terminal_disposition": "merge",
+    "per_comment": {"c1": "skipped-invalid"},
+    "auto_actions": [["squash-merge", "do"], ["squash-merge", "done"]]
+  }
+}

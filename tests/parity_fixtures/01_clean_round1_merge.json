@@ -1,0 +1,26 @@
+{
+  "name": "clean_round1_merge",
+  "description": "The reviewer posts the clean sentinel on round 1 — voluntarily done, nothing to fix, the loop squash-merges.",
+  "pr": "101",
+  "repo": "example-org/widget",
+  "auto_merge": true,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "No issues found.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-05T10:00:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {},
+    "terminal_disposition": "merge",
+    "per_comment": {},
+    "auto_actions": [["squash-merge", "do"], ["squash-merge", "done"]]
+  }
+}

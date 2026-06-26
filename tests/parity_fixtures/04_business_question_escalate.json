@@ -1,0 +1,28 @@
+{
+  "name": "business_question_escalate",
+  "description": "A strategy/scope question the docs do not settle (drop a legacy column?). The kernel routes it to the human; the console ask goes unanswered, so the loop hands the PR back. Classifier response is JSON behind a prose preamble (brace-walk path).",
+  "pr": "104",
+  "repo": "example-org/widget",
+  "auto_merge": false,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "unanswered",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "should this migration drop the legacy `status` column outright, or keep it for back-compat? Nothing in the README or CONTRIBUTING settles this.",
+        "path": "migrations/0007_status.py",
+        "created_at": "2026-01-07T14:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "I consulted the README and the contributor guide and found nothing that settles this product-scope decision.\n{\"label\": \"BUSINESS_QUESTION\", \"bot\": \"claude\", \"model\": \"opus\", \"effort\": \"high\", \"severity\": \"high\", \"reason\": \"dropping the legacy column is the owner's call; docs do not settle it\"}"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "BUSINESS_QUESTION"},
+    "terminal_disposition": "escalate-to-human",
+    "per_comment": {"c1": "escalated"},
+    "auto_actions": []
+  }
+}

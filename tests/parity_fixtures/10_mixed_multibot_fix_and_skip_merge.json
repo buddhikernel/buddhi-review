@@ -1,0 +1,55 @@
+{
+  "name": "mixed_multibot_fix_and_skip_merge",
+  "description": "Two bots in one round: Claude flags a real bug (fixed) and Copilot cites a helper that was never added (INVALID, skipped). The next round is clean from both and the loop merges. Exercises multi-bot + mixed disposition in one run.",
+  "pr": "110",
+  "repo": "example-org/widget",
+  "auto_merge": true,
+  "config": {"active_reviewers": ["claude", "copilot"], "auto_on_open": {"claude": false, "copilot": true}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "the cache key here omits the tenant id, so two tenants collide on the same entry",
+        "path": "app/cache.py",
+        "diff_hunk": "@@ -3,2 +3,3 @@\n+    key = f\"{resource}:{name}\"",
+        "created_at": "2026-01-13T09:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "```json\n{\"label\": \"SUBSTANTIVE\", \"bot\": \"claude\", \"model\": \"sonnet\", \"effort\": \"high\", \"severity\": \"critical\", \"reason\": \"cache key omits tenant id; cross-tenant collision\"}\n```",
+        "fix_outcome": "applied"
+      },
+      {
+        "id": "c2",
+        "login": "copilot[bot]",
+        "body": "call the new normalize_tenant() helper before building the key",
+        "path": "app/cache.py",
+        "created_at": "2026-01-13T09:01:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "INVALID|copilot|haiku|low|normalize_tenant() is not defined anywhere in this PR"
+      }
+    ],
+    [
+      {
+        "id": "c3",
+        "login": "claude[bot]",
+        "body": "No issues found.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-13T09:30:00Z"
+      },
+      {
+        "id": "c4",
+        "login": "copilot[bot]",
+        "body": "I have no further comments.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-13T09:31:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "SUBSTANTIVE", "c2": "INVALID"},
+    "terminal_disposition": "merge",
+    "per_comment": {"c1": "fixed", "c2": "skipped-invalid"},
+    "auto_actions": [["squash-merge", "do"], ["squash-merge", "done"]]
+  }
+}
