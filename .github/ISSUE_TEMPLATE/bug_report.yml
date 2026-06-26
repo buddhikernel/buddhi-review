@@ -1,0 +1,23 @@
+name: Bug report
+description: Report a problem with buddhi-review
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes: { label: What happened?, description: What you saw vs. what you expected. }
+    validations: { required: true }
+  - type: textarea
+    id: repro
+    attributes: { label: Steps to reproduce }
+    validations: { required: true }
+  - type: input
+    id: version
+    attributes: { label: Versions, description: "Output of `pip show buddhi-review buddhikernel`." }
+    validations: { required: true }
+  - type: input
+    id: env
+    attributes: { label: OS + Python, placeholder: "macOS 14 / Python 3.11" }
+    validations: { required: true }
+  - type: textarea  
+    id: logs
+    attributes: { label: Relevant logs, render: shell }
