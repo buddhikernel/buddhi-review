@@ -14,7 +14,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "buddhi-review"
-version = "0.1.0"
+version = "0.1.1"
 description = "Free PR review-and-fix loop for Claude Code: fans out review bots, classifies each comment, applies fixes, and merges on a clean pass (opt-in)."
 readme = "README.md"
 requires-python = ">=3.9"
