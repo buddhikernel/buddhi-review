@@ -110,7 +110,7 @@ def test_unconfirmed_offers_global_defaults_fallback(skill):
     gate = _gate(skill)
     # Option 2 proceeds on the global default fleet without writing a per-repo entry.
     assert "Use global defaults" in gate
-    assert "refuses to launch" in gate  # names the no-default fail-closed consequence
+    assert "will refuse to launch" in gate  # names the no-default fail-closed consequence
 
 
 @pytest.mark.parametrize("skill", _SKILLS)
