@@ -9,12 +9,16 @@
 # declared as package data so they are included in the sdist and wheel.
 
 [build-system]
-requires = ["setuptools>=62.3", "wheel"]
+# setuptools>=64 ships PEP 660 ``build_editable``, required for ``pip install -e .``
+# on a pyproject-only project (62.3 predates it).
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "buddhi-review"
-version = "0.1.2"
+# Version is single-sourced from ``buddhi_review.__version__`` (see
+# [tool.setuptools.dynamic] below) so it can never drift from the package.
+dynamic = ["version"]
 description = "Free PR review-and-fix loop for Claude Code: fans out review bots, classifies each comment, applies fixes, and merges on a clean pass (opt-in)."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -66,6 +70,9 @@ Kernel = "https://github.com/buddhikernel/buddhi"
 
 [tool.setuptools]
 packages = ["buddhi_review"]
+
+[tool.setuptools.dynamic]
+version = { attr = "buddhi_review.__version__" }
 
 [tool.setuptools.package-data]
 buddhi_review = ["skills/**/*", "launch-review.sh", "launch-setup.sh", "plan_profiles.yml"]

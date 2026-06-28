@@ -11,7 +11,12 @@ an editable file you answer from the terminal.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+# Single source of truth for the package version. pyproject.toml reads this string
+# literal via setuptools' ``dynamic = ["version"]`` (``attr = buddhi_review.__version__``),
+# which extracts it by AST WITHOUT importing the package — so it MUST stay a plain
+# top-level string literal (never computed). ``skill_provenance.package_version()``
+# returns it, and the version-stamp transform records it into installed skills.
+__version__ = "0.1.3"
 
 __all__ = [
     "Classification",
