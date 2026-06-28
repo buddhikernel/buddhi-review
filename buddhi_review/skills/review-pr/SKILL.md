@@ -153,10 +153,11 @@ and must NEVER block the loop. Otherwise parse the single JSON object
        On a headless host the launcher prints the one-liner to run by hand
        instead. After it returns, reply exactly: ``Setup opened in a new window —
        finish it there, then re-run /review-pr.`` and **EXIT**.
-    2. **Use global defaults** — continue to Step 2 without writing a per-repo
-       entry; the loop runs with your global default fleet. (When
-       `has_global_default` is `false` there is no fallback fleet and the review
-       loop refuses to launch by design — pick option 1.)
+    2. **Use global defaults** *(offer only when `has_global_default` is `true`)* —
+       continue to Step 2 without writing a per-repo entry; the loop runs with
+       your global default fleet. When `has_global_default` is `false`, omit this
+       option entirely — there is no fallback fleet and the loop will refuse to
+       launch; option 1 is the only path.
 
 This gate is interactive-only and **never configures reviewers itself** — it only
 offers to launch the terminal wizard (the single deterministic setup brain) or
