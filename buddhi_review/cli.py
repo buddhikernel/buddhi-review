@@ -13,6 +13,8 @@ Subcommands:
                    git decision tree (commit/branch/push) → gh pr create → launch the
                    review adapter detached (PR URL is the last stdout line).
   ``setup``      — the interactive onboarding wizard (plan, repo, reviewer fleet).
+  ``status``     — print per-repo setup status as JSON (``repo_confirmed`` /
+                   ``has_global_default``) for the SKILL.md gate to shell out to.
 
 Answers come from the terminal.
 """
@@ -28,7 +30,14 @@ from buddhi_review import __version__, gh_ingest, model_call, round_driver, upse
 from buddhi_review.actuators import default_fix_dispatch
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.backends import launch_review_loop
-from buddhi_review.config import active_reviewers, load_config, notifier_channel, plan
+from buddhi_review.config import (
+    active_reviewers,
+    has_global_default,
+    load_config,
+    notifier_channel,
+    plan,
+    repo_entry,
+)
 from buddhi_review.fix_apply import VERIFY_MODES
 from buddhi_review.loop import Comment, process_comments
 from buddhi_review.notifier import ConsoleNotifier
@@ -190,6 +199,20 @@ def _setup(args: argparse.Namespace) -> int:
     return wizard.run(argv=argv)
 
 
+def _status(args: argparse.Namespace) -> int:
+    """Print the per-repo setup status as JSON for the SKILL.md gate to shell out
+    to: whether ``--repo`` has a CONFIRMED reviewer fleet (a ``repos[<repo>]``
+    entry) and whether a global default exists to fall back to. Pure read — one
+    config load, no network, no loop. JSON is the only thing on stdout (any
+    config-missing warning goes to stderr)."""
+    cfg = load_config()
+    print(json.dumps({
+        "repo_confirmed": repo_entry(cfg, args.repo) is not None,
+        "has_global_default": has_global_default(cfg),
+    }))
+    return 0
+
+
 def _add_loop_args(p: argparse.ArgumentParser) -> None:
     """The review-loop flags, shared by ``review-pr`` (the front door) and
     ``run-loop`` (the detached engine) so they never drift."""
@@ -255,6 +278,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("setup", help="interactive onboarding wizard")
     sp.add_argument("--repo", help="pre-bind this owner/repo (per-repo confirm mode)")
+
+    stp = sub.add_parser("status", help="print per-repo setup status as JSON (for the skill gate)")
+    stp.add_argument("--repo", required=True, help="owner/repo to report on")
     return p
 
 
@@ -270,6 +296,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _create_pr(args)
     if args.command == "setup":
         return _setup(args)
+    if args.command == "status":
+        return _status(args)
     build_parser().print_help()
     return 0
 

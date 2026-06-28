@@ -163,3 +163,12 @@ def has_global_default() -> bool:
     ``active_reviewers`` present as a list). An unconfirmed repo may run against
     the global default only when this holds."""
     return config.has_global_default(load_config())
+
+
+def label_gated_ci(repo: Optional[str] = None) -> bool:
+    """Whether the "ready-for-ci" label gate guards the merge for ``repo`` — the
+    per-repo ``label_gated_ci`` when the repo is confirmed, else the global flag,
+    else the default (off). The named resolver the round loop / pre-merge gate
+    reads; per-repo resolution lives in :func:`buddhi_review.config.label_gated_ci`.
+    ``repo=None`` reads the global flag."""
+    return config.label_gated_ci(load_config(), repo)
