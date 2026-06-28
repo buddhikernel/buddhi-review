@@ -13,7 +13,8 @@ _PAID_KEYS = (
     "github_billing_token", "dashboard_refresh_interval", "budget_throttle",
     "claude_credit_reserve", "github_review_minutes",
 )
-_FREE_KEYS = {"plan", "active_reviewers", "auto_on_open", "notifications", "repo", "cwd"}
+_FREE_KEYS = {"plan", "active_reviewers", "auto_on_open", "notifications", "repo", "cwd",
+              "repos"}
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────────
@@ -139,6 +140,25 @@ def test_run_writes_only_free_keys(monkeypatch, tmp_path):
     # GitHub-App bots auto-review) so a default flip is caught.
     assert cfg["auto_on_open"] == {"copilot": True, "gemini": True, "codex": True, "claude": False}
     assert cfg["repo"] == "acme/widgets"
+
+
+def test_full_run_confirms_the_bound_repo(monkeypatch, tmp_path):
+    """The full wizard records repos[<bound repo>] (presence == confirmed) in
+    ADDITION to the top-level global default, so the per-repo gate (F5/F6) sees the
+    repo as confirmed. _drive's injected single_select returns the preselect, so the
+    per-repo auto-merge + label-gated-CI default to off."""
+    from buddhi_review import config
+    rc, _, cfg_path = _drive(monkeypatch, tmp_path, workflow_present=True)
+    assert rc == 0
+    cfg = _load_yaml(cfg_path)
+    # The bound repo (inferred as acme/widgets) has a confirmed per-repo entry.
+    assert config.repo_entry(cfg, "acme/widgets") is not None
+    assert config.active_reviewers(cfg, "acme/widgets") == wizard._REVIEWERS
+    # Off-by-default per-repo settings round-trip through the F1 readers.
+    assert config.repo_entry(cfg, "acme/widgets")["auto_merge"] is False
+    assert config.label_gated_ci(cfg, "acme/widgets") is False
+    # The top-level global default still exists alongside the per-repo entry.
+    assert config.has_global_default(cfg) is True
 
 
 def test_run_renders_locked_teasers(monkeypatch, tmp_path):
