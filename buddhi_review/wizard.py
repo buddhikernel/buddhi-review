@@ -18,8 +18,13 @@ Only the free keys are persisted: ``plan``, ``repo``, ``cwd``,
 ``active_reviewers``, ``auto_on_open``, ``notifications: console``. A shell-rc
 secret (the Copilot ``GH_TOKEN`` escape hatch) is written via
 :mod:`buddhi_review.shell_env`, never into config. The Claude reviewer path can
-write the bundled ``claude-code-review.yml`` and set the ``CLAUDE_CODE_OAUTH_TOKEN``
-repo secret.
+provision the workflow server-side — when the checkout is on a feature branch it
+opens a ``gh``-api PR that lands ``claude-code-review.yml`` on the default branch
+(an issue_comment workflow runs ONLY from there) without touching the local tree,
+falling back to a local copy — and set the ``CLAUDE_CODE_OAUTH_TOKEN`` secret. The
+secret is scoped repo-only by default (least blast radius); on an org-owned repo
+an explicit, separately-confirmed opt-in can scope it org-wide but visible to this
+repo alone, gated on org-admin with a repo-scope fallback.
 
 The wizard is an interactive raw-mode TTY program; the ``/review-pr setup`` skill
 step opens it in a fresh window via :mod:`buddhi_review.setup_launcher`. Every
@@ -29,12 +34,14 @@ real terminal.
 """
 from __future__ import annotations
 
+import base64
 import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -61,6 +68,15 @@ _PRO_SOON_TEASER = "More automation is coming soon — stay tuned."
 _ACTIONS_NOTE = ("Note: the Claude review workflow runs on GitHub Actions and uses "
                  "your repo's Actions minutes (private repos have a free monthly "
                  "allowance; public repos are free) — see github.com/settings/billing.")
+
+# A clear, single-purpose Claude re-check prompt. Names the workflow file
+# explicitly and SPLITS the two independent facts (the workflow is committed on
+# the default branch · the CLAUDE_CODE_OAUTH_TOKEN secret is set) instead of
+# mashing them into one run-on question, so a user who just merged the install PR
+# or set the secret in another window can re-confirm in one keypress.
+_CLAUDE_RECHECK_PROMPT = (
+    "Has the workflow file claude-code-review.yml been committed on the default "
+    "branch (and the CLAUDE_CODE_OAUTH_TOKEN secret set)? Shall I confirm now?")
 
 
 # ── Colour + output ──────────────────────────────────────────────────────────────
@@ -346,6 +362,54 @@ def repo_toplevel(run, cwd: Optional[str] = None) -> Optional[str]:
     return (getattr(r, "stdout", "") or "").strip() or None
 
 
+# ── GitHub-fact probes (the provisioning engine reads these) ──────────────────────
+
+def _owner_type(owner: Optional[str], *, run) -> Optional[str]:
+    """Whether a repo's ``owner`` is a GitHub Organization or a personal User
+    account, via ``gh api users/<owner> --jq .type`` (the Users API reports both
+    kinds and returns "Organization" for org logins). ``owner`` may be a bare login
+    or an ``owner/repo`` slug — the repo part is dropped. Returns
+    ``"Organization"`` / ``"User"``, or ``None`` when the lookup can't run (no
+    owner, a malformed login, a gh error, or an unexpected value); callers treat
+    ``None`` as "not an org" and stay on the safe repo-scoped path."""
+    if not owner:
+        return None
+    login = str(owner).split("/", 1)[0].strip()
+    if not login or not re.match(r"^[A-Za-z0-9_-]+$", login):
+        return None
+    ok, out = _run_ok(run, ["gh", "api", f"users/{login}", "--jq", ".type"])
+    if not ok:
+        return None
+    t = out.strip()
+    return t if t in ("Organization", "User") else None
+
+
+def _default_branch(repo: Optional[str], *, run) -> Optional[str]:
+    """The repo's default branch name (the ONLY branch an issue_comment workflow
+    runs from), via ``gh repo view``. ``None`` when it can't be read."""
+    if not repo:
+        return None
+    ok, out = _run_ok(run, ["gh", "repo", "view", repo, "--json", "defaultBranchRef",
+                            "--jq", ".defaultBranchRef.name"])
+    if not ok:
+        return None
+    return out.strip() or None
+
+
+def _current_branch(cwd: Optional[str], *, run) -> Optional[str]:
+    """The checked-out branch name in ``cwd``, or ``None`` (no cwd, not a repo,
+    detached HEAD, or git unavailable). A detached HEAD reports 'HEAD' from
+    rev-parse — treated as unknown since it is not a branch the workflow could live
+    on."""
+    if not cwd:
+        return None
+    ok, out = _run_ok(run, ["git", "-C", str(cwd), "rev-parse", "--abbrev-ref", "HEAD"])
+    if not ok:
+        return None
+    b = out.strip()
+    return b if (b and b != "HEAD") else None
+
+
 def build_config(plan: str, repo: Optional[str], cwd: Optional[str],
                  active_reviewers: Sequence[str], auto_on_open: Dict[str, bool]) -> Dict[str, Any]:
     """The free config dict — ONLY the free keys. No budget / monitoring / push-channel
@@ -532,19 +596,296 @@ def _write_workflow_template(cwd: Optional[str]) -> Optional[Path]:
         return None
 
 
-def _gh_secret_exists(repo: str, name: str, run) -> bool:
-    # gh secret list emits tab-separated rows: NAME\tUPDATED_AT; split("\t")[0] is reliable.
-    ok, out = _run_ok(run, ["gh", "secret", "list", "--repo", repo])
-    return ok and any(line.split("\t")[0].strip() == name for line in out.splitlines())
+def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
+                    message: str, title: str, branch: str, *,
+                    recovery_path: Optional[str] = None, run) -> Tuple[bool, str]:
+    """Open a PR that adds an arbitrary file (``path``, text ``content``) to the
+    repo's DEFAULT branch entirely server-side — no local checkout is touched, so
+    the user's feature branch and working tree are left exactly as they were:
+
+      1. read the default branch's head SHA,
+      2. create a fresh ref ``branch`` off it,
+      3. PUT ``content`` to ``path`` on that ref (one commit, message ``message``),
+      4. open a PR titled ``title`` (base=default, head=branch).
+
+    Generic by design — it installs the Claude review workflow today and the
+    ``ready-for-ci`` template later (F4). ``recovery_path`` (defaults to ``path``)
+    is the file probed when a previous partial run already created ``branch``: its
+    blob SHA is needed for the Contents-API update (a PUT over an existing file 422s
+    without it), so a re-run reuses the branch and updates the file instead of
+    failing. Returns ``(ok, detail)`` — ``detail`` is the PR URL on success, else a
+    short reason. The PUT needs a token with the ``workflow`` scope; without it
+    GitHub rejects the write and the caller falls back to a local copy."""
+    path = str(path).lstrip("/")
+    recovery_path = str(recovery_path or path).lstrip("/")
+    enc_path = urllib.parse.quote(path, safe="/")
+    enc_recovery = urllib.parse.quote(recovery_path, safe="/")
+    enc_branch = urllib.parse.quote(branch, safe="")
+    b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    try:
+        head = run(["gh", "api", f"repos/{repo}/git/ref/heads/{default_branch}",
+                    "--jq", ".object.sha"], timeout=20)
+        if getattr(head, "returncode", 1) != 0 or not (getattr(head, "stdout", "") or "").strip():
+            return (False, "couldn't read the default branch head")
+        sha = head.stdout.strip()
+        ref = run(["gh", "api", f"repos/{repo}/git/refs",
+                   "-f", f"ref=refs/heads/{branch}", "-f", f"sha={sha}"], timeout=20)
+        sha_args: List[str] = []
+        if getattr(ref, "returncode", 1) != 0:
+            # Branch creation failed — it may already exist from a partial earlier
+            # run. Reuse it (so recovery needs no manual cleanup) but ONLY after
+            # confirming it really exists; otherwise the create genuinely failed.
+            probe = run(["gh", "api", f"repos/{repo}/git/ref/heads/{enc_branch}"], timeout=15)
+            if getattr(probe, "returncode", 1) != 0:
+                return (False, f"couldn't create branch '{branch}'")
+            # The Contents API requires the blob sha when updating an existing file
+            # (422 otherwise); probe `recovery_path` on the branch so a re-run that
+            # already committed the file updates it cleanly.
+            file_probe = run(["gh", "api",
+                              f"repos/{repo}/contents/{enc_recovery}?ref={enc_branch}",
+                              "--jq", ".sha"], timeout=15)
+            if getattr(file_probe, "returncode", 1) == 0 and (file_probe.stdout or "").strip():
+                sha_args = ["-f", f"sha={file_probe.stdout.strip()}"]
+        put = run(["gh", "api", "-X", "PUT",
+                   f"repos/{repo}/contents/{enc_path}",
+                   "-f", f"message={message}",
+                   "-f", f"content={b64}", "-f", f"branch={branch}"] + sha_args, timeout=20)
+        if getattr(put, "returncode", 1) != 0:
+            return (False, "couldn't write the file "
+                           "(for workflow paths the gh token may need the 'workflow' scope)")
+        pr = run(["gh", "pr", "create", "--repo", repo,
+                  "--base", default_branch, "--head", branch,
+                  "--title", title,
+                  "--body", f"Adds `{path}` to the default branch. "
+                            "(Opened by the Buddhi setup wizard.)"], timeout=30)
+    except Exception as exc:
+        return (False, type(exc).__name__)
+    if getattr(pr, "returncode", 1) != 0:
+        return (False, "branch pushed but opening the PR failed")
+    out = (getattr(pr, "stdout", "") or "").strip()
+    url = out.splitlines()[-1] if out else "(PR opened)"
+    return (True, url)
 
 
-def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream) -> str:
-    """Walk the user through setting ``CLAUDE_CODE_OAUTH_TOKEN`` as a repo secret.
-    Returns a short status string."""
+def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, stream,
+                                   input_fn=input) -> Optional[str]:
+    """Offer to install ``claude-code-review.yml`` when it is absent from the
+    default branch. An issue_comment workflow runs ONLY from the default branch, so
+    a silent write into a feature checkout never enables reviews. On a feature
+    branch this offers the SERVER-SIDE route first — a ``gh``-api PR that lands the
+    workflow on the default branch on a fresh branch, leaving the local checkout
+    untouched — and falls back to a local copy only if that fails or is declined.
+    Returns ``'pr'`` (a PR was opened), ``True`` (written into the local checkout),
+    or ``None`` (nothing done)."""
+    template = _workflow_template_path()
+    if not template.exists():
+        return None
+    try:
+        template_text: Optional[str] = template.read_text(encoding="utf-8")
+    except OSError:
+        template_text = None
+
+    cur = _current_branch(cwd, run=run)
+    default = _default_branch(repo, run=run)
+    on_feature = bool(cur and default and cur != default)
+
+    if on_feature and template_text is not None and _is_tty():
+        _row("warn", f"This checkout is on '{cur}', not the default branch "
+                     f"'{default}'. GitHub runs the review workflow only from the "
+                     f"default branch, so committing it to '{cur}' won't enable "
+                     f"Claude reviews until it lands on '{default}'.", pal, stream)
+        if _ask_yes_no(f"Open a PR that adds the workflow to '{default}' on a fresh "
+                       "branch instead?", default=True, input_fn=input_fn, stream=stream):
+            ok, detail = _create_file_pr(
+                repo, default,
+                ".github/workflows/claude-code-review.yml",       # path
+                template_text,                                    # content
+                "Add Claude code-review workflow (Buddhi setup)",  # message
+                "Add Claude code-review workflow",                # title
+                "buddhi/add-claude-review-workflow",              # branch
+                run=run)
+            if ok:
+                _row("ok", f"Opened a PR to add the workflow: {detail}", pal, stream)
+                print(f"  {pal.GREY}{_ACTIONS_NOTE}{pal.RESET}", file=stream)
+                _row("info", f"Merge that PR to put the workflow on '{default}', then "
+                             "set the CLAUDE_CODE_OAUTH_TOKEN secret below.", pal, stream)
+                return "pr"
+            _row("warn", f"Could not open the PR automatically ({detail}). Falling "
+                         "back to a local copy you can land yourself.", pal, stream)
+            # fall through to the local-write offer
+
+    # Local-copy fallback (the historical behavior).
+    local_file = Path(cwd) / ".github" / "workflows" / "claude-code-review.yml" if cwd else None
+    if local_file and local_file.exists():
+        _row("info", f"Claude — local workflow file already exists at {local_file}. "
+                     "Commit and push it to the default branch to activate.", pal, stream)
+        return True
+    if cwd and _ask_yes_no("Write the bundled claude-code-review.yml into this repo now?",
+                           default=True, input_fn=input_fn, stream=stream):
+        dest = _write_workflow_template(cwd)
+        if dest:
+            _row("ok", f"Wrote {dest} — commit + push it to the default branch", pal, stream)
+            print(f"  {pal.GREY}{_ACTIONS_NOTE}{pal.RESET}", file=stream)
+            return True
+        _row("warn", "Could not write the workflow template", pal, stream)
+    return None
+
+
+def _gh_secret_exists(repo: str, name: str, *, org: Optional[str] = None, run) -> Optional[bool]:
+    """Whether ``name`` is among the Actions secrets visible to ``repo``. Checks the
+    repo's own secrets (``gh secret list --repo``); when ``repo``'s owner is an
+    Organization it ALSO checks the org-level secrets actually shared with ``repo``
+    via ``repos/{repo}/actions/organization-secrets`` (NOT ``gh secret list --org``,
+    which lists ALL org secrets regardless of per-repo visibility — a
+    ``selected``-visibility org secret absent from this repo's share list would
+    false-positive and skip prompting). Returns ``True`` / ``False``, or ``None``
+    when NEITHER check could run (so the caller offers to set it rather than
+    silently assume it is present). ``org`` is auto-resolved from the owner when not
+    given; pass it explicitly to avoid a repeat owner-type lookup."""
+    if not repo:
+        return None
+    if org is None and "/" in repo:
+        owner = repo.split("/", 1)[0]
+        if _owner_type(owner, run=run) == "Organization":
+            org = owner
+
+    def _scan(args) -> Tuple[bool, bool]:
+        # (ran, found). `gh secret list` prints "NAME\tUPDATED" per line; match the
+        # first whitespace-delimited token exactly so a name that is a substring of
+        # another can't false-positive.
+        ok, out = _run_ok(run, ["gh", "secret", "list"] + args)
+        if not ok:
+            return (False, False)
+        for ln in out.splitlines():
+            tok = ln.split()
+            if tok and tok[0].upper() == name.upper():
+                return (True, True)
+        return (True, False)
+
+    ran_repo, found = _scan(["--repo", repo])
+    if found:
+        return True
+    if org:
+        # Repo-scoped org-secrets endpoint: only the org secrets actually shared
+        # with THIS repo, not the org-wide list.
+        ok, out = _run_ok(run, ["gh", "api", "--paginate",
+                                f"repos/{repo}/actions/organization-secrets",
+                                "--jq", ".secrets[].name"])
+        if ok:
+            org_names = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            if name.upper() in (on.upper() for on in org_names):
+                return True
+            # Org check ran and missed it; if the repo check itself failed we still
+            # can't rule out a repo-level secret — say unknown.
+            return False if ran_repo else None
+        return None  # org API failed; status unknown
+    return False if ran_repo else None
+
+
+def _org_admin(org: Optional[str], *, run) -> Optional[bool]:
+    """Whether the authenticated gh user is an ADMIN (owner) of ``org``, via the
+    org-membership API (``role`` is "admin" for owners, "member" otherwise). Only an
+    org admin can create org-level Actions secrets, so the org-scope opt-in is gated
+    on this. Returns ``True`` / ``False``, or ``None`` when the check can't run (no
+    org, gh error, or the user isn't a member) — callers treat anything but ``True``
+    as 'not confirmed' and stay repo-scoped."""
+    if not org or not re.match(r"^[A-Za-z0-9_-]+$", org):
+        return None
+    ok, out = _run_ok(run, ["gh", "api", f"user/memberships/orgs/{org}", "--jq", ".role"])
+    if not ok:
+        return None
+    return out.strip() == "admin"
+
+
+def _set_gh_secret(repo: str, name: str, value: str, *, org: Optional[str] = None,
+                   run) -> Tuple[bool, str]:
+    """Set the Actions secret ``name`` to ``value`` by piping the value into
+    ``gh secret set`` on stdin (the ``--body`` flag reads stdin when omitted, so the
+    secret never appears on argv or in the process list).
+
+    Scope: by default the secret is set on ``repo`` (``--repo``, the least blast
+    radius). When ``org`` is given it is set org-wide with ``--visibility selected``,
+    and the current repo is UNIONED into the existing selected-repo list (fetched
+    first) so repos already sharing the secret keep access — gh ``--repos`` REPLACES
+    the list, it does not append. Returns ``(ok, detail)``."""
+    if not (repo and value):
+        return (False, "missing repo or value")
+    if org:
+        # --visibility selected requires --repos; the org's repo is named without the
+        # owner (gh resolves it within the org). Union the current repo into the
+        # existing selected list so omitting it can't silently revoke other repos.
+        repo_name = repo.split("/", 1)[-1]
+        repos_to_set = [repo_name]
+        ok, out = _run_ok(run, ["gh", "api", "--paginate",
+                                f"orgs/{org}/actions/secrets/{name}/repositories",
+                                "--jq", ".repositories[].name"])
+        if ok:
+            existing = [ln.strip() for ln in out.splitlines() if ln.strip()]
+            if existing:
+                repos_to_set = existing if repo_name in existing else existing + [repo_name]
+        argv = ["gh", "secret", "set", name, "--org", org,
+                "--visibility", "selected", "--repos", ",".join(repos_to_set)]
+    else:
+        argv = ["gh", "secret", "set", name, "--repo", repo]
+    try:
+        r = run(argv, input=value, timeout=20)
+    except Exception as exc:
+        return (False, type(exc).__name__)
+    if getattr(r, "returncode", 1) != 0:
+        return (False, (getattr(r, "stderr", "") or "").strip() or "gh secret set failed")
+    return (True, "secret set")
+
+
+def _set_secret_scoped(repo: str, name: str, value: str, *, prefer_org: bool = False,
+                       run) -> Tuple[bool, str, str]:
+    """Set the Actions secret ``name`` to ``value``, choosing the scope SAFELY.
+
+    Default → repo scope (``--repo``, the least blast radius). This seam NEVER goes
+    org-wide on its own; ``prefer_org`` is the caller's EXPLICIT, separately-confirmed
+    opt-in (offered only when ``_owner_type`` reports an Organization). Even with
+    ``prefer_org`` it goes org-wide ONLY after confirming the gh user is an org admin
+    (``_org_admin``); on a non-admin org, a permission denial, or ANY org-set failure
+    it FALLS BACK to repo scope — the flow never fails because of an org attempt. The
+    org secret is scoped to this repo only (``--visibility selected``), so it is not
+    exposed across the whole org. Returns ``(ok, detail, scope)`` where ``scope`` is
+    the scope actually used ("org" or "repo")."""
+    if prefer_org and repo and "/" in repo:
+        org = repo.split("/", 1)[0]
+        if _org_admin(org, run=run) is True:
+            ok, detail = _set_gh_secret(repo, name, value, org=org, run=run)
+            if ok:
+                return (ok, detail, "org")
+            # org set failed (permission/denial/other) → fall back to repo scope
+        # non-admin, unknown role, or failed org set → repo-scope fallback
+    ok, detail = _set_gh_secret(repo, name, value, run=run)
+    return (ok, detail, "repo")
+
+
+def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream,
+                       single_select=single_select, input_fn=input,
+                       owner_type: Optional[str] = None) -> str:
+    """Walk the user through setting ``CLAUDE_CODE_OAUTH_TOKEN``. Returns a short
+    status string.
+
+    Dual-credential (FREE): either credential satisfies the workflow — the
+    pay-as-you-go ``ANTHROPIC_API_KEY`` or the subscription
+    ``CLAUDE_CODE_OAUTH_TOKEN`` — and the bundled template accepts both, so the
+    prompt is SKIPPED when EITHER is already present. The existence check is
+    org-aware: an org-set secret won't appear in ``gh secret list --repo``.
+
+    Safe scoping: the new secret is set on THIS repo only by default (least blast
+    radius). When ``repo``'s owner is an Organization an EXPLICIT, separately-
+    confirmed opt-in to scope it org-wide (visible to this repo alone) is offered
+    and routed through ``_set_secret_scoped``, which enforces the org-admin check
+    and the repo-scope fallback — so this never widens exposure without consent."""
     name = "CLAUDE_CODE_OAUTH_TOKEN"
-    # Either credential is sufficient — ANTHROPIC_API_KEY (pay-as-you-go) or
-    # CLAUDE_CODE_OAUTH_TOKEN (subscription). Only prompt when both are absent.
-    if _gh_secret_exists(repo, name, run) or _gh_secret_exists(repo, "ANTHROPIC_API_KEY", run):
+    if owner_type is None and "/" in repo:
+        owner_type = _owner_type(repo, run=run)
+    org = repo.split("/", 1)[0] if (owner_type == "Organization" and "/" in repo) else None
+    # Skip the prompt only when one credential is CONFIRMED present (True). An
+    # unknown result (None) is NOT treated as present — we offer to set it.
+    if (_gh_secret_exists(repo, name, org=org, run=run) is True or
+            _gh_secret_exists(repo, "ANTHROPIC_API_KEY", org=org, run=run) is True):
         return "present"
     if not _is_tty():
         _row("info", f"Set the {name} repo secret later: `claude setup-token` then "
@@ -561,18 +902,26 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
         token = ""
     if not token:
         return "skipped"
-    # `gh secret set NAME --repo R` reads the value from stdin when --body is omitted.
-    r = None
-    try:
-        r = run(["gh", "secret", "set", name, "--repo", repo], input=token, timeout=20)
-        ok = getattr(r, "returncode", 1) == 0
-    except Exception:
-        ok = False
+    # Scope SAFELY: repo-only by default. On an org-owned repo, offer the explicit
+    # org-wide opt-in (still visible to this repo alone); _set_secret_scoped checks
+    # org-admin and falls back to repo scope on any denial.
+    prefer_org = False
+    if org and _is_tty():
+        idx = single_select(
+            f"{org} is a GitHub organization. Where should {name} live?",
+            [("This repository only (recommended)",
+              "least exposure — a repo secret on this repo alone"),
+             (f"Org-wide, scoped to {repo.split('/')[-1]} only",
+              "an org secret visible only to this repo (needs org-admin; "
+              "falls back to repo scope otherwise)")],
+            preselect=0, pal=pal, stream=stream, input_fn=input_fn)
+        prefer_org = (idx == 1)
+    ok, detail, scope = _set_secret_scoped(repo, name, token, prefer_org=prefer_org, run=run)
     if ok:
-        _row("ok", f"{name} set on {repo}", pal, stream)
+        _row("ok", f"{name} set on {repo} ({scope} scope)", pal, stream)
         return "set"
-    err_detail = f" ({r.stderr.strip()})" if r is not None and getattr(r, "stderr", None) else ""
-    _row("warn", f"Could not set {name}{err_detail} — set it by hand with `gh secret set {name} --repo {repo}`", pal, stream)
+    _row("warn", f"Could not set {name} ({detail}) — set it by hand with "
+                 f"`gh secret set {name} --repo {repo}`", pal, stream)
     return "failed"
 
 
@@ -600,7 +949,8 @@ def _offer_gh_token(*, run, getpass_fn, pal, stream, input_fn=input) -> None:
 
 def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, Any], *,
                    run, spawn_command, getpass_fn, pal, stream,
-                   multi_select=multi_select, input_fn=input) -> Tuple[List[str], Dict[str, bool]]:
+                   multi_select=multi_select, single_select=single_select,
+                   input_fn=input) -> Tuple[List[str], Dict[str, bool]]:
     """Step 5 — reviewer fleet: multi-select, validate each, capture auto_on_open."""
     _panel("Step 5 — Reviewer fleet", ["Enable only the reviewers you have set up on this repo."],
            pal, stream)
@@ -638,21 +988,21 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
             _row("ok" if present else "warn", f"Claude — {note}", pal, stream)
             if repo:
                 if not present:
-                    local_file = Path(cwd) / ".github" / "workflows" / "claude-code-review.yml" if cwd else None
-                    if local_file and local_file.exists():
-                        _row("info", f"Claude — local workflow file already exists at {local_file}. Commit and push it to activate.", pal, stream)
-                    elif cwd and _ask_yes_no(
-                            "Write the bundled claude-code-review.yml into this repo now?",
-                            default=True, input_fn=input_fn, stream=stream):
-                        dest = _write_workflow_template(cwd)
-                        if dest:
-                            _row("ok", f"Wrote {dest} — commit + push it to the default branch", pal, stream)
-                            print(f"  {pal.GREY}{_ACTIONS_NOTE}{pal.RESET}", file=stream)
-                        else:
-                            _row("warn", "Could not write the workflow template", pal, stream)
+                    _offer_install_claude_workflow(repo, cwd, run=run, pal=pal,
+                                                   stream=stream, input_fn=input_fn)
                 if doctor.get("gh_auth"):
                     _set_claude_secret(repo, run=run, spawn_command=spawn_command,
-                                       getpass_fn=getpass_fn, pal=pal, stream=stream)
+                                       getpass_fn=getpass_fn, pal=pal, stream=stream,
+                                       single_select=single_select, input_fn=input_fn)
+                # P7 #1: a clear, single-purpose re-check — it names the workflow
+                # file and splits the two facts (workflow committed · secret set)
+                # so a user who just merged the install PR / set the secret can
+                # re-confirm without re-running the wizard.
+                if not present and _is_tty() and _ask_yes_no(
+                        _CLAUDE_RECHECK_PROMPT, default=False,
+                        input_fn=input_fn, stream=stream):
+                    present2, note2 = _probe_claude_workflow(repo, run)
+                    _row("ok" if present2 else "warn", f"Claude — {note2}", pal, stream)
 
         # auto_on_open: Claude is mention-driven (never auto-reviews on open); the
         # GitHub-App bots are asked (default True).
@@ -727,7 +1077,8 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
         step_budgets_locked(pal=pal, stream=stream)  # paid teaser
         reviewers, auto_on_open = step_reviewers(
             repo, cwd, doctor, run=run, spawn_command=spawn_command, getpass_fn=getpass_fn,
-            pal=pal, stream=stream, multi_select=multi_select, input_fn=input_fn)
+            pal=pal, stream=stream, multi_select=multi_select, single_select=single_select,
+            input_fn=input_fn)
         step_monitoring_locked(pal=pal, stream=stream)  # paid teaser
 
         new_cfg = build_config(plan, repo, cwd, reviewers, auto_on_open)
