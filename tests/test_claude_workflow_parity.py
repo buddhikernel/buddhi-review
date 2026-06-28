@@ -182,3 +182,78 @@ def test_workflow_stays_publish_clean() -> None:
     text = _workflow_text()
     for needle in ("manasvi", "m-s-21", "/Users/", "buddhi/", "buddhi-claude"):
         assert needle not in text, f"private reference {needle!r} leaked into the template"
+
+
+# ---------------------------------------------------------------------------
+# F9: the auth-failure post-step guard (turns a silent 401 RED, not green)
+# ---------------------------------------------------------------------------
+_GUARD_NAME_FRAGMENT = "authentication error"
+
+
+def _guard_step() -> dict:
+    """The auth-failure post-step, indexed by its ``name:`` so a reorder can't
+    silently read the wrong block."""
+    doc = yaml.safe_load(_workflow_text())
+    steps = doc["jobs"]["review"]["steps"]
+    step = next(
+        (s for s in steps if _GUARD_NAME_FRAGMENT in (s.get("name") or "")), None
+    )
+    assert step is not None, "workflow missing the auth-failure guard post-step"
+    return step
+
+
+def test_action_step_carries_a_stable_id() -> None:
+    """The action step needs a stable ``id`` so the guard can read its
+    ``execution_file`` output. (Reordering steps can't break the coupling.)"""
+    assert _action_step().get("id") == "claude_review", _action_step().get("id")
+
+
+def test_guard_step_present_and_runs_always() -> None:
+    """The post-step must run on ``always()`` — the action concludes ``success``
+    on a 401, so a ``success()``-gated step would be skipped and the silent
+    failure would stay invisible. It reads the action's ``execution_file``."""
+    guard = _guard_step()
+    assert str(guard.get("if")).strip() == "always()"
+    env = guard.get("env") or {}
+    assert "execution_file" in (env.get("CLAUDE_EXECUTION_FILE") or ""), (
+        "guard must read the action's execution_file output"
+    )
+    assert "steps.claude_review.outputs.execution_file" in env["CLAUDE_EXECUTION_FILE"]
+    assert isinstance(guard.get("run"), str) and guard["run"].strip()
+
+
+def test_guard_fails_only_on_the_auth_signature_not_a_clean_or_plain_failure() -> None:
+    """The run-script must fail (``exit 1``) ONLY on the token-invalid auth
+    signature AND only when there is no clean-success result — so a clean review
+    (is_error:false) or an ordinary non-auth failure is never turned red."""
+    run = _guard_step()["run"]
+    # Matches the auth signature (mirrors the detector).
+    assert "invalid bearer token" in run
+    assert "authentication_error" in run
+    # The is_error:false clean-success guard is present (condition 2): a clean
+    # review never fires even if the phrase is quoted in the reviewed diff.
+    assert "is_error == false" in run
+    assert "exit 1" in run
+    # Fail-safe toward green when the tooling/output is absent — never a false red.
+    assert "command -v jq" in run
+    assert run.count("exit 0") >= 2  # missing-file path AND no-failure path
+
+
+def test_guard_is_self_contained_and_publish_clean() -> None:
+    """The template is copied verbatim into third-party repos, so the guard
+    script must reference no repo file and leak no private/paid identifier."""
+    run = _guard_step()["run"]
+    for forbidden in ("tools/", "python3 ", "../", "review_loop"):
+        assert forbidden not in run, f"guard script references {forbidden!r}"
+    for needle in ("manasvi", "m-s-21", "/Users/", "buddhi/", "buddhi-claude"):
+        assert needle not in run, f"private reference {needle!r} leaked into the guard"
+
+
+def test_credential_inputs_unchanged_and_runs_on_standard_runner() -> None:
+    """F9 only ADDS detection — it must not weaken the dual-credential inputs and
+    must keep the free standard runner."""
+    with_ = _action_step()["with"]
+    assert with_.get("claude_code_oauth_token") == "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"
+    assert with_.get("anthropic_api_key") == "${{ secrets.ANTHROPIC_API_KEY }}"
+    doc = yaml.safe_load(_workflow_text())
+    assert doc["jobs"]["review"]["runs-on"] == "ubuntu-latest"
