@@ -1,0 +1,65 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Label-gated CI — your CI runs ONCE, at merge, instead of on every push.
+#
+# WHY THIS GATE EXISTS
+#   While a pull request is under review it gets pushed to many times. Running the
+#   full CI suite on every one of those pushes burns CI minutes for little
+#   benefit. This workflow defers CI to merge time: the merge automation adds the
+#   `ready-for-ci` label to a PR right before it merges, and the job below runs
+#   ONLY when that label is present. Pushes made before the label is added cost no
+#   runner minutes.
+#
+# HOW IT WORKS
+#   on.pull_request.types:
+#     - labeled       fires the instant the `ready-for-ci` label is added — this
+#                     is the run that gates the merge.
+#     - synchronize   re-runs if the PR is pushed again AFTER it already carries
+#                     the label (e.g. a rebase before merge), so the gate always
+#                     reflects the commit being merged.
+#   The job-level `if:` is the real gate: the job is skipped unless the
+#   `ready-for-ci` label is currently on the PR, so pushes made before the label
+#   is added never spend a runner.
+#
+# WIRE IN YOUR OWN CI
+#   Replace the placeholder `run:` step below with your project's real test /
+#   lint / build command(s) (for example `make ci`, `npm test`, or
+#   `go test ./...`). Leave the `on:` block and the job-level `if:` guard
+#   unchanged — they are what make the label gate work and what the merge
+#   automation detects before it trusts the gate.
+# ──────────────────────────────────────────────────────────────────────────────
+name: Ready-for-CI
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+
+permissions:
+  contents: read          # checkout only — widen if your CI needs more scopes
+
+jobs:
+  ci:
+    # The gate. Do NOT remove this guard: without it CI runs on every push and
+    # the whole point of label-gating (running CI once, at merge) is lost.
+    #
+    # SKIPPED-IS-SUCCESS IS INTENTIONAL HERE. On a push without the label this
+    # job is skipped, and GitHub reports a skipped job as success. That is safe
+    # in this design because the GATE is the merge automation, not branch
+    # protection: at merge time the automation adds the `ready-for-ci` label,
+    # which fires a FRESH run of this job (the `labeled` trigger above), and it
+    # waits for THAT run to go green before it merges. So do NOT mark this job's
+    # check as a REQUIRED status check in branch protection — a required-check
+    # posture is the one configuration where a pre-label skipped-success could
+    # satisfy the merge before the real labeled run executes. Let the merge
+    # automation own the gate.
+    if: contains(github.event.pull_request.labels.*.name, 'ready-for-ci')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # ── Replace this step with your project's CI command ─────────────────────
+      # This placeholder fails loudly so the gate stays CLOSED until you wire in
+      # a real CI command. Replace the run: line below with your actual test /
+      # lint / build command (e.g. `make ci`, `npm test`, `go test ./...`).
+      - name: CI
+        run: |
+          echo "ERROR: replace this placeholder with your real CI command (tests, lint, build)."
+          exit 1
