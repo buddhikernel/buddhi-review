@@ -985,8 +985,12 @@ def _guide_app_install(bot: str, repo: Optional[str], *, pal, stream) -> None:
 def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, Any], *,
                    run, spawn_command, getpass_fn, pal, stream,
                    multi_select=multi_select, single_select=single_select,
-                   input_fn=input) -> Tuple[List[str], Dict[str, bool]]:
-    """Step 5 — reviewer fleet: multi-select, validate each, capture auto_on_open."""
+                   input_fn=input, seed: Optional[Sequence[str]] = None
+                   ) -> Tuple[List[str], Dict[str, bool]]:
+    """Step 5 — reviewer fleet: multi-select, validate each, capture auto_on_open.
+    ``seed`` (when given — e.g. the per-repo confirm mode passes the global default)
+    is the set of reviewers to PRESELECT; ``None`` preselects all four (the full
+    wizard's first-run default)."""
     _panel("Step 5 — Reviewer fleet", ["Enable only the reviewers you have set up on this repo."],
            pal, stream)
     labels = {
@@ -996,7 +1000,12 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
         "claude": "Claude    (claude-code-review.yml workflow)",
     }
     options = [(labels[b], "") for b in _REVIEWERS]
-    chosen_idx = multi_select("  Which reviewers should run?", options, preselected=None,
+    if seed is None:
+        preselected = None
+    else:
+        seed_set = {str(b).strip().lower() for b in seed}
+        preselected = {i for i, b in enumerate(_REVIEWERS) if b in seed_set}
+    chosen_idx = multi_select("  Which reviewers should run?", options, preselected=preselected,
                               pal=pal, stream=stream, input_fn=input_fn)
     enabled = [_REVIEWERS[i] for i in sorted(chosen_idx)]
     if not enabled:
@@ -1062,15 +1071,110 @@ def step_monitoring_locked(*, pal, stream) -> None:
     _teaser(_MONITORING_TEASER, pal, stream)
 
 
+# ── Per-repo confirmation steps (auto_merge · label-gated CI · global default) ─────
+
+def step_repo_auto_merge(repo: str, current_default: bool, *, pal, stream,
+                         single_select=single_select, input_fn=input) -> bool:
+    """Ask the auto-merge default for THIS repo specifically. ``current_default``
+    (the global / inherited auto-merge bool) preselects the matching option so a
+    bare Enter confirms it. Returns the per-repo choice. Mirrors the reference
+    wizard's ``step_repo_auto_merge``."""
+    _panel("Per-repo — Auto-merge", [
+        f"Repo: {pal.BOLD}{repo}{pal.RESET}",
+        "When a loop exits cleanly (all reviewers satisfied), Buddhi can squash-merge",
+        "the PR and delete its branch automatically — or leave it open for you.",
+    ], pal, stream)
+    idx = single_select(
+        f"  Auto-merge default for {repo}?",
+        [("Off", "you merge manually after a clean loop exit"),
+         ("On", "clean exit → squash-merge + branch delete")],
+        preselect=1 if current_default else 0, pal=pal, stream=stream, input_fn=input_fn)
+    return idx == 1
+
+
+def step_repo_label_gated_ci(repo: str, current_default: bool, *, pal, stream,
+                             single_select=single_select, input_fn=input) -> bool:
+    """Opt THIS repo into label-gated pre-merge CI, CONSEQUENCE-CONFIRMED.
+    ``current_default`` (the global / inherited bool) preselects the first prompt so
+    a bare Enter confirms the inherited setting. Turning it ON requires an explicit
+    SECOND confirmation (preselected "No") so enabling is a deliberate act, never a
+    stray Enter — the value F5's pre-merge gate consumes via
+    ``config.label_gated_ci(cfg, repo)``. Mirrors the reference wizard's
+    ``step_repo_label_gated_ci``. (Detecting + installing the ``ready-for-ci``
+    workflow that makes the opt-in a real saving is F4's job, not this step's.)"""
+    _panel("Per-repo — Label-gated CI", [
+        f"Repo: {pal.BOLD}{repo}{pal.RESET}",
+        "Label-gated CI saves Actions minutes: instead of CI running on every push,",
+        "Buddhi adds the `ready-for-ci` label right before merge so CI runs ONCE.",
+        "",
+        "CONSEQUENCE of turning this ON for this repo:",
+        "  • CI will NOT run on your manual / intermediate pushes to a PR.",
+        "  • A required status check that gates on the label BLOCKS a human merge",
+        "    until the label is added.",
+    ], pal, stream)
+    idx = single_select(
+        f"  Label-gated CI default for {repo}?",
+        [("Off", "CI runs on every push (Buddhi never defers it to the label)"),
+         ("On", "CI runs only when the `ready-for-ci` label is added at merge")],
+        preselect=1 if current_default else 0, pal=pal, stream=stream, input_fn=input_fn)
+    if idx != 1:
+        return False
+    confirm = single_select(
+        "  Confirm: enable label-gated CI for this repo? CI will NOT run on manual "
+        "pushes — only when the `ready-for-ci` label is added at merge.",
+        [("No — leave it off", "CI keeps running on every push"),
+         ("Yes — enable label-gated CI", "I understand CI defers to the merge label")],
+        preselect=0, pal=pal, stream=stream, input_fn=input_fn)
+    return confirm == 1
+
+
+def step_set_global_default(repo: str, has_existing_default: bool,
+                            reviewers: Sequence[str], auto_on_open: Dict[str, bool], *,
+                            pal, stream, single_select=single_select,
+                            input_fn=input) -> bool:
+    """Ask whether the just-confirmed fleet should ALSO become the GLOBAL default
+    (the fall-back fleet for repos with no confirmed entry). Returns a bool.
+
+    Preselect YES when no global default exists yet (a default lets runs on other
+    repos proceed without a hard stop); otherwise NO, so a single-repo confirm does
+    not silently rewrite an established default.
+
+    P7 #3: the prompt NAMES its subject — the concrete reviewer fleet and which of
+    those reviewers auto-post on PR open — so the question has an explicit antecedent
+    (no bare "these"). The user sees exactly which reviewers would become the
+    cross-repo default and which auto-review on open."""
+    fleet = ", ".join(reviewers) if reviewers else "an empty fleet"
+    auto_names = [b for b in reviewers if auto_on_open.get(b)]
+    auto_desc = (f"auto-posts on PR open: {', '.join(auto_names)}"
+                 if auto_names else "none auto-post on open; all are summoned")
+    idx = single_select(
+        f"  Also set this reviewer fleet ({fleet}) and its auto-post-on-PR-open "
+        f"settings as your GLOBAL default (not just {repo})?",
+        [(f"Yes — also use {fleet} as my global default",
+          f"repos with no confirmed fleet fall back to this ({auto_desc})"),
+         ("No — only for this repo", "leaves the global default unchanged")],
+        preselect=1 if has_existing_default else 0, pal=pal, stream=stream,
+        input_fn=input_fn)
+    return idx == 0
+
+
 def step_summary(plan: str, repo: Optional[str], reviewers: Sequence[str],
-                 auto_on_open: Dict[str, bool], *, pal, stream) -> None:
-    """Step 7a — read-back."""
+                 auto_on_open: Dict[str, bool], *, pal, stream,
+                 auto_merge: Optional[bool] = None,
+                 label_gated_ci: Optional[bool] = None) -> None:
+    """Step 7a — read-back. ``auto_merge`` / ``label_gated_ci`` are the bound repo's
+    confirmed per-repo settings; each is shown only when supplied (the full wizard
+    confirms a bound repo, so it passes them)."""
     _panel("Step 7 — What's active", [], pal, stream)
     _kv("Claude plan", plan, pal, stream)
     _kv("Repo", repo or "(inferred at runtime)", pal, stream)
     _kv("Reviewers", ", ".join(reviewers) or "(none)", pal, stream)
     aoo = ", ".join(f"{b}:{'auto' if v else 'summon'}" for b, v in auto_on_open.items()) or "(none)"
     _kv("Auto-on-open", aoo, pal, stream)
+    if auto_merge is not None:
+        _kv("Auto-merge", "on" if auto_merge else "off", pal, stream)
+    if label_gated_ci is not None:
+        _kv("Label-gated CI", "on" if label_gated_ci else "off", pal, stream)
     _kv("Notifications", "console", pal, stream)
 
 
@@ -1083,6 +1187,133 @@ def step_done(path: Path, *, pal, stream) -> None:
         "Create a PR    : /create-pr",
     ], pal, stream)
     _teaser(_PRO_SOON_TEASER, pal, stream)
+
+
+# ── Per-repo confirm mode (parity with the reference wizard) ───────────────────────
+
+def _write_global_default(reviewers: Sequence[str], auto_on_open: Dict[str, bool],
+                          path: Path) -> bool:
+    """Persist the top-level (global-default) reviewer fleet + ``auto_on_open``,
+    leaving every other key — sibling ``repos`` entries included — intact. The
+    global default is the fall-back fleet for repos with no confirmed entry
+    (:func:`buddhi_review.config.has_global_default`)."""
+    existing = config.load_config(path) if path.exists() else {}
+    cfg = dict(existing)
+    cfg["active_reviewers"] = list(reviewers)
+    cfg["auto_on_open"] = {b: bool(v) for b, v in auto_on_open.items()}
+    return write_config(cfg, path)
+
+
+def _repo_auto_merge_default(cfg: Dict[str, Any], repo: Optional[str]) -> bool:
+    """The bound repo's previously-confirmed ``auto_merge`` (a per-repo entry key),
+    else off. There is no global ``auto_merge`` reader (the loop takes auto-merge
+    from a per-run flag), so this only consults ``repos[<repo>]``."""
+    entry = config.repo_entry(cfg, repo) or {}
+    v = entry.get("auto_merge")
+    return v if isinstance(v, bool) else False
+
+
+def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
+                             run, spawn_command, getpass_fn, pal, stream, cfg_path: Path,
+                             multi_select=multi_select, single_select=single_select,
+                             input_fn=input) -> int:
+    """The lightweight ``setup --repo <owner/repo>`` mode — parity with the reference
+    wizard's ``confirm_repo_interactive``: confirm ONE repo's reviewer fleet +
+    ``auto_on_open`` + ``auto_merge`` + label-gated CI (seeded from the global
+    default), optionally promote the fleet to the GLOBAL default, and write
+    ``repos[<repo>]`` through :func:`buddhi_review.config.set_repo_keys`. Skips the
+    full wizard's plan / budget / monitoring steps. Returns an exit code (0 ok ·
+    1 write failure · 2 no repo)."""
+    repo = (repo or "").strip().rstrip("/")
+    if not repo:
+        repo = infer_repo(run) or ""
+        if not repo:
+            _row("warn", "No repo given and none could be inferred from the git "
+                         "remote. Run from inside the repo checkout or pass "
+                         "--repo owner/repo.", pal, stream)
+            return 2
+    if cwd is None:
+        cwd = repo_toplevel(run) or os.getcwd()
+
+    # A light tooling probe — only `gh auth`, which the reviewer step needs for the
+    # Copilot + Claude-secret paths. The full doctor's per-tier model pings aren't
+    # worth their latency in a single-repo confirm.
+    gh_auth, _ = _run_ok(run, ["gh", "auth", "status"])
+    doctor: Dict[str, Any] = {"gh_auth": gh_auth}
+
+    _panel("Confirm reviewers", [
+        f"Repo: {pal.BOLD}{repo}{pal.RESET}",
+        "Confirm which reviewers are set up on THIS repo and which auto-review when",
+        "a PR is opened. Seeded from your global default.",
+    ], pal, stream)
+
+    existing = config.load_config(cfg_path) if cfg_path.exists() else {}
+    has_gd = config.has_global_default(existing)
+    seed = list(config.active_reviewers(existing)) if has_gd else None
+
+    reviewers, auto_on_open = step_reviewers(
+        repo, cwd, doctor, run=run, spawn_command=spawn_command, getpass_fn=getpass_fn,
+        pal=pal, stream=stream, multi_select=multi_select, single_select=single_select,
+        input_fn=input_fn, seed=seed)
+
+    set_gd = step_set_global_default(repo, has_gd, reviewers, auto_on_open, pal=pal,
+                                     stream=stream, single_select=single_select,
+                                     input_fn=input_fn)
+    # Guard the global-default WIPE: confirming a repo with an EMPTY fleet (e.g. the
+    # user deselected every reviewer) must not silently clear an existing non-empty
+    # global default. Ask, defaulting to KEEP — this repo's entry is still written.
+    if set_gd and not reviewers and has_gd:
+        current = list(config.active_reviewers(existing))
+        if current:
+            _row("warn", f"Your global default fleet is {', '.join(current)}. Setting "
+                         "an EMPTY fleet as the global default clears it for every repo "
+                         "with no confirmed reviewers.", pal, stream)
+            keep = single_select(
+                "  Clear your global default reviewer fleet?",
+                [("No — keep my current global default",
+                  f"leaves {', '.join(current)} in place; still writes this repo's entry"),
+                 ("Yes — clear it",
+                  "every repo with no confirmed fleet then has no reviewers")],
+                preselect=0, pal=pal, stream=stream, input_fn=input_fn)
+            if keep == 0:
+                set_gd = False
+                _row("info", "Keeping your existing global default; writing only this "
+                             "repo's entry.", pal, stream)
+
+    am = step_repo_auto_merge(repo, _repo_auto_merge_default(existing, repo), pal=pal,
+                              stream=stream, single_select=single_select, input_fn=input_fn)
+    lgc = step_repo_label_gated_ci(repo, config.label_gated_ci(existing, repo), pal=pal,
+                                   stream=stream, single_select=single_select,
+                                   input_fn=input_fn)
+
+    ok = config.set_repo_keys(repo, {
+        "active_reviewers": list(reviewers),
+        "auto_on_open": {b: bool(v) for b, v in auto_on_open.items()},
+        "auto_merge": bool(am),
+        "label_gated_ci": bool(lgc),
+    }, cfg_path)
+    if ok and set_gd:
+        ok = _write_global_default(reviewers, auto_on_open, cfg_path) and ok
+    if not ok:
+        _row("bad", f"Could not write {cfg_path} — check the path's permissions",
+             pal, stream)
+        return 1
+
+    # Read everything back through the F1 readers so the summary reflects what
+    # actually persisted, not just what we intended to write.
+    cfg = config.load_config(cfg_path)
+    final_reviewers = config.active_reviewers(cfg, repo)
+    entry = config.repo_entry(cfg, repo) or {}
+    _row("ok", f"Confirmed reviewers for {repo}: "
+               f"{', '.join(final_reviewers) if final_reviewers else '(none)'}"
+               + ("  ·  set as global default" if set_gd else ""), pal, stream)
+    _row("ok", f"Auto-merge for {repo}: {'on' if entry.get('auto_merge') else 'off'}",
+         pal, stream)
+    _row("ok", f"Label-gated CI for {repo}: "
+               f"{'on' if config.label_gated_ci(cfg, repo) else 'off'}", pal, stream)
+    _row("info", f"Everyday usage: /review-pr {repo.split('/')[-1]} <pr-number>",
+         pal, stream)
+    return 0
 
 
 # ── Orchestration ──────────────────────────────────────────────────────────────
@@ -1110,6 +1341,16 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
             preset_repo = args[i + 1]
 
     try:
+        # `setup --repo <owner/repo>` → the lightweight per-repo confirm mode (parity
+        # with the reference wizard); the no-arg path runs the full wizard below.
+        if preset_repo:
+            print(f"{pal.BOLD}buddhi-review — confirm reviewers for a repo{pal.RESET}",
+                  file=stream)
+            return confirm_repo_interactive(
+                preset_repo, None, run=run, spawn_command=spawn_command,
+                getpass_fn=getpass_fn, pal=pal, stream=stream, cfg_path=cfg_path,
+                multi_select=multi_select, single_select=single_select, input_fn=input_fn)
+
         print(f"{pal.BOLD}buddhi-review setup{pal.RESET}", file=stream)
 
         doctor = step_doctor(run=run, which=which, pal=pal, stream=stream)
@@ -1122,12 +1363,34 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
             input_fn=input_fn)
         step_monitoring_locked(pal=pal, stream=stream)  # paid teaser
 
-        new_cfg = build_config(plan, repo, cwd, reviewers, auto_on_open)
         existing = config.load_config(cfg_path) if cfg_path.exists() else {}
+        # Per-repo confirmation for the bound repo: ask the auto-merge + label-gated
+        # CI defaults so repos[<repo>] records a genuine per-repo opt-in.
+        repo_auto_merge = repo_label_gated_ci = None
+        if repo:
+            repo_auto_merge = step_repo_auto_merge(
+                repo, _repo_auto_merge_default(existing, repo), pal=pal, stream=stream,
+                single_select=single_select, input_fn=input_fn)
+            repo_label_gated_ci = step_repo_label_gated_ci(
+                repo, config.label_gated_ci(existing, repo), pal=pal, stream=stream,
+                single_select=single_select, input_fn=input_fn)
+
+        new_cfg = build_config(plan, repo, cwd, reviewers, auto_on_open)
         merged = merge_preserving(existing, new_cfg)
         ok = write_config(merged, cfg_path)
+        # Record the bound repo's per-repo entry (presence == confirmed). The
+        # top-level fleet written above is ALSO the global default — non-disruptive;
+        # the full wizard always establishes one.
+        if ok and repo:
+            config.set_repo_keys(repo, {
+                "active_reviewers": list(reviewers),
+                "auto_on_open": {b: bool(v) for b, v in auto_on_open.items()},
+                "auto_merge": bool(repo_auto_merge),
+                "label_gated_ci": bool(repo_label_gated_ci),
+            }, cfg_path)
 
-        step_summary(plan, repo, reviewers, auto_on_open, pal=pal, stream=stream)
+        step_summary(plan, repo, reviewers, auto_on_open, pal=pal, stream=stream,
+                     auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
         if ok:
             step_done(cfg_path, pal=pal, stream=stream)
             return 0
