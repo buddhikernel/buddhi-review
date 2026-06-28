@@ -140,15 +140,93 @@ def test_regular_prose_is_no_signal():
     assert detectors.detect_signal("No issues found.") is None  # clean ≠ a status signal
 
 
+# ---------------------------------------------------------------------------
+# Auth-failure signature — AUTH_FAILED_RE (used by the round driver's check-run
+# probe against the failed "Claude Code Review" run log, NOT comment text).
+# ---------------------------------------------------------------------------
+
+def test_auth_failed_regex_matches_the_401_signatures():
+    """AUTH_FAILED_RE recognises the token-invalid 401 family — the signature the
+    bundled workflow's post-step fails the GitHub job red on and emits into the run
+    log. The first alternatives are the post-step's own grep set; plus a named
+    credential reported expired."""
+    for msg in (
+        # the literal ``::error`` message the post-step writes into the run log
+        "::error title=Claude review auth failed::CLAUDE_CODE_OAUTH_TOKEN is "
+        "invalid or expired — the Claude review returned 401 (Invalid bearer token)",
+        "API Error: 401 Invalid bearer token",
+        "401 Unauthorized: Invalid bearer token",
+        'authentication_error: {"message":"Invalid bearer token"}',
+        "authentication_failed",
+        "OAuth authentication failed.",
+        "Your token has expired; re-mint it.",
+        "The OAuth token is expired.",
+        "The CLAUDE_CODE_OAUTH_TOKEN has expired.",
+        "API key expired.",
+    ):
+        assert detectors.AUTH_FAILED_RE.search(msg), msg
+
+
+def test_auth_failed_regex_does_not_match_errored_clean_or_a_finding():
+    """The auth regex must NOT match an ordinary (transient) errored message, a
+    clean review, a finding that merely mentions an HTTP 401/unauthorized status,
+    OR a git-checkout "Authentication failed" (space form, a different failure with
+    a different fix) — any of which would wrongly trip the token-re-mint guard."""
+    for msg in (
+        # errored / clean
+        "I encountered an internal error while reviewing.",
+        "Failed to generate a review for this PR.",
+        "Something went wrong. Please try again.",
+        "Review run failed.",
+        "No issues found.",
+        "LGTM!",
+        "no problems detected in this change",
+        # genuine findings about the reviewed code's auth handling
+        "The 401 status code is appropriate here.",
+        "The 401 response is correct per the API specification.",
+        "HTTP 401 Unauthorized is returned for unauthenticated requests.",
+        "This is an unauthorized endpoint — access is restricted.",
+        "Returning 401 here is consistent with RFC 6750.",
+        "We reviewed 401 error handling in the API.",
+        # a git-checkout auth failure (space form) — NOT a token-invalid 401
+        "fatal: Authentication failed for 'https://github.com/o/r.git/'",
+        # an OIDC token-fetch failure — a different setup fix, not a re-mint
+        "Error: Could not fetch an OIDC token from the GitHub provider.",
+    ):
+        assert not detectors.AUTH_FAILED_RE.search(msg), msg
+
+
+def test_detect_signal_never_classifies_an_auth_finding_as_a_status():
+    """Auth detection is deliberately NOT comment-based: a real reviewer 401 posts
+    no comment, so the only comments carrying an auth term are FINDINGS about the
+    reviewed code's auth handling. detect_signal must NOT classify those as a
+    status signal — that would silently drop a real finding. They flow through as
+    None (actionable) and reach the kernel; the round driver's check-run probe
+    owns auth detection. A genuine errored message still classifies as errored."""
+    for finding in (
+        "This logs the bearer token on an authentication_error.",
+        "The invalid_token case falls through to the success handler.",
+        "The expired token is still accepted on the second call.",
+        "HTTP 401 Unauthorized is returned for unauthenticated requests.",
+        "The authentication failure leaks the stack trace to the client.",
+    ):
+        assert detectors.detect_signal(finding) is None, repr(finding)
+    assert detectors.detect_signal(
+        "I encountered an internal error while reviewing.") == detectors.SIGNAL_ERRORED
+
+
 def test_signal_not_fired_on_actionable_review_prose():
-    """Actionable feedback that merely *mentions* quota/rate-limit terms must not
-    be misclassified as a bot status signal and must not drop the comment."""
+    """Actionable feedback that merely *mentions* quota/rate-limit/auth terms must
+    not be misclassified as a bot status signal and must not drop the comment."""
     for msg in (
         "Consider handling the rate limit (429) response here.",
         "You should add error handling for the case when the API returns 429.",
         "I'd recommend adding a retry for 429 responses.",
         "The PR diff is quite large — consider splitting into smaller commits.",
         "You should handle the case where the review queue fails to process.",
+        "Consider returning 401 when the bearer token is missing.",
+        "You should reject an expired token instead of returning 200.",
+        "Recommend handling the unauthorized case explicitly.",
     ):
         assert detectors.detect_signal(msg) is None, repr(msg)
 

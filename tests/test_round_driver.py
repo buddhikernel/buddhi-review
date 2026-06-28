@@ -475,3 +475,128 @@ def test_max_rounds_exhaustion_does_not_merge():
     outcome = driver.run()
     assert outcome.status == "max-rounds" and outcome.rounds == 2
     assert not gh.matching("gh", "merge")
+
+
+# ---------------------------------------------------------------------------
+# Reviewer auth-failure signal (F9): the realistic Claude 401 posts ZERO comments
+# while the GitHub job concludes, so the loop observes it via a CHECK-RUN probe
+# (not comments) at run end — a SILENT claude whose "Claude Code Review" run log
+# carries the token-invalid signature gets the LOUD re-mint banner instead of the
+# generic "remove it from your fleet" silent banner.
+# ---------------------------------------------------------------------------
+
+_CLAUDE_FAILED_CHECK = json.dumps([{
+    "name": "Claude Code Review", "workflow": "Claude Code Review",
+    "link": "https://github.com/o/r/actions/runs/123/job/9",
+    "bucket": "fail", "state": "FAILURE",
+}])
+# The post-step's own ``::error`` line, which survives show_full_output:false.
+_AUTH_LOG = (
+    "review\tFail the check on a Claude authentication error\n"
+    "review\t::error title=Claude review auth failed::CLAUDE_CODE_OAUTH_TOKEN is "
+    "invalid or expired — the Claude review returned 401 (Invalid bearer token) "
+    "and posted nothing while the job stayed green.\n"
+)
+_NONAUTH_LOG = (
+    "review\tRun anthropics/claude-code-action@v1\n"
+    "review\tError: Could not fetch an OIDC token from the GitHub provider.\n"
+)
+
+
+class AuthProbeGh(GhRecorder):
+    """A gh runner that answers the auth-failure probe's `gh pr checks` /
+    `gh run view` calls; everything else behaves like GhRecorder."""
+    def __init__(self, *, checks_json="[]", run_log=""):
+        super().__init__()
+        self.checks_json = checks_json
+        self.run_log = run_log
+    def __call__(self, argv, *, cwd=None, timeout=None):
+        self.calls.append(list(argv))
+        if argv[:3] == ["gh", "pr", "checks"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=self.checks_json, stderr="")
+        if argv[:3] == ["gh", "run", "view"]:
+            return subprocess.CompletedProcess(argv, 0, stdout=self.run_log, stderr="")
+        out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+
+
+def test_silent_claude_auth_failure_emits_remint_banner(capsys):
+    gh = AuthProbeGh(checks_json=_CLAUDE_FAILED_CHECK, run_log=_AUTH_LOG)
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "REVIEWER AUTH FAILED" in out          # the re-mint banner fired ...
+    assert "/review-pr setup" in out              # ... with the re-run-setup directive
+    assert "CLAUDE_CODE_OAUTH_TOKEN" in out
+    assert "REVIEWER SILENT" not in out           # NOT the generic "remove it" banner
+
+
+def test_silent_claude_clean_run_emits_generic_silent_banner(capsys):
+    # No failed Claude check / no auth signature → the silence is "not installed",
+    # so the generic banner fires, NOT the re-mint banner.
+    gh = AuthProbeGh(checks_json="[]", run_log="")
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "REVIEWER SILENT" in out
+    assert "REVIEWER AUTH FAILED" not in out
+
+
+def test_silent_claude_non_auth_failure_emits_generic_banner(capsys):
+    # The Claude check failed, but for a NON-auth reason (OIDC) — the log carries
+    # no token-invalid signature, so this must NOT misfire the re-mint banner.
+    gh = AuthProbeGh(checks_json=_CLAUDE_FAILED_CHECK, run_log=_NONAUTH_LOG)
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "REVIEWER AUTH FAILED" not in out
+    assert "REVIEWER SILENT" in out
+
+
+def test_auth_probe_is_claude_only_and_does_not_probe_others(capsys):
+    # A silent non-claude reviewer (GitHub-App auth, not CLAUDE_CODE_OAUTH_TOKEN)
+    # must take the generic path with NO check-run probe and NO re-mint banner.
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    gh = AuthProbeGh(checks_json=_CLAUDE_FAILED_CHECK, run_log=_AUTH_LOG)
+    driver, clock, _ = make_driver([], cfg=cfg, gh=gh)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "REVIEWER AUTH FAILED" not in out
+    assert "REVIEWER SILENT" in out
+    assert gh.matching("gh", "pr", "checks") == []   # never probed for a non-claude bot
+
+
+def test_detect_auth_failure_never_raises_on_gh_error():
+    # A gh/network explosion in the probe must degrade to False (generic banner),
+    # never crash the run-end warning.
+    class BoomGh(GhRecorder):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            self.calls.append(list(argv))
+            if argv[:2] == ["gh", "pr"] and "checks" in argv:
+                raise OSError("network down")
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=BoomGh())
+    assert driver._detect_auth_failure("claude") is False
+
+
+def test_no_auth_banner_on_clean_review(capsys):
+    # claude responded (clean) → not silent → the probe never runs.
+    timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]"))]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY, auto_merge=True)
+    driver.run()
+    assert "REVIEWER AUTH FAILED" not in capsys.readouterr().out
+
+
+def test_no_auth_banner_on_normal_review_round(capsys):
+    # claude responded with a finding then a clean re-review → not silent.
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+        (90, Comment(id="b", text="No issues found.", source="claude[bot]")),
+    ]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        auto_merge=True, answer_waiter=lambda esc, **k: {},
+    )
+    driver.run()
+    assert "REVIEWER AUTH FAILED" not in capsys.readouterr().out

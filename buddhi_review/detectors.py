@@ -130,6 +130,40 @@ ERRORED_RE = re.compile(
     r"|(?:\bsomething went wrong\b)"
     r"|(?:\breview (?:run )?failed\b)"
 )
+# A reviewer-run AUTHENTICATION failure — a mis-pasted / expired / wrong
+# CLAUDE_CODE_OAUTH_TOKEN makes the model call return 401 (observed live:
+# "401 Invalid bearer token"). This signature is matched by the round driver's
+# check-run auth probe (``RoundDriver._detect_auth_failure``) against the failed
+# "Claude Code Review" run log — NOT against PR comment text. The realistic 401
+# posts ZERO comments while the job concluded green, so a comment-text scan would
+# almost never see a real failure and could only mis-flag a reviewer's FINDING
+# about HTTP-auth code; the bundled workflow's post-step makes the job RED on
+# this same signature in the action's execution log, and the probe reads that
+# failed run's log (the post-step's own ``::error`` survives show_full_output:
+# false). Deliberately NOT a bare "401"/"unauthorized": those appear constantly
+# in a review of auth code ("the 401 response is correct"), so the matcher keys
+# only off the SDK token-invalid error strings + a named-credential-expired shape.
+# The first three alternatives are byte-for-byte the post-step's own ``grep -iE``
+# set, so the probe recognises exactly what the workflow makes the job RED on (its
+# ``::error`` message — "401 (Invalid bearer token)" — lands in the run log).
+# ``authentication_(error|failed)`` uses an UNDERSCORE only (the SDK's machine
+# error code), NOT a space, so a git-checkout "Authentication failed for <url>" —
+# a different failure with a different fix — does not trip the re-mint guard.
+AUTH_FAILED_RE = re.compile(
+    r"(?i)"
+    r"(?:\binvalid bearer token\b)"
+    r"|(?:\bauthentication_(?:error|failed)\b)"
+    r"|(?:\boauth authentication failed\b)"
+    # a named auth credential reported as expired (the post-step's message also
+    # says "invalid or expired"), in either word order. The short window keeps
+    # "token"/"key"/"credential" adjacent to "expired" so a log line mentioning an
+    # unrelated "expired" thing is not swept in. ``\w*`` matches a glued identifier
+    # form too (e.g. CLAUDE_CODE_OAUTH_TOKEN).
+    r"|(?:\b\w*tokens?\b[^.\n]{0,16}\bexpired\b)"
+    r"|(?:\bexpired\b[^.\n]{0,16}\b\w*tokens?\b)"
+    r"|(?:\b(?:credentials?|api[ _]?keys?)\b[^.\n]{0,16}\bexpired\b)"
+    r"|(?:\bexpired\b[^.\n]{0,16}\b(?:credentials?|api[ _]?keys?)\b)"
+)
 
 SIGNAL_CLEAN = "clean"
 SIGNAL_QUOTA = "quota"
@@ -308,6 +342,12 @@ def detect_signal(text: str) -> Optional[str]:
         return SIGNAL_PR_TOO_LARGE
     if ERRORED_RE.search(text):
         return SIGNAL_ERRORED
+    # NOTE: auth failure is deliberately NOT classified from comment text here. A
+    # reviewer's own 401 posts no comment (the job concluded green-and-silent),
+    # so the only comments carrying the auth signature are FINDINGS about the
+    # reviewed code's auth handling — classifying those as a status signal would
+    # silently drop a real finding. Auth detection lives in the round driver's
+    # check-run probe (AUTH_FAILED_RE against the failed run log) instead.
     return None
 
 

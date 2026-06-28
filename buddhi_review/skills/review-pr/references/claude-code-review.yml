@@ -47,6 +47,9 @@ jobs:
           # changed files rather than stale base-branch contents.
           ref: refs/pull/${{ github.event.issue.number || github.event.pull_request.number }}/head
       - uses: anthropics/claude-code-action@v1
+        # Stable step id so the auth-failure guard below can read this step's
+        # `execution_file` output (the on-disk JSON log of SDK messages).
+        id: claude_review
         with:
           # Surface the SDK's per-tool transcript in the Actions log. Without
           # this the SDK redacts everything past the init banner ("Running
@@ -200,3 +203,70 @@ jobs:
             --model opus
             --disallowedTools "AskUserQuestion"
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(wc:*),Bash(cat:*),Bash(echo:*),Read,Glob,Grep"
+      # Make a silent Claude auth failure RED instead of green-success. An
+      # invalid/expired CLAUDE_CODE_OAUTH_TOKEN makes the model call 401: the
+      # action above posts ZERO comments yet still concludes `success`, so to the
+      # review loop and the operator it looks exactly like "Claude reviewed and
+      # found nothing" — and the loop waits its full silent-review window each
+      # round on a non-response. This post-step inspects the action's execution
+      # output and fails the check on the token-invalid signature so the failure
+      # is visible. Fully self-contained (inline jq + grep, no repo files)
+      # because this workflow is copied verbatim into third-party repos.
+      - name: Fail the check on a Claude authentication error
+        # if: always() is load-bearing: the action concludes `success` on a 401,
+        # so a success()-gated step would be skipped and the failure would stay
+        # invisible. Run regardless of the action's outcome.
+        if: always()
+        shell: bash
+        env:
+          CLAUDE_EXECUTION_FILE: ${{ steps.claude_review.outputs.execution_file }}
+        run: |
+          set -uo pipefail
+          f="${CLAUDE_EXECUTION_FILE:-}"
+          # A missing or empty execution file is never an auth signal on its own:
+          # passing here can only ever LET a clean/quiet run stay green, never
+          # turn one red. A genuinely failed action step is already red by
+          # itself; the local review loop surfaces a missing run separately.
+          if [ -z "$f" ] || [ ! -s "$f" ]; then
+            echo "No Claude execution file to inspect — nothing to flag."
+            exit 0
+          fi
+          # jq is preinstalled on ubuntu-latest. If it is somehow unavailable we
+          # cannot tell a clean run from a 401 (the is_error gate below needs
+          # it), so skip rather than risk turning a clean review red on a tooling
+          # gap — fail-safe toward green, never a false red.
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq unavailable — skipping the Claude auth-failure check."
+            exit 0
+          fi
+          # The execution file is a JSON array of Claude Agent SDK messages
+          # (anthropics/claude-code-action base-action/src/execution-file.ts —
+          # JSON.stringify(messages)). On an invalid/expired
+          # CLAUDE_CODE_OAUTH_TOKEN the model call 401s and the SDK records
+          # is_error:true plus the auth error text, while the action still
+          # concludes success having posted nothing.
+          #
+          # Fail ONLY when BOTH hold:
+          #   1. the token-invalid auth signature appears in a non-user message
+          #      (result/assistant/system), AND
+          #   2. the run produced NO cleanly-successful result message (every
+          #      clean review ends in a result message with is_error:false).
+          # Condition 1 scopes the grep to SDK-emitted messages only, so PR diff
+          # content and tool_result bodies (which arrive in user messages) cannot
+          # trigger this check even when a run fails for an unrelated reason.
+          # Condition 2 is belt-and-suspenders: a clean review always ends with
+          # is_error:false on the result message, so a successful run can never
+          # fire even if the assistant echoed the phrase in commentary.
+          #
+          # Deliberately NOT a bare "401": the App-not-installed failure is also
+          # a 401 but reads "Claude Code is not installed on this repository" and
+          # needs a different fix (install the GitHub App), so it must not trip
+          # this token-re-mint message.
+          sig="$(jq -r '.. | objects | select(.type == "result" or .type == "assistant" or .type == "system") | (.result // empty), (.. | objects | .text // empty)' "$f" 2>/dev/null | grep -iEc 'invalid bearer token|authentication_error|authentication_failed|oauth authentication failed' || true)"
+          clean_success="$(jq -r 'any(.. | objects | select(.type == "result"); .is_error == false)' "$f" 2>/dev/null || echo false)"
+          if [ "${sig:-0}" -gt 0 ] && [ "$clean_success" != "true" ]; then
+            echo "::error title=Claude review auth failed::CLAUDE_CODE_OAUTH_TOKEN is invalid or expired — the Claude review returned 401 (Invalid bearer token) and posted nothing while the job stayed green. Re-mint and re-store it: run \`claude setup-token\`, then set the CLAUDE_CODE_OAUTH_TOKEN repo secret (e.g. via the /review-pr setup wizard)."
+            exit 1
+          fi
+          echo "No Claude authentication failure detected."
+          exit 0

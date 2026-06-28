@@ -28,6 +28,7 @@ network.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -170,6 +171,11 @@ TRIGGER_COMMENTS: Dict[str, str] = {
     "codex": _env_trigger("BUDDHI_TRIGGER_CODEX", "@codex review"),
     "claude": _env_trigger("BUDDHI_TRIGGER_CLAUDE", "@claude review"),
 }
+
+# The display name the bundled claude-code-review.yml publishes as a PR check
+# (line 1: `name: Claude Code Review`). The auth-failure probe resolves the
+# Claude run id from `gh pr checks` by matching this name.
+CLAUDE_REVIEW_CHECK_NAME = "Claude Code Review"
 
 
 @dataclass
@@ -1036,6 +1042,101 @@ class RoundDriver:
             f"Install/enable the reviewers (run the setup wizard) so a real "
             f"review arrives, or merge it yourself after reviewing by hand.")
 
+    def _emit_auth_failure_banner(self, bot: str) -> None:
+        """Loud, actionable console banner when a silent reviewer's run failed
+        AUTHENTICATION — an invalid / expired / wrong ``CLAUDE_CODE_OAUTH_TOKEN``
+        (a 401). Distinct from the persistent-silent banner (which says "turn the
+        reviewer off"): here the reviewer IS wired up and the fix is to RE-MINT
+        the token. Emitted in place of the silent banner when ``_detect_auth_
+        failure`` finds the token-invalid signature in the reviewer's failed
+        check-run log. The free product ships no settings UI, so the call to
+        action is the setup entry point (``/review-pr setup``)."""
+        label = _REVIEWER_LABEL.get(bot, bot.capitalize())
+        _print_refusal_banner(
+            f"REVIEWER AUTH FAILED — '{bot}' token invalid or expired",
+            f"The {label} review ran but its model call returned 401 (an invalid "
+            f"or expired bearer token), so it posted no review while the GitHub "
+            f"job still concluded — which is why this looked like silence. This is "
+            f"NOT a reviewer to turn off and NOT a setup step left half-wired: the "
+            f"CLAUDE_CODE_OAUTH_TOKEN credential itself is bad. Re-mint and "
+            f"re-store it — run /review-pr setup, which re-mints via `claude "
+            f"setup-token` and re-stores the CLAUDE_CODE_OAUTH_TOKEN repo secret. "
+            f"Until the token is re-minted, {label} cannot review this or any PR.")
+
+    # ---- auth-failure check-run probe (the FREE twin of the loop's 401 signal) ----
+    # round_driver ingests only PR comments (gh_ingest.fetch_comments), and a real
+    # 401 posts ZERO comments while the GitHub job concludes — so the failure is
+    # NOT observable in comments. The bundled claude-code-review.yml's post-step
+    # makes the job RED on the token-invalid signature (reading the action's
+    # execution_file), and emits its own ``::error`` line into the run log. That
+    # ``::error`` survives ``show_full_output: false`` (which redacts only the
+    # claude-code-action SDK output, not a later step's stdout), so the failure IS
+    # observable in the failed run log. This probe reads it: a SILENT reviewer
+    # whose "Claude Code Review" run carries the auth signature is a 401, not an
+    # uninstalled bot — so we point the operator at re-minting, not removal.
+
+    def _pr_checks_rows(self) -> List[dict]:
+        """``gh pr checks`` rows for this PR, or [] on any error. Never raises."""
+        argv = ["gh", "pr", "checks", self.pr,
+                "--json", "name,workflow,link,bucket,state"]
+        if self.repo:
+            argv += ["-R", self.repo]
+        try:
+            proc = self.gh_run(argv, cwd=self.cwd)
+        except (subprocess.SubprocessError, OSError):
+            return []
+        if getattr(proc, "returncode", 1) != 0:
+            return []
+        try:
+            rows = json.loads((proc.stdout or "").strip() or "[]")
+        except (ValueError, TypeError):
+            return []
+        return rows if isinstance(rows, list) else []
+
+    def _claude_review_run_id(self, rows: List[dict]) -> Optional[str]:
+        """The workflow run id of the "Claude Code Review" check, REGARDLESS of
+        conclusion, parsed from the run link. None on no match."""
+        for key in ("name", "workflow"):
+            for row in rows or []:
+                if isinstance(row, dict) and row.get(key) == CLAUDE_REVIEW_CHECK_NAME:
+                    m = re.search(r"/runs/(\d+)(?:/|$)", row.get("link") or "")
+                    if m:
+                        return m.group(1)
+        return None
+
+    def _fetch_run_log(self, run_id: str) -> str:
+        """The failed-step log (then the full log) of run ``run_id``, or "" on any
+        error. ``--log-failed`` is small and carries the post-step's ``::error``
+        on an auth failure (the post-step is the step that exits non-zero)."""
+        for extra in (["--log-failed"], ["--log"]):
+            argv = ["gh", "run", "view", str(run_id), *extra]
+            if self.repo:
+                argv += ["-R", self.repo]
+            try:
+                proc = self.gh_run(argv, cwd=self.cwd)
+            except (subprocess.SubprocessError, OSError):
+                continue
+            if getattr(proc, "returncode", 1) == 0 and (proc.stdout or "").strip():
+                return proc.stdout
+        return ""
+
+    def _detect_auth_failure(self, bot: str) -> bool:
+        """Best-effort: True iff ``bot``'s "Claude Code Review" run carries the
+        token-invalid 401 signature. Scoped to ``claude`` (the only reviewer that
+        authenticates with CLAUDE_CODE_OAUTH_TOKEN; the others use the GitHub App).
+        Any missing repo / gh / network error → False (fall back to the generic
+        silent banner). Never raises."""
+        if bot != "claude" or not self.repo:
+            return False
+        try:
+            run_id = self._claude_review_run_id(self._pr_checks_rows())
+            if run_id is None:
+                return False
+            log = self._fetch_run_log(run_id)
+            return bool(log) and bool(detectors.AUTH_FAILED_RE.search(log))
+        except Exception:
+            return False
+
     # ------------------------------------------------- silent-reviewer warning
 
     def _record_round_attendance(self, expected: Sequence[str]) -> None:
@@ -1081,7 +1182,17 @@ class RoundDriver:
             rounds = self.silent_rounds.get(bot, 0)
             if rounds < 1:
                 continue
-            self._emit_silent_banner(bot, rounds)
+            # A silent reviewer can mean two very different things with opposite
+            # fixes: (1) not installed/enabled → remove it / install it, or (2)
+            # installed but its credential 401'd (the run posted nothing yet the
+            # job concluded green-and-silent). Before the generic "remove it"
+            # banner, probe the reviewer's failed check-run for the token-invalid
+            # signature; if found, emit the RE-MINT banner instead — same silence,
+            # opposite remediation.
+            if self._detect_auth_failure(bot):
+                self._emit_auth_failure_banner(bot)
+            else:
+                self._emit_silent_banner(bot, rounds)
 
     def _emit_silent_banner(self, bot: str, rounds: int) -> None:
         """Loud, actionable console banner for a configured reviewer that never
