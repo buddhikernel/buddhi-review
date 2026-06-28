@@ -44,7 +44,8 @@ from buddhi_review import commit_push, detectors, escalation_wait, gh_ingest, me
 from buddhi_review.actuators import ActionResult, FixDispatch, act_on_result
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.config import (
-    active_reviewers, auto_on_open, has_global_default, load_config, repo_entry,
+    active_reviewers, auto_on_open, has_global_default, label_gated_ci,
+    load_config, repo_entry,
 )
 from buddhi_review.loop import Comment, CommentResult, process_comments
 from buddhi_review.transparency import _colour_enabled, automation_notice
@@ -610,6 +611,30 @@ class RoundDriver:
         self.processed_ids: Set[str] = set()
         self.actions: List[ActionResult] = []
 
+        # ── F5 run-cumulative review tracking (the SAFETY gate + silent-reviewer
+        # warning) ──────────────────────────────────────────────────────────────
+        # reviewed_ever: reviewers that GENUINELY reviewed this run — a clean
+        #   approval / "No issues found." sentinel OR an actionable comment that
+        #   flowed to the kernel. Accumulated in REAL TIME in _classify_signal.
+        #   Quota / PR-too-large / errored placeholders are caught upstream (they
+        #   detect as signals and return before the actionable add), so a
+        #   placeholder can NEVER land here — it is a response, not a review.
+        self.reviewed_ever: Set[str] = set()
+        # responded_ever: reviewers that posted ANYTHING in any round (comment,
+        #   clean approval, OR a quota/error placeholder). A single response in
+        #   any round permanently protects a reviewer from the silent warning.
+        self.responded_ever: Set[str] = set()
+        # requested_ever: reviewers the loop successfully re-requested at least
+        #   once — so silence is the reviewer's, not a failed summon.
+        self.requested_ever: Set[str] = set()
+        # silent_rounds: per-reviewer count of rounds it was expected yet silent
+        #   (drives the "never responded across N rounds" message).
+        self.silent_rounds: Dict[str, int] = {}
+        # _run_start_fleet: the expected fleet snapshotted at run start — the
+        #   non-empty check that distinguishes "no reviewers by design" (quiet)
+        #   from "reviewers expected but none reviewed" (loud block).
+        self._run_start_fleet: Set[str] = set()
+
     # ------------------------------------------------------------------ state
 
     def expected_bots(self) -> List[str]:
@@ -732,6 +757,10 @@ class RoundDriver:
             if proc.returncode != 0:
                 self.notice("re-request", f"{bot} re-request failed: "
                             f"{(proc.stderr or '').strip()[:120]}", status="fallback")
+            else:
+                # The summon landed — so a later silence is the reviewer's, not a
+                # failed request (never flag a bot we could not actually summon).
+                self.requested_ever.add(bot)
         except (subprocess.SubprocessError, OSError) as exc:
             self.notice("re-request", f"{bot} re-request failed: {exc}", status="fallback")
 
@@ -789,6 +818,10 @@ class RoundDriver:
         if detectors.detect_clean_review(comment.text, llm_json=self.clean_llm):
             self.done.add(bot)
             st.signal = detectors.SIGNAL_CLEAN
+            # A clean approval / "No issues found." sentinel IS a genuine review —
+            # it feeds the SAFETY gate's reviewed-set (a fleet that approves clean
+            # with zero comments still merges; the critical no-false-positive case).
+            self.reviewed_ever.add(bot)
             print(f"[clean-review] {bot}: nothing to flag — voluntarily done")
             return None
         # The PR conversation channel (issues/<pr>/comments) is scanned for the
@@ -799,6 +832,9 @@ class RoundDriver:
         # classified and acted on as if it were a real finding.
         if comment.from_issue_channel:
             return None
+        # An actionable inline / review-body comment is a genuine review (the
+        # placeholders were already filtered above), so it feeds the SAFETY gate.
+        self.reviewed_ever.add(bot)
         return bot
 
     def _maybe_errored_comeback(self, comment: Comment, result: CommentResult) -> None:
@@ -854,6 +890,16 @@ class RoundDriver:
     # ------------------------------------------------------------------- run
 
     def run(self) -> RunOutcome:
+        """Snapshot the run-start fleet (for the SAFETY gate's empty-vs-silent
+        distinction), drive the round loop, and ALWAYS emit the persistent
+        silent-reviewer warning at run end (every exit path, via ``finally``)."""
+        self._run_start_fleet = set(self.expected_bots())
+        try:
+            return self._run_loop()
+        finally:
+            self._warn_persistently_silent()
+
+    def _run_loop(self) -> RunOutcome:
         for round_no in range(1, self.max_rounds + 1):
             expected = _canonical(self.expected_bots())
             if not expected:
@@ -866,6 +912,7 @@ class RoundDriver:
                   f"{', '.join(expected)}")
             self._summon(round_no, expected)
             actionable = self._wait_for_quiescence(expected, self.clock())
+            self._record_round_attendance(expected)  # silent-streak bookkeeping
 
             if not actionable:
                 self._render_round(round_no, [], [])  # status-only round summary
@@ -934,8 +981,124 @@ class RoundDriver:
     def _clean_exit(self, rounds: int) -> RunOutcome:
         print("[round] clean — every expected reviewer is done/excluded and "
               "no actionable comments remain")
+        if self.auto_merge:
+            # ── SAFETY gate (parity of the reference loop's never-merge-unreviewed
+            # backstop): never auto-merge code that no expected reviewer actually
+            # reviewed. Three-way distinction (the run-start fleet snapshot is the
+            # discriminator) ─────────────────────────────────────────────────────
+            fleet = set(self._run_start_fleet)
+            if not fleet:
+                # (a) zero reviewers by design → quiet no-auto-merge. There is
+                #     nothing to gate on, so leaving the PR open is the safe,
+                #     unalarming outcome (no review ever happened).
+                self.notice("squash-merge",
+                            f"no reviewers configured for this repo — leaving "
+                            f"PR #{self.pr} open (nothing reviewed it)",
+                            status="skip",
+                            hint="add reviewers via the setup wizard, or merge by hand")
+                return RunOutcome("clean", rounds, False, self.actions)
+            if not (fleet & self.reviewed_ever):
+                # (b) reviewers were expected but NONE genuinely reviewed → loud
+                #     handback + block. A quota/error placeholder is a response,
+                #     not a review, so it never lands in reviewed_ever (filtered in
+                #     _classify_signal) and cannot satisfy this gate.
+                self._block_unreviewed_merge(fleet)
+                return RunOutcome("clean", rounds, False, self.actions)
+            # (c) >=1 expected reviewer genuinely reviewed (incl. a clean approval)
+            #     → the merge may proceed (subject to the label-gated CI gate).
+            if label_gated_ci(self.cfg, self.repo):
+                ci_ok = merge.wait_for_ci_green(
+                    self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run,
+                    notice=self.notice, sleep=self.sleep,
+                )
+                if not ci_ok:
+                    # CI red / never-settled — hand the PR back, do not merge.
+                    return RunOutcome("clean", rounds, False, self.actions)
         merged = merge.squash_merge(
             self.pr, repo=self.repo, enabled=self.auto_merge, cwd=self.cwd,
             run=self.gh_run, notice=self.notice,
         )
         return RunOutcome("clean", rounds, merged, self.actions)
+
+    def _block_unreviewed_merge(self, fleet: Set[str]) -> None:
+        """Loud console handback when a would-be clean auto-merge is refused
+        because NO expected reviewer ever reviewed the PR (case b). Names the
+        configured fleet so the admin can see exactly which reviewers stayed
+        silent; the per-reviewer 'never responded' banner (emitted at run end)
+        carries the actionable fix."""
+        names = ", ".join(_canonical(fleet)) or "the configured fleet"
+        _print_refusal_banner(
+            f"NOT MERGING — NO REVIEW — PR #{self.pr}",
+            f"The review round is clean, but NONE of the expected reviewers "
+            f"({names}) actually reviewed this PR — no comment and no clean "
+            f"approval. Auto-merging now would land code that no reviewer ever "
+            f"saw, so the loop is leaving PR #{self.pr} open and handing it back. "
+            f"Install/enable the reviewers (run the setup wizard) so a real "
+            f"review arrives, or merge it yourself after reviewing by hand.")
+
+    # ------------------------------------------------- silent-reviewer warning
+
+    def _record_round_attendance(self, expected: Sequence[str]) -> None:
+        """Round-end bookkeeping for the persistent-silent-reviewer warning. For
+        every reviewer EXPECTED this round: if it posted anything (its round-scoped
+        ``last_seen`` is set — a comment, clean approval, OR a quota/error
+        placeholder all count) it has responded and is permanently protected from
+        the warning; otherwise its consecutive-silent round count is bumped.
+        Reviewers not expected this round (done / excluded) are left untouched."""
+        for bot in expected:
+            if self._bot_state(bot).last_seen is not None:
+                self.responded_ever.add(bot)
+            else:
+                self.silent_rounds[bot] = self.silent_rounds.get(bot, 0) + 1
+
+    def _was_review_expected(self, bot: str) -> bool:
+        """True iff the loop genuinely EXPECTED a review from ``bot`` — it was
+        successfully summoned at least once, OR it is configured
+        ``auto_on_open=true`` (the loop deliberately does not summon such a bot;
+        it is expected to review on PR open, so total silence is still meaningful
+        — the new-repo uninstalled-fleet case). Never flags a bot the loop could
+        not summon."""
+        if bot in self.requested_ever:
+            return True
+        try:
+            return bool(auto_on_open(self.cfg, bot, self.repo))
+        except Exception:
+            return False
+
+    def _warn_persistently_silent(self) -> None:
+        """Run-end: for every run-start reviewer that was genuinely expected yet
+        NEVER responded in any round (and has no other known reason — not
+        quota/PR-too-large/errored-excluded), emit a loud console warning naming
+        the reviewer and the rounds it was silent. The free product ships no
+        settings UI, so the call to action points at the setup wizard / config."""
+        for bot in _canonical(self._run_start_fleet):
+            if bot in self.responded_ever:
+                continue  # responded at least once → not wastefully silent
+            if self.store.is_excluded(bot):
+                continue  # quota / PR-too-large / errored — a known reason, not silence
+            if not self._was_review_expected(bot):
+                continue  # never actually summonable → don't penalize
+            rounds = self.silent_rounds.get(bot, 0)
+            if rounds < 1:
+                continue
+            self._emit_silent_banner(bot, rounds)
+
+    def _emit_silent_banner(self, bot: str, rounds: int) -> None:
+        """Loud, actionable console banner for a configured reviewer that never
+        responded across the run — it wasted loop time and is almost certainly not
+        installed/enabled on this repo. Mirrors the reference loop's persistent-
+        silent escalation; the CTA names the setup wizard / config (the free
+        product ships no settings UI)."""
+        label = _REVIEWER_LABEL.get(bot, bot.capitalize())
+        n = max(1, int(rounds))
+        rnd = "round" if n == 1 else "rounds"
+        _print_refusal_banner(
+            f"REVIEWER SILENT — '{bot}' never responded across {n} {rnd}",
+            f"The loop expected a review from {label} and waited, but it posted "
+            f"nothing — no comment and no clean approval. That wasted loop time "
+            f"on a reviewer that is almost certainly not installed/enabled on "
+            f"this repo. Remove '{bot}' from your reviewer fleet (run the setup "
+            f"wizard, or edit active_reviewers in your config) until its app / "
+            f"workflow / secret is installed — or, if it should auto-review on PR "
+            f"open, install it and enable that setting. The loop will keep "
+            f"requesting and waiting on it every run until you do.")
