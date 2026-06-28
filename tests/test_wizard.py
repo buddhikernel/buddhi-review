@@ -223,6 +223,34 @@ def test_claude_secret_checked_even_when_workflow_present(monkeypatch, tmp_path)
         "the secret check must run even when the Claude workflow is already present"
 
 
+def test_step_reviewers_guides_claude_github_app_install(tmp_path):
+    """The Claude path must PROMINENTLY guide installing github.com/apps/claude —
+    the workflow + token alone 401 and post nothing (the buddhi-review PR #3
+    silent-Claude failure). Without this guidance a user wires the workflow + token
+    and is surprised when claude[bot] never posts."""
+    def run(argv, cwd=None, timeout=30, input=None):
+        if argv[:2] == ["gh", "api"]:
+            return types.SimpleNamespace(returncode=0, stdout="base64==")  # workflow present
+        return types.SimpleNamespace(returncode=0, stdout="")
+
+    pal = wizard._Palette(False)
+    buf = io.StringIO()
+    wizard.step_reviewers(
+        "acme/widgets", str(tmp_path), {"gh_auth": False}, run=run,
+        spawn_command=lambda *a, **k: None, getpass_fn=lambda *a: "",
+        pal=pal, stream=buf, multi_select=lambda *a, **k: {3}, input_fn=lambda *a: "")
+    out = buf.getvalue()
+    assert "github.com/apps/claude" in out, "must guide the Claude GitHub App install"
+    assert "401" in out, "must explain the silent-failure symptom"
+
+
+def test_app_install_lines_name_each_app():
+    claude = " ".join(wizard._app_install_lines("claude", "o/r"))
+    assert "github.com/apps/claude" in claude and "401" in claude
+    assert "Connectors" in " ".join(wizard._app_install_lines("codex", "o/r"))
+    assert "gemini-code-assist" in " ".join(wizard._app_install_lines("gemini", "o/r"))
+
+
 def test_no_paid_surface_strings_in_wizard_source():
     """OSS purity: the wizard names no paid mechanism. The locked teasers cite a
     benefit (e.g. 'Mobile push'), never the paid product or channel by name."""

@@ -947,6 +947,41 @@ def _offer_gh_token(*, run, getpass_fn, pal, stream, input_fn=input) -> None:
         _row("warn", "Could not persist GH_TOKEN — set it in your shell rc by hand", pal, stream)
 
 
+def _app_install_lines(bot: str, repo: Optional[str]) -> List[str]:
+    """The GitHub-UI steps to install an app-backed reviewer on ``repo``. The vendor
+    apps can't be installed via API, so setup GUIDES the install. Claude needs the
+    ``github.com/apps/claude`` App too — its workflow + token alone 401 and post
+    nothing (the silent-Claude failure: a workflow run that 401s with 'Claude Code
+    is not installed on this repository')."""
+    where = f"`{repo}`" if repo else "this repo"
+    if bot == "claude":
+        return [
+            "Install the Claude GitHub App:  github.com/apps/claude",
+            f"then grant it access to {where}.",
+            "Without it the claude-code-review run fails 401 (\"Claude Code is not "
+            "installed on this repository\") and claude[bot] posts NOTHING — the "
+            "workflow + token alone are NOT enough.",
+        ]
+    if bot == "codex":
+        return ["Install the OpenAI Codex app via Codex ▸ Settings ▸ Connectors ▸ "
+                f"GitHub, and grant it access to {where}.",
+                "It then replies to '@codex review' on a PR."]
+    if bot == "gemini":
+        return [f"Install  github.com/apps/gemini-code-assist  and grant it access "
+                f"to {where}.",
+                "It then replies to '/gemini review' on a PR."]
+    return [f"Install {bot}'s GitHub app and grant it access to {where}."]
+
+
+def _guide_app_install(bot: str, repo: Optional[str], *, pal, stream) -> None:
+    """Print a PROMINENT (bold-headed panel) app-install guide so the steps never
+    get lost among the other ✓/⚠ rows. Used for the vendor GitHub-App reviewers and
+    — equally REQUIRED, not optional — the Claude GitHub App."""
+    required = " (REQUIRED)" if bot == "claude" else ""
+    _panel(f"{bot.capitalize()} GitHub App{required} — install it + grant repo access",
+           _app_install_lines(bot, repo), pal, stream)
+
+
 def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, Any], *,
                    run, spawn_command, getpass_fn, pal, stream,
                    multi_select=multi_select, single_select=single_select,
@@ -976,8 +1011,9 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
                 _row("warn", "Copilot needs gh authenticated (and a paid Copilot plan)", pal, stream)
                 _offer_gh_token(run=run, getpass_fn=getpass_fn, pal=pal, stream=stream, input_fn=input_fn)
         elif bot in ("gemini", "codex"):
-            _row("info", f"{bot.capitalize()} — trusted from your selection "
-                         f"(verify the GitHub app is installed on this repo)", pal, stream)
+            # The vendor app can't be installed via API — GUIDE the install
+            # prominently (legible, not a dim aside) so it isn't missed.
+            _guide_app_install(bot, repo, pal=pal, stream=stream)
         elif bot == "claude":
             # Claude review needs TWO independent things: the workflow on the
             # default branch AND the CLAUDE_CODE_OAUTH_TOKEN repo secret. Check both
@@ -1003,6 +1039,11 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
                         input_fn=input_fn, stream=stream):
                     present2, note2 = _probe_claude_workflow(repo, run)
                     _row("ok" if present2 else "warn", f"Claude — {note2}", pal, stream)
+            # The THIRD requirement, beyond the workflow + token: the Claude GitHub
+            # App. Without it the workflow 401s ("Claude Code is not installed on
+            # this repository") and posts nothing — guide it prominently so it's
+            # never missed (the buddhi-review PR #3 silent-Claude failure).
+            _guide_app_install("claude", repo, pal=pal, stream=stream)
 
         # auto_on_open: Claude is mention-driven (never auto-reviews on open); the
         # GitHub-App bots are asked (default True).
