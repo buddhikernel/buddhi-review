@@ -1,0 +1,229 @@
+name: Claude Code Review
+# Subscription-quota PR reviewer. Auth is CLAUDE_CODE_OAUTH_TOKEN (a
+# subscription Agent SDK credential from `claude setup-token`), NOT
+# ANTHROPIC_API_KEY — so review usage bills to the Claude subscription, never
+# pay-as-you-go API. The token has a 365-day lifetime; a yearly Telegram
+# reminder (see check-claude-token-expiry.sh) flags rotation before it 401s.
+on:
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+permissions:
+  contents: read          # review-only: the action must NOT push commits/fixes
+  pull-requests: write    # post inline review comments
+  issues: write           # post top-level PR comments (GitHub routes PR timeline comments through the issues API)
+  id-token: write         # REQUIRED by anthropics/claude-code-action@v1: without
+                          # this, every run fails with "Could not fetch an OIDC
+                          # token" before reaching auth — claude[bot] posts only
+                          # its initial 👀 sticky and never gets to the actual
+                          # review comments.
+
+jobs:
+  review:
+    # Mention-driven only: a human's or review_loop.py's "@claude" comment is
+    # the sole trigger. Deliberately no `pull_request: synchronize` trigger —
+    # otherwise every loop fix-commit push would fire Claude twice (once on the
+    # push, once on the loop's own "@claude review" nudge) and race the loop.
+    # The local review loop owns the re-review cadence.
+    #
+    # PR-only guard is already enforced: for `issue_comment`,
+    # `github.event.issue.pull_request` is truthy ONLY on a PR (null on a plain
+    # issue), so ordinary-issue "@claude" mentions never run this job; the
+    # `pull_request_review_comment` branch covers review-comment events. The
+    # `contains('@claude')` match is intentionally loose (not an exact phrase /
+    # actor allowlist) so BOTH a human and review_loop.py's "@claude review"
+    # nudge trigger it; unauthorized-actor protection is already provided by
+    # claude-code-action's built-in write-access permission gate.
+    if: ${{ contains(github.event.comment.body, '@claude') && (github.event.issue.pull_request || github.event_name == 'pull_request_review_comment') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # For issue_comment events, checkout defaults to the default branch,
+          # not the PR head. Fetch the PR head so Read/Glob/Grep see the actual
+          # changed files rather than stale base-branch contents.
+          ref: refs/pull/${{ github.event.issue.number || github.event.pull_request.number }}/head
+      - uses: anthropics/claude-code-action@v1
+        with:
+          # Surface the SDK's per-tool transcript in the Actions log. Without
+          # this the SDK redacts everything past the init banner ("Running
+          # Claude Code via SDK (full output hidden for security)"), so a
+          # silent-give-up like PR #110 run 26455227886 — `success` with
+          # `permission_denials_count: 1` and zero comments posted — gives no
+          # way to identify which tool was denied. Safe on this repo: the
+          # prompt carries no secrets, and the only env var threaded in is the
+          # OAuth token, which the SDK never echoes.
+          show_full_output: true
+          # Auth: pass the subscription OAuth token as an explicit input.
+          # claude-code-action@v1 no longer reads CLAUDE_CODE_OAUTH_TOKEN from
+          # the step's env: block — runs fail at "Environment variable
+          # validation failed" before reaching the model. The token still has
+          # to be the `claude setup-token` subscription credential (not
+          # ANTHROPIC_API_KEY) so usage bills to the Claude subscription.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # Three load-bearing prompt contracts the loop depends on:
+          #
+          # 1. Findings MUST be inline review comments. review_loop.py only
+          #    adds INLINE review comments to its fix batch (poll_and_yield_
+          #    comments' inline branch); top-level review bodies and PR-level
+          #    issue comments are scanned only for clean/quota/error signals,
+          #    never fixed. A substantive finding placed in the top-level
+          #    comment would be ignored and merged past. So the prompt forces
+          #    every finding inline and reserves the top-level comment for the
+          #    clean sentinel alone.
+          # 2. The trailing "No issues found." sentinel is load-bearing: it
+          #    matches review_loop.py's existing CLEAN_REVIEW_PATTERNS[0]
+          #    (r"no (issues?|...) (found|detected|to report)") with no
+          #    "but/however", so the loop's generic clean-review detector flips
+          #    Claude to voluntarily-done with zero Claude-specific regexes.
+          #    CLEAN_REVIEW_PATTERNS[0] has no mixed-feedback negative
+          #    lookahead, so contract 1 (findings never share the top-level
+          #    comment with the sentinel) is what keeps a dirty review from
+          #    being misread as clean.
+          #    Strengthened 2026-06-14 after PR #277 run 27500576358: on a clean
+          #    RE-review (round 2, prior findings now resolved) Claude reviewed
+          #    fine (success, 15 turns, $1.35, result text literally said "No
+          #    issues found.") but only NARRATED the sentinel in its final
+          #    message instead of POSTING it — zero comments on the PR. The loop
+          #    sees only POSTED comments, so it stayed "waiting on claude" for
+          #    the full 30-min MAX_WAIT_TOTAL ceiling each round. The prompt now
+          #    makes the POST a mandatory, operational FINAL action and spells
+          #    out that an unposted sentinel is invisible. A workflow POST-STEP
+          #    posting the sentinel was rejected: review_loop's bot_key credits
+          #    the clean signal ONLY to login `claude[bot]` (the Claude GitHub
+          #    App), and a plain step authenticates as `github-actions[bot]`,
+          #    which the loop never maps to claude — so only Claude posting it
+          #    (or a re-invocation of THIS action) authors it correctly.
+          # 3. The PR number is PINNED into the prompt via GitHub Actions
+          #    expression interpolation. Without this, claude-code-action@v1
+          #    no longer auto-injects "you are reviewing PR #N" context, and
+          #    Claude runs `gh pr list`, sees multiple open PRs, and bails out
+          #    by calling the built-in AskUserQuestion tool — which in a
+          #    headless Actions runner is a silent-give-up: the action exits
+          #    `success` with zero comments posted. Observed on PRs #122 and
+          #    #123 (runs 26571387658 / 26571013791 on 2026-05-28). Paired
+          #    with `--disallowedTools "AskUserQuestion"` in claude_args below,
+          #    which removes the escape hatch so any prompt ambiguity surfaces
+          #    as a tool denial in the log rather than a silent no-op.
+          #    For `issue_comment` events, the PR number is at
+          #    `github.event.issue.number`; for
+          #    `pull_request_review_comment`, it's at
+          #    `github.event.pull_request.number`. One of those is always set
+          #    given the `on:` triggers above.
+          #
+          # The "classify changed files" rubric in the prompt below names this
+          # repo's own buddhi/ and buddhi-*/ paths. It is INTENTIONALLY retained
+          # in both this canonical workflow and the byte-identical bundled copy
+          # that setup_wizard._offer_install_claude_workflow shutil.copyfile()s
+          # into a user's repo as their .github/workflows/claude-code-review.yml.
+          # It is INERT for any repo that has no buddhi/ or buddhi-*/ files: that
+          # branch of the rubric never matches, so every changed file falls
+          # through to the standard code-review criteria — a third-party install
+          # is not silently down-graded. Two tests pin this on purpose:
+          # tests/test_claude_workflow_parity.py requires bundle == canonical
+          # byte-for-byte, and tests/test_review_context_routing.py requires the
+          # buddhi/ + buddhi-*/ routing strings to be present. A round-1 removal
+          # of this block was reverted; round 2 deliberately re-applied only the
+          # checkout fix and kept this block. Do not strip it from the bundle
+          # without also dropping the verbatim-parity goal and updating both tests.
+          prompt: >-
+            You are reviewing pull request
+            #${{ github.event.issue.number || github.event.pull_request.number }}
+            in the repository ${{ github.repository }}. The PR number is fixed
+            by the comment that triggered this run — do NOT call
+            AskUserQuestion to ask which PR to review, and do NOT run
+            `gh pr list` to choose one. Use `gh pr view
+            ${{ github.event.issue.number || github.event.pull_request.number }}`
+            and `gh pr diff
+            ${{ github.event.issue.number || github.event.pull_request.number }}`
+            to fetch the diff and metadata.
+
+
+            Review this PR for logic errors, security issues, and regressions.
+            Post every finding as an INLINE review comment on the specific
+            file and line it concerns. The automated review loop only acts on
+            inline review comments; a substantive finding placed in the
+            top-level PR comment is ignored and merged past. Do NOT put
+            findings in the top-level comment, and do NOT commit or push any
+            changes.
+
+
+            If and only if you find zero issues, you MUST post the clean
+            sentinel by ACTUALLY RUNNING this command as your FINAL action —
+            invoking the tool, not describing it:
+            `gh pr comment
+            ${{ github.event.issue.number || github.event.pull_request.number }}
+            --body "No issues found."` — a top-level comment whose last line is
+            exactly this line on its own: No issues found.
+            Do NOT merely WRITE "No issues found." in your reply and stop: the
+            review loop reads ONLY comments POSTED to the PR, never your final
+            message, so a sentinel you did not post is invisible to it and stalls
+            the loop for ~30 minutes before it gives up on you. A clean review
+            you did not POST counts as NO review at all. This applies on EVERY
+            run, INCLUDING a re-review where your earlier findings are now all
+            resolved — if there is nothing left to flag, your job is not done
+            until you have POSTED the sentinel.
+
+
+            Before reviewing, classify changed files. This repo has two
+            disjoint halves (see README.md and CLAUDE.md). If ANY changed file
+            lies under `buddhi/` (EXCEPT files under `buddhi/roadmap/`, which
+            carry the one acknowledged exception — the roadmap renderer is
+            executable Python) OR under an adapter sibling folder (`buddhi-*/`,
+            e.g. `buddhi-review/`, `buddhi-n8n/`), apply design-review
+            criteria to those files: these folders are design-only — do NOT
+            suggest adding tests, implementations, refactors, or type hints for
+            those files; DO check naming/routing-table consistency,
+            canonical-home cross-reference discipline, and that internal-only
+            folders (`buddhi/monetization/`, `buddhi/ip-and-legal/`,
+            `buddhi/meta/`, and all `buddhi-*/` adapter siblings) are not being
+            re-exposed in public-facing indexes or links. For files outside
+            `buddhi/` and `buddhi-*/` AND for files under `buddhi/roadmap/`,
+            apply standard code-review criteria from `CLAUDE.md` and
+            `docs/architecture/review-loop-flags.md` (flag contracts, `/tmp`
+            path convention via `tmp_paths.py`, test coverage in `tests/` for
+            business-logic changes). Mixed PRs apply both rubrics file-by-file.
+          # claude_args: explicit allowlist is REQUIRED. Without it the SDK
+          # denies every GitHub tool call (observed on PR #79 run
+          # 26262677561: 16 permission_denials, zero comments posted, SDK
+          # still exits "success"). Tools mirror anthropics/claude-code-action's
+          # own examples/pr-review-*.yml:
+          #   - mcp__github_inline_comment__create_inline_comment: the MCP
+          #     tool the action ships for posting inline review comments
+          #     (the only finding channel the local review loop consumes).
+          #   - Bash(gh pr comment:*): needed so Claude can post the
+          #     load-bearing top-level "No issues found." sentinel that
+          #     CLEAN_REVIEW_PATTERNS[0] matches on a clean review.
+          #   - Bash(gh pr diff:*) / Bash(gh pr view:*): read-only context
+          #     fetches Claude uses while reviewing.
+          #   - Read / Glob / Grep: read-only filesystem access so Claude can
+          #     open individual changed files for full context on multi-file
+          #     PRs. Without these, observed on PR #83 (15 files): 12
+          #     permission_denials, Claude gave up without posting EITHER
+          #     inline findings OR the "No issues found." sentinel, and the
+          #     loop's quiet-bot ask gate kept re-poking. Safe because the job
+          #     already has `contents: read` and no write tools.
+          # Added 2026-05-27 after PR #110 run 26455227886 silent-give-up:
+          #   - Bash(gh pr review:*): Claude reaches for `gh pr review --comment`
+          #     as a natural alternative to `gh pr comment` for the top-level
+          #     sentinel; without it the model gives up after the denial
+          #     instead of falling back to `gh pr comment`.
+          #   - Bash(gh api:*): on large PRs (110 had 36 changed files) Claude
+          #     pages `gh api repos/.../pulls/<n>/files` for full per-file diff
+          #     context past `gh pr diff`'s default. The job's GITHUB_TOKEN
+          #     still gates writes (contents: read), so this stays read-only
+          #     for repo contents.
+          # Added 2026-05-28 after PR #122 / #123 silent-give-up (runs
+          # 26571387658 / 26571013791): the built-in AskUserQuestion tool is
+          # implicitly available to the SDK and was Claude's escape hatch when
+          # the prompt didn't pin a PR — Claude called it, the headless runner
+          # could never answer, and the action terminated `success` with zero
+          # comments posted. Pairs with the PR-pin in the prompt above:
+          # belt-and-suspenders, so any future prompt ambiguity surfaces as a
+          # tool denial in the log rather than another silent no-op.
+          claude_args: >-
+            --model opus
+            --disallowedTools "AskUserQuestion"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh api:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(wc:*),Bash(cat:*),Bash(echo:*),Bash(printenv:*),Bash(env:*),Read,Glob,Grep"
