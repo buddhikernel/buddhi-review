@@ -24,7 +24,11 @@ opens a ``gh``-api PR that lands ``claude-code-review.yml`` on the default branc
 falling back to a local copy — and set the ``CLAUDE_CODE_OAUTH_TOKEN`` secret. The
 secret is scoped repo-only by default (least blast radius); on an org-owned repo
 an explicit, separately-confirmed opt-in can scope it org-wide but visible to this
-repo alone, gated on org-admin with a repo-scope fallback.
+repo alone, gated on org-admin with a repo-scope fallback. When a repo opts into
+label-gated CI, the wizard likewise offers to install the bundled
+``tests-ready-for-ci.yml`` gate on the default branch (its CI command detected from
+the checkout and confirmed), via the same server-side PR path — so the opt-in
+provisions a real gate, not just a recorded preference.
 
 The wizard is an interactive raw-mode TTY program; the ``/review-pr setup`` skill
 step opens it in a fresh window via :mod:`buddhi_review.setup_launcher`. Every
@@ -35,6 +39,7 @@ real terminal.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import shutil
@@ -731,6 +736,225 @@ def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, s
     return None
 
 
+# ── Label-gated CI: the ready-for-ci workflow installer (F4) ───────────────────────
+
+# The placeholder line the bundled ``tests-ready-for-ci.yml`` carries in its single
+# ``run:`` step. The wizard substitutes the repo's detected+confirmed CI command for
+# it at install time, so the gate runs a REAL command instead of a failing
+# placeholder the user must hand-edit.
+_CI_COMMAND_MARKER = "__BUDDHI_CI_COMMAND__"
+
+
+def _ready_for_ci_template_path() -> Path:
+    return Path(__file__).parent / "skills" / "review-pr" / "references" / "tests-ready-for-ci.yml"
+
+
+def _probe_ready_for_ci_workflow(repo: Optional[str], run) -> bool:
+    """Whether the generic label gate ``tests-ready-for-ci.yml`` is already on the
+    repo's DEFAULT branch — ONE ``gh api …/contents`` fetch, mirroring
+    :func:`_probe_claude_workflow`. Returns ``True`` (present), ``False`` (absent,
+    unreadable, no repo, or the fetch failed). This is the P7 #4 probe-before-install:
+    it SKIPS re-offering the install PR when the gate is already there; without it a
+    re-run opens a redundant second identical PR every time."""
+    if not repo:
+        return False
+    ok, out = _run_ok(run, ["gh", "api",
+                            f"repos/{repo}/contents/.github/workflows/tests-ready-for-ci.yml",
+                            "--jq", ".content"])
+    stripped = out.strip()
+    return bool(ok and stripped and stripped != "null")
+
+
+def _detect_ci_command(cwd: Optional[str]) -> Optional[str]:
+    """Best-effort detect a repo's CI/test command from its LOCAL checkout, so the
+    label gate is auto-wired with a real command instead of a failing placeholder.
+    Returns a shell command string, or ``None`` when nothing recognisable is found
+    (the caller then asks, pre-filling this as the default). Only READS files — it
+    never executes them, and never assumes a stack the repo does not actually show."""
+    if not cwd:
+        return None
+    root = Path(cwd)
+    if not root.is_dir():
+        return None
+
+    def _reads(p: Path) -> str:
+        try:
+            return p.read_text(encoding="utf-8", errors="replace") if p.is_file() else ""
+        except OSError:
+            return ""
+
+    # A Makefile ``ci:``/``test:`` target — honour the project's own entry point first.
+    mk = ""
+    for name in ("Makefile", "makefile", "GNUmakefile"):
+        if (root / name).is_file():
+            mk = _reads(root / name)
+            break
+    if re.search(r"(?m)^ci\s*:(?!=)", mk):
+        return "make ci"
+    if re.search(r"(?m)^test\s*:(?!=)", mk):
+        return "make test"
+    # Node — a package.json with a REAL ``test`` script. SKIP npm's "no test
+    # specified" default (it itself ``exit 1``s); baking that would re-create the
+    # very red gate this auto-wire exists to kill.
+    pkg = root / "package.json"
+    if pkg.is_file():
+        try:
+            data = json.loads(pkg.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        scripts = data.get("scripts") if isinstance(data, dict) else None
+        test_script = scripts.get("test") if isinstance(scripts, dict) else None
+        if (isinstance(test_script, str) and test_script.strip()
+                and "no test specified" not in test_script and "exit 1" not in test_script):
+            if (root / "yarn.lock").is_file():
+                return "yarn install && yarn test"
+            if (root / "pnpm-lock.yaml").is_file():
+                return "pnpm install && pnpm test"
+            return "npm ci && npm test" if (root / "package-lock.json").is_file() else "npm install && npm test"
+    # Python — a package manifest AND real evidence of a test suite (a tests dir or
+    # a pytest config). Without that evidence ``pytest`` exits non-zero on a repo with
+    # no tests yet → a red gate, so fall through to ASK rather than bake a guess.
+    has_manifest = any((root / n).is_file() for n in ("pyproject.toml", "setup.py", "setup.cfg"))
+    has_tests = (
+        (root / "tests").is_dir() or (root / "test").is_dir()
+        or (root / "conftest.py").is_file() or (root / "pytest.ini").is_file()
+        or (root / "tox.ini").is_file()
+        or "[tool:pytest]" in _reads(root / "setup.cfg")
+        or "[tool.pytest" in _reads(root / "pyproject.toml")
+    )
+    if has_manifest and has_tests:
+        return "python -m pip install -e . && python -m pytest"
+    # Go / Rust.
+    if (root / "go.mod").is_file():
+        return "go test ./..."
+    if (root / "Cargo.toml").is_file():
+        return "cargo test"
+    return None
+
+
+def _bake_ci_command(content: str, command: str) -> str:
+    """Substitute ``command`` for the ``_CI_COMMAND_MARKER`` line in the label-gated
+    CI template, preserving the YAML ``run: |`` block indentation so a multi-line
+    command stays valid. Returns the wired template text."""
+    out: List[str] = []
+    for ln in content.splitlines(keepends=True):
+        if ln.strip() == _CI_COMMAND_MARKER:
+            indent = ln[: len(ln) - len(ln.lstrip())]
+            ending = "\r\n" if ln.endswith("\r\n") else "\n"
+            for cmd_line in (command.splitlines() or [command]):
+                out.append(f"{indent}{cmd_line}{ending}")
+        else:
+            out.append(ln)
+    return "".join(out)
+
+
+def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stream,
+                                input_fn=input) -> Optional[str]:
+    """After a repo opts INTO label-gated CI, install the generic
+    ``tests-ready-for-ci.yml`` label gate on the repo's DEFAULT branch via a
+    server-side PR (reusing :func:`_create_file_pr` with its OWN branch + path,
+    distinct from the Claude installer), leaving the local checkout untouched. This
+    is the missing mechanism the per-repo opt-in needs: the merge automation only
+    reaps the Actions-minute saving when a workflow on the BASE branch actually gates
+    on the ``ready-for-ci`` label — without this template the opt-in is inert.
+
+    The gate's CI command is WIRED FOR the user — detected from the local checkout
+    (:func:`_detect_ci_command`), confirmed on a TTY with that detection as the
+    default, and baked into the single ``run:`` step — so the installed workflow runs
+    a REAL command, never a failing ``exit 1`` placeholder the user has to hand-edit.
+
+    P7 #4 (probe-before-install): if the gate is already on the default branch, it
+    says so and opens NO redundant second PR. P7 #2 (merge-me callout): on a
+    successful PR it prints a PROMINENT warn row — not a dim line — that the gate
+    stays INACTIVE until the PR is merged. Returns ``'pr'`` (a PR was opened) or
+    ``None`` (already present / no template / declined / no command resolved / write
+    failed); on any failure it prints the manual fallback."""
+    # P7 #4 — probe first; never open a redundant second PR for a gate already there.
+    if _probe_ready_for_ci_workflow(repo, run):
+        _row("ok", "Label-gated CI workflow already on the default branch", pal, stream)
+        return None
+    template = _ready_for_ci_template_path()
+    if not template.exists():
+        _row("warn", f"Bundled label-gated CI template not found: {template}", pal, stream)
+        return None
+    try:
+        content = template.read_text(encoding="utf-8")
+    except OSError as exc:
+        _row("warn", f"Couldn't read the label-gated CI template: {exc}", pal, stream)
+        return None
+    # The marker MUST be exactly one standalone line — ``_bake_ci_command`` replaces
+    # a line whose strip() equals the marker, so a 0/2+/embedded marker would either
+    # leak the literal token or wire nothing.
+    marker_lines = [ln for ln in content.splitlines() if ln.strip() == _CI_COMMAND_MARKER]
+    if len(marker_lines) != 1:
+        _row("warn", f"Label-gated CI template must carry exactly one "
+                     f"{_CI_COMMAND_MARKER} marker line (found {len(marker_lines)}) — "
+                     "can't auto-wire the CI command. Update the bundled template.", pal, stream)
+        return None
+    # Resolve the REAL CI command BEFORE opening the PR so the gate never ships a
+    # failing placeholder.
+    detected = _detect_ci_command(cwd)
+    if not _is_tty():
+        if not detected:
+            _row("warn", "Skipping label-gated CI workflow install — no TTY to capture "
+                         "a CI command and none auto-detected. Re-run setup in a "
+                         "terminal, or copy the bundled tests-ready-for-ci.yml in by "
+                         "hand and set its CI command.", pal, stream)
+            return None
+        ci_command = detected
+        _row("info", f"No TTY — wiring the auto-detected CI command: {ci_command}", pal, stream)
+    else:
+        if not _ask_yes_no("Install the label-gated CI workflow "
+                           "(.github/workflows/tests-ready-for-ci.yml) on the default "
+                           "branch via a PR?", default=True, input_fn=input_fn, stream=stream):
+            _row("info", "Skipped. Label-gated CI stays a config preference until a "
+                         "workflow on the default branch gates on the `ready-for-ci` "
+                         "label.", pal, stream)
+            return None
+        # Wire the command FOR the user — a detected default they accept or edit; never
+        # a workflow file they hand-edit afterwards.
+        suffix = (f" [{detected}]" if detected
+                  else " (e.g. `make ci`, `npm test`, `python -m pytest`)")
+        try:
+            entered = input_fn(f"  Command this gate runs at merge (your "
+                               f"tests/lint/build){suffix}: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            entered = ""
+        ci_command = entered or detected
+        if not ci_command:
+            _row("warn", "No CI command given — not installing a gate that would run "
+                         "nothing. Re-run setup and enter your test command.", pal, stream)
+            return None
+    content = _bake_ci_command(content, ci_command)
+    default = _default_branch(repo, run=run)
+    if not default:
+        _row("warn", "Couldn't determine the default branch — install the template "
+                     "manually.", pal, stream)
+        return None
+    ok, detail = _create_file_pr(
+        repo, default,
+        ".github/workflows/tests-ready-for-ci.yml",        # path
+        content,                                           # content (CI command baked in)
+        "Add label-gated CI workflow (Buddhi setup)",      # message
+        "Add label-gated CI workflow",                     # title
+        "buddhi/add-ready-for-ci-workflow",                # branch (its own, != claude)
+        run=run)
+    if ok:
+        _row("ok", f"Opened a PR to add the label gate (CI command: {ci_command}): "
+                   f"{detail}", pal, stream)
+        # P7 #2 — a loud, attention-grabbing callout (a warn row, not a dim line):
+        # the gate does NOTHING until this PR merges onto the default branch.
+        _row("warn", f"MERGE THIS PR to activate the gate — it stays INACTIVE until it "
+                     f"is reviewed and merged onto '{default}' (the default branch). "
+                     f"Until then the merge automation attaches `ready-for-ci` but no "
+                     f"workflow listens for it, so CI is never gated.", pal, stream)
+        return "pr"
+    _row("warn", f"Couldn't open the PR automatically ({detail}). Copy the bundled "
+                 "tests-ready-for-ci.yml into .github/workflows/ on your default "
+                 "branch by hand.", pal, stream)
+    return None
+
+
 def _gh_secret_exists(repo: str, name: str, *, org: Optional[str] = None, run) -> Optional[bool]:
     """Whether ``name`` is among the Actions secrets visible to ``repo``. Checks the
     repo's own secrets (``gh secret list --repo``); when ``repo``'s owner is an
@@ -1019,6 +1243,11 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
             else:
                 _row("warn", "Copilot needs gh authenticated (and a paid Copilot plan)", pal, stream)
                 _offer_gh_token(run=run, getpass_fn=getpass_fn, pal=pal, stream=stream, input_fn=input_fn)
+            # P7 #5 — the entry-point hint so the operator knows WHERE Copilot code
+            # review is turned on (there is no API to install it, like the app bots).
+            _row("info", "Enable Copilot code review for this repo: repo (or org) ▸ "
+                         "Settings ▸ Rules/Reviewers (requires a paid Copilot plan).",
+                 pal, stream)
         elif bot in ("gemini", "codex"):
             # The vendor app can't be installed via API — GUIDE the install
             # prominently (legible, not a dim aside) so it isn't missed.
@@ -1285,6 +1514,13 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
     lgc = step_repo_label_gated_ci(repo, config.label_gated_ci(existing, repo), pal=pal,
                                    stream=stream, single_select=single_select,
                                    input_fn=input_fn)
+    # F4 — opting in is only a real saving if a workflow on the default branch
+    # actually gates CI on the `ready-for-ci` label; install that mechanism (a
+    # server-side PR with the CI command detected + confirmed). The probe-before-
+    # install (P7 #4) skips a redundant PR when the gate is already present.
+    if lgc:
+        _offer_install_ready_for_ci(repo, cwd, run=run, pal=pal, stream=stream,
+                                    input_fn=input_fn)
 
     ok = config.set_repo_keys(repo, {
         "active_reviewers": list(reviewers),
@@ -1374,6 +1610,11 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
             repo_label_gated_ci = step_repo_label_gated_ci(
                 repo, config.label_gated_ci(existing, repo), pal=pal, stream=stream,
                 single_select=single_select, input_fn=input_fn)
+            # F4 — provision the ready-for-ci gate when the bound repo opts in
+            # (same server-side install + probe-before-install as the confirm flow).
+            if repo_label_gated_ci:
+                _offer_install_ready_for_ci(repo, cwd, run=run, pal=pal, stream=stream,
+                                            input_fn=input_fn)
 
         new_cfg = build_config(plan, repo, cwd, reviewers, auto_on_open)
         merged = merge_preserving(existing, new_cfg)
