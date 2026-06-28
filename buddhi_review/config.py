@@ -1,8 +1,9 @@
 """Config — ``~/.config/review-loop/config.yaml``.
 
-Keys: ``plan``, ``active_reviewers``, ``auto_on_open``, ``repos``,
-``notifications`` (always ``console``), ``repo``, ``cwd``. The notifier writes
-to the console.
+Keys: ``plan``, ``active_reviewers``, ``auto_on_open``, ``label_gated_ci``,
+``repos``, ``notifications`` (always ``console``), ``repo``, ``cwd``. The notifier
+writes to the console. :func:`set_repo_keys` is the per-repo writer (deep-merge
+into ``repos[<repo>]``, atomic, sibling-preserving).
 
 Reviewer availability is **per-repo** — Copilot/Gemini/Codex are GitHub Apps
 installed per repo and ``claude[bot]`` needs its workflow in each repo — so the
@@ -51,6 +52,10 @@ DEFAULT_AUTO_ON_OPEN: Dict[str, bool] = {
     "codex": True,
     "claude": False,
 }
+# Whether a "ready-for-ci" label gate guards the merge — a pre-merge CI gate the
+# loop attaches + polls. Default OFF (opt-in per repo / globally); mirrors the
+# reference loop's default-off ``label_gated_ci``.
+DEFAULT_LABEL_GATED_CI = False
 
 
 def config_path() -> Path:
@@ -151,6 +156,71 @@ def auto_on_open(cfg: Dict[str, Any], bot: str, repo: Optional[str] = None) -> b
     if isinstance(m, dict) and bot in m:
         return bool(m[bot])
     return DEFAULT_AUTO_ON_OPEN.get(bot, True)
+
+
+def label_gated_ci(cfg: Dict[str, Any], repo: Optional[str] = None) -> bool:
+    """Whether a "ready-for-ci" label gate guards the merge for ``repo``. A
+    CONFIRMED repo's per-repo ``label_gated_ci`` (a ``repos[<repo>]`` entry that
+    carries the key) wins; otherwise the top-level global ``label_gated_ci``;
+    otherwise ``DEFAULT_LABEL_GATED_CI`` (off). Mirrors the
+    :func:`active_reviewers` resolution order. The presence of a per-repo
+    ``label_gated_ci`` key shadows the global flag even when malformed (a non-bool
+    value falls to the default, never the global). ``repo=None`` reads the global
+    flag."""
+    entry = repo_entry(cfg, repo)
+    if entry is not None and "label_gated_ci" in entry:
+        v = entry.get("label_gated_ci")
+    else:
+        v = cfg.get("label_gated_ci")
+    return v if isinstance(v, bool) else DEFAULT_LABEL_GATED_CI
+
+
+# ── Per-repo writer (the ``repos:`` map) ────────────────────────────────────────
+
+def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of ``base`` with ``overlay`` recursively layered on: nested
+    dicts merge key-by-key, every other value (lists included) replaces wholesale.
+    Keys present in ``base`` but absent from ``overlay`` are preserved."""
+    out = dict(base)
+    for k, v in overlay.items():
+        cur = out.get(k)
+        if isinstance(v, dict) and isinstance(cur, dict):
+            out[k] = _deep_merge(cur, v)
+        else:
+            out[k] = v
+    return out
+
+
+def set_repo_keys(repo: str, keys: Dict[str, Any], path: Optional[Path] = None) -> bool:
+    """Deep-merge ``keys`` into ``cfg["repos"][norm_repo(repo)]`` and persist the
+    config atomically, leaving sibling repos and every unknown key intact.
+
+    This is the per-repo CONFIRMATION writer: it records a repo's
+    ``active_reviewers`` / ``auto_on_open`` / ``label_gated_ci`` and, by creating
+    the ``repos[<repo>]`` entry, marks the repo confirmed (:func:`repo_entry`'s
+    presence marker). An existing entry is updated in place under a
+    case-insensitive match, so re-confirming a repo never spawns a duplicate
+    sibling key. Returns ``False`` (writing nothing) for an unusable repo / non-dict
+    ``keys`` or when the atomic write fails."""
+    key = norm_repo(repo)
+    if key is None or not isinstance(keys, dict):
+        return False
+    p = path or config_path()
+    cfg = load_config(p) if p.exists() else {}
+    repos = cfg.get("repos")
+    repos = dict(repos) if isinstance(repos, dict) else {}
+    # Update the existing entry in place under a case-insensitive match so the same
+    # repo never gains a second, differently-cased sibling key.
+    target = next((k for k in repos if str(k).strip().lower() == key), key)
+    base = repos.get(target)
+    repos[target] = _deep_merge(base if isinstance(base, dict) else {}, keys)
+    cfg = dict(cfg)
+    cfg["repos"] = repos
+    # Reuse the wizard's single atomic, merge-preserving writer. Deferred import:
+    # wizard imports config at module load, so a top-level import here would be
+    # circular — config is the lower layer.
+    from buddhi_review.wizard import write_config
+    return write_config(cfg, p)
 
 
 def notifier_channel(cfg: Dict[str, Any]) -> str:
