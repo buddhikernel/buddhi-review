@@ -579,6 +579,42 @@ def test_detect_auth_failure_never_raises_on_gh_error():
     assert driver._detect_auth_failure("claude") is False
 
 
+def test_pr_checks_rows_returns_rows_on_nonzero_exit(capsys):
+    # `gh pr checks` exits non-zero when checks are pending or failing — exactly
+    # the case when a Claude review 401'd.  Returncode must NOT suppress the rows;
+    # the auth-failure probe relies on them to find the failed run id.
+    class FailingChecksGh(AuthProbeGh):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            result = super().__call__(argv, cwd=cwd, timeout=timeout)
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return subprocess.CompletedProcess(argv, 1, stdout=result.stdout, stderr="")
+            return result
+
+    gh = FailingChecksGh(checks_json=_CLAUDE_FAILED_CHECK, run_log=_AUTH_LOG)
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+    rows = driver._pr_checks_rows()
+    assert len(rows) > 0, "rows must not be dropped when gh pr checks exits non-zero"
+    assert driver._detect_auth_failure("claude") is True
+
+
+def test_silent_claude_auth_failure_emits_remint_banner_even_on_nonzero_checks_exit(capsys):
+    # End-to-end: when gh pr checks exits non-zero (failing check) but still
+    # prints JSON rows, the re-mint banner must fire — not the generic silent banner.
+    class FailingChecksGh(AuthProbeGh):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            result = super().__call__(argv, cwd=cwd, timeout=timeout)
+            if argv[:3] == ["gh", "pr", "checks"]:
+                return subprocess.CompletedProcess(argv, 1, stdout=result.stdout, stderr="")
+            return result
+
+    gh = FailingChecksGh(checks_json=_CLAUDE_FAILED_CHECK, run_log=_AUTH_LOG)
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "REVIEWER AUTH FAILED" in out
+    assert "REVIEWER SILENT" not in out
+
+
 def test_no_auth_banner_on_clean_review(capsys):
     # claude responded (clean) → not silent → the probe never runs.
     timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]"))]

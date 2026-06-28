@@ -1076,7 +1076,10 @@ class RoundDriver:
     # uninstalled bot — so we point the operator at re-minting, not removal.
 
     def _pr_checks_rows(self) -> List[dict]:
-        """``gh pr checks`` rows for this PR, or [] on any error. Never raises."""
+        """``gh pr checks`` rows for this PR, or [] on any error. Never raises.
+        ``gh pr checks`` exits non-zero when checks are pending or failing (the
+        normal case when a Claude review 401'd), so returncode is NOT consulted —
+        rows are parsed from stdout regardless (same approach as merge._fetch_pr_checks)."""
         argv = ["gh", "pr", "checks", self.pr,
                 "--json", "name,workflow,link,bucket,state"]
         if self.repo:
@@ -1084,8 +1087,6 @@ class RoundDriver:
         try:
             proc = self.gh_run(argv, cwd=self.cwd)
         except (subprocess.SubprocessError, OSError):
-            return []
-        if getattr(proc, "returncode", 1) != 0:
             return []
         try:
             rows = json.loads((proc.stdout or "").strip() or "[]")
