@@ -38,8 +38,10 @@ terminal.
 ## Critical behaviour rules
 
 - **Only sanctioned interactive gates, otherwise silent.** The ONLY questions you
-  may ask are the **first-run setup** prompt (Step 0) and the **rebase gate**
-  (Step 2, only when the branch is behind base). Run everything else back-to-back.
+  may ask are the **first-run setup** prompt (Step 0), the **per-repo reviewer
+  confirmation** prompt (Step 1.1, only when this repo's reviewers are
+  unconfirmed), and the **rebase gate** (Step 2, only when the branch is behind
+  base). Run everything else back-to-back.
 - **The actuator does the git mechanics.** `python3 -m buddhi_review create-pr`
   detects the git state, commits/branches/pushes as needed, opens the PR, and
   launches the review loop. You author the title/body and pick the branch; you do
@@ -90,6 +92,57 @@ Interactive-only and best-effort; if you cannot prompt, proceed with defaults.
 2. **Author the PR title + body** from the work on the branch, and pick a branch
    prefix (`feat` / `fix` / `refactor`) — used only when the work is sitting on the
    base branch and a new branch must be created.
+
+### 1.1 Per-repo reviewer confirmation gate
+
+Reviewer availability is **per-repo** — Copilot/Gemini/Codex are vendor GitHub
+Apps installed per repo, and `claude[bot]` needs `claude-code-review.yml` committed
+in each repo — so a fleet confirmed for one repo must NOT be assumed for another.
+Resolve `OWNER/REPO` (the explicit `owner/repo` argument when given, else the cwd's
+remote) and ask the status reader whether THIS repo's reviewers have been
+confirmed:
+
+```bash
+OWNER_REPO=${OWNER_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)}
+python3 -m buddhi_review status --repo "$OWNER_REPO" 2>/dev/null
+```
+
+If `OWNER/REPO` cannot be resolved yet (a brand-new repo with no remote), or the
+command is absent / prints nothing / unparseable output, **skip this gate** and
+proceed to Step 2 — it is best-effort and must NEVER block the flow. Otherwise
+parse the single JSON object (`{"repo_confirmed": …, "has_global_default": …}`)
+and act on `repo_confirmed`:
+
+- **`true`** — proceed silently to Step 2.
+- **`false`** — ask with **AskUserQuestion** (a sanctioned gate; ask ONCE). **Do
+  NOT configure reviewers in this session — every piece of deterministic setup
+  (reviewer selection, auto-on-open, auto-merge, label-gated CI, GitHub-side
+  provisioning) runs in the terminal wizard, never here:**
+  - Question: *"Reviewers for `<OWNER/REPO>` haven't been confirmed (they're
+    installed per-repo). Configure this repo now?"*
+  - Options:
+    1. **Run setup now** *(recommended)* — open the per-repo setup wizard in a
+       fresh terminal window (a raw-mode TTY this session cannot drive), then
+       **EXIT** so the user can finish it:
+
+       ```bash
+       SETUP=$(python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
+       bash "$SETUP" --repo "$OWNER_REPO"
+       ```
+
+       On a headless host the launcher prints the one-liner to run by hand
+       instead. After it returns, reply exactly: ``Setup opened in a new window —
+       finish it there, then re-run /create-pr.`` and **EXIT**.
+    2. **Use global defaults** *(offer only when `has_global_default` is `true`)* —
+       continue to Step 2 without writing a per-repo entry; the loop runs with
+       your global default fleet. When `has_global_default` is `false`, omit this
+       option entirely — there is no fallback fleet and the loop will refuse to
+       launch; option 1 is the only path.
+
+This gate is interactive-only and **never configures reviewers itself** — it only
+offers to launch the terminal wizard (the single deterministic setup brain) or
+falls back to global defaults. If you cannot prompt, proceed to Step 2 with
+defaults.
 
 ### 2. Pre-launch rebase gate (interactive)
 
