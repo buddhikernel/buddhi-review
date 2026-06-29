@@ -36,8 +36,7 @@ from buddhi_review.mapping import raw_item_for
 # "same label + same disposition", so this map is load-bearing.
 DISPOSITION = {
     MODEL_HANDLED: "fix",            # dispatch the fixer
-    CONVERGED: "already-resolved",   # fix was applied in a prior round; kernel's
-    # convergence detector (step 3) fires — unrelated to OOB/detect_resolved (step 6)
+    CONVERGED: "already-resolved",   # nothing to do
     DISCARDED: "skip",               # OUTDATED / INVALID — do not act
     ESCALATED: "escalate",           # asked a human via the console channel
     INVALID_ASK: "escalate",         # malformed question still surfaces to a human
