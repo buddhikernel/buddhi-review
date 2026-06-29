@@ -4,9 +4,11 @@
 # right before it merges; the job below runs ONLY when that label is present, then
 # the loop waits for it to go green before merging.
 #
-# This is WIRED to buddhi-review's real CI — the same pytest suite + fail-closed
-# publish-readiness gate as ci.yml — so the gate is a genuine merge check, not the
-# `exit 1` placeholder the setup wizard ships for a brand-new repo.
+# This is buddhi-review's real CI — the full pytest suite + the fail-closed
+# publish-readiness gate — so the gate is a genuine merge check, not the
+# `exit 1` placeholder the setup wizard ships for a brand-new repo. It is the
+# ONLY full-suite + publish-gate run in this repo: there is no per-push or
+# per-PR duplicate, so CI spends a runner exactly once per PR, at merge.
 # ──────────────────────────────────────────────────────────────────────────────
 name: Ready-for-CI
 
@@ -34,7 +36,7 @@ jobs:
         with:
           python-version: '3.11'
       # buddhi-review's real CI: the full pytest suite + the fail-closed
-      # publish-readiness gate (mirrors ci.yml's two jobs).
+      # publish-readiness gate (the repo's only full-suite + publish-gate run).
       - run: pip install -e '.[test]' build setuptools wheel
       - run: python -m pytest -q
       - run: python tools/publish_gate.py scan
