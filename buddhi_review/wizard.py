@@ -425,7 +425,7 @@ def _validate_claude_token(token, *, run, which=shutil.which) -> str:
             return "valid" if isolated else "unknown"
         blob = (getattr(r, "stdout", "") or "") + "\n" + (getattr(r, "stderr", "") or "")
         if _TOKEN_INVALID_RE.search(blob):
-            return "invalid"
+            return "invalid" if isolated else "unknown"
         return "unknown"
     finally:
         if prev_cwd is not None:
