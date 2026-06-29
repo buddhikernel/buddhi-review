@@ -525,12 +525,13 @@ def _rebase_conflicted_files(cwd: Optional[str], *, run: Run = _default_run) -> 
 
 
 def _restore_branch(cwd: Optional[str], sha: str, *, run: Run = _default_run) -> None:
-    """Guarantee the branch is back at exactly ``sha`` after an aborted rebase.
+    """Best-effort restoration of the branch to exactly ``sha`` after an aborted rebase.
 
     Aborts any in-progress rebase first (``git rebase --abort`` — a no-op exit is
     ignored), then VERIFIES HEAD is the snapshot SHA and, only if it drifted,
     hard-resets to it. Belt-and-suspenders so a conflict can never leave a
-    half-rebased branch behind. Best-effort: every step swallows its own error."""
+    half-rebased branch behind. Every step swallows its own error, so restoration
+    is not guaranteed if git commands themselves fail."""
     try:
         run(["git", "rebase", "--abort"], cwd=cwd)
     except (subprocess.SubprocessError, OSError):
@@ -595,7 +596,8 @@ def exit_rebase(
     if not head:
         return "skipped", "could not resolve HEAD — not rebasing"
 
-    # 4. Fetch the remote so the base tip and our own remote tip are both current.
+    # 4. Fetch the push remote so our own remote tip is current for the
+    #    --force-with-lease check below.
     try:
         fr = run(["git", "fetch", remote], cwd=cwd)
     except (subprocess.SubprocessError, OSError) as exc:
@@ -603,7 +605,32 @@ def exit_rebase(
     if getattr(fr, "returncode", 1) != 0:
         return "skipped", f"could not fetch from {remote} — not rebasing"
 
-    base_ref = f"{remote}/{base}"
+    # Derive the base remote separately from the push remote.  In a fork setup
+    # (push → origin/fork, PR base → upstream/main) the push remote and the
+    # remote that hosts the base branch are different.  git config
+    # branch.<base>.remote tells us if there is an explicit tracking remote for
+    # the base branch; when unset (typical non-fork deployment) the push remote
+    # doubles as the base remote.
+    def _base_remote_cfg() -> str:
+        try:
+            r = run(["git", "config", "--get", f"branch.{base}.remote"], cwd=cwd)
+            val = (getattr(r, "stdout", "") or "").strip()
+            if getattr(r, "returncode", 1) == 0 and val:
+                return val
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return remote
+
+    base_remote = _base_remote_cfg()
+    if base_remote != remote:
+        try:
+            bfr = run(["git", "fetch", base_remote], cwd=cwd)
+            if getattr(bfr, "returncode", 1) != 0:
+                base_remote = remote  # fall back; base_ref resolve may still fail below
+        except (subprocess.SubprocessError, OSError):
+            base_remote = remote
+
+    base_ref = f"{base_remote}/{base}"
     base_sha = _git_rev_parse(cwd, base_ref, run=run)
     if not base_sha:
         return "skipped", f"could not resolve {base_ref} after fetch — not rebasing"
@@ -623,6 +650,22 @@ def exit_rebase(
            f"merged cleanly", status="do",
            hint="manual-landing rebase (force-with-lease, own branch only)")
 
+    # 5c. Detect a rebase already in progress — git rebase would reject this
+    #     with a non-zero exit and no conflicted files, which would otherwise
+    #     be misclassified as 'conflict'.
+    try:
+        gd = run(["git", "rev-parse", "--git-dir"], cwd=cwd)
+        git_dir = (getattr(gd, "stdout", "") or "").strip()
+        if git_dir:
+            git_dir_abs = (git_dir if os.path.isabs(git_dir)
+                           else os.path.join(cwd, git_dir))
+            if (os.path.isdir(os.path.join(git_dir_abs, "rebase-merge"))
+                    or os.path.isdir(os.path.join(git_dir_abs, "rebase-apply"))):
+                return "error", ("a rebase is already in progress in this worktree "
+                                 "— resolve or abort it first: `git rebase --abort`")
+    except (subprocess.SubprocessError, OSError):
+        pass
+
     # 6. Rebase onto the latest base.
     try:
         rb = run(["git", "rebase", base_ref], cwd=cwd)
@@ -631,15 +674,23 @@ def exit_rebase(
         return "error", (f"the rebase command failed to run ({exc}) — the branch "
                          f"was restored to its pre-rebase state")
     if getattr(rb, "returncode", 1) != 0:
-        # Conflict (or another rebase failure). There is no resolver here: capture
-        # the conflicted files, abort, and restore the EXACT pre-rebase SHA.
+        # Non-zero exit: check for actual unmerged files to distinguish a real
+        # merge conflict from other git failures (e.g., unexpected error states).
+        # Only return 'conflict' when conflicted files are present; otherwise
+        # return 'error' to avoid a misleading diagnosis and wrong status routing.
         conflicted = _rebase_conflicted_files(cwd, run=run)
         _restore_branch(cwd, head, run=run)
-        files = ", ".join(conflicted) if conflicted else "one or more files"
+        if not conflicted:
+            return "error", (
+                f"the rebase onto {base_ref} failed with a non-zero exit but no "
+                f"conflicted files were found (not a merge conflict). The branch "
+                f"was restored; rebase by hand: "
+                f"`git fetch {base_remote} {base} && git rebase {base_ref}`.")
+        files = ", ".join(conflicted)
         return "conflict", (
             f"the rebase onto {base_ref} hit a conflict in {files}; the branch "
             f"was left exactly as it was. Rebase it by hand: "
-            f"`git fetch {remote} {base} && git rebase {base_ref}`, resolve the "
+            f"`git fetch {base_remote} {base} && git rebase {base_ref}`, resolve the "
             f"conflict, then `git push --force-with-lease`.")
 
     # 6b. A clean rebase leaves a clean tree. If anything is dirty (should never

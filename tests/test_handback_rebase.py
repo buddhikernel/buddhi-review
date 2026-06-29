@@ -28,12 +28,21 @@ class NoticeRec:
         return [c for c in self.calls if c[0] == "manual-landing"]
 
 
-def gh_run(base="main"):
-    """A fake git/gh seam: answers the baseRefName query with ``base`` (or empty
-    to simulate an unresolvable base), everything else rc=0/empty."""
+def gh_run(base="main", head=None, current_branch=None):
+    """A fake git/gh seam: answers baseRefName with ``base``, headRefName with
+    ``head``, and ``git rev-parse --abbrev-ref HEAD`` with ``current_branch``.
+    Pass empty string for ``base`` to simulate an unresolvable base.
+    Everything else rc=0/empty."""
     def run(argv, *, cwd=None, timeout=None):
         joined = " ".join(argv)
-        out = (base + "\n") if ("baseRefName" in joined and base) else ""
+        if "baseRefName" in joined and base:
+            out = base + "\n"
+        elif "headRefName" in joined and head:
+            out = head + "\n"
+        elif "rev-parse" in joined and "--abbrev-ref" in joined and current_branch:
+            out = current_branch + "\n"
+        else:
+            out = ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
     return run
 
@@ -85,6 +94,18 @@ def test_bucket_c_rebase_skip_is_not_rebased(stub_rebase):
     landing = nr.landing()
     assert landing and landing[-1][2] == "skip"
     assert "unverifiable" in landing[-1][1]
+
+
+def test_branch_mismatch_skips_rebase(stub_rebase):
+    nr = NoticeRec()
+    # Worktree is on "main" but the PR head is "feature/pr-7" → must skip.
+    d = make_driver(nr, gh=gh_run(base="main", head="feature/pr-7",
+                                  current_branch="main"))
+    d._maybe_exit_rebase(RunOutcome("clean", 1, merged=False))
+    assert stub_rebase["calls"] == []    # mis-pointed worktree → never rebased
+    landing = nr.landing()
+    assert landing and landing[-1][2] == "skip"
+    assert "feature/pr-7" in landing[-1][1]
 
 
 def test_unresolvable_base_is_not_rebased(stub_rebase):

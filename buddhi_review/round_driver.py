@@ -1124,6 +1124,20 @@ class RoundDriver:
                         f"could not determine PR #{self.pr}'s base branch — not "
                         f"rebasing for manual landing", status="skip")
             return
+        # Guard: verify the worktree is on the PR's own feature branch before
+        # force-pushing — a mis-pointed worktree would otherwise rebase+push
+        # whichever unrelated branch happens to be checked out in cwd.
+        # Fails OPEN (proceeds) when either value is unresolvable, so a transient
+        # gh/git failure never silently blocks a legitimate hand-back.
+        pr_head = _pr_head_branch(self.pr, self.repo, self.cwd, self.gh_run)
+        current_branch = _git_line(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], self.cwd, self.gh_run)
+        if pr_head and current_branch and pr_head != current_branch:
+            self.notice("manual-landing",
+                        f"not rebasing PR #{self.pr} — the worktree is on "
+                        f"{current_branch!r} but the PR head is {pr_head!r}; "
+                        f"resolve by hand", status="skip")
+            return
         status, detail = commit_push.exit_rebase(
             self.cwd, base=base, run=self.gh_run, notice=self.notice)
         if status == "rebased":
