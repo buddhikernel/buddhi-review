@@ -1,11 +1,16 @@
 # ──────────────────────────────────────────────────────────────────────────────
-# Label-gated CI — buddhi-review's own CI runs ONCE, at merge, instead of on every
-# push. The merge automation (the Buddhi review loop) adds the `ready-for-ci` label
-# right before it merges; the job below runs ONLY when that label is present, then
-# the loop waits for it to go green before merging.
+# Label-gated CI — buddhi-review's own CI runs only when the `ready-for-ci` label
+# is present. The merge automation (the Buddhi review loop) adds that label right
+# before it merges; the job below runs only when the label is present, then the
+# loop waits for it to go green before merging. Pushes made before the label is
+# applied are skipped (SKIPPED-IS-SUCCESS by design — see the job-level `if`).
 #
-# This is WIRED to buddhi-review's real CI — the same pytest suite + fail-closed
-# publish-readiness gate as ci.yml — so the gate is a genuine merge check, not the
+# Note: the workflow fires on both `labeled` and `synchronize` events. If new
+# commits are pushed while `ready-for-ci` is already applied, this job re-runs —
+# so it may run more than once per PR in that case.
+#
+# This is buddhi-review's real CI — the full pytest suite + the fail-closed
+# publish-readiness gate — so the gate is a genuine merge check, not the
 # `exit 1` placeholder the setup wizard ships for a brand-new repo.
 # ──────────────────────────────────────────────────────────────────────────────
 name: Ready-for-CI
@@ -34,7 +39,7 @@ jobs:
         with:
           python-version: '3.11'
       # buddhi-review's real CI: the full pytest suite + the fail-closed
-      # publish-readiness gate (mirrors ci.yml's two jobs).
+      # publish-readiness gate (the repo's only full-suite + publish-gate run).
       - run: pip install -e '.[test]' build setuptools wheel
       - run: python -m pytest -q
       - run: python tools/publish_gate.py scan
