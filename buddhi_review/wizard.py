@@ -1341,26 +1341,73 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     return "failed"
 
 
+def _probe_gh_token(token, *, run) -> Tuple[bool, str, str]:
+    """Verify a pasted GitHub token with a real ``gh api user`` round-trip, the token
+    FORCED into the child env (``GH_TOKEN``) so it authenticates as the PASTED token
+    even while ``gh`` itself is logged out (this hatch only runs when gh is
+    unauthenticated). Returns ``(ok, login, error)``: ``ok`` is True only on exit 0
+    with a non-empty login. The token is passed ONLY via ``env`` — never on argv or
+    in a log line. ``GH_TOKEN`` outranks ``GITHUB_TOKEN`` in gh's own precedence, so
+    forcing it guarantees the probe tests the pasted value, not an ambient cred."""
+    env = {**os.environ, shell_env.GH_TOKEN_NAME: token}
+    try:
+        r = run(["gh", "api", "user", "--jq", ".login"], env=env)
+    except Exception as exc:  # network / spawn failure → not verifiable → fail closed
+        return False, "", (str(exc) or exc.__class__.__name__)
+    login = (getattr(r, "stdout", "") or "").strip()
+    if getattr(r, "returncode", 1) == 0 and login:
+        return True, login, ""
+    err = ((getattr(r, "stderr", "") or "").strip()
+           or (getattr(r, "stdout", "") or "").strip())
+    err = err.splitlines()[0] if err else ""  # keep the surfaced error to one line
+    return False, "", err
+
+
 def _offer_gh_token(*, run, getpass_fn, pal, stream, input_fn=input) -> None:
     """When gh is unauthenticated, offer the GH_TOKEN env escape hatch (persisted
-    via shell_env, never config). The user may instead run `gh auth login`."""
+    via shell_env, never config). A freshly-pasted token is VERIFIED by a real
+    ``gh api user`` call BEFORE it is saved (see :func:`_probe_gh_token`); a wrong /
+    expired / mis-pasted token is therefore never written to the shell rc, where it
+    would silently shadow a later ``gh auth login`` and break every gh call. Because
+    the value lands in the rc (not a re-mintable GitHub secret), this path fails
+    CLOSED — an unverifiable token is NOT stored. The user may instead run
+    ``gh auth login``. The token value is never echoed or logged."""
     if not _is_tty():
         return
     if not _ask_yes_no("gh is not authenticated. Persist a GH_TOKEN now? "
                        "(otherwise run `gh auth login` yourself)",
                        default=False, input_fn=input_fn, stream=stream):
         return
-    try:
-        token = getpass_fn("  Paste a GitHub token (input hidden), or blank to skip: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        token = ""
-    if not token:
+    max_attempts = 2  # one paste + one bounded re-prompt, then skip (never loop)
+    for attempt in range(1, max_attempts + 1):
+        try:
+            token = getpass_fn("  Paste a GitHub token (input hidden), or blank to skip: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            token = ""
+        if not token:
+            return
+        _row("step", "Testing the token …", pal, stream)
+        ok_probe, login, err = _probe_gh_token(token, run=run)
+        if ok_probe:
+            ok, path = shell_env.upsert({shell_env.GH_TOKEN_NAME: token}, also_env=True)
+            if ok:
+                who = f" (authenticated as {login})" if login else ""
+                _row("ok", f"GH_TOKEN written to {path}{who} — open a new shell to "
+                           f"pick it up", pal, stream)
+            else:
+                _row("warn", "Could not persist GH_TOKEN — set it in your shell rc by hand",
+                     pal, stream)
+            return
+        # Probe failed → surface the REAL error briefly + guidance, and do NOT store.
+        detail = f": {err}" if err else ""
+        _row("warn", f"That token didn't authenticate{detail}", pal, stream)
+        if attempt < max_attempts:
+            _row("info", "Check it has not expired and has `repo`/`read:org` scope, then "
+                         "paste it again — or run `gh auth login` instead.", pal, stream)
+            continue
+        _row("warn", "Not persisting GH_TOKEN. Run `gh auth login`, or set a verified "
+                     "token in your shell rc by hand.", pal, stream)
         return
-    ok, path = shell_env.upsert({shell_env.GH_TOKEN_NAME: token}, also_env=True)
-    if ok:
-        _row("ok", f"GH_TOKEN written to {path} — open a new shell to pick it up", pal, stream)
-    else:
-        _row("warn", "Could not persist GH_TOKEN — set it in your shell rc by hand", pal, stream)
 
 
 def _app_install_lines(bot: str, repo: Optional[str]) -> List[str]:

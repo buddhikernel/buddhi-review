@@ -726,3 +726,201 @@ def test_set_claude_secret_probe_raising_seam_doesnt_crash(monkeypatch):
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "tok", pal=pal, stream=buf)   # auth_probe=None → real probe
     assert status == "present"
+
+
+# ── F11 — _offer_gh_token: verify-before-store the GH_TOKEN escape hatch ──────────────
+# A pasted GH_TOKEN goes to the SHELL RC (not a re-mintable GitHub secret), so a wrong
+# value silently shadows a later `gh auth login` and breaks every gh call. This path
+# probes the token with a real `gh api user` (the pasted token FORCED into the child
+# env) BEFORE storing, fails CLOSED on any failure, and re-prompts once then skips.
+
+def _gh_probe_run(*results):
+    """Fake `run` for the GH_TOKEN probe. Returns each queued result in order (a _R,
+    or a BaseException to raise), recording the argv + env of every call so a test can
+    assert the pasted token was threaded via env and never on argv. A depleted queue
+    defaults to a clean success."""
+    queue = list(results)
+    calls = []
+
+    def run(argv, cwd=None, timeout=30, input=None, env=None):
+        calls.append({"argv": list(argv), "env": dict(env or {})})
+        outcome = queue.pop(0) if queue else _R(returncode=0, stdout="octocat\n")
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    return run, calls
+
+
+def _capture_upsert(monkeypatch, ok=True):
+    """Capture `shell_env.upsert` so a test can assert WHETHER and WITH WHAT a token
+    was persisted, without touching a real rc file."""
+    seen = {"called": False, "mapping": None}
+
+    def fake_upsert(mapping, **kwargs):
+        seen["called"] = True
+        seen["mapping"] = dict(mapping)
+        seen["kwargs"] = kwargs
+        return (ok, "/home/u/.zshrc")
+
+    monkeypatch.setattr(wizard.shell_env, "upsert", fake_upsert)
+    return seen
+
+
+def _getpass_seq(*values):
+    it = iter(values)
+    return lambda *a, **k: next(it)
+
+
+def test_offer_gh_token_stores_after_valid_probe(monkeypatch):
+    # A valid probe (gh api user → login, exit 0) → the token is persisted via upsert,
+    # the ✓ row names the authenticated login, and the probe authenticated as the
+    # PASTED token in env (never on argv).
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
+    seen = _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    wizard._offer_gh_token(run=run, getpass_fn=lambda *a: "ghp_PASTED", pal=pal,
+                           stream=buf, input_fn=lambda *a: "y")
+    assert seen["called"] and seen["mapping"] == {"GH_TOKEN": "ghp_PASTED"}
+    assert len(calls) == 1
+    assert calls[0]["argv"] == ["gh", "api", "user", "--jq", ".login"]
+    assert calls[0]["env"]["GH_TOKEN"] == "ghp_PASTED"            # pasted token in env
+    assert all("ghp_PASTED" not in tok for tok in calls[0]["argv"])  # never on argv
+    out = buf.getvalue()
+    assert "octocat" in out and "GH_TOKEN written" in out
+
+
+def test_offer_gh_token_invalid_never_stored_bounded_reprompt(monkeypatch):
+    # ADVERSARIAL guard: a 401 on BOTH the paste and the single re-prompt → the token
+    # is NEVER stored, guidance is shown, and getpass is called exactly twice (bounded
+    # re-prompt, then skip — never an unbounded loop).
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _gh_probe_run(_R(returncode=1, stderr="gh: Bad credentials (HTTP 401)"),
+                               _R(returncode=1, stderr="gh: Bad credentials (HTTP 401)"))
+    seen = _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    getpass_calls = {"n": 0}
+
+    def gp(*a):
+        getpass_calls["n"] += 1
+        return "ghp_BAD"
+    wizard._offer_gh_token(run=run, getpass_fn=gp, pal=pal, stream=buf,
+                           input_fn=lambda *a: "y")
+    assert seen["called"] is False                 # nothing persisted on any path
+    assert getpass_calls["n"] == 2                 # one paste + one bounded re-prompt
+    assert len(calls) == 2                         # probed twice, no third attempt
+    out = buf.getvalue()
+    assert "didn't authenticate" in out and "HTTP 401" in out
+    assert "gh auth login" in out                  # guidance to the alternative
+
+
+def test_offer_gh_token_invalid_then_valid_stores(monkeypatch):
+    # Re-prompt recovery: a rejected paste, then an accepted one → stored on the second.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _gh_probe_run(_R(returncode=1, stderr="HTTP 401"),
+                               _R(returncode=0, stdout="octocat\n"))
+    seen = _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    wizard._offer_gh_token(run=run, getpass_fn=_getpass_seq("ghp_BAD", "ghp_GOOD"),
+                           pal=pal, stream=buf, input_fn=lambda *a: "y")
+    assert seen["called"] and seen["mapping"] == {"GH_TOKEN": "ghp_GOOD"}
+    assert len(calls) == 2 and calls[1]["env"]["GH_TOKEN"] == "ghp_GOOD"
+
+
+def test_offer_gh_token_network_failure_not_stored(monkeypatch):
+    # A spawn / network failure (run raises) → not verifiable → fail CLOSED: not stored,
+    # guidance shown. The rc-written token must never be persisted unverified.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _gh_probe_run(OSError("gh: network unreachable"),
+                               OSError("gh: network unreachable"))
+    seen = _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    wizard._offer_gh_token(run=run, getpass_fn=lambda *a: "ghp_X", pal=pal, stream=buf,
+                           input_fn=lambda *a: "y")
+    assert seen["called"] is False
+    assert len(calls) == 2                       # re-prompted once, then skipped
+    assert "didn't authenticate" in buf.getvalue()
+
+
+def test_offer_gh_token_blank_paste_skips(monkeypatch):
+    # A blank paste → skip immediately: NO probe, NO store (the existing early-return).
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _gh_probe_run()
+    seen = _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    wizard._offer_gh_token(run=run, getpass_fn=lambda *a: "", pal=pal, stream=buf,
+                           input_fn=lambda *a: "y")
+    assert calls == [] and seen["called"] is False
+
+
+def test_offer_gh_token_non_tty_noop(monkeypatch):
+    # Non-TTY → early no-op (unchanged): no prompt, no probe, no store.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: False)
+    run, calls = _gh_probe_run()
+    seen = _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    getpass_calls = {"n": 0}
+    wizard._offer_gh_token(run=run,
+                           getpass_fn=lambda *a: getpass_calls.__setitem__("n", 1) or "x",
+                           pal=pal, stream=buf, input_fn=lambda *a: "y")
+    assert calls == [] and seen["called"] is False and getpass_calls["n"] == 0
+
+
+def test_offer_gh_token_declined_noop(monkeypatch):
+    # The user declines the GH_TOKEN prompt → no probe, no store.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _gh_probe_run()
+    seen = _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    wizard._offer_gh_token(run=run, getpass_fn=lambda *a: "ghp_X", pal=pal, stream=buf,
+                           input_fn=lambda *a: "n")
+    assert calls == [] and seen["called"] is False
+
+
+def test_offer_gh_token_probe_forces_pasted_token_over_ambient(monkeypatch):
+    # ADVERSARIAL guard for the false-positive concern. A fake `run` cannot exercise
+    # gh's real GH_TOKEN-over-GITHUB_TOKEN precedence, so this asserts the CODE's half
+    # of that contract: even with a different ambient GITHUB_TOKEN present, the child
+    # env carries GH_TOKEN == the PASTED value (which gh resolves ahead of the ambient
+    # GITHUB_TOKEN, per its documented precedence — that resolution lives in gh, not
+    # here). If the code stopped forcing GH_TOKEN, this fails.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setenv("GITHUB_TOKEN", "ambient-WRONG")
+    run, calls = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
+    _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    wizard._offer_gh_token(run=run, getpass_fn=lambda *a: "ghp_PASTED", pal=pal,
+                           stream=buf, input_fn=lambda *a: "y")
+    assert calls[0]["env"]["GH_TOKEN"] == "ghp_PASTED"       # pasted forced as GH_TOKEN
+    assert calls[0]["env"]["GITHUB_TOKEN"] == "ambient-WRONG"  # ambient left intact; gh ranks GH_TOKEN first
+    assert all("ghp_PASTED" not in tok for tok in calls[0]["argv"])
+
+
+def test_offer_gh_token_value_never_logged(monkeypatch):
+    # The token value must never be echoed into the console (getpass hides input; the
+    # code prints the login + rc path, never the token) — on BOTH success and failure.
+    secret = "ghp_SUPER_SECRET_VALUE"
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run_ok, _ = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
+    _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    wizard._offer_gh_token(run=run_ok, getpass_fn=lambda *a: secret, pal=pal,
+                           stream=buf, input_fn=lambda *a: "y")
+    run_bad, _ = _gh_probe_run(_R(returncode=1, stderr="HTTP 401"),
+                               _R(returncode=1, stderr="HTTP 401"))
+    wizard._offer_gh_token(run=run_bad, getpass_fn=lambda *a: secret, pal=pal,
+                           stream=buf, input_fn=lambda *a: "y")
+    assert secret not in buf.getvalue()
+
+
+def test_probe_gh_token_returns_login_and_errors():
+    # The probe contract directly: (ok, login, error). Success → (True, login, ""); a
+    # failure surfaces the first error line; an exit-0-but-empty-login is NOT ok.
+    run_ok, calls = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
+    assert wizard._probe_gh_token("ghp_X", run=run_ok) == (True, "octocat", "")
+    assert calls[0]["env"]["GH_TOKEN"] == "ghp_X"
+    run_bad, _ = _gh_probe_run(_R(returncode=1, stderr="line1\nline2"))
+    assert wizard._probe_gh_token("ghp_X", run=run_bad) == (False, "", "line1")
+    run_empty, _ = _gh_probe_run(_R(returncode=0, stdout="   \n"))
+    assert wizard._probe_gh_token("ghp_X", run=run_empty)[0] is False
