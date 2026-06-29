@@ -242,3 +242,105 @@ def test_bot_for_login():
     assert detectors.bot_for_login("claude[bot]") == "claude"
     assert detectors.bot_for_login("human-dev") is None
     assert detectors.bot_for_login("") is None
+
+
+# ---------------------------------------------------------------------------
+# F10: repo-scoped token-401 probe (latest_run_token_auth_failed) — the setup
+# wizard's re-mint evidence. Best-effort, never raises; reuses AUTH_FAILED_RE.
+# ---------------------------------------------------------------------------
+import types as _types  # noqa: E402
+
+
+def _proc(returncode=0, stdout=""):
+    return _types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
+
+
+def _probe_run(*, list_out='[{"databaseId": 7}]', list_rc=0,
+               log_failed="", log_full="", raise_on=None):
+    """Fake `run` for the probe: serves `gh run list` (latest run id) then
+    `gh run view` (--log-failed, falling back to --log)."""
+    def run(argv, **kw):
+        joined = " ".join(argv)
+        if raise_on and raise_on in joined:
+            raise OSError("gh missing")
+        if argv[:3] == ["gh", "run", "list"]:
+            return _proc(returncode=list_rc, stdout=list_out)
+        if argv[:3] == ["gh", "run", "view"]:
+            out = log_failed if "--log-failed" in argv else log_full
+            return _proc(returncode=0 if out else 1, stdout=out)
+        return _proc()
+    return run
+
+
+# The bundled workflow's post-step ::error message (lands in the run log on a 401).
+_AUTH_401_LOG = ("review\t2026-01-01T00:00:00Z\t::error title=Claude review auth "
+                 "failed::CLAUDE_CODE_OAUTH_TOKEN is invalid or expired — the Claude "
+                 "review returned 401 (Invalid bearer token) and posted nothing.")
+_CLEAN_LOG = "review\t2026-01-01T00:00:00Z\tNo Claude authentication failure detected."
+# The App-not-installed failure is ALSO a 401 but reads differently and needs a
+# DIFFERENT fix (install the App, not re-mint) — must NOT match.
+_APP_NOT_INSTALLED_LOG = ("review\t2026-01-01T00:00:00Z\t401 Claude Code is not "
+                          "installed on this repository")
+
+
+def test_probe_token_401_detected_in_failed_log():
+    run = _probe_run(log_failed=_AUTH_401_LOG)
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is True
+
+
+def test_probe_clean_run_not_flagged():
+    run = _probe_run(log_failed="", log_full=_CLEAN_LOG)
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is False
+
+
+def test_probe_app_not_installed_is_not_a_token_401():
+    run = _probe_run(log_failed=_APP_NOT_INSTALLED_LOG)
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is False
+
+
+def test_probe_falls_back_to_full_log_when_no_failed_step():
+    # A stale workflow without the post-step 401s GREEN — no failed step, so the 401
+    # lives only in the full --log.
+    run = _probe_run(log_failed="", log_full=_AUTH_401_LOG)
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is True
+
+
+def test_probe_no_run_returns_false():
+    run = _probe_run(list_out="[]")
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is False
+
+
+def test_probe_missing_repo_returns_false():
+    run = _probe_run(log_failed=_AUTH_401_LOG)
+    assert detectors.latest_run_token_auth_failed("", run=run) is False
+    assert detectors.latest_run_token_auth_failed(None, run=run) is False
+
+
+def test_probe_malformed_run_list_json_returns_false():
+    run = _probe_run(list_out="not json")
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is False
+
+
+def test_probe_raising_gh_seam_never_raises():
+    # Best-effort contract: any gh/network error → False ("couldn't tell"), no raise.
+    assert detectors.latest_run_token_auth_failed(
+        "acme/widgets", run=_probe_run(raise_on="run list")) is False
+    assert detectors.latest_run_token_auth_failed(
+        "acme/widgets", run=_probe_run(log_failed=_AUTH_401_LOG, raise_on="run view")) is False
+
+
+def test_probe_uses_workflow_basename_and_repo_flag():
+    # The list query is scoped by --workflow <basename> + --repo (no local cwd reliance).
+    seen = {}
+
+    def run(argv, **kw):
+        if argv[:3] == ["gh", "run", "list"]:
+            seen["list"] = argv
+            return _proc(returncode=0, stdout='[{"databaseId": 7}]')
+        if argv[:3] == ["gh", "run", "view"]:
+            return _proc(returncode=0, stdout=_AUTH_401_LOG)
+        return _proc()
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is True
+    assert "--workflow" in seen["list"]
+    assert detectors.CLAUDE_REVIEW_WORKFLOW in seen["list"]
+    assert "--repo" in seen["list"] and "acme/widgets" in seen["list"]

@@ -7,6 +7,8 @@ secret never goes org-wide without an explicit confirmation + an org-admin check
 a repo-scope fallback, the org-aware existence check can't false-positive or miss
 an org-set secret, and the installer always targets the default branch."""
 import io
+import os
+import subprocess
 import types
 
 import pytest
@@ -19,11 +21,15 @@ def _R(returncode=0, stdout="", stderr=""):
 
 
 def _recorder(router):
-    """Wrap a routing function as an injectable `run`, recording every argv."""
+    """Wrap a routing function as an injectable `run`, recording every argv.
+
+    Accepts the full seam signature including the F10 ``env`` kwarg so a call site
+    that threads an isolated credential env (the token validator) does not break the
+    fake (`_default_run(argv, *, timeout, input, env)`)."""
     calls = []
 
-    def run(argv, cwd=None, timeout=30, input=None):
-        calls.append({"argv": list(argv), "input": input})
+    def run(argv, cwd=None, timeout=30, input=None, env=None):
+        calls.append({"argv": list(argv), "input": input, "env": env})
         return router(list(argv), input)
 
     return run, calls
@@ -349,7 +355,8 @@ def test_set_claude_secret_org_optin_declined_stays_repo(monkeypatch):
     status = wizard._set_claude_secret(
         "acme/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "tok", pal=pal, stream=buf,
-        single_select=lambda *a, **k: 0)   # "this repository only"
+        single_select=lambda *a, **k: 0,   # "this repository only"
+        validate_fn=lambda *a, **k: "valid")   # F10: skip the real isolated ping
     assert status == "set"
     sets = [c["argv"] for c in calls if c["argv"][:3] == ["gh", "secret", "set"]]
     assert sets and all("--org" not in s for s in sets)
@@ -362,7 +369,8 @@ def test_set_claude_secret_org_optin_confirmed_goes_org(monkeypatch):
     status = wizard._set_claude_secret(
         "acme/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "tok", pal=pal, stream=buf,
-        single_select=lambda *a, **k: 1)   # "org-wide, scoped to this repo"
+        single_select=lambda *a, **k: 1,   # "org-wide, scoped to this repo"
+        validate_fn=lambda *a, **k: "valid")   # F10: skip the real isolated ping
     assert status == "set"
     assert any("--org" in c["argv"] for c in calls
               if c["argv"][:3] == ["gh", "secret", "set"])
@@ -380,7 +388,8 @@ def test_set_claude_secret_personal_repo_never_offers_org(monkeypatch):
         return 0
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
-        getpass_fn=lambda *a: "tok", pal=pal, stream=buf, single_select=ss)
+        getpass_fn=lambda *a: "tok", pal=pal, stream=buf, single_select=ss,
+        validate_fn=lambda *a, **k: "valid")   # F10: skip the real isolated ping
     assert status == "set"
     assert selector_calls["n"] == 0
 
@@ -439,3 +448,281 @@ def test_claude_recheck_prompt_is_clear_and_names_the_file():
     # secret-set clause, then a single confirm — not one mashed-together question
     assert "default branch" in p
     assert p.strip().endswith("?")
+
+
+# ── F10 Part A — _validate_claude_token (verify a candidate BEFORE storing) ──────────
+
+def _validating_run(returncode=0, stdout="", stderr=""):
+    """A fake `run` for the token validator that CAPTURES the env + cwd it was
+    invoked with (the load-bearing isolation surface), then returns a canned result.
+    Accepts the exact seam call the validator makes: ``run(argv, timeout=…, env=…)``."""
+    cap = {}
+
+    def run(argv, *, timeout=None, env=None, input=None):
+        cap["argv"] = list(argv)
+        cap["env"] = dict(env or {})
+        cap["cwd"] = os.getcwd()
+        cfg = (env or {}).get("CLAUDE_CONFIG_DIR")
+        cap["cwd_is_config_dir"] = bool(cfg) and cfg == os.getcwd()
+        cap["cwd_existed"] = os.path.isdir(os.getcwd())
+        return _R(returncode=returncode, stdout=stdout, stderr=stderr)
+
+    return run, cap
+
+
+def test_validate_claude_token_valid_on_clean_ping():
+    run, _ = _validating_run(returncode=0)
+    assert wizard._validate_claude_token(
+        "oat-CANDIDATE", run=run, which=lambda _b: "/usr/bin/claude") == "valid"
+
+
+@pytest.mark.parametrize("stderr", [
+    "401 Invalid bearer token",
+    "authentication_failed: 401",
+    "authentication_error: token rejected",
+    "Error: 401 Unauthorized",
+    "Your token has expired",
+])
+def test_validate_claude_token_invalid_on_auth_signature(stderr):
+    run, _ = _validating_run(returncode=1, stderr=stderr)
+    assert wizard._validate_claude_token(
+        "oat-bad", run=run, which=lambda _b: "/usr/bin/claude") == "invalid"
+
+
+def test_validate_claude_token_unknown_without_binary():
+    # No claude on PATH → cannot test → "unknown" (never blocks setup); run not called.
+    called = {"n": 0}
+
+    def run(*a, **k):
+        called["n"] += 1
+        return _R()
+    assert wizard._validate_claude_token(
+        "oat", run=run, which=lambda _b: None) == "unknown"
+    assert called["n"] == 0
+
+
+def test_validate_claude_token_unknown_on_timeout():
+    def run(*a, **k):
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=25)
+    assert wizard._validate_claude_token(
+        "oat", run=run, which=lambda _b: "/usr/bin/claude") == "unknown"
+
+
+def test_validate_claude_token_unknown_on_ambiguous_failure():
+    # Non-zero exit but NO auth signature → "unknown", never "invalid".
+    run, _ = _validating_run(returncode=1, stderr="network unreachable")
+    assert wizard._validate_claude_token(
+        "oat", run=run, which=lambda _b: "/usr/bin/claude") == "unknown"
+
+
+def test_validate_claude_token_full_isolation(monkeypatch):
+    # ADVERSARIAL CLAIM #1 guard: the candidate must be the ONLY credential the ping
+    # can use — every higher-precedence ENV cred popped AND the apiKeyHelper (#4)
+    # neutralised via an empty CLAUDE_CONFIG_DIR + cwd, and NEVER `--bare` (which
+    # ignores CLAUDE_CODE_OAUTH_TOKEN → would test the local login).
+    candidate = "oat-CANDIDATE-VALUE-do-not-leak"
+    creds = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK",
+             "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY")
+    for c in creds:
+        monkeypatch.setenv(c, "SHOULD-BE-POPPED")
+    orig_cwd = os.getcwd()
+    run, cap = _validating_run(returncode=0)
+    state = wizard._validate_claude_token(
+        candidate, run=run, which=lambda _b: "/usr/bin/claude")
+    assert state == "valid"
+    # the candidate IS set, and is the ONLY claude credential in the child env
+    assert cap["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == candidate
+    for c in creds:
+        assert c not in cap["env"], f"{c} was not popped from the validation env"
+    # settings-FILE isolation: CLAUDE_CONFIG_DIR is an empty dir AND cwd is that dir
+    assert "CLAUDE_CONFIG_DIR" in cap["env"]
+    assert cap["cwd_is_config_dir"] is True
+    assert cap["cwd_existed"] is True
+    # the cheap real round-trip — `-p ping --model haiku`, NEVER `--bare`
+    assert "-p" in cap["argv"] and "ping" in cap["argv"]
+    assert "--model" in cap["argv"] and "haiku" in cap["argv"]
+    assert "--bare" not in cap["argv"]
+    # ADVERSARIAL CLAIM #3 guard: the token NEVER appears on argv (only in env)
+    assert all(candidate not in tok for tok in cap["argv"])
+    # the process cwd is restored after the probe, and the tempdir is cleaned up
+    assert os.getcwd() == orig_cwd
+    assert not os.path.isdir(cap["env"]["CLAUDE_CONFIG_DIR"])
+
+
+# ── F10 Part A wired into _set_claude_secret (validate BEFORE the store) ──────────────
+
+def test_set_claude_secret_stores_only_after_valid(monkeypatch):
+    # A "valid" verdict → the token is piped to `gh secret set` on STDIN, never argv.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _recorder(_full_secret_router(owner_type="User"))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "oat-GOOD", pal=pal, stream=buf,
+        validate_fn=lambda token, **k: "valid")
+    assert status == "set"
+    sets = [c for c in calls if c["argv"][:3] == ["gh", "secret", "set"]]
+    assert sets and sets[0]["input"] == "oat-GOOD"
+    assert all("oat-GOOD" not in tok for c in calls for tok in c["argv"])
+
+
+def test_set_claude_secret_invalid_token_never_stored(monkeypatch):
+    # ADVERSARIAL CLAIM #1/#3 guard: an "invalid" verdict re-prompts (bounded ~3) and
+    # the invalid token NEVER reaches `gh secret set`.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _recorder(_full_secret_router(owner_type="User"))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    attempts = {"n": 0}
+
+    def vf(token, **k):
+        attempts["n"] += 1
+        return "invalid"
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "oat-BAD", pal=pal, stream=buf, validate_fn=vf)
+    assert status == "failed"
+    assert attempts["n"] == 3
+    assert not any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
+
+
+def test_set_claude_secret_invalid_then_valid_stores(monkeypatch):
+    # Re-prompt recovery: a rejected paste, then an accepted one → stored.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _recorder(_full_secret_router(owner_type="User"))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    verdicts = iter(["invalid", "valid"])
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "oat", pal=pal, stream=buf,
+        validate_fn=lambda token, **k: next(verdicts))
+    assert status == "set"
+    assert any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
+
+
+def test_set_claude_secret_unknown_token_stored_with_warning(monkeypatch):
+    # "unknown" (no binary / inconclusive) → store anyway so a transient check never
+    # blocks setup, but warn that it is unverified.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _recorder(_full_secret_router(owner_type="User"))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "oat", pal=pal, stream=buf,
+        validate_fn=lambda token, **k: "unknown")
+    assert status == "set"
+    assert "unverified" in buf.getvalue()
+    assert any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
+
+
+def test_set_claude_secret_validator_crash_fails_safe(monkeypatch):
+    # ADVERSARIAL CLAIM #1 guard: a validator that RAISES is a bug, not transient →
+    # fail SAFE (never store on it).
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _recorder(_full_secret_router(owner_type="User"))
+    pal, buf = wizard._Palette(False), io.StringIO()
+
+    def boom(token, **k):
+        raise RuntimeError("validator bug")
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "oat", pal=pal, stream=buf, validate_fn=boom)
+    assert status == "failed"
+    assert not any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
+
+
+# ── F10 Part B — re-mint a stored-but-broken token (the live buddhi-review fix) ───────
+
+def test_set_claude_secret_present_and_401_enters_remint(monkeypatch):
+    # The stored OAuth token is failing live (probe → True) → DON'T skip; enter the
+    # re-mint flow. A blank paste there aborts to "skipped" (NOT "present"), and the
+    # operator is told the reviews are failing.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, _ = _recorder(_exists_router(owner_type="User",
+                                      repo_secrets=["CLAUDE_CODE_OAUTH_TOKEN"]))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    probe_calls = {"n": 0}
+
+    def probe(repo, **k):
+        probe_calls["n"] += 1
+        assert repo == "alice/widgets"
+        return True
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "", pal=pal, stream=buf, auth_probe=probe)
+    assert status == "skipped"          # entered the mint flow; a blank paste aborts
+    assert probe_calls["n"] == 1
+    out = buf.getvalue()
+    assert "failing" in out and "re-mint" in out
+
+
+def test_set_claude_secret_present_and_clean_stays_present(monkeypatch):
+    # ADVERSARIAL CLAIM #2 guard: a stored token that works (probe → False) keeps the
+    # skip — NO mint, NO paste, NO re-mint of a working token.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _recorder(_exists_router(owner_type="User",
+                                          repo_secrets=["CLAUDE_CODE_OAUTH_TOKEN"]))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    getpass_calls = {"n": 0}
+
+    def gp(*a):
+        getpass_calls["n"] += 1
+        return "tok"
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=gp, pal=pal, stream=buf, auth_probe=lambda repo, **k: False)
+    assert status == "present"
+    assert getpass_calls["n"] == 0
+    assert not any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
+
+
+def test_set_claude_secret_present_and_probe_cant_tell_stays_present(monkeypatch):
+    # "couldn't tell" maps to False → keep the skip (never blind-re-mint on uncertainty).
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, _ = _recorder(_exists_router(owner_type="User",
+                                      repo_secrets=["CLAUDE_CODE_OAUTH_TOKEN"]))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "tok", pal=pal, stream=buf,
+        auth_probe=lambda repo, **k: False)
+    assert status == "present"
+
+
+def test_set_claude_secret_anthropic_present_never_probes(monkeypatch):
+    # ADVERSARIAL CLAIM #2 guard: a working ANTHROPIC_API_KEY backs the repo → keep
+    # the skip WITHOUT probing (the probe only knows the OAuth token's 401).
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, _ = _recorder(_exists_router(owner_type="User",
+                                      repo_secrets=["ANTHROPIC_API_KEY"]))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    probe_calls = {"n": 0}
+
+    def probe(repo, **k):
+        probe_calls["n"] += 1
+        return True
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "tok", pal=pal, stream=buf, auth_probe=probe)
+    assert status == "present"
+    assert probe_calls["n"] == 0
+
+
+def test_set_claude_secret_probe_raising_seam_doesnt_crash(monkeypatch):
+    # ADVERSARIAL CLAIM #2 guard: the REAL probe (auth_probe=None) over a gh seam that
+    # RAISES is best-effort — returns False ("couldn't tell"), the skip is kept, no crash.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+
+    def router(argv, _inp):
+        if argv[:2] == ["gh", "api"] and _startswith(argv, "users/"):
+            return _R(returncode=0, stdout="User\n")
+        if argv[:3] == ["gh", "secret", "list"]:
+            return _R(returncode=0, stdout="CLAUDE_CODE_OAUTH_TOKEN\t2026-01-01")
+        if argv[:3] in (["gh", "run", "list"], ["gh", "run", "view"]):
+            raise OSError("gh missing")
+        return _R()
+    run, _ = _recorder(router)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "tok", pal=pal, stream=buf)   # auth_probe=None → real probe
+    assert status == "present"
