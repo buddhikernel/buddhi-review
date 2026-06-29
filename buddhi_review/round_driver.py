@@ -191,6 +191,13 @@ class RunOutcome:
     rounds: int = 0
     merged: bool = False
     actions: List[ActionResult] = field(default_factory=list)
+    # rebase_skip: this hand-back is a dirty/diverged/unverifiable state that must
+    #   NEVER be rebased + force-pushed on the way out — a poisoned worktree, a
+    #   failed push (a local commit the remote never got), or a red-gate stop with
+    #   uncommitted/unpushed residue. Set ONLY at those exits; the manual-landing
+    #   exit-rebase honours it and skips entirely (commit_push.exit_rebase + its
+    #   own clean-worktree guard are the second line of defence).
+    rebase_skip: bool = False
 
 
 # The §5 parity vocabulary: a run ends in exactly one of three terminal
@@ -640,6 +647,10 @@ class RoundDriver:
         #   non-empty check that distinguishes "no reviewers by design" (quiet)
         #   from "reviewers expected but none reviewed" (loud block).
         self._run_start_fleet: Set[str] = set()
+        # _premerge_ci_red: set when the pre-merge label-gated CI gate failed at a
+        #   clean exit — used so a manual-landing rebase reports the honest state
+        #   ("CI is red — merge at your discretion") instead of "ready to merge".
+        self._premerge_ci_red: bool = False
 
     # ------------------------------------------------------------------ state
 
@@ -901,7 +912,13 @@ class RoundDriver:
         silent-reviewer warning at run end (every exit path, via ``finally``)."""
         self._run_start_fleet = set(self.expected_bots())
         try:
-            return self._run_loop()
+            outcome = self._run_loop()
+            # On a manual-landing hand-back, rebase the loop's OWN branch onto the
+            # latest base + --force-with-lease push it, so the operator can merge a
+            # current PR. No-op on a merged run; skips dirty/diverged Bucket-C
+            # states; reports the HONEST post-rebase state (see _maybe_exit_rebase).
+            self._maybe_exit_rebase(outcome)
+            return outcome
         finally:
             self._warn_persistently_silent()
 
@@ -961,7 +978,9 @@ class RoundDriver:
             if any(a.rollback_failed for a in round_actions):
                 print("[round] a fixer rollback could not be proven clean — "
                       "poisoned worktree, halting before push for manual review")
-                return RunOutcome("needs-human", round_no, False, self.actions)
+                # Bucket C: a poisoned worktree must never be rebased/force-pushed.
+                return RunOutcome("needs-human", round_no, False, self.actions,
+                                  rebase_skip=True)
 
             if any(a.final == "fixed" for a in round_actions) and self.push:
                 pushed = commit_push.commit_and_push(
@@ -975,11 +994,16 @@ class RoundDriver:
                     notice=self.notice,
                 )
                 if pushed == "stopped":
-                    return RunOutcome("stopped", round_no, False, self.actions)
+                    # Stopped on a red gate with uncommitted/unpushed round residue
+                    # → Bucket C: do not rebase/force-push an unverified tree.
+                    return RunOutcome("stopped", round_no, False, self.actions,
+                                      rebase_skip=True)
                 if pushed == "error":
                     # push failed: local commit exists but remote never got it;
                     # continuing could lead to squash_merge on stale remote code.
-                    return RunOutcome("needs-human", round_no, False, self.actions)
+                    # Bucket C: local/remote diverged — never rebase/force-push it.
+                    return RunOutcome("needs-human", round_no, False, self.actions,
+                                      rebase_skip=True)
 
         print(f"[round] max rounds ({self.max_rounds}) reached — not merging")
         return RunOutcome("max-rounds", self.max_rounds, False, self.actions)
@@ -1018,13 +1042,115 @@ class RoundDriver:
                     notice=self.notice, sleep=self.sleep,
                 )
                 if not ci_ok:
-                    # CI red / never-settled — hand the PR back, do not merge.
+                    # CI red / never-settled — hand the PR back, do not merge. Flag
+                    # it so the manual-landing rebase reports the honest state.
+                    self._premerge_ci_red = True
                     return RunOutcome("clean", rounds, False, self.actions)
         merged = merge.squash_merge(
             self.pr, repo=self.repo, enabled=self.auto_merge, cwd=self.cwd,
             run=self.gh_run, notice=self.notice,
         )
         return RunOutcome("clean", rounds, merged, self.actions)
+
+    # --------------------------------------------------- manual-landing exit-rebase
+
+    def _base_branch(self) -> Optional[str]:
+        """The PR's base branch via ``gh pr view``, or None on any failure (the
+        caller then skips the rebase — it can't rebase onto an unknown base)."""
+        argv = ["gh", "pr", "view", str(self.pr), "--json", "baseRefName",
+                "-q", ".baseRefName"]
+        if self.repo:
+            argv += ["-R", self.repo]
+        return _git_line(argv, self.cwd, self.gh_run)
+
+    def _handback_caution_reason(self, outcome: RunOutcome) -> Optional[str]:
+        """Why a rebased hand-back is NOT 'ready to merge' (Bucket B), or None when
+        it genuinely is ready (Bucket A: a real review happened and nothing is
+        wrong). Read only on a successful rebase to phrase the honest outcome."""
+        if outcome.status == "stopped":
+            return "the run was stopped before a clean finish"
+        if outcome.status == "max-rounds":
+            return "the review did not reach a clean finish within the round budget"
+        if outcome.status == "needs-human":
+            return "a review thread or fix still needs you"
+        # A clean, unmerged exit: ready ONLY if a real review happened and the
+        # pre-merge CI (when gated) was not red.
+        if self._premerge_ci_red:
+            return "the pre-merge CI is red"
+        fleet = set(self._run_start_fleet)
+        if not fleet:
+            return "no reviewers are configured for this repo"
+        if not (fleet & self.reviewed_ever):
+            return "no expected reviewer actually reviewed this PR"
+        return None  # Bucket A — a genuine clean review; ready to merge
+
+    def _maybe_exit_rebase(self, outcome: RunOutcome) -> None:
+        """Exit-rebase wrapper that can never lose the run's outcome: the rebase is
+        a courtesy on the way out, so ANY unexpected error degrades to a console
+        note and the hand-back still returns normally."""
+        try:
+            self._exit_rebase_impl(outcome)
+        except Exception as exc:  # never let the courtesy rebase crash the run
+            self.notice("manual-landing",
+                        f"manual-landing rebase skipped after an unexpected error "
+                        f"({exc}) — merge PR #{self.pr} by hand", status="fallback")
+
+    def _exit_rebase_impl(self, outcome: RunOutcome) -> None:
+        """On a manual-landing hand-back, rebase the loop's OWN branch onto the
+        latest base and ``--force-with-lease`` push it so the operator can merge a
+        current PR (NEW capability — see :func:`commit_push.exit_rebase`).
+
+        Buckets: rebase the A+B hand-backs; SKIP Bucket C (poisoned worktree /
+        push-failed / unverifiable — ``outcome.rebase_skip``). A merged run and a
+        push-disabled run are no-ops, and an already-current branch is never
+        force-pushed. After a clean rebase the hand-back line states the REAL
+        state — 'ready to merge' ONLY when a real review happened and nothing is
+        wrong (Bucket A); otherwise 'merge at your discretion' with the reason
+        (Bucket B). Never relabels a Bucket-B PR as ready."""
+        if run_terminal_disposition(outcome) == "merge":
+            return  # the loop merged it — nothing to rebase
+        if not self.push:
+            return  # pushing is off for this run — never force-push
+        if outcome.rebase_skip:
+            self.notice("manual-landing",
+                        f"not rebasing PR #{self.pr} for manual landing — the "
+                        f"worktree/branch is in an unverifiable state (uncommitted "
+                        f"residue or an unpushed commit); resolve it by hand before "
+                        f"merging", status="skip")
+            return
+        base = self._base_branch()
+        if not base:
+            self.notice("manual-landing",
+                        f"could not determine PR #{self.pr}'s base branch — not "
+                        f"rebasing for manual landing", status="skip")
+            return
+        status, detail = commit_push.exit_rebase(
+            self.cwd, base=base, run=self.gh_run, notice=self.notice)
+        if status == "rebased":
+            reason = self._handback_caution_reason(outcome)
+            if reason is None:
+                self.notice("manual-landing",
+                            f"PR #{self.pr} rebased onto the latest {base} — "
+                            f"ready to merge", status="done")
+            else:
+                self.notice("manual-landing",
+                            f"PR #{self.pr} rebased onto the latest {base}, but "
+                            f"{reason} — merge at your discretion", status="fallback")
+        elif status == "current":
+            self.notice("manual-landing",
+                        f"PR #{self.pr} is already up to date with {base} — nothing "
+                        f"to rebase", status="skip")
+        elif status == "conflict":
+            self.notice("manual-landing",
+                        f"PR #{self.pr} could not be rebased for manual landing: "
+                        f"{detail}", status="stop")
+        elif status == "skipped":
+            self.notice("manual-landing",
+                        f"PR #{self.pr} left as-is for manual landing — {detail}",
+                        status="skip")
+        else:  # "error"
+            self.notice("manual-landing",
+                        f"PR #{self.pr} — {detail}", status="fallback")
 
     def _block_unreviewed_merge(self, fleet: Set[str]) -> None:
         """Loud console handback when a would-be clean auto-merge is refused

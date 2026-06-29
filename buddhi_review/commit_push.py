@@ -483,3 +483,191 @@ def commit_and_push(
     # Clean-tree tripwire: the worktree must be clean after commit+push.
     _assert_clean_after_commit(cwd, run=run, notice=notice)
     return "pushed"
+
+
+# ── Exit-rebase: rebase a hand-back PR onto latest base + --force-with-lease ─────
+# A NEW capability and a deliberate, narrowly-scoped extension of this skill's
+# "never rebases, force-pushes" stance (see merge.py): the per-round push above
+# stays strictly non-force, and the squash-merge never rebases. The ONLY place a
+# force-push is ever performed is here — and only on a manual-landing hand-back,
+# only on the loop's OWN feature branch, only with --force-with-lease (never a
+# bare -f), and only when the rebase is clean. There is no conflict resolver: the
+# behaviour is the most conservative one possible — a clean rebase proceeds, but
+# the FIRST sign of a conflict is escalated WITH a diagnosis (the conflicted
+# files + the manual steps), never resolved; the branch is restored to its EXACT
+# pre-rebase state. It never leaves a half-rebased branch or silently swallows a
+# conflict.
+
+
+def _git_rev_parse(cwd: Optional[str], ref: str, *, run: Run = _default_run) -> Optional[str]:
+    """The SHA ``ref`` resolves to, or None if it does not resolve / on any error.
+    Uses ``--verify --quiet`` so a missing ref is a clean None, never a raise."""
+    try:
+        r = run(["git", "rev-parse", "--verify", "--quiet", ref], cwd=cwd)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    out = (getattr(r, "stdout", "") or "").strip()
+    return out or None
+
+
+def _rebase_conflicted_files(cwd: Optional[str], *, run: Run = _default_run) -> List[str]:
+    """The unmerged (conflicted) paths during an in-progress rebase, via
+    ``git diff --name-only --diff-filter=U``. Best-effort: any error → ``[]``."""
+    try:
+        r = run(["git", "diff", "--name-only", "--diff-filter=U"], cwd=cwd)
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if getattr(r, "returncode", 1) != 0:
+        return []
+    return [ln.strip() for ln in (getattr(r, "stdout", "") or "").splitlines() if ln.strip()]
+
+
+def _restore_branch(cwd: Optional[str], sha: str, *, run: Run = _default_run) -> None:
+    """Guarantee the branch is back at exactly ``sha`` after an aborted rebase.
+
+    Aborts any in-progress rebase first (``git rebase --abort`` — a no-op exit is
+    ignored), then VERIFIES HEAD is the snapshot SHA and, only if it drifted,
+    hard-resets to it. Belt-and-suspenders so a conflict can never leave a
+    half-rebased branch behind. Best-effort: every step swallows its own error."""
+    try:
+        run(["git", "rebase", "--abort"], cwd=cwd)
+    except (subprocess.SubprocessError, OSError):
+        pass
+    if _git_rev_parse(cwd, "HEAD", run=run) != sha:
+        try:
+            run(["git", "reset", "--hard", sha], cwd=cwd)
+        except (subprocess.SubprocessError, OSError):
+            pass
+
+
+def exit_rebase(
+    cwd: str,
+    *,
+    base: str,
+    run: Run = _default_run,
+    notice: Callable[..., str] = automation_notice,
+) -> Tuple[str, str]:
+    """Rebase the loop's OWN feature branch onto the latest ``base`` and
+    ``git push --force-with-lease`` it, so a hand-back PR can be merged cleanly.
+
+    See the module-level note above for the safety stance. Returns
+    ``(status, detail)``:
+
+      * ``"rebased"``  — clean rebase + ``--force-with-lease`` push succeeded.
+      * ``"current"``  — already on top of ``base``; no-op (no gratuitous push).
+      * ``"conflict"`` — a rebase conflict; ABORTED and restored to the exact
+                         pre-rebase SHA. ``detail`` names the conflicted files and
+                         the manual rebase steps.
+      * ``"skipped"``  — a precondition was not met (dirty worktree, an
+                         unresolvable push target, a failed fetch / base lookup).
+                         ``detail`` says why; nothing was changed.
+      * ``"error"``    — an unexpected git failure; the branch was restored where
+                         a restore was needed. ``detail`` says what to do by hand.
+
+    The worktree MUST be clean (a dirty / poisoned worktree → ``"skipped"``), the
+    push target MUST resolve to this branch's own name (reusing
+    :func:`_resolve_push_target`), and the force-push is always
+    ``--force-with-lease`` against the remote tip we last fetched, so a remote
+    that advanced under us is rejected rather than clobbered. ``run`` is the same
+    injectable git seam the rest of this module uses."""
+    # 1. Resolve THIS branch's own push remote + name. Detached HEAD / no
+    #    upstream → skip (we will not synthesise a target for a force-push).
+    remote, branch = _resolve_push_target(cwd, run=run)
+    if not (remote and branch):
+        return "skipped", ("could not resolve this branch's push target "
+                           "(detached HEAD or no upstream) — not rebasing")
+
+    # 2. The worktree MUST be clean — a rebase needs it, and a dirty tree is a
+    #    poisoned/unverifiable state we never rebase or force-push.
+    try:
+        st = run(["git", "status", "--porcelain"], cwd=cwd)
+    except (subprocess.SubprocessError, OSError) as exc:
+        return "skipped", f"could not read the worktree state ({exc}) — not rebasing"
+    if getattr(st, "returncode", 1) != 0:
+        return "skipped", "could not read the worktree state — not rebasing"
+    if (getattr(st, "stdout", "") or "").strip():
+        return "skipped", "the worktree has uncommitted changes — not rebasing"
+
+    # 3. Snapshot the pre-rebase SHA so any failure restores the branch exactly.
+    head = _git_rev_parse(cwd, "HEAD", run=run)
+    if not head:
+        return "skipped", "could not resolve HEAD — not rebasing"
+
+    # 4. Fetch the remote so the base tip and our own remote tip are both current.
+    try:
+        fr = run(["git", "fetch", remote], cwd=cwd)
+    except (subprocess.SubprocessError, OSError) as exc:
+        return "skipped", f"could not fetch from {remote} ({exc}) — not rebasing"
+    if getattr(fr, "returncode", 1) != 0:
+        return "skipped", f"could not fetch from {remote} — not rebasing"
+
+    base_ref = f"{remote}/{base}"
+    base_sha = _git_rev_parse(cwd, base_ref, run=run)
+    if not base_sha:
+        return "skipped", f"could not resolve {base_ref} after fetch — not rebasing"
+
+    # 5. Already on top of base (base is an ancestor of HEAD) → no-op. Never
+    #    force-push a branch that is already current.
+    try:
+        anc = run(["git", "merge-base", "--is-ancestor", base_sha, "HEAD"], cwd=cwd)
+        already_current = getattr(anc, "returncode", 1) == 0
+    except (subprocess.SubprocessError, OSError):
+        already_current = False
+    if already_current:
+        return "current", ""
+
+    notice("exit-rebase",
+           f"rebasing this branch onto the latest {base_ref} so the PR can be "
+           f"merged cleanly", status="do",
+           hint="manual-landing rebase (force-with-lease, own branch only)")
+
+    # 6. Rebase onto the latest base.
+    try:
+        rb = run(["git", "rebase", base_ref], cwd=cwd)
+    except (subprocess.SubprocessError, OSError) as exc:
+        _restore_branch(cwd, head, run=run)
+        return "error", (f"the rebase command failed to run ({exc}) — the branch "
+                         f"was restored to its pre-rebase state")
+    if getattr(rb, "returncode", 1) != 0:
+        # Conflict (or another rebase failure). There is no resolver here: capture
+        # the conflicted files, abort, and restore the EXACT pre-rebase SHA.
+        conflicted = _rebase_conflicted_files(cwd, run=run)
+        _restore_branch(cwd, head, run=run)
+        files = ", ".join(conflicted) if conflicted else "one or more files"
+        return "conflict", (
+            f"the rebase onto {base_ref} hit a conflict in {files}; the branch "
+            f"was left exactly as it was. Rebase it by hand: "
+            f"`git fetch {remote} {base} && git rebase {base_ref}`, resolve the "
+            f"conflict, then `git push --force-with-lease`.")
+
+    # 6b. A clean rebase leaves a clean tree. If anything is dirty (should never
+    #     happen on a zero exit), restore and bail rather than force-push a mess.
+    try:
+        st2 = run(["git", "status", "--porcelain"], cwd=cwd)
+        dirty_after = bool((getattr(st2, "stdout", "") or "").strip())
+    except (subprocess.SubprocessError, OSError):
+        dirty_after = True
+    if dirty_after:
+        _restore_branch(cwd, head, run=run)
+        return "error", ("the rebase reported success but left an unexpected dirty "
+                         "tree — the branch was restored; rebase by hand")
+
+    # 7. Force-with-lease push the OWN branch by its own name. The --force-with-lease
+    #    arg asserts the remote is still at the tip we just fetched, so a remote that
+    #    advanced under us is REJECTED (never clobbered). Never a bare -f / --force.
+    expect = _git_rev_parse(cwd, f"{remote}/{branch}", run=run)
+    lease_arg = (f"--force-with-lease=refs/heads/{branch}:{expect}"
+                 if expect else "--force-with-lease")
+    push = ["git", "push", lease_arg, remote, f"HEAD:refs/heads/{branch}"]
+    try:
+        pp = run(push, cwd=cwd)
+    except (subprocess.SubprocessError, OSError) as exc:
+        return "error", (f"rebased locally but the --force-with-lease push failed "
+                         f"to run ({exc}) — push it by hand")
+    if getattr(pp, "returncode", 1) != 0:
+        detail = (getattr(pp, "stderr", "") or getattr(pp, "stdout", "") or "").strip()[:200]
+        return "error", (f"rebased locally but the --force-with-lease push was "
+                         f"rejected: {detail} — push it by hand")
+    return "rebased", ""
