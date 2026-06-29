@@ -50,7 +50,7 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from buddhi_review import config, plan_profile, setup_launcher, shell_env, upsell
+from buddhi_review import config, detectors, plan_profile, setup_launcher, shell_env, upsell
 from buddhi_review.transparency import _colour_enabled
 
 _GH_MIN = (2, 87)
@@ -309,8 +309,13 @@ def _teaser(text: str, pal: _Palette, stream) -> None:
 
 # ── Subprocess seam ──────────────────────────────────────────────────────────────
 
-def _default_run(argv, *, timeout=30, input=None):
-    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=input)
+def _default_run(argv, *, timeout=30, input=None, env=None):
+    # ``env`` threads an isolated credential environment for the token validator
+    # (the candidate CLAUDE_CODE_OAUTH_TOKEN + a stripped set of higher-precedence
+    # creds). It defaults to None → subprocess inherits os.environ, so every
+    # existing call site is unaffected.
+    return subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                          input=input, env=env)
 
 
 def _run_ok(run, argv, *, timeout=15) -> Tuple[bool, str]:
@@ -320,6 +325,116 @@ def _run_ok(run, argv, *, timeout=15) -> Tuple[bool, str]:
     except Exception:
         return False, ""
     return getattr(r, "returncode", 1) == 0, (getattr(r, "stdout", "") or "")
+
+
+# ── Candidate-token validation (verify BEFORE storing the secret) ──────────────────
+# Credentials that OUTRANK CLAUDE_CODE_OAUTH_TOKEN (#5) in Claude Code's auth
+# precedence. They MUST be stripped from the validation subprocess env, else the
+# candidate token is never exercised — Claude authenticates via one of these (or, if
+# all absent, the keychain at #6) and a BAD pasted token passes as a FALSE POSITIVE.
+# ANTHROPIC_API_KEY / _AUTH_TOKEN are #2–#3; the Bedrock/Vertex/Foundry switches (#1)
+# reroute auth to a cloud provider entirely. The #4 credential — ``apiKeyHelper``, a
+# script in settings.json — is NOT an env var and cannot be popped here; it is
+# neutralised by pointing CLAUDE_CONFIG_DIR at an empty dir + running from it (below).
+_HIGHER_PRECEDENCE_CREDS = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
+# Token-VALUE-rejection signature from a DIRECT `claude -p ping` (a mis-pasted /
+# expired / wrong-account CLAUDE_CODE_OAUTH_TOKEN). Unlike the repo-run signature
+# (detectors.AUTH_FAILED_RE, which excludes a bare "401" to avoid the
+# App-not-installed confound), a bare 401 from a direct CLI ping unambiguously means
+# the pasted token is bad — there is no App-not-installed case on a local ping — so a
+# bare 401 IS matched here. An ambiguous/blank failure is NOT matched: it must read
+# "unknown", never "invalid".
+_TOKEN_INVALID_RE = re.compile(
+    r"\b401\b|unauthorized|invalid bearer|invalid.*token|expired|"
+    r"authentication_error|authentication_failed",
+    re.IGNORECASE,
+)
+
+
+def _validate_claude_token(token, *, run, which=shutil.which) -> str:
+    """Tri-state validation of a candidate ``CLAUDE_CODE_OAUTH_TOKEN`` via a headless
+    ``claude -p ping --model haiku`` in an ISOLATED subprocess env. Returns
+    ``"valid"`` / ``"invalid"`` / ``"unknown"``. The token is passed ONLY via ``env``
+    — never on argv or in a log line.
+
+    Why this EXACT mechanism (load-bearing — do not re-derive):
+      * No ``claude`` on PATH → ``"unknown"``: we cannot test, so never block setup.
+      * ``-p ping --model haiku`` is the cheapest real round-trip. NEVER ``--bare``:
+        bare mode IGNORES CLAUDE_CODE_OAUTH_TOKEN and would test the operator's local
+        login → a false positive (a bad token reads valid).
+      * Env-credential isolation: the child env copies ``os.environ``, SETS
+        CLAUDE_CODE_OAUTH_TOKEN to the candidate, and POPS every higher-precedence
+        credential (:data:`_HIGHER_PRECEDENCE_CREDS`), so a bad value 401s here
+        instead of silently passing via a higher cred or the keychain.
+      * Settings-FILE isolation closes the one credential that is NOT an env var:
+        ``apiKeyHelper`` (a settings.json script) ranks ABOVE the OAuth token (#4),
+        so popping env creds can't reach it. Point CLAUDE_CONFIG_DIR at a fresh EMPTY
+        dir (no settings.json → no user ``apiKeyHelper``) AND run FROM that dir (no
+        project ``.claude/settings.json`` is discovered). ``--settings '{}'`` does
+        NOT work — it MERGES, it does not replace. A managed/enterprise
+        ``apiKeyHelper`` at precedence #1 is intentionally un-overridable per the
+        docs, so on such a machine the result is advisory.
+      * returncode 0 (with isolation intact) → ``"valid"``. Non-zero WITH an auth
+        signature → ``"invalid"``. Exception / timeout, isolation failure, or
+        non-zero WITHOUT a signature → ``"unknown"`` (an ambiguous failure is NEVER
+        called invalid).
+
+    The OAuth token minted by ``claude setup-token`` IS valid for this path — do NOT
+    switch to ANTHROPIC_API_KEY. No public token-introspection endpoint exists, so a
+    tiny model round-trip is the only reliable check."""
+    claude_bin = which("claude")
+    if not claude_bin:
+        return "unknown"
+    env = dict(os.environ)
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    for _cred in _HIGHER_PRECEDENCE_CREDS:
+        env.pop(_cred, None)
+    # Settings-FILE isolation, achieved via the process cwd (the run seam does not
+    # thread cwd): chdir into the empty CLAUDE_CONFIG_DIR so the spawned `claude`
+    # inherits it and discovers neither a user nor a project settings.json. Restore
+    # the original cwd in `finally`, before removing the tempdir.
+    cfg_dir = None
+    prev_cwd = None
+    isolated = False
+    argv = [claude_bin, "--model", "haiku", "--permission-mode", "bypassPermissions",
+            "--strict-mcp-config", "--no-session-persistence", "-p", "ping"]
+    try:
+        try:
+            # realpath so the value matches os.getcwd() after chdir — on macOS
+            # mkdtemp returns /var/… but the cwd resolves to /private/var/….
+            cfg_dir = os.path.realpath(tempfile.mkdtemp(prefix="buddhi-toktest-"))
+            env["CLAUDE_CONFIG_DIR"] = cfg_dir
+            prev_cwd = os.getcwd()
+            os.chdir(cfg_dir)
+            isolated = True
+        except Exception:
+            isolated = False  # couldn't isolate settings; env-cred pops still apply
+        try:
+            r = run(argv, timeout=25, env=env)
+        except Exception:
+            return "unknown"
+        if getattr(r, "returncode", 1) == 0:
+            # An apiKeyHelper could have authenticated a BAD token if settings
+            # isolation failed, so a pass without it is untrustworthy → "unknown".
+            return "valid" if isolated else "unknown"
+        blob = (getattr(r, "stdout", "") or "") + "\n" + (getattr(r, "stderr", "") or "")
+        if _TOKEN_INVALID_RE.search(blob):
+            return "invalid" if isolated else "unknown"
+        return "unknown"
+    finally:
+        if prev_cwd is not None:
+            try:
+                os.chdir(prev_cwd)
+            except Exception:
+                pass
+        if cfg_dir:
+            shutil.rmtree(cfg_dir, ignore_errors=True)
 
 
 # ── Pure helpers (unit-tested directly) ───────────────────────────────────────────
@@ -1087,15 +1202,35 @@ def _set_secret_scoped(repo: str, name: str, value: str, *, prefer_org: bool = F
 
 def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream,
                        single_select=single_select, input_fn=input,
-                       owner_type: Optional[str] = None) -> str:
-    """Walk the user through setting ``CLAUDE_CODE_OAUTH_TOKEN``. Returns a short
-    status string.
+                       owner_type: Optional[str] = None,
+                       validate_fn=_validate_claude_token, auth_probe=None) -> str:
+    """Walk the user through setting ``CLAUDE_CODE_OAUTH_TOKEN`` — minting + storing
+    it, validating it BEFORE the store, and RE-MINTING a stored one that has gone
+    bad. Returns a short status string.
 
     Dual-credential (FREE): either credential satisfies the workflow — the
     pay-as-you-go ``ANTHROPIC_API_KEY`` or the subscription
     ``CLAUDE_CODE_OAUTH_TOKEN`` — and the bundled template accepts both, so the
     prompt is SKIPPED when EITHER is already present. The existence check is
     org-aware: an org-set secret won't appear in ``gh secret list --repo``.
+
+    Part A — verify-before-store (``validate_fn``, defaulting to
+    :func:`_validate_claude_token`, injectable for tests). A freshly-pasted token is
+    validated by a real, isolated ``claude -p ping`` BEFORE it is saved: ``"valid"``
+    → store; ``"invalid"`` → warn + re-prompt (bounded ~3, then give up without
+    storing — an invalid token NEVER reaches ``gh secret set``); ``"unknown"`` →
+    loud warn + store anyway (a transient/offline check never blocks setup). The
+    token value is never echoed or logged.
+
+    Part B — re-mint a stored-but-broken token (``auth_probe``, defaulting to
+    :func:`detectors.latest_run_token_auth_failed`). GitHub Actions secrets are
+    write-only, so a stored token can't be read to test it; the only evidence is the
+    runtime signal. When the OAuth secret already EXISTS (and no working
+    ANTHROPIC_API_KEY backs it), this probes ``repo``'s latest claude-code-review run
+    for a token-401. A 401 → the stored token is broken → enter the re-mint flow
+    (Part A's paste+validate+store, framed as a re-mint). Clean / no run / couldn't
+    tell → keep the skip (``"present"``) — a working or UNKNOWN token is NEVER
+    blind-re-minted. The probe is best-effort and never raises.
 
     Safe scoping: the new secret is set on THIS repo only by default (least blast
     radius). When ``repo``'s owner is an Organization an EXPLICIT, separately-
@@ -1108,24 +1243,81 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     org = repo.split("/", 1)[0] if (owner_type == "Organization" and "/" in repo) else None
     # Skip the prompt only when one credential is CONFIRMED present (True). An
     # unknown result (None) is NOT treated as present — we offer to set it.
-    if (_gh_secret_exists(repo, name, org=org, run=run) is True or
-            _gh_secret_exists(repo, "ANTHROPIC_API_KEY", org=org, run=run) is True):
-        return "present"
+    claude_present = _gh_secret_exists(repo, name, org=org, run=run) is True
+    anthropic_present = _gh_secret_exists(repo, "ANTHROPIC_API_KEY", org=org, run=run) is True
+    remint = False
+    if claude_present or anthropic_present:
+        # Part B — re-mint detection. Probe ONLY when the OAuth token is the sole
+        # credential:
+        # ANTHROPIC_API_KEY satisfies the workflow on its own and is NOT the token
+        # that 401s here, so a working pay-as-you-go key backing the repo keeps the
+        # skip. A token-401 on the latest review run → the stored OAuth token is
+        # broken → fall through to the re-mint flow. Clean / no run / couldn't-tell →
+        # keep the skip (never blind-re-mint a working or unknown token). The probe
+        # is best-effort and never raises.
+        if claude_present and not anthropic_present:
+            probe = auth_probe or detectors.latest_run_token_auth_failed
+            try:
+                remint = bool(probe(repo, run=run))
+            except Exception:
+                remint = False
+        if not remint:
+            return "present"
     if not _is_tty():
-        _row("info", f"Set the {name} repo secret later: `claude setup-token` then "
+        verb = "Re-mint" if remint else "Set"
+        _row("info", f"{verb} the {name} repo secret later: `claude setup-token` then "
                      f"`gh secret set {name} --repo {repo}`", pal, stream)
         return "deferred"
+    if remint:
+        _row("warn", f"Claude's reviews are failing on {repo} — its {name} looks "
+                     f"invalid or expired; let's re-mint it.", pal, stream)
     _row("info", "Opening `claude setup-token` in a new window to mint a token …", pal, stream)
     try:
         spawn_command("claude setup-token", label="claude-setup-token", stream=stream)
     except Exception:
         pass
-    try:
-        token = getpass_fn("  Paste the token (input hidden), or blank to skip: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        token = ""
-    if not token:
-        return "skipped"
+    # Part A — paste → verify-before-store, with bounded re-prompts on a rejected
+    # token. The token is stored ONLY once it authenticates ("valid") or its status
+    # is genuinely "unknown" (no claude binary / inconclusive); an "invalid" token
+    # never reaches the writer. The token value is never echoed or logged.
+    validate = validate_fn or _validate_claude_token
+    token = ""
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            token = getpass_fn("  Paste the token (input hidden), or blank to skip: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            token = ""
+        if not token:
+            return "skipped"
+        _row("step", "Testing the token …", pal, stream)
+        try:
+            state = validate(token, run=run)
+        except Exception:
+            # A validator that RAISES (vs. the default, which catches its own errors
+            # and returns "unknown") is a contract violation / bug, not a transient
+            # blip — fail SAFE: never store on it.
+            _row("warn", f"The token check crashed — not saving {name} on GitHub", pal, stream)
+            return "failed"
+        if state == "valid":
+            break
+        if state == "unknown":
+            # Couldn't prove it good OR bad — warn loudly, then store it anyway so a
+            # transient / offline check never blocks setup.
+            _row("warn", f"Couldn't verify the token — storing {name} unverified. If "
+                         f"Claude's reviews 401 on this repo later, re-run setup to "
+                         f"re-mint it.", pal, stream)
+            break
+        # "invalid": the token didn't authenticate.
+        _row("warn", "That token didn't authenticate — it may be mis-pasted, expired, "
+                     "or for the wrong account.", pal, stream)
+        if attempt < max_attempts:
+            _row("info", "Copy the token again from the `claude setup-token` window, "
+                         "then paste it below.", pal, stream)
+            continue
+        _row("warn", f"Still not authenticating after {max_attempts} tries — not "
+                     f"saving {name} on GitHub", pal, stream)
+        return "failed"
     # Scope SAFELY: repo-only by default. On an org-owned repo, offer the explicit
     # org-wide opt-in (still visible to this repo alone); _set_secret_scoped checks
     # org-admin and falls back to repo scope on any denial.

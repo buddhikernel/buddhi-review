@@ -39,6 +39,7 @@ write config and does not wire the round loop.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 import secrets
@@ -552,3 +553,101 @@ def detect_claude_auto_on_open(
     except (ValueError, TypeError):
         return None  # present but undecodable → unknown
     return workflow_triggers_on_open(text)
+
+
+# ── Repo-scoped token-401 probe (the setup wizard's re-mint evidence) ───────────────
+# GitHub Actions secrets are WRITE-ONLY: nothing — not the wizard, not the loop —
+# can read back a stored ``CLAUDE_CODE_OAUTH_TOKEN`` to test it. The only evidence a
+# STORED token still works is the runtime signal: a mis-pasted / expired token makes
+# the model call 401, the action posts zero comments, yet the job still concludes —
+# observed live on buddhi-review #4/#7. The bundled ``claude-code-review.yml``
+# post-step turns that 401 RED and lands its own ``::error`` ("401 (Invalid bearer
+# token)") in the run log. This probe reads the repo's LATEST review run's log and
+# reports whether it carries the token-invalid signature — the REPO-scoped twin of
+# the round driver's PR-scoped ``_detect_auth_failure`` (both match the SAME
+# :data:`AUTH_FAILED_RE`; keep them in sync). It is the setup wizard re-mint flow's
+# only honest input: the wizard has no PR in hand, it asks "is the stored token
+# working on this repo right now?". Every function here is best-effort and NEVER
+# raises — any missing repo / ``gh`` absence / network / parse error returns the SAFE
+# value ("couldn't tell" → False), so a re-mint never fires on uncertainty.
+
+# ``gh run list --workflow`` accepts the workflow FILE BASENAME (the most stable
+# handle — survives a ``name:`` rename); it is the tail of CLAUDE_WORKFLOW_PATH.
+CLAUDE_REVIEW_WORKFLOW = "claude-code-review.yml"
+
+
+def _latest_claude_run_id(
+    repo: Optional[str], *, run: Callable[..., "subprocess.CompletedProcess[str]"]
+) -> Optional[str]:
+    """``databaseId`` of ``repo``'s most recent Claude Code Review run, or ``None``.
+    Fetches the single latest run REGARDLESS of conclusion — the documented
+    auth-failure is a run the post-step turns RED, but a stale workflow without the
+    post-step 401s GREEN, so a failing-only filter could miss it. ``None`` on any
+    error / no run."""
+    if not repo:
+        return None
+    try:
+        proc = run(["gh", "run", "list", "--workflow", CLAUDE_REVIEW_WORKFLOW,
+                    "--repo", repo, "--limit", "1", "--json", "databaseId"])
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0 or not (getattr(proc, "stdout", "") or "").strip():
+        return None
+    try:
+        data = json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+        return None
+    rid = data[0].get("databaseId")
+    return str(rid) if rid not in (None, "") else None
+
+
+def _fetch_claude_run_log(
+    repo: Optional[str], run_id: Optional[str],
+    *, run: Callable[..., "subprocess.CompletedProcess[str]"]
+) -> str:
+    """The log text of run ``run_id``, or ``""`` on any error. Tries ``--log-failed``
+    first (small + cheap — the post-step is the failed step on a RED 401), then the
+    full ``--log`` (the GREEN-but-401 stale-workflow case has no failed step, so its
+    401 lives only in the full log; an auth-failed run is short, so that stays
+    small). Never raises."""
+    if run_id is None:
+        return ""
+    for extra in (["--log-failed"], ["--log"]):
+        try:
+            proc = run(["gh", "run", "view", str(run_id), "--repo", repo, *extra])
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if getattr(proc, "returncode", 1) == 0 and (getattr(proc, "stdout", "") or "").strip():
+            return proc.stdout
+    return ""
+
+
+def latest_run_token_auth_failed(
+    repo: Optional[str],
+    *,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> bool:
+    """Best-effort: ``True`` iff ``repo``'s LATEST Claude Code Review run carries the
+    token-invalid 401 signature (a mis-pasted / expired ``CLAUDE_CODE_OAUTH_TOKEN``).
+
+    Resolves the latest run id (any conclusion), pulls its log, and matches
+    :data:`AUTH_FAILED_RE` — the SAME signature the round driver's check-run probe
+    uses, so the wizard's re-mint check recognises exactly what the workflow makes
+    the job RED on. Deliberately NOT a bare ``401``: the App-not-installed failure is
+    also a 401 ("Claude Code is not installed on this repository") with a DIFFERENT
+    fix (install the App, not re-mint the token), and AUTH_FAILED_RE already excludes
+    it. Any missing repo / ``gh`` / network / parse error → ``False`` ("couldn't
+    tell"), so the caller NEVER blind-re-mints a working or unknown token. Never
+    raises."""
+    try:
+        if not repo:
+            return False
+        run_id = _latest_claude_run_id(repo, run=run)
+        if run_id is None:
+            return False
+        log = _fetch_claude_run_log(repo, run_id, run=run)
+        return bool(log) and bool(AUTH_FAILED_RE.search(log))
+    except Exception:
+        return False
