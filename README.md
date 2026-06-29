@@ -27,8 +27,9 @@ carries out whatever the kernel returns. Concretely, for each comment the loop:
 1. **Classifies** it into one of six labels: `SUBSTANTIVE`, `COSMETIC`,
    `BUSINESS_QUESTION`, `PR_DESCRIPTION`, `OUTDATED`, `INVALID`. If the classifier
    can't produce a usable label, the comment becomes a synthetic
-   `CLASSIFICATION_FAILED` and is escalated to you instead of being dropped — so a
-   comment is never silently lost just because it could not be classified.
+   `CLASSIFICATION_FAILED` and is escalated to you when the interrupt budget allows,
+   otherwise deferred — so a comment is never silently lost just because it could not
+   be classified.
 2. **Maps** the label onto a kernel work item and runs it through the kernel's
    seven decisions.
 3. **Acts** on the kernel's disposition:
@@ -39,6 +40,7 @@ carries out whatever the kernel returns. Concretely, for each comment the loop:
    | escalate | ask you via the console answer-file channel (BUSINESS_QUESTION / PR_DESCRIPTION / classifier failure) |
    | skip | do nothing (OUTDATED / INVALID) |
    | defer | the day's human-interrupt budget is spent: hold the item, never drop it |
+   | already-resolved | the comment was already resolved before the loop reached it — no action taken |
 
 The disposition is the **kernel's** call, not a pile of hand-tuned `if` branches in
 the adapter — `buddhi-review` only carries out the I/O; every decision stays in the
@@ -54,6 +56,12 @@ technical fork with more than one defensible answer and nothing in the repo to c
 between; or a taste call about user-facing wording or design that the docs leave open.
 Anything the code and docs already settle, the loop handles on its own without
 interrupting you.
+
+Two additional cases always route to you regardless of the docs: a `PR_DESCRIPTION`
+comment (a reviewer asked you to update the PR body itself) and a
+`CLASSIFICATION_FAILED` comment (the classifier could not produce a usable label).
+Both escalate when your interrupt budget allows, and defer rather than drop if it
+doesn't.
 
 When it does need you, the question is written to an editable answer file: the loop
 prints a `file://` link, you type a number (or free text) on the `>` line and save,
