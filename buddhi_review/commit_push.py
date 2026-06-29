@@ -494,9 +494,9 @@ def commit_and_push(
 # bare -f), and only when the rebase is clean. There is no conflict resolver: the
 # behaviour is the most conservative one possible — a clean rebase proceeds, but
 # the FIRST sign of a conflict is escalated WITH a diagnosis (the conflicted
-# files + the manual steps), never resolved; the branch is restored to its EXACT
-# pre-rebase state. It never leaves a half-rebased branch or silently swallows a
-# conflict.
+# files + the manual steps), never resolved; a best-effort restore to the
+# pre-rebase state is attempted. It never leaves a half-rebased branch or
+# silently swallows a conflict.
 
 
 def _git_rev_parse(cwd: Optional[str], ref: str, *, run: Run = _default_run) -> Optional[str]:
@@ -691,10 +691,10 @@ def exit_rebase(
                 f"`git fetch {base_remote} {base} && git rebase {base_ref}`.")
         files = ", ".join(conflicted)
         return "conflict", (
-            f"the rebase onto {base_ref} hit a conflict in {files}; the branch "
-            f"was left exactly as it was. Rebase it by hand: "
+            f"the rebase onto {base_ref} hit a conflict in {files}; a restore to "
+            f"the pre-rebase state was attempted. Rebase it by hand: "
             f"`git fetch {base_remote} {base} && git rebase {base_ref}`, resolve the "
-            f"conflict, then `git push --force-with-lease`.")
+            f"conflict, then `git push --force-with-lease` — verify your branch state before proceeding.")
 
     # 6b. A clean rebase leaves a clean tree. If anything is dirty (should never
     #     happen on a zero exit), restore and bail rather than force-push a mess.
