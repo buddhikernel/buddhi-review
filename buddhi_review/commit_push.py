@@ -558,14 +558,17 @@ def exit_rebase(
 
       * ``"rebased"``  — clean rebase + ``--force-with-lease`` push succeeded.
       * ``"current"``  — already on top of ``base``; no-op (no gratuitous push).
-      * ``"conflict"`` — a rebase conflict; ABORTED and restored to the exact
-                         pre-rebase SHA. ``detail`` names the conflicted files and
-                         the manual rebase steps.
+      * ``"conflict"`` — a rebase conflict; ABORTED and a best-effort restore to
+                         the pre-rebase SHA attempted (``_restore_branch`` swallows
+                         errors, so restore is not guaranteed if git commands fail).
+                         ``detail`` names the conflicted files and the manual rebase
+                         steps.
       * ``"skipped"``  — a precondition was not met (dirty worktree, an
                          unresolvable push target, a failed fetch / base lookup).
                          ``detail`` says why; nothing was changed.
-      * ``"error"``    — an unexpected git failure; the branch was restored where
-                         a restore was needed. ``detail`` says what to do by hand.
+      * ``"error"``    — an unexpected git failure; a best-effort restore to the
+                         pre-rebase SHA was attempted where needed. ``detail`` says
+                         what to do by hand.
 
     The worktree MUST be clean (a dirty / poisoned worktree → ``"skipped"``), the
     push target MUST resolve to this branch's own name (reusing

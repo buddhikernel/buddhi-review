@@ -28,10 +28,11 @@ class NoticeRec:
         return [c for c in self.calls if c[0] == "manual-landing"]
 
 
-def gh_run(base="main", head=None, current_branch=None):
+def gh_run(base="main", head="feature/pr-7", current_branch="feature/pr-7"):
     """A fake git/gh seam: answers baseRefName with ``base``, headRefName with
     ``head``, and ``git rev-parse --abbrev-ref HEAD`` with ``current_branch``.
-    Pass empty string for ``base`` to simulate an unresolvable base.
+    Pass empty string for any param to simulate an unresolvable value.
+    Defaults supply a matching head+current_branch so the fail-closed guard passes.
     Everything else rc=0/empty."""
     def run(argv, *, cwd=None, timeout=None):
         joined = " ".join(argv)
@@ -116,6 +117,28 @@ def test_unresolvable_base_is_not_rebased(stub_rebase):
     landing = nr.landing()
     assert landing and landing[-1][2] == "skip"
     assert "base branch" in landing[-1][1]
+
+
+def test_unresolvable_pr_head_skips_rebase(stub_rebase):
+    nr = NoticeRec()
+    # headRefName lookup fails — guard must fail closed, not proceed.
+    d = make_driver(nr, gh=gh_run(base="main", head="", current_branch="feature/pr-7"))
+    d._maybe_exit_rebase(RunOutcome("clean", 1, merged=False))
+    assert stub_rebase["calls"] == []
+    landing = nr.landing()
+    assert landing and landing[-1][2] == "skip"
+    assert "could not verify" in landing[-1][1]
+
+
+def test_unresolvable_current_branch_skips_rebase(stub_rebase):
+    nr = NoticeRec()
+    # git rev-parse --abbrev-ref HEAD fails — guard must fail closed.
+    d = make_driver(nr, gh=gh_run(base="main", head="feature/pr-7", current_branch=""))
+    d._maybe_exit_rebase(RunOutcome("clean", 1, merged=False))
+    assert stub_rebase["calls"] == []
+    landing = nr.landing()
+    assert landing and landing[-1][2] == "skip"
+    assert "could not verify" in landing[-1][1]
 
 
 def test_handback_calls_exit_rebase_with_resolved_base(stub_rebase):
