@@ -623,6 +623,72 @@ def test_no_auth_banner_on_clean_review(capsys):
     assert "REVIEWER AUTH FAILED" not in capsys.readouterr().out
 
 
+# ---------------------------------------------------------------------------
+# Manual-landing exit-rebase: Bucket-C hand-backs carry rebase_skip=True so the
+# exit-rebase NEVER force-pushes a dirty/diverged/unverifiable branch.
+# ---------------------------------------------------------------------------
+
+def test_poisoned_worktree_handback_sets_rebase_skip():
+    timeline = [(0, Comment(id="a", text="missing null check", source="claude[bot]"))]
+    fix: FixDispatch = lambda c, r: FixOutcome(
+        status="rejected", rollback_failed=True, detail="refused")
+    driver, _, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        answer_waiter=lambda esc, **k: {},
+    )
+    outcome = driver.run()
+    assert outcome.status == "needs-human" and outcome.rebase_skip is True
+    assert not gh.matching("git", "push")              # poisoned tree never pushed
+    assert not gh.matching("git", "rebase")            # and never rebased
+
+
+def test_push_failed_handback_sets_rebase_skip():
+    timeline = [(0, Comment(id="a", text="missing null check", source="claude[bot]"))]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+
+    class PushFailGh(GhRecorder):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            rc = 1 if argv[:2] == ["git", "push"] else 0
+            out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
+            return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="push rejected")
+
+    gh = PushFailGh()
+    driver, _, _ = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        gh=gh, answer_waiter=lambda esc, **k: {},
+    )
+    outcome = driver.run()
+    assert outcome.status == "needs-human" and outcome.rebase_skip is True
+    assert not gh.matching("git", "rebase")            # diverged remote never rebased
+
+
+def test_red_gate_stop_handback_sets_rebase_skip(monkeypatch):
+    timeline = [(0, Comment(id="a", text="missing null check", source="claude[bot]"))]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    # The per-round push stopped on a red test gate, leaving uncommitted residue.
+    monkeypatch.setattr(round_driver.commit_push, "commit_and_push",
+                        lambda *a, **k: "stopped")
+    driver, _, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        answer_waiter=lambda esc, **k: {},
+    )
+    outcome = driver.run()
+    assert outcome.status == "stopped" and outcome.rebase_skip is True
+    assert not gh.matching("git", "rebase")
+
+
+def test_eligible_handback_does_not_set_rebase_skip():
+    # An unanswered escalation is a Bucket-A/B hand-back — rebase-eligible.
+    timeline = [(0, Comment(id="a", text="should we drop this column?",
+                            source="claude[bot]"))]
+    driver, _, _ = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("BUSINESS_QUESTION"),
+        answer_waiter=lambda esc, **k: {"a": None},
+    )
+    outcome = driver.run()
+    assert outcome.status == "needs-human" and outcome.rebase_skip is False
+
+
 def test_no_auth_banner_on_normal_review_round(capsys):
     # claude responded with a finding then a clean re-review → not silent.
     timeline = [
