@@ -17,15 +17,19 @@ walks you from `pip install` through your first reviewed PR.
 
 ## What it is
 
-`buddhi-review` is the **adapter**: it supplies the substrate I/O for a PR
-review (read comments, classify with `claude -p`, escalate to you, observe a
-resolution). The **kernel** supplies the decision. Concretely, for each comment the
-loop:
+Buddhi splits a PR review into two halves: the decision, and the I/O around it. The
+[Buddhi kernel](https://github.com/buddhikernel/buddhi) makes the decision — for each
+review comment it decides whether to fix it, ask you, skip it, or defer it.
+`buddhi-review` is the **adapter** that does everything around that decision on the
+GitHub side: it reads the comments off your PR, hands each one to the kernel, and
+carries out whatever the kernel returns. Concretely, for each comment the loop:
 
 1. **Classifies** it into one of six labels: `SUBSTANTIVE`, `COSMETIC`,
-   `BUSINESS_QUESTION`, `PR_DESCRIPTION`, `OUTDATED`, `INVALID` (an unusable
-   classifier reply becomes the synthetic `CLASSIFICATION_FAILED`, which still
-   counts as a real finding).
+   `BUSINESS_QUESTION`, `PR_DESCRIPTION`, `OUTDATED`, `INVALID`. If the classifier
+   can't produce a usable label, the comment becomes a synthetic
+   `CLASSIFICATION_FAILED` and is escalated to you when the interrupt budget allows,
+   otherwise deferred — so a comment is never silently lost just because it could not
+   be classified.
 2. **Maps** the label onto a kernel work item and runs it through the kernel's
    seven decisions.
 3. **Acts** on the kernel's disposition:
@@ -36,20 +40,32 @@ loop:
    | escalate | ask you via the console answer-file channel (BUSINESS_QUESTION / PR_DESCRIPTION / classifier failure) |
    | skip | do nothing (OUTDATED / INVALID) |
    | defer | the day's human-interrupt budget is spent: hold the item, never drop it |
+   | already-resolved | the comment was already resolved before the loop reached it — no action taken |
 
 The disposition is the **kernel's** call, not a pile of hand-tuned `if` branches in
-the adapter. The adapter only supplies the substrate I/O; the decision logic stays
-in the kernel.
+the adapter — `buddhi-review` only carries out the I/O; every decision stays in the
+kernel.
 
-## How it answers your questions
+## When it asks you
 
-When the kernel decides to escalate, the skill asks you right in your terminal:
+The kernel asks you only when a review comment can't be settled by the code plus your
+project's own docs, conventions, and PR description — when resolving it would mean
+making a call that is really yours. In practice that is a question about product
+direction, scope, or a business rule the docs don't answer; a genuinely ambiguous
+technical fork with more than one defensible answer and nothing in the repo to choose
+between; or a taste call about user-facing wording or design that the docs leave open.
+Anything the code and docs already settle, the loop handles on its own without
+interrupting you.
 
-- A question is written to an editable answer file; the loop prints a `file://`
-  link, you type a number (or free text) on the `>` line and save, and the loop
-  picks it up. Everything happens locally.
-- Because the skill makes no outbound network connections of its own, it needs no
-  TLS bundle (`certifi`) to run.
+Two additional cases always route to you regardless of the docs: a `PR_DESCRIPTION`
+comment (a reviewer asked you to update the PR body itself) and a
+`CLASSIFICATION_FAILED` comment (the classifier could not produce a usable label).
+Both escalate when your interrupt budget allows, and defer rather than drop if it
+doesn't.
+
+When it does need you, the question is written to an editable answer file: the loop
+prints a `file://` link, you type a number (or free text) on the `>` line and save,
+and the loop picks it up. Everything happens locally.
 
 The notifier is a small, swappable interface, so an alternative delivery channel
 can be wired in later without touching the review loop.
@@ -190,18 +206,16 @@ for the full breakdown.
 
 ## Status
 
-buddhi-review is alpha. It runs the full kernel-driven pipeline (classify →
-kernel-decide → disposition) over a live `gh` comment fetch: snapshot/rollback
-fix-apply with its safety floor, the multi-round quiescence loop with re-request
-handling, console escalation + answer poll, opt-in squash-merge, the create-pr
-git-decision actuator, the interactive setup wizard, and a transparency layer that
-prints a `⚙ [auto]` marker whenever the skill acts on its own. All four CLI
-subcommands — self-check, setup, review-pr, create-pr — run end to end. Run the test
-suite with `pip install -e ".[test]" && python3 -m pytest -q`.
+buddhi-review is in **alpha**: the CLI flags, output format, and Python API may
+change between releases, with no semantic-versioning guarantees before v1.0. It has
+been exercised end to end but not yet hardened across a wide range of repositories,
+so expect rough edges. Issues and PRs are welcome.
+
+Run the test suite with `pip install -e ".[test]" && python3 -m pytest -q`.
 
 ## Architecture
 
-A small adapter re-homes the kernel onto the GitHub PR-review substrate.
+`buddhi-review` is an adapter of the Buddhi kernel onto the GitHub PR-review substrate.
 
 - **The four-verb adapter** (`buddhi_review/adapter.py`) implements the kernel's
   `Adapter` contract: `ingest` (yield the PR's raw comments), `run_embedded`
@@ -216,8 +230,7 @@ A small adapter re-homes the kernel onto the GitHub PR-review substrate.
   - **Router**: a stakes-based effort recommendation.
   - **Escalation**: translates the kernel's pre-reasoned ask into a
     channel-agnostic ask and delivers it over the console channel.
-  - **OOB source**: declares the substrate can observe a *signaled* resolution;
-    it never autonomously detects one.
+  - **OOB source**: declares the substrate can observe a *signaled* resolution.
   - **PolicyPack**: the single policy contract, bundling the discard predicate, the
     effort taxonomy, the judgment threshold, the validity rule, the ask phrasings,
     and the bounded interrupt budget.
