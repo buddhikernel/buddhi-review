@@ -24,7 +24,7 @@ from typing import Dict, List, Optional
 # is detected as out of date. A file with NO marker is a legacy (pre-versioning)
 # copy and is treated as older than any versioned shipped file.
 MANAGED_VERSION_RE = re.compile(
-    r"(?im)^[ \t]*#[ \t]*buddhi-managed-version:[ \t]*(\d+)[ \t]*$"
+    r"(?im)^[ \t]*#[ \t]*buddhi-managed-version:[ \t]*(\d+)[ \t]*\r?$"
 )
 
 _REFERENCES_DIR = (
