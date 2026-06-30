@@ -1,3 +1,6 @@
+# buddhi-managed-version: 1
+# ^ Buddhi tracks this file's version so `review-pr setup` can offer to update an
+#   outdated installed copy (the old one stays in the update PR's git history).
 name: Claude Code Review
 # PR reviewer powered by Claude. Auth uses whichever credential the repo has set:
 # CLAUDE_CODE_OAUTH_TOKEN (a `claude setup-token` subscription credential, so review

@@ -50,7 +50,8 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from buddhi_review import config, detectors, plan_profile, setup_launcher, shell_env, upsell
+from buddhi_review import (config, detectors, managed_files, plan_profile,
+                           setup_launcher, shell_env, upsell)
 from buddhi_review.transparency import _colour_enabled
 
 _GH_MIN = (2, 87)
@@ -718,30 +719,39 @@ def _write_workflow_template(cwd: Optional[str]) -> Optional[Path]:
 
 def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
                     message: str, title: str, branch: str, *,
-                    recovery_path: Optional[str] = None, run) -> Tuple[bool, str]:
-    """Open a PR that adds an arbitrary file (``path``, text ``content``) to the
-    repo's DEFAULT branch entirely server-side — no local checkout is touched, so
-    the user's feature branch and working tree are left exactly as they were:
+                    recovery_path: Optional[str] = None,
+                    body: Optional[str] = None, run) -> Tuple[bool, str]:
+    """Open a PR that CREATES OR UPDATES an arbitrary file (``path``, text
+    ``content``) on the repo's DEFAULT branch entirely server-side — no local
+    checkout is touched, so the user's feature branch and working tree are left
+    exactly as they were:
 
       1. read the default branch's head SHA,
-      2. create a fresh ref ``branch`` off it,
+      2. create a fresh ref ``branch`` off it (reusing it if a partial earlier run
+         already created the branch),
       3. PUT ``content`` to ``path`` on that ref (one commit, message ``message``),
-      4. open a PR titled ``title`` (base=default, head=branch).
+         supplying the existing blob SHA when ``path`` is already present so an
+         UPDATE doesn't 422,
+      4. open a PR titled ``title`` (base=default, head=branch) with body ``body``.
 
-    Generic by design — it installs the Claude review workflow today and the
-    ``ready-for-ci`` template later (F4). ``recovery_path`` (defaults to ``path``)
-    is the file probed when a previous partial run already created ``branch``: its
-    blob SHA is needed for the Contents-API update (a PUT over an existing file 422s
-    without it), so a re-run reuses the branch and updates the file instead of
-    failing. Returns ``(ok, detail)`` — ``detail`` is the PR URL on success, else a
-    short reason. The PUT needs a token with the ``workflow`` scope; without it
-    GitHub rejects the write and the caller falls back to a local copy."""
+    Generic by design — it installs the Claude review workflow and the
+    ``ready-for-ci`` template, and UPDATES either to a newer bundled version. Because
+    the branch is cut from the default branch (which already carries any existing
+    file), the existing blob SHA is probed UNCONDITIONALLY before the PUT — absent
+    (a fresh create) it is a plain add, present it is an in-place update.
+    ``recovery_path`` (defaults to ``path``) is the path probed for that blob SHA;
+    ``body`` overrides the default PR body. Returns ``(ok, detail)`` — ``detail`` is
+    the PR URL on success, else a short reason. The PUT needs a token with the
+    ``workflow`` scope; without it GitHub rejects the write and the caller falls back
+    to a local copy."""
     path = str(path).lstrip("/")
     recovery_path = str(recovery_path or path).lstrip("/")
     enc_path = urllib.parse.quote(path, safe="/")
     enc_recovery = urllib.parse.quote(recovery_path, safe="/")
     enc_branch = urllib.parse.quote(branch, safe="")
     b64 = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    pr_body = body or (f"Adds `{path}` to the default branch. "
+                       "(Opened by the Buddhi setup wizard.)")
     try:
         head = run(["gh", "api", f"repos/{repo}/git/ref/heads/{default_branch}",
                     "--jq", ".object.sha"], timeout=20)
@@ -750,7 +760,6 @@ def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
         sha = head.stdout.strip()
         ref = run(["gh", "api", f"repos/{repo}/git/refs",
                    "-f", f"ref=refs/heads/{branch}", "-f", f"sha={sha}"], timeout=20)
-        sha_args: List[str] = []
         if getattr(ref, "returncode", 1) != 0:
             # Branch creation failed — it may already exist from a partial earlier
             # run. Reuse it (so recovery needs no manual cleanup) but ONLY after
@@ -758,14 +767,16 @@ def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
             probe = run(["gh", "api", f"repos/{repo}/git/ref/heads/{enc_branch}"], timeout=15)
             if getattr(probe, "returncode", 1) != 0:
                 return (False, f"couldn't create branch '{branch}'")
-            # The Contents API requires the blob sha when updating an existing file
-            # (422 otherwise); probe `recovery_path` on the branch so a re-run that
-            # already committed the file updates it cleanly.
-            file_probe = run(["gh", "api",
-                              f"repos/{repo}/contents/{enc_recovery}?ref={enc_branch}",
-                              "--jq", ".sha"], timeout=15)
-            if getattr(file_probe, "returncode", 1) == 0 and (file_probe.stdout or "").strip():
-                sha_args = ["-f", f"sha={file_probe.stdout.strip()}"]
+        # The Contents API requires the existing blob SHA to UPDATE a file (a PUT
+        # over one 422s without it). The branch is cut from the default branch, so
+        # if `recovery_path` is already there it carries the SHA we need; probe for it
+        # unconditionally — absent (a fresh CREATE) → no SHA, a plain add.
+        sha_args: List[str] = []
+        file_probe = run(["gh", "api",
+                          f"repos/{repo}/contents/{enc_recovery}?ref={enc_branch}",
+                          "--jq", ".sha"], timeout=15)
+        if getattr(file_probe, "returncode", 1) == 0 and (file_probe.stdout or "").strip():
+            sha_args = ["-f", f"sha={file_probe.stdout.strip()}"]
         put = run(["gh", "api", "-X", "PUT",
                    f"repos/{repo}/contents/{enc_path}",
                    "-f", f"message={message}",
@@ -776,8 +787,7 @@ def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
         pr = run(["gh", "pr", "create", "--repo", repo,
                   "--base", default_branch, "--head", branch,
                   "--title", title,
-                  "--body", f"Adds `{path}` to the default branch. "
-                            "(Opened by the Buddhi setup wizard.)"], timeout=30)
+                  "--body", pr_body], timeout=30)
     except Exception as exc:
         return (False, type(exc).__name__)
     if getattr(pr, "returncode", 1) != 0:
@@ -785,6 +795,82 @@ def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
     out = (getattr(pr, "stdout", "") or "").strip()
     url = out.splitlines()[-1] if out else "(PR opened)"
     return (True, url)
+
+
+# The muted reassurance shown after an update PR — the old file is never lost.
+_REVERT_NOTE = ("Your previous version is preserved in the PR's git history — "
+                "revert the PR to roll back.")
+
+
+def _installed_managed_file_text(repo: Optional[str], dest_path: str, run) -> Optional[str]:
+    """Decoded text of a managed file as it currently exists on ``repo``'s default
+    branch, or ``None`` if absent / unreadable. Read so the wizard can compare the
+    INSTALLED copy's ``buddhi-managed-version`` marker against the bundled template
+    and offer an update when it is older. Best-effort — never raises."""
+    if not repo:
+        return None
+    ok, out = _run_ok(run, ["gh", "api", f"repos/{repo}/contents/{dest_path}",
+                            "--jq", ".content"])
+    if not ok or not out.strip():
+        return None
+    try:
+        # The Contents API returns base64 (with embedded newlines gh strips via --jq).
+        return base64.b64decode(out).decode("utf-8", "replace")
+    except Exception:
+        return None
+
+
+def _offer_update_managed_file(repo: str, default: Optional[str], spec: Dict[str, object],
+                               installed_text: Optional[str], *, run, pal, stream,
+                               input_fn=input) -> Optional[str]:
+    """Offer a server-side PR that updates a managed file IN PLACE when the installed
+    copy is older than the bundled template (verbatim overwrite — for files with NO
+    per-install baking, i.e. the Claude workflow; ``ready-for-ci`` re-bakes its CI
+    command via its own installer). The old version stays in the update PR's git
+    history. Returns ``'pr'`` (update PR opened) or ``None`` (already current /
+    unknown / declined / non-TTY / no default branch / write failed)."""
+    template = spec["template"]  # type: ignore[index]
+    name = str(spec["name"])
+    shipped = managed_files.shipped_version(template)  # type: ignore[arg-type]
+    installed_v = managed_files.file_version(installed_text)
+    if not managed_files.needs_update(installed_v, shipped):
+        return None
+    if not default:
+        return None
+    cur = "unversioned" if installed_v is None else f"v{installed_v}"
+    _row("warn", f"{name} — your installed copy ({cur}) is older than the bundled "
+                 f"v{shipped}. Updating it brings the latest fixes (e.g. the "
+                 "auth-failure guard that turns a silent 401 red).", pal, stream)
+    if not _is_tty():
+        _row("info", f"Re-run setup in a terminal to update {name} to v{shipped}.",
+             pal, stream)
+        return None
+    if not _ask_yes_no(f"Open a PR to update {name} to v{shipped} on '{default}'?",
+                       default=True, input_fn=input_fn, stream=stream):
+        return None
+    try:
+        content = Path(template).read_text(encoding="utf-8")  # type: ignore[arg-type]
+    except OSError as exc:
+        _row("warn", f"Couldn't read the bundled {name}: {exc}", pal, stream)
+        return None
+    dest = str(spec["dest"])
+    slug = name.replace(".yml", "").replace(".", "-")
+    ok, detail = _create_file_pr(
+        repo, default, dest, content,
+        f"Update {name} to v{shipped} (Buddhi setup)",   # message
+        f"Update {name} to v{shipped}",                  # title
+        f"buddhi/update-{slug}-v{shipped}",              # branch
+        body=(f"Updates `{dest}` to Buddhi managed version v{shipped}. "
+              f"(Opened by the Buddhi setup wizard.)\n\n{_REVERT_NOTE}"),
+        run=run)
+    if ok:
+        _row("ok", f"Opened a PR to update {name}: {detail}", pal, stream)
+        print(f"  {pal.GREY}{_REVERT_NOTE}{pal.RESET}", file=stream)
+        _row("info", f"Merge that PR to put {name} v{shipped} on '{default}'.", pal, stream)
+        return "pr"
+    _row("warn", f"Couldn't open the update PR automatically ({detail}). You can copy "
+                 f"the bundled {name} in by hand.", pal, stream)
+    return None
 
 
 def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, stream,
@@ -985,9 +1071,26 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
     ``None`` (already present / no template / declined / no command resolved / write
     failed); on any failure it prints the manual fallback."""
     # P7 #4 — probe first; never open a redundant second PR for a gate already there.
+    # Version-aware: when the installed gate is OLDER than the bundled template, fall
+    # through to the bake-and-PR flow as an UPDATE (re-wiring the CI command) instead
+    # of skipping; a current / unknown installed copy is left untouched.
+    is_update = False
     if _probe_ready_for_ci_workflow(repo, run):
-        _row("ok", "Label-gated CI workflow already on the default branch", pal, stream)
-        return None
+        _spec = next((s for s in managed_files.MANAGED_FILES
+                      if s["name"] == "tests-ready-for-ci.yml"), None)
+        _shipped_v = managed_files.shipped_version(_spec["template"]) if _spec else None
+        _installed_v = managed_files.file_version(
+            _installed_managed_file_text(
+                repo, ".github/workflows/tests-ready-for-ci.yml", run))
+        if not managed_files.needs_update(_installed_v, _shipped_v):
+            _row("ok", "Label-gated CI workflow already on the default branch "
+                       "(up to date)", pal, stream)
+            return None
+        _cur = "unversioned" if _installed_v is None else f"v{_installed_v}"
+        _row("warn", f"Label-gated CI workflow on the default branch is older "
+                     f"({_cur}) than the bundled v{_shipped_v} — offering an update.",
+             pal, stream)
+        is_update = True
     template = _ready_for_ci_template_path()
     if not template.exists():
         _row("warn", f"Bundled label-gated CI template not found: {template}", pal, stream)
@@ -1050,13 +1153,22 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
         repo, default,
         ".github/workflows/tests-ready-for-ci.yml",        # path
         content,                                           # content (CI command baked in)
-        "Add label-gated CI workflow (Buddhi setup)",      # message
-        "Add label-gated CI workflow",                     # title
-        "buddhi/add-ready-for-ci-workflow",                # branch (its own, != claude)
+        ("Update label-gated CI workflow (Buddhi setup)" if is_update
+         else "Add label-gated CI workflow (Buddhi setup)"),       # message
+        ("Update label-gated CI workflow" if is_update
+         else "Add label-gated CI workflow"),                      # title
+        ("buddhi/update-ready-for-ci-workflow" if is_update
+         else "buddhi/add-ready-for-ci-workflow"),                 # branch (its own, != claude)
+        body=((f"Updates `.github/workflows/tests-ready-for-ci.yml` to the latest "
+               f"bundled version (CI command re-wired). (Opened by the Buddhi setup "
+               f"wizard.)\n\n{_REVERT_NOTE}") if is_update else None),
         run=run)
     if ok:
-        _row("ok", f"Opened a PR to add the label gate (CI command: {ci_command}): "
+        _verb = "update" if is_update else "add"
+        _row("ok", f"Opened a PR to {_verb} the label gate (CI command: {ci_command}): "
                    f"{detail}", pal, stream)
+        if is_update:
+            print(f"  {pal.GREY}{_REVERT_NOTE}{pal.RESET}", file=stream)
         # P7 #2 — a loud, attention-grabbing callout (a warn row, not a dim line):
         # the gate does NOTHING until this PR merges onto the default branch.
         _row("warn", f"MERGE THIS PR to activate the gate — it stays INACTIVE until it "
@@ -1503,6 +1615,20 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
                 if not present:
                     _offer_install_claude_workflow(repo, cwd, run=run, pal=pal,
                                                    stream=stream, input_fn=input_fn)
+                else:
+                    # Present — but maybe an OLDER version. Offer an in-place update
+                    # when the installed copy's `buddhi-managed-version` marker is
+                    # behind the bundled template; this is what brings the auth-
+                    # failure guard to a repo whose workflow predates it (the
+                    # buddhi-review pre-guard copy that silently 401'd green).
+                    _spec = next((s for s in managed_files.MANAGED_FILES
+                                  if s["name"] == "claude-code-review.yml"), None)
+                    if _spec is not None:
+                        _installed = _installed_managed_file_text(
+                            repo, str(_spec["dest"]), run)
+                        _offer_update_managed_file(
+                            repo, _default_branch(repo, run=run), _spec, _installed,
+                            run=run, pal=pal, stream=stream, input_fn=input_fn)
                 if doctor.get("gh_auth"):
                     _set_claude_secret(repo, run=run, spawn_command=spawn_command,
                                        getpass_fn=getpass_fn, pal=pal, stream=stream,

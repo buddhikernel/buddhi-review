@@ -576,19 +576,33 @@ def detect_claude_auto_on_open(
 CLAUDE_REVIEW_WORKFLOW = "claude-code-review.yml"
 
 
+# Conclusions whose run produced NO review-job log to scan. The mention-driven
+# workflow emits a `skipped` run for EVERY non-`@claude` comment (and GitHub may
+# record action_required/cancelled/neutral/stale), all with an empty log. The
+# token-401 probe must look PAST them to the most recent run that actually executed
+# the review job — otherwise a `skipped` no-op (frequently the newest run) masks a
+# real auth failure one slot below it, and the probe false-negatives.
+_NON_EXECUTED_CONCLUSIONS = frozenset(
+    {"skipped", "action_required", "cancelled", "neutral", "stale"}
+)
+
+
 def _latest_claude_run_id(
     repo: Optional[str], *, run: Callable[..., "subprocess.CompletedProcess[str]"]
 ) -> Optional[str]:
-    """``databaseId`` of ``repo``'s most recent Claude Code Review run, or ``None``.
-    Fetches the single latest run REGARDLESS of conclusion — the documented
-    auth-failure is a run the post-step turns RED, but a stale workflow without the
-    post-step 401s GREEN, so a failing-only filter could miss it. ``None`` on any
-    error / no run."""
+    """``databaseId`` of ``repo``'s most recent EXECUTED Claude Code Review run, or
+    ``None``. Fetches a small window (any conclusion) and returns the newest run that
+    actually RAN the review job, skipping ``skipped``/``action_required``/… no-ops
+    whose log is empty. Still returns both RED and GREEN executed runs (a stale
+    workflow without the post-step 401s green), so a failing-only filter can't miss
+    it — only the empty-log conclusions are skipped. ``None`` on any error / no
+    executed run in the window."""
     if not repo:
         return None
     try:
         proc = run(["gh", "run", "list", "--workflow", CLAUDE_REVIEW_WORKFLOW,
-                    "--repo", repo, "--limit", "1", "--json", "databaseId"])
+                    "--repo", repo, "--limit", "20",
+                    "--json", "databaseId,conclusion"])
     except (OSError, subprocess.SubprocessError):
         return None
     if getattr(proc, "returncode", 1) != 0 or not (getattr(proc, "stdout", "") or "").strip():
@@ -597,10 +611,18 @@ def _latest_claude_run_id(
         data = json.loads(proc.stdout)
     except (ValueError, TypeError):
         return None
-    if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+    if not isinstance(data, list):
         return None
-    rid = data[0].get("databaseId")
-    return str(rid) if rid not in (None, "") else None
+    for entry in data:  # gh returns most-recent-first
+        if not isinstance(entry, dict):
+            continue
+        conclusion = str(entry.get("conclusion") or "").strip().lower()
+        if not conclusion or conclusion in _NON_EXECUTED_CONCLUSIONS:
+            continue
+        rid = entry.get("databaseId")
+        if rid not in (None, ""):
+            return str(rid)
+    return None
 
 
 def _fetch_claude_run_log(

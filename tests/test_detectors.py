@@ -255,10 +255,10 @@ def _proc(returncode=0, stdout=""):
     return _types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr="")
 
 
-def _probe_run(*, list_out='[{"databaseId": 7}]', list_rc=0,
+def _probe_run(*, list_out='[{"databaseId": 7, "conclusion": "success"}]', list_rc=0,
                log_failed="", log_full="", raise_on=None):
-    """Fake `run` for the probe: serves `gh run list` (latest run id) then
-    `gh run view` (--log-failed, falling back to --log)."""
+    """Fake `run` for the probe: serves `gh run list` (the run window, newest-first,
+    each with a conclusion) then `gh run view` (--log-failed, falling back to --log)."""
     def run(argv, **kw):
         joined = " ".join(argv)
         if raise_on and raise_on in joined:
@@ -336,7 +336,7 @@ def test_probe_uses_workflow_basename_and_repo_flag():
     def run(argv, **kw):
         if argv[:3] == ["gh", "run", "list"]:
             seen["list"] = argv
-            return _proc(returncode=0, stdout='[{"databaseId": 7}]')
+            return _proc(returncode=0, stdout='[{"databaseId": 7, "conclusion": "success"}]')
         if argv[:3] == ["gh", "run", "view"]:
             return _proc(returncode=0, stdout=_AUTH_401_LOG)
         return _proc()
@@ -344,3 +344,40 @@ def test_probe_uses_workflow_basename_and_repo_flag():
     assert "--workflow" in seen["list"]
     assert detectors.CLAUDE_REVIEW_WORKFLOW in seen["list"]
     assert "--repo" in seen["list"] and "acme/widgets" in seen["list"]
+
+
+def test_probe_skips_skipped_runs_to_the_executed_run():
+    """REGRESSION (the buddhi-review silent self-heal bug): the NEWEST Claude run is
+    frequently a `skipped` no-op (a non-`@claude` comment trips the workflow's `if:`
+    guard) with an EMPTY log. The probe must look PAST it to the most recent EXECUTED
+    run and detect THAT run's 401 — not stop at the skipped run and false-negative."""
+    # gh returns newest-first: a skipped no-op (id 9) then the executed 401 run (id 7).
+    list_out = ('[{"databaseId": 9, "conclusion": "skipped"}, '
+                '{"databaseId": 7, "conclusion": "success"}]')
+    seen = {}
+
+    def run(argv, **kw):
+        if argv[:3] == ["gh", "run", "list"]:
+            return _proc(returncode=0, stdout=list_out)
+        if argv[:3] == ["gh", "run", "view"]:
+            seen["view_id"] = argv[3]
+            # Only the EXECUTED run (7) carries the 401; the skipped run (9) has no
+            # log. A correct probe never views 9.
+            if argv[3] != "7":
+                return _proc(returncode=1, stdout="")
+            out = "" if "--log-failed" in argv else _AUTH_401_LOG  # green-stale: 401 in full log
+            return _proc(returncode=0 if out else 1, stdout=out)
+        return _proc()
+
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is True
+    assert seen.get("view_id") == "7", f"probed the wrong run: {seen.get('view_id')!r}"
+
+
+def test_probe_all_skipped_window_returns_false():
+    """A window of ONLY non-executed runs (all skipped/cancelled) → no executed run to
+    inspect → False ('couldn't tell'), never a blind re-mint."""
+    list_out = ('[{"databaseId": 9, "conclusion": "skipped"}, '
+                '{"databaseId": 8, "conclusion": "cancelled"}, '
+                '{"databaseId": 7, "conclusion": "action_required"}]')
+    run = _probe_run(list_out=list_out, log_full=_AUTH_401_LOG)
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is False

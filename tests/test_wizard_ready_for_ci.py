@@ -17,7 +17,11 @@ from pathlib import Path
 
 import pytest
 
-from buddhi_review import config, wizard
+from buddhi_review import config, managed_files, wizard
+
+# The version the bundled ready-for-ci template currently ships at — an installed
+# copy at this version is "up to date" and must NOT be offered an update.
+_SHIPPED_RFC = managed_files.shipped_version(wizard._ready_for_ci_template_path())
 
 # Re-use the publish-gate scanner the OSS-purity suite uses (one definition).
 sys.path.insert(0, str(Path(wizard.__file__).resolve().parent.parent / "tools"))
@@ -190,9 +194,18 @@ def test_probe_false_when_absent_or_null_or_no_repo():
 
 # ── _offer_install_ready_for_ci ─────────────────────────────────────────────────────
 
-def _install_router(*, present=False, default="main", head_sha="deadbeef",
+def _install_router(*, present=False, version=None, default="main", head_sha="deadbeef",
                     pr_url="https://github.com/octocat/Hello-World/pull/9",
                     put_rc=0, pr_rc=0):
+    # The content the contents-probe returns for an already-installed gate: a file
+    # carrying the buddhi-managed-version marker (``version``), or — when ``version``
+    # is None — a legacy UNMARKED copy that the version-check treats as outdated.
+    if version is None:
+        _installed_b64 = base64.b64encode(b"name: legacy ci\n").decode()
+    else:
+        _installed_b64 = base64.b64encode(
+            f"# buddhi-managed-version: {version}\nname: ci\n".encode()).decode()
+
     def router(argv, _inp):
         joined = " ".join(argv)
         if argv[:3] == ["gh", "repo", "view"]:
@@ -203,8 +216,8 @@ def _install_router(*, present=False, default="main", head_sha="deadbeef",
             if "-X" in argv and "PUT" in argv:
                 return _R(returncode=put_rc)
             if "tests-ready-for-ci.yml" in joined and "--jq" in argv and ".content" in argv:
-                # the probe
-                return _R(returncode=0, stdout="x\n") if present else _R(returncode=1, stdout="")
+                # the present-probe AND the version-check both read this content
+                return _R(returncode=0, stdout=_installed_b64 + "\n") if present else _R(returncode=1, stdout="")
             if "/git/ref/heads/" in joined and "--jq" in argv:
                 return _R(returncode=0, stdout=head_sha + "\n")
             if argv[2].endswith("/git/refs"):
@@ -246,13 +259,31 @@ class _tty:
         wizard._is_tty = self._orig
 
 
-def test_offer_skips_when_already_present(tmp_path):
-    """P7 #4 — a gate already on the default branch opens NO redundant second PR."""
+def test_offer_skips_when_already_present_and_current(tmp_path):
+    """P7 #4 — a gate already on the default branch AT THE CURRENT VERSION opens NO
+    redundant second PR."""
     result, out, calls = _offer(tmp_path, is_tty=True,
-                                router=_install_router(present=True))
+                                router=_install_router(present=True, version=_SHIPPED_RFC))
     assert result is None
     assert "already on the default branch" in out
     assert not any(c["argv"][:2] == ["gh", "pr"] for c in calls), "must not open a PR"
+
+
+def test_offer_updates_when_present_but_outdated(tmp_path):
+    """Versioned sync: a gate present on the default branch but at an OLDER version (or
+    legacy unmarked) is offered an in-place UPDATE — a PR on the dedicated update
+    branch, the CI command re-baked, and the muted git-revert reassurance shown."""
+    result, out, calls = _offer(
+        tmp_path, is_tty=True, router=_install_router(present=True, version=None),
+        input_answers={"Install the label-gated CI workflow": "y"})
+    assert result == "pr"
+    # The update rides its OWN branch (distinct from the add branch) so the two can't
+    # collide, and the PUT targets the ready-for-ci path.
+    put = next(c["argv"] for c in calls if "-X" in c["argv"] and "PUT" in c["argv"])
+    assert "branch=buddhi/update-ready-for-ci-workflow" in put
+    pr = next(c["argv"] for c in calls if c["argv"][:2] == ["gh", "pr"])
+    assert pr[pr.index("--head") + 1] == "buddhi/update-ready-for-ci-workflow"
+    assert "older" in out and "revert the PR" in out
 
 
 def test_offer_happy_path_opens_pr_with_baked_command(tmp_path):
@@ -335,10 +366,10 @@ def test_offer_pr_failure_prints_manual_fallback(tmp_path):
 
 # ── Wire-up into the per-repo confirm flow + the full wizard ─────────────────────────
 
-def _confirm_run(*, gh_auth=True, default="main", present=False):
+def _confirm_run(*, gh_auth=True, default="main", present=False, version=None):
     """A run() for confirm_repo_interactive driving a copilot-only fleet (no claude
     provisioning noise) + the ready-for-ci installer."""
-    base = _install_router(present=present, default=default)
+    base = _install_router(present=present, version=version, default=default)
     calls = []
 
     def run(argv, cwd=None, timeout=30, input=None):
@@ -402,10 +433,10 @@ def test_confirm_lgc_off_does_not_install(tmp_path):
         "no ready-for-ci provisioning when the opt-in is off"
 
 
-def test_confirm_lgc_on_already_present_opens_no_pr(tmp_path):
-    """Claim #2 (#4 probe): a re-run where the gate is already on the default branch
-    opts in but opens NO redundant second PR."""
-    run, calls = _confirm_run(present=True)
+def test_confirm_lgc_on_already_present_and_current_opens_no_pr(tmp_path):
+    """Claim #2 (#4 probe): a re-run where the gate is already on the default branch AT
+    THE CURRENT VERSION opts in but opens NO redundant second PR."""
+    run, calls = _confirm_run(present=True, version=_SHIPPED_RFC)
     rc, out, _ = _drive_confirm(tmp_path, run, lgc_on=True)
     assert rc == 0
     assert not any(c[:2] == ["gh", "pr"] for c in calls)
