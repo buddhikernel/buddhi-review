@@ -645,7 +645,7 @@ def step_doctor(*, run, which, pal, stream) -> Dict[str, Any]:
             # Per-tier rows tell the user which tiers aren't on their plan (a single
             # summary row would hide that).
             _row("ok" if ok else "warn",
-                 tier if ok else f"{tier} — not on your plan", pal, stream)
+                 tier if ok else f"{tier} — unreachable (plan limit, auth, or network)", pal, stream)
 
     # Fix-and-rerun footer when a tooling check (Claude CLI, or gh presence / version /
     # auth) warned. OSS never hard-exits — it points the user at the ⚠ rows instead.
@@ -680,7 +680,7 @@ def step_repo(preset_repo: Optional[str], *, run, pal, stream, input_fn=input) -
     """Step 3 — repo binding."""
     _panel("Step 3 — Repo binding", ["Which repository should the loop review?"], pal, stream)
     cwd = repo_toplevel(run)
-    inferred = infer_repo(run)
+    inferred = infer_repo(run) if not preset_repo else None
     repo = preset_repo or inferred
     if repo:
         if not preset_repo and inferred:
