@@ -1629,7 +1629,7 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
     is the set of reviewers to PRESELECT; ``None`` preselects all four (the full
     wizard's first-run default)."""
     _panel("Step 5 — Reviewer fleet", [
-        "Enable only the reviewers you have set up on this repo. Each is validated for reachability.",
+        "Enable only the reviewers you have set up on this repo.",
         "EVERY reviewer you enable must already have its vendor GitHub app + plan "
         "installed on this repo, with its trigger configured and working — otherwise "
         "the round-1 request may have no effect (the per-bot setup steps follow).",
@@ -1785,8 +1785,8 @@ def step_repo_label_gated_ci(repo: str, current_default: bool, *, pal, stream,
         "",
         "CONSEQUENCE of turning this ON for this repo:",
         "  • CI will NOT run on your manual / intermediate pushes to a PR.",
-        "  • A required status check that gates on the label BLOCKS a human merge "
-        "until the label is added.",
+        "  • A required status check that gates on the label BLOCKS a human merge",
+        "    until the label is added.",
     ], pal, stream)
     idx = single_select(
         f"  Label-gated CI default for {repo}?",
