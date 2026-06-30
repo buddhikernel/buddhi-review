@@ -11,11 +11,21 @@ through the F1 readers (:func:`config.active_reviewers` / :func:`config.auto_on_
 import io
 import types
 
+import pytest
+
 from buddhi_review import config, wizard
 
 REPO = "octocat/Hello-World"
 # Reviewer indices in wizard._REVIEWERS == ("copilot", "gemini", "codex", "claude").
 COPILOT, GEMINI, CODEX, CLAUDE = 0, 1, 2, 3
+
+
+@pytest.fixture(autouse=True)
+def _interactive(monkeypatch):
+    """The per-repo confirm flow is an interactive TTY program; force a TTY so the
+    F1 fail-closed install-confirmation gate can obtain its explicit Yes. Without
+    this the gate (correctly) drops every reviewer for lack of a TTY to confirm on."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
 
 
 # ── Injected seams ─────────────────────────────────────────────────────────────────
@@ -66,12 +76,18 @@ def _confirm(cfg_path, *, repo=REPO, reviewers, ss_answers=None, yn_answers=None
     of indices into wizard._REVIEWERS. Returns ``(rc, output)``."""
     buf = io.StringIO()
     ms = multi_select or (lambda *a, **k: set(reviewers))
+    # Auto-confirm the F1 install gate by default — these tests drive a SUCCESSFUL
+    # confirmation. The gate is a labeled single_select ("… ready to review PRs?"),
+    # so it routes on the single_select channel (option 1 = Yes), entirely separate
+    # from the input_fn per-bot auto-on-open routing. A test wanting a drop overrides
+    # "ready to review PRs".
+    ss = {"ready to review PRs": 1, **(ss_answers or {})}
     rc = wizard.confirm_repo_interactive(
         repo, "/work/checkout",
         run=_run_factory(gh_auth=gh_auth), spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "", pal=wizard._Palette(False), stream=buf,
         cfg_path=cfg_path, multi_select=ms,
-        single_select=_ss_router(ss_answers or {}, captured),
+        single_select=_ss_router(ss, captured),
         input_fn=_in_router(yn_answers or {}))
     return rc, buf.getvalue()
 
@@ -280,7 +296,8 @@ def test_confirm_infers_repo_from_git_remote(tmp_path):
         "", None, run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "", pal=wizard._Palette(False), stream=buf,
         cfg_path=cfg_path, multi_select=lambda *a, **k: {COPILOT},
-        single_select=_ss_router({"GLOBAL default": 1, "Auto-merge default for": 0,
+        single_select=_ss_router({"ready to review PRs": 1, "GLOBAL default": 1,
+                                  "Auto-merge default for": 0,
                                   "Label-gated CI default for": 0}),
         input_fn=_in_router({"Copilot": "y"}))
     assert rc == 0
