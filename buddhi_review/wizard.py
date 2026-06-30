@@ -952,9 +952,9 @@ def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, s
         _row("info", f"Claude — local workflow file already exists at {local_file}. "
                      "Commit and push it to the default branch to activate.", pal, stream)
         return True
-    if cwd and _is_tty() and _ask_yes_no("Write the bundled claude-code-review.yml into "
-                                          ".github/workflows/ now?", default=True,
-                                          input_fn=input_fn, stream=stream):
+    if cwd and _ask_yes_no("Write the bundled claude-code-review.yml into "
+                           ".github/workflows/ now?", default=True, input_fn=input_fn,
+                           stream=stream):
         dest = _write_workflow_template(cwd)
         if dest:
             _row("ok", f"Wrote {dest} — commit + push it, then merge into '{default}' "
