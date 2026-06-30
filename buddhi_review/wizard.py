@@ -84,6 +84,13 @@ _CLAUDE_RECHECK_PROMPT = (
     "Has the workflow file claude-code-review.yml been committed on the default "
     "branch (and the CLAUDE_CODE_OAUTH_TOKEN secret set)? Shall I confirm now?")
 
+# Claude's confirm-install gate is declined / un-confirmed: the disabled row keeps
+# OSS's clean lead and adds why it matters (the 401 / silent-post symptom), so the
+# Claude case reads differently from the generic GitHub-App reviewers' row.
+_CLAUDE_DISABLED_ROW = (
+    "Claude not confirmed installed — left DISABLED (re-run setup once it is "
+    "installed; without it the workflow 401s and claude[bot] posts nothing).")
+
 
 # ── Colour + output ──────────────────────────────────────────────────────────────
 
@@ -600,22 +607,27 @@ def write_config(cfg: Dict[str, Any], path: Path) -> bool:
 def step_doctor(*, run, which, pal, stream) -> Dict[str, Any]:
     """Step 1 — tooling doctor. Reports each check; never hard-exits (setup stays
     useful even if a tool is missing — the loop's own preflight catches it)."""
-    _panel("Step 1 — Tooling doctor", [], pal, stream)
+    _panel("Step 1 — Tooling doctor", ["Checking the tools the loop depends on."], pal, stream)
+    _row("step", "Checking Claude CLI…", pal, stream)
     claude_bin = which("claude")
     if claude_bin:
         _row("ok", f"Claude CLI found ({claude_bin})", pal, stream)
     else:
-        _row("warn", "Claude CLI not found on PATH — install it to run reviews/fixes", pal, stream)
+        _row("warn", "Claude CLI not found — install it to run reviews/fixes: "
+                     "https://claude.com/claude-code", pal, stream)
 
+    _row("step", f"Checking gh CLI (≥ {_GH_MIN[0]}.{_GH_MIN[1]})…", pal, stream)
     gh_present, gh_out = _run_ok(run, ["gh", "--version"])
     ver, ok_ver = gh_version_ok(gh_out)
     if not gh_present:
-        _row("warn", "gh CLI not found — install GitHub CLI and run `gh auth login`", pal, stream)
+        _row("warn", "gh CLI not found — install GitHub CLI (https://cli.github.com), "
+                     "then run `gh auth login`", pal, stream)
     elif ok_ver:
-        _row("ok", f"gh {ver[0]}.{ver[1]} (>= {_GH_MIN[0]}.{_GH_MIN[1]})", pal, stream)
+        _row("ok", f"gh {ver[0]}.{ver[1]} (≥ {_GH_MIN[0]}.{_GH_MIN[1]})", pal, stream)
     else:
         shown = f"{ver[0]}.{ver[1]}" if ver else "unknown"
-        _row("warn", f"gh {shown} is below {_GH_MIN[0]}.{_GH_MIN[1]} — Copilot review needs the newer gh", pal, stream)
+        _row("warn", f"gh {shown} is below {_GH_MIN[0]}.{_GH_MIN[1]} — Copilot review "
+                     "needs the newer gh; upgrade: https://cli.github.com", pal, stream)
 
     gh_auth, _ = _run_ok(run, ["gh", "auth", "status"]) if gh_present else (False, "")
     _row("ok" if gh_auth else "warn",
@@ -624,13 +636,21 @@ def step_doctor(*, run, which, pal, stream) -> Dict[str, Any]:
 
     tiers: Dict[str, bool] = {}
     if claude_bin:
+        _row("step", "Probing reachable model tiers…", pal, stream)
         for tier in _MODEL_TIERS:
             ok, _ = _run_ok(run, [claude_bin, "--model", tier, "--permission-mode",
                                   "bypassPermissions", "--strict-mcp-config", "-p", "ping"],
                             timeout=60)
             tiers[tier] = ok
-        reachable = ", ".join(t for t in _MODEL_TIERS if tiers.get(t)) or "none reachable"
-        _row("ok" if any(tiers.values()) else "warn", f"Model tiers: {reachable}", pal, stream)
+            # Per-tier rows tell the user which tiers aren't on their plan (a single
+            # summary row would hide that).
+            _row("ok" if ok else "warn",
+                 tier if ok else f"{tier} — not on your plan", pal, stream)
+
+    # Fix-and-rerun footer when a tooling check (Claude CLI, or gh presence / version /
+    # auth) warned. OSS never hard-exits — it points the user at the ⚠ rows instead.
+    if not (claude_bin and gh_present and ok_ver and gh_auth):
+        _row("warn", "Fix the ⚠ items above, then re-run /review-pr setup.", pal, stream)
 
     return {"claude_bin": claude_bin, "gh_ok": bool(gh_present and ok_ver),
             "gh_auth": gh_auth, "tiers": tiers}
@@ -647,7 +667,9 @@ def step_plan(doctor: Dict[str, Any], *, pal, stream, single_select=single_selec
         options.append((name, f"fixes run {model}"))
     rec = recommend_plan(doctor.get("tiers", {}))
     preselect = plans.index(rec) if rec in plans else 0
-    _panel("Step 2 — Claude plan", ["Drives which model each role runs (resolved from your plan)."],
+    _panel("Step 2 — Claude plan",
+           ["Drives which model each role runs, resolved from your Claude plan "
+            "(Pro uses Sonnet; Max and up use Opus for the hard calls)."],
            pal, stream)
     idx = single_select("  Which Claude plan are you on?", options, preselect=preselect,
                         pal=pal, stream=stream, input_fn=input_fn)
@@ -656,10 +678,13 @@ def step_plan(doctor: Dict[str, Any], *, pal, stream, single_select=single_selec
 
 def step_repo(preset_repo: Optional[str], *, run, pal, stream, input_fn=input) -> Tuple[Optional[str], Optional[str]]:
     """Step 3 — repo binding."""
-    _panel("Step 3 — Repo binding", [], pal, stream)
+    _panel("Step 3 — Repo binding", ["Which repository should the loop review?"], pal, stream)
     cwd = repo_toplevel(run)
-    repo = preset_repo or infer_repo(run)
+    inferred = infer_repo(run)
+    repo = preset_repo or inferred
     if repo:
+        if not preset_repo and inferred:
+            _row("info", f"Inferred from git remote: {inferred}", pal, stream)
         use = _ask_yes_no(f"Use {repo}?", default=True, input_fn=input_fn, stream=stream)
         if not use:
             try:
@@ -913,8 +938,9 @@ def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, s
             if ok:
                 _row("ok", f"Opened a PR to add the workflow: {detail}", pal, stream)
                 print(f"  {pal.GREY}{_ACTIONS_NOTE}{pal.RESET}", file=stream)
-                _row("info", f"Merge that PR to put the workflow on '{default}', then "
-                             "set the CLAUDE_CODE_OAUTH_TOKEN secret below.", pal, stream)
+                _row("info", f"Merge that PR to put the workflow on '{default}' (the "
+                             "default branch), then set the CLAUDE_CODE_OAUTH_TOKEN "
+                             "secret below.", pal, stream)
                 return "pr"
             _row("warn", f"Could not open the PR automatically ({detail}). Falling "
                          "back to a local copy you can land yourself.", pal, stream)
@@ -926,11 +952,13 @@ def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, s
         _row("info", f"Claude — local workflow file already exists at {local_file}. "
                      "Commit and push it to the default branch to activate.", pal, stream)
         return True
-    if cwd and _ask_yes_no("Write the bundled claude-code-review.yml into this repo now?",
-                           default=True, input_fn=input_fn, stream=stream):
+    if cwd and _ask_yes_no("Write the bundled claude-code-review.yml into "
+                           ".github/workflows/ now?", default=True, input_fn=input_fn,
+                           stream=stream):
         dest = _write_workflow_template(cwd)
         if dest:
-            _row("ok", f"Wrote {dest} — commit + push it to the default branch", pal, stream)
+            _row("ok", f"Wrote {dest} — commit + push it, then merge into '{default}' "
+                       "to enable Claude reviews.", pal, stream)
             print(f"  {pal.GREY}{_ACTIONS_NOTE}{pal.RESET}", file=stream)
             return True
         _row("warn", "Could not write the workflow template", pal, stream)
@@ -1376,14 +1404,16 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
         if not remint:
             return "present"
     if not _is_tty():
-        verb = "Re-mint" if remint else "Set"
-        _row("info", f"{verb} the {name} repo secret later: `claude setup-token` then "
-                     f"`gh secret set {name} --repo {repo}`", pal, stream)
+        _row("info", "Set/Re-mint the reviewer token by hand:", pal, stream)
+        print("    claude setup-token        # prints a long-lived OAuth token", file=stream)
+        print(f"    gh secret set {name} --repo {repo}    # paste that token", file=stream)
         return "deferred"
     if remint:
         _row("warn", f"Claude's reviews are failing on {repo} — its {name} looks "
-                     f"invalid or expired; let's re-mint it.", pal, stream)
-    _row("info", "Opening `claude setup-token` in a new window to mint a token …", pal, stream)
+                     "invalid or expired. That secret is write-only, so it can't be "
+                     "repaired — only replaced; let's re-mint it.", pal, stream)
+    _row("info", "A terminal opened running `claude setup-token` — finish login there, "
+                 "copy the printed token, then paste it below.", pal, stream)
     try:
         spawn_command("claude setup-token", label="claude-setup-token", stream=stream)
     except Exception:
@@ -1397,19 +1427,20 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
-            token = getpass_fn("  Paste the token (input hidden), or blank to skip: ").strip()
+            token = getpass_fn(f"  Paste the {name} (input hidden), or blank to skip: ").strip()
         except (EOFError, KeyboardInterrupt):
             token = ""
         if not token:
             return "skipped"
-        _row("step", "Testing the token …", pal, stream)
+        _row("step", "Testing the token…", pal, stream)
         try:
             state = validate(token, run=run)
-        except Exception:
+        except Exception as exc:
             # A validator that RAISES (vs. the default, which catches its own errors
             # and returns "unknown") is a contract violation / bug, not a transient
             # blip — fail SAFE: never store on it.
-            _row("warn", f"The token check crashed — not saving {name} on GitHub", pal, stream)
+            _row("warn", f"The token check crashed ({type(exc).__name__}) — not saving "
+                         f"{name} on GitHub.", pal, stream)
             return "failed"
         if state == "valid":
             break
@@ -1428,7 +1459,7 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
                          "then paste it below.", pal, stream)
             continue
         _row("warn", f"Still not authenticating after {max_attempts} tries — not "
-                     f"saving {name} on GitHub", pal, stream)
+                     f"saving {name} on GitHub.", pal, stream)
         return "failed"
     # Scope SAFELY: repo-only by default. On an org-owned repo, offer the explicit
     # org-wide opt-in (still visible to this repo alone); _set_secret_scoped checks
@@ -1446,10 +1477,10 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
         prefer_org = (idx == 1)
     ok, detail, scope = _set_secret_scoped(repo, name, token, prefer_org=prefer_org, run=run)
     if ok:
-        _row("ok", f"{name} set on {repo} ({scope} scope)", pal, stream)
+        _row("ok", f"{name} set on {repo} ({scope} scope).", pal, stream)
         return "set"
     _row("warn", f"Could not set {name} ({detail}) — set it by hand with "
-                 f"`gh secret set {name} --repo {repo}`", pal, stream)
+                 f"`gh secret set {name} --repo {repo}`.", pal, stream)
     return "failed"
 
 
@@ -1531,19 +1562,19 @@ def _app_install_lines(bot: str, repo: Optional[str]) -> List[str]:
     where = f"`{repo}`" if repo else "this repo"
     if bot == "claude":
         return [
-            "Install the Claude GitHub App:  github.com/apps/claude",
-            f"then grant it access to {where}.",
-            "Without it the claude-code-review run fails 401 (\"Claude Code is not "
+            f"Install the Claude GitHub App (github.com/apps/claude), then grant it access to {where}.",
+            "Without it the claude-code-review run fails with 401 (\"Claude Code is not "
             "installed on this repository\") and claude[bot] posts NOTHING — the "
             "workflow + token alone are NOT enough.",
         ]
     if bot == "codex":
-        return ["Install the OpenAI Codex app via Codex ▸ Settings ▸ Connectors ▸ "
-                f"GitHub, and grant it access to {where}.",
+        return ["A ChatGPT plan that includes Codex is required.",
+                "Install the OpenAI Codex app via Codex ▸ Settings ▸ Connectors ▸ "
+                f"GitHub and grant it access to {where}.",
                 "It then replies to '@codex review' on a PR."]
     if bot == "gemini":
-        return [f"Install  github.com/apps/gemini-code-assist  and grant it access "
-                f"to {where}.",
+        return ["Install the Gemini Code Assist GitHub App (github.com/apps/gemini-code-assist) "
+                f"and grant it access to {where}.",
                 "It then replies to '/gemini review' on a PR."]
     return [f"Install {bot}'s GitHub app and grant it access to {where}."]
 
@@ -1557,6 +1588,37 @@ def _guide_app_install(bot: str, repo: Optional[str], *, pal, stream) -> None:
            _app_install_lines(bot, repo), pal, stream)
 
 
+def _confirm_reviewer_installed(bot: str, repo: Optional[str], *, single_select, pal, stream,
+                                input_fn) -> bool:
+    """Fail-closed gate: did the user CONFIRM ``bot`` is actually installed on this
+    repo and ready to review? Selecting a reviewer in the multi-select signals only
+    INTENT — the vendor app / Copilot installs happen in the GitHub UI and setup
+    cannot verify them through an API. Recording an UN-installed reviewer as an
+    expected auto-reviewer is the dangerous case: the loop then waits forever for a
+    review that never arrives, or — with auto-merge on — squash-merges a PR that got
+    ZERO reviews. So this preselects **No**: only an explicit Yes keeps the reviewer.
+    A decline, a blank answer, or a NON-INTERACTIVE run (no TTY to answer) all leave
+    the reviewer disabled, and the caller drops the bot from BOTH the enabled fleet
+    and ``auto_on_open`` — so it can never default to auto-review.
+
+    The decision deliberately hinges on :func:`_is_tty` (a module global, not a DI
+    param): without a TTY there is no way to obtain the explicit confirmation, so the
+    only safe answer is No. The question + labeled options carry the CONSEQUENCE of
+    each choice so the user understands why an unconfirmed reviewer is left out."""
+    if not _is_tty():
+        return False
+    where = f" on {repo}" if repo else ""
+    repo_name = repo or "this repo"
+    idx = single_select(
+        f"  Confirm the '{bot}' reviewer is installed{where} and ready to review PRs?",
+        [("No / not sure — leave it disabled",
+          "the loop won't wait on a reviewer that can't respond"),
+         (f"Yes — {bot} is installed and will review PRs on {repo_name}",
+          "the loop treats it as an expected reviewer")],
+        preselect=0, pal=pal, stream=stream, input_fn=input_fn)
+    return idx == 1
+
+
 def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, Any], *,
                    run, spawn_command, getpass_fn, pal, stream,
                    multi_select=multi_select, single_select=single_select,
@@ -1566,15 +1628,19 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
     ``seed`` (when given — e.g. the per-repo confirm mode passes the global default)
     is the set of reviewers to PRESELECT; ``None`` preselects all four (the full
     wizard's first-run default)."""
-    _panel("Step 5 — Reviewer fleet", ["Enable only the reviewers you have set up on this repo."],
-           pal, stream)
+    _panel("Step 5 — Reviewer fleet", [
+        "Enable only the reviewers you have set up on this repo. Each is validated for reachability.",
+        "EVERY reviewer you enable must already have its vendor GitHub app + plan "
+        "installed on this repo, with its trigger configured and working — otherwise "
+        "the round-1 request may have no effect (the per-bot setup steps follow).",
+    ], pal, stream)
     labels = {
-        "copilot": "Copilot   (GitHub Copilot code review)",
-        "gemini": "Gemini    (Gemini Code Assist app)",
-        "codex": "Codex     (OpenAI Codex app)",
-        "claude": "Claude    (claude-code-review.yml workflow)",
+        "copilot": ("Copilot", "needs gh ≥ 2.87 + Copilot Pro/Enterprise"),
+        "gemini": ("Gemini", "needs the Gemini Code Assist GitHub app on the repo"),
+        "codex": ("Codex", "needs the OpenAI Codex GitHub app + a ChatGPT plan"),
+        "claude": ("Claude", "needs claude-code-review.yml + CLAUDE_CODE_OAUTH_TOKEN secret"),
     }
-    options = [(labels[b], "") for b in _REVIEWERS]
+    options = [labels[b] for b in _REVIEWERS]
     if seed is None:
         preselected = None
     else:
@@ -1587,6 +1653,7 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
         _row("warn", "No reviewers selected — the loop will have nothing to fan out to", pal, stream)
 
     auto_on_open: Dict[str, bool] = {}
+    confirmed: List[str] = []
     for bot in enabled:
         if bot == "copilot":
             if doctor.get("gh_auth"):
@@ -1648,6 +1715,21 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
             # never missed (the buddhi-review PR #3 silent-Claude failure).
             _guide_app_install("claude", repo, pal=pal, stream=stream)
 
+        # Fail-closed install confirmation. Selecting a reviewer above is only INTENT;
+        # the vendor app / Copilot installs happen in the GitHub UI and can't be
+        # verified by API. A reviewer the user does NOT explicitly confirm as installed
+        # is dropped from BOTH the enabled fleet and auto_on_open — otherwise the loop
+        # would wait forever for a review that never comes, or (auto-merge on) merge a
+        # PR that got ZERO reviews. A non-interactive run can't confirm → also dropped.
+        if not _confirm_reviewer_installed(bot, repo, single_select=single_select, pal=pal,
+                                           stream=stream, input_fn=input_fn):
+            disabled_row = _CLAUDE_DISABLED_ROW if bot == "claude" else (
+                f"{bot.capitalize()} not confirmed installed — left DISABLED "
+                "(re-run setup once it is installed on this repo).")
+            _row("warn", disabled_row, pal, stream)
+            continue
+        confirmed.append(bot)
+
         # auto_on_open: Claude is mention-driven (never auto-reviews on open); the
         # GitHub-App bots are asked (default True).
         if bot == "claude":
@@ -1656,7 +1738,7 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
             auto_on_open[bot] = _ask_yes_no(
                 f"Does {bot.capitalize()} auto-review when a PR is opened?",
                 default=True, input_fn=input_fn, stream=stream)
-    return enabled, auto_on_open
+    return confirmed, auto_on_open
 
 
 def step_monitoring_locked(*, pal, stream) -> None:
@@ -1675,7 +1757,7 @@ def step_repo_auto_merge(repo: str, current_default: bool, *, pal, stream,
     wizard's ``step_repo_auto_merge``."""
     _panel("Per-repo — Auto-merge", [
         f"Repo: {pal.BOLD}{repo}{pal.RESET}",
-        "When a loop exits cleanly (all reviewers satisfied), Buddhi can squash-merge",
+        "When a loop exits cleanly (all reviewers satisfied), Buddhi can squash-merge "
         "the PR and delete its branch automatically — or leave it open for you.",
     ], pal, stream)
     idx = single_select(
@@ -1698,13 +1780,13 @@ def step_repo_label_gated_ci(repo: str, current_default: bool, *, pal, stream,
     workflow that makes the opt-in a real saving is F4's job, not this step's.)"""
     _panel("Per-repo — Label-gated CI", [
         f"Repo: {pal.BOLD}{repo}{pal.RESET}",
-        "Label-gated CI saves Actions minutes: instead of CI running on every push,",
+        "Label-gated CI saves Actions minutes: instead of CI running on every push, "
         "Buddhi adds the `ready-for-ci` label right before merge so CI runs ONCE.",
         "",
         "CONSEQUENCE of turning this ON for this repo:",
         "  • CI will NOT run on your manual / intermediate pushes to a PR.",
-        "  • A required status check that gates on the label BLOCKS a human merge",
-        "    until the label is added.",
+        "  • A required status check that gates on the label BLOCKS a human merge "
+        "until the label is added.",
     ], pal, stream)
     idx = single_select(
         f"  Label-gated CI default for {repo}?",
@@ -1761,14 +1843,23 @@ def step_summary(plan: str, repo: Optional[str], reviewers: Sequence[str],
     confirms a bound repo, so it passes them)."""
     _panel("Step 7 — What's active", [], pal, stream)
     _kv("Claude plan", plan, pal, stream)
-    _kv("Repo", repo or "(inferred at runtime)", pal, stream)
+    _kv("Repo", repo or "(inferred at runtime from the git remote)", pal, stream)
     _kv("Reviewers", ", ".join(reviewers) or "(none)", pal, stream)
-    aoo = ", ".join(f"{b}:{'auto' if v else 'summon'}" for b, v in auto_on_open.items()) or "(none)"
-    _kv("Auto-on-open", aoo, pal, stream)
+    # Labeled auto / summon split reads clearer than a compact bot:auto|summon token.
+    auto_names = [b for b, v in auto_on_open.items() if v]
+    summon_names = [b for b, v in auto_on_open.items() if not v]
+    parts = []
+    if auto_names:
+        parts.append(f"auto: {', '.join(auto_names)}")
+    if summon_names:
+        parts.append(f"summon round 1: {', '.join(summon_names)}")
+    _kv("Auto-on-open", " · ".join(parts) or "(none)", pal, stream)
     if auto_merge is not None:
-        _kv("Auto-merge", "on" if auto_merge else "off", pal, stream)
+        _kv("Auto-merge", "on — clean PRs squash-merge" if auto_merge
+            else "off — you merge manually", pal, stream)
     if label_gated_ci is not None:
-        _kv("Label-gated CI", "on" if label_gated_ci else "off", pal, stream)
+        _kv("Label-gated CI", "on — CI deferred to the merge label" if label_gated_ci
+            else "off — CI runs on every push", pal, stream)
     _kv("Notifications", "console", pal, stream)
 
 
@@ -1781,6 +1872,20 @@ def step_done(path: Path, *, pal, stream) -> None:
         "Create a PR    : /create-pr",
     ], pal, stream)
     _teaser(_PRO_SOON_TEASER, pal, stream)
+
+
+def _offer_first_review(repo: Optional[str], *, pal, stream, input_fn=input) -> None:
+    """After setup completes, offer to go straight into the first review. On an
+    explicit Yes, print the EXACT launch command so the user runs a review without
+    hunting for the entry point. Fail-soft: a non-interactive run or a decline is a
+    no-op (nothing is printed and nothing is launched — setup already succeeded)."""
+    if not _is_tty():
+        return
+    if not _ask_yes_no("Review an open PR now?", default=False, input_fn=input_fn, stream=stream):
+        return
+    target = f" {repo}" if repo else ""
+    _row("step", f"Launch it:  /review-pr <pr-number>{target}   "
+                 "(omit the number to auto-select an open PR)", pal, stream)
 
 
 # ── Per-repo confirm mode (parity with the reference wizard) ───────────────────────
@@ -1999,6 +2104,7 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
                      auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
         if ok:
             step_done(cfg_path, pal=pal, stream=stream)
+            _offer_first_review(repo, pal=pal, stream=stream, input_fn=input_fn)
             return 0
         _row("bad", f"Could not write {cfg_path} — check the path's permissions", pal, stream)
         return 1
