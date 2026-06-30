@@ -102,6 +102,99 @@ def test_set_repo_keys_replaces_list_values_wholesale(tmp_path):
     assert config.active_reviewers(_read(cfg_path), REPO) == ("claude",)
 
 
+# ---------------------------------------------------------------------------
+# auto_on_open prune — a setup re-run that drops a reviewer must not leave that
+# bot's stale auto_on_open flag behind (active_reviewers is a list → replaced
+# wholesale, but auto_on_open is a dict → merged key-by-key, so the dropped bot's
+# flag would otherwise survive the re-run).
+# ---------------------------------------------------------------------------
+
+def test_set_repo_keys_prunes_stale_auto_on_open_on_reviewer_drop(tmp_path):
+    cfg_path = tmp_path / "config.yaml"
+    config.set_repo_keys(REPO, {
+        "active_reviewers": ["claude", "codex"],
+        "auto_on_open": {"claude": True, "codex": False},  # codex explicitly off
+    }, cfg_path)
+    # Re-run drops codex from the fleet; the wizard writes the full block for the
+    # new (smaller) fleet.
+    config.set_repo_keys(REPO, {
+        "active_reviewers": ["claude"],
+        "auto_on_open": {"claude": True},
+    }, cfg_path)
+    entry = config.repo_entry(_read(cfg_path), REPO)
+    assert entry["active_reviewers"] == ["claude"]
+    assert "codex" not in entry["auto_on_open"]          # the stale flag is gone
+    assert entry["auto_on_open"] == {"claude": True}
+    # With the stale codex flag pruned, the reader falls to codex's DEFAULT (True
+    # for a GitHub-App bot) — proving the stored False no longer shadows it.
+    assert config.auto_on_open(_read(cfg_path), "codex", REPO) is True
+
+
+def test_set_repo_keys_prunes_codex_even_when_write_omits_it_from_auto_on_open(tmp_path):
+    # The dormant-bug shape: the new fleet drops codex and the write's auto_on_open
+    # carries only the surviving bot. The dict-merge would keep the old codex flag;
+    # the prune drops it against the new active_reviewers list.
+    cfg_path = tmp_path / "config.yaml"
+    config.set_repo_keys(REPO, {
+        "active_reviewers": ["claude", "codex"],
+        "auto_on_open": {"claude": True, "codex": True},
+    }, cfg_path)
+    config.set_repo_keys(REPO, {
+        "active_reviewers": ["claude"],
+        "auto_on_open": {"claude": False},  # only the surviving bot
+    }, cfg_path)
+    entry = config.repo_entry(_read(cfg_path), REPO)
+    assert entry["auto_on_open"] == {"claude": False}    # codex pruned, claude updated
+
+
+def test_set_repo_keys_preserves_auto_on_open_for_still_active_bots(tmp_path):
+    # The prune must NEVER drop a flag for a bot still in the fleet — a partial
+    # update to one fleet bot (no active_reviewers in the write) leaves the others'
+    # flags intact and updates only the targeted bot.
+    cfg_path = tmp_path / "config.yaml"
+    config.set_repo_keys(REPO, {
+        "active_reviewers": ["claude", "copilot", "gemini"],
+        "auto_on_open": {"claude": False, "copilot": True, "gemini": True},
+    }, cfg_path)
+    config.set_repo_keys(REPO, {"auto_on_open": {"copilot": False}}, cfg_path)
+    entry = config.repo_entry(_read(cfg_path), REPO)
+    assert entry["active_reviewers"] == ["claude", "copilot", "gemini"]
+    assert entry["auto_on_open"] == {"claude": False, "copilot": False, "gemini": True}
+
+
+def test_set_repo_keys_does_not_prune_when_no_active_reviewers_present(tmp_path):
+    # A write of auto_on_open alone, against an entry that never carried an
+    # active_reviewers list, must NOT prune — pruning against an absent fleet would
+    # wipe every flag.
+    cfg_path = tmp_path / "config.yaml"
+    config.set_repo_keys(REPO, {"auto_on_open": {"copilot": True, "gemini": True}}, cfg_path)
+    entry = config.repo_entry(_read(cfg_path), REPO)
+    assert entry == {"auto_on_open": {"copilot": True, "gemini": True}}  # nothing wiped
+    # A second auto_on_open-only write still does not prune (no fleet to prune to).
+    config.set_repo_keys(REPO, {"auto_on_open": {"claude": True}}, cfg_path)
+    entry = config.repo_entry(_read(cfg_path), REPO)
+    assert entry["auto_on_open"] == {"copilot": True, "gemini": True, "claude": True}
+
+
+def test_set_repo_keys_does_not_prune_against_malformed_active_reviewers(tmp_path):
+    # A non-list active_reviewers (a malformed hand-edit) is not a usable fleet; the
+    # prune must treat it as absent and leave auto_on_open untouched rather than
+    # wipe every flag against it.
+    cfg_path = tmp_path / "config.yaml"
+    config.set_repo_keys(REPO, {
+        "active_reviewers": ["claude", "codex"],  # both in the fleet → nothing pruned yet
+        "auto_on_open": {"claude": True, "codex": True},
+    }, cfg_path)
+    seeded = _read(cfg_path)
+    seeded["repos"][config.norm_repo(REPO)]["active_reviewers"] = "claude"  # string, not list
+    from buddhi_review.wizard import write_config
+    write_config(seeded, cfg_path)
+    # An unrelated partial write must not trigger a prune against the bad fleet.
+    config.set_repo_keys(REPO, {"label_gated_ci": True}, cfg_path)
+    entry = config.repo_entry(_read(cfg_path), REPO)
+    assert entry["auto_on_open"] == {"claude": True, "codex": True}  # both survive
+
+
 def test_set_repo_keys_updates_in_place_case_insensitively(tmp_path):
     cfg_path = tmp_path / "config.yaml"
     config.set_repo_keys("Octocat/Hello-World", {"active_reviewers": ["claude"]}, cfg_path)

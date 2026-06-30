@@ -191,6 +191,27 @@ def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]
     return out
 
 
+def _prune_stale_auto_on_open(entry: Dict[str, Any]) -> None:
+    """Drop ``auto_on_open`` flags for bots no longer in ``entry``'s
+    ``active_reviewers``. :func:`_deep_merge` replaces the ``active_reviewers``
+    list wholesale but merges the ``auto_on_open`` dict key-by-key, so a setup
+    re-run that drops a reviewer would otherwise leave that bot's stale flag
+    behind. Prune only when the merged entry carries a **list**
+    ``active_reviewers`` — never against an absent or malformed fleet, which would
+    wipe every flag. Membership is the exact per-bot string match the
+    :func:`auto_on_open` reader uses, so a flag survives iff a current reviewer
+    would still look it up. Mutates ``entry`` in place, and only when a key is
+    actually dropped (a no-op leaves the merged block, and its identity, intact)."""
+    fleet = entry.get("active_reviewers")
+    block = entry.get("auto_on_open")
+    if not isinstance(fleet, list) or not isinstance(block, dict):
+        return
+    live = {str(b) for b in fleet}
+    pruned = {bot: flag for bot, flag in block.items() if bot in live}
+    if len(pruned) != len(block):
+        entry["auto_on_open"] = pruned
+
+
 def set_repo_keys(repo: str, keys: Dict[str, Any], path: Optional[Path] = None) -> bool:
     """Deep-merge ``keys`` into ``cfg["repos"][norm_repo(repo)]`` and persist the
     config atomically, leaving sibling repos and every unknown key intact.
@@ -200,8 +221,11 @@ def set_repo_keys(repo: str, keys: Dict[str, Any], path: Optional[Path] = None) 
     the ``repos[<repo>]`` entry, marks the repo confirmed (:func:`repo_entry`'s
     presence marker). An existing entry is updated in place under a
     case-insensitive match, so re-confirming a repo never spawns a duplicate
-    sibling key. Returns ``False`` (writing nothing) for an unusable repo / non-dict
-    ``keys`` or when the atomic write fails."""
+    sibling key. After the merge, ``auto_on_open`` is pruned to the resulting
+    ``active_reviewers`` (see :func:`_prune_stale_auto_on_open`) so a re-run that
+    drops a reviewer cannot leave that bot's stale flag behind. Returns ``False``
+    (writing nothing) for an unusable repo / non-dict ``keys`` or when the atomic
+    write fails."""
     key = norm_repo(repo)
     if key is None or not isinstance(keys, dict):
         return False
@@ -213,7 +237,13 @@ def set_repo_keys(repo: str, keys: Dict[str, Any], path: Optional[Path] = None) 
     # repo never gains a second, differently-cased sibling key.
     target = next((k for k in repos if str(k).strip().lower() == key), key)
     base = repos.get(target)
-    repos[target] = _deep_merge(base if isinstance(base, dict) else {}, keys)
+    merged = _deep_merge(base if isinstance(base, dict) else {}, keys)
+    # _deep_merge replaces the active_reviewers LIST wholesale but merges the
+    # auto_on_open DICT key-by-key, so a re-run that drops a reviewer would leave
+    # its stale auto_on_open flag behind. Prune the merged block back to the
+    # resulting fleet (no-op when the entry has no list active_reviewers).
+    _prune_stale_auto_on_open(merged)
+    repos[target] = merged
     cfg = dict(cfg)
     cfg["repos"] = repos
     # Reuse the wizard's single atomic, merge-preserving writer. Deferred import:
