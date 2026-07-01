@@ -289,7 +289,8 @@ def multi_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselected
 
 
 def _ask_yes_no(prompt: str, *, default: bool, input_fn=input, stream=None,
-                pal: Optional[_Palette] = None) -> bool:
+                pal: Optional[_Palette] = None,
+                single_select_fn: Optional[Callable] = None) -> bool:
     """A Yes/No question. On a real TTY it renders as the SAME arrow radio selector
     as every other prompt (↑/↓ + Enter over Yes / No) — one consistent pattern, never
     a bare ``[Y/n]`` text line. Off a TTY (pipes / CI) it falls back to the plain text
@@ -298,9 +299,10 @@ def _ask_yes_no(prompt: str, *, default: bool, input_fn=input, stream=None,
     Yes (True) or No (False)."""
     stream = stream or sys.stdout
     if _is_tty():
-        idx = single_select(prompt, [("Yes", ""), ("No", "")],
-                            preselect=0 if default else 1,
-                            pal=pal, stream=stream, input_fn=input_fn)
+        _ss = single_select_fn if single_select_fn is not None else single_select
+        idx = _ss(prompt, [("Yes", ""), ("No", "")],
+                  preselect=0 if default else 1,
+                  pal=pal, stream=stream, input_fn=input_fn)
         return idx == 0
     suffix = "[Y/n]" if default else "[y/N]"
     try:

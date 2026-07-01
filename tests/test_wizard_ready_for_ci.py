@@ -18,20 +18,7 @@ from pathlib import Path
 import pytest
 
 from buddhi_review import config, managed_files, wizard
-
-
-def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
-    """Bridge single_select for _ask_yes_no on a forced TTY: reads the test's
-    input_fn (which supplies 'y'/'n'/'') and maps to an option index."""
-    try:
-        raw = (input_fn(prompt) or "").strip().lower()
-    except EOFError:
-        raw = ""
-    if raw in ("y", "yes", "1"):
-        return 0
-    if raw in ("n", "no", "2"):
-        return 1
-    return preselect
+from conftest import _yn_bridge
 
 # The version the bundled ready-for-ci template currently ships at — an installed
 # copy at this version is "up to date" and must NOT be offered an update.
