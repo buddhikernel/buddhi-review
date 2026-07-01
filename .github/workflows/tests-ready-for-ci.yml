@@ -1,17 +1,36 @@
+# buddhi-managed-version: 1
+# ^ Buddhi tracks this file's version so `review-pr setup` can offer to update an
+#   outdated installed copy (the old one stays in the update PR's git history).
 # ──────────────────────────────────────────────────────────────────────────────
-# Label-gated CI — buddhi-review's own CI runs only when the `ready-for-ci` label
-# is present. The merge automation (the Buddhi review loop) adds that label right
-# before it merges; the job below runs only when the label is present, then the
-# loop waits for it to go green before merging. Pushes made before the label is
-# applied are skipped (SKIPPED-IS-SUCCESS by design — see the job-level `if`).
+# Label-gated CI — your CI runs ONCE, at merge, instead of on every push.
 #
-# Note: the workflow fires on both `labeled` and `synchronize` events. If new
-# commits are pushed while `ready-for-ci` is already applied, this job re-runs —
-# so it may run more than once per PR in that case.
+# WHY THIS GATE EXISTS
+#   While a pull request is under review it gets pushed to many times. Running the
+#   full CI suite on every one of those pushes burns CI minutes for little
+#   benefit. This workflow defers CI to merge time: the merge automation adds the
+#   `ready-for-ci` label to a PR right before it merges, and the job below runs
+#   ONLY when that label is present. Pushes made before the label is added cost no
+#   runner minutes.
 #
-# This is buddhi-review's real CI — the full pytest suite + the fail-closed
-# publish-readiness gate — so the gate is a genuine merge check, not the
-# `exit 1` placeholder the setup wizard ships for a brand-new repo.
+# HOW IT WORKS
+#   on.pull_request.types:
+#     - labeled       fires the instant the `ready-for-ci` label is added — this
+#                     is the run that gates the merge.
+#     - synchronize   re-runs if the PR is pushed again AFTER it already carries
+#                     the label (e.g. a rebase before merge), so the gate always
+#                     reflects the commit being merged.
+#   The job-level `if:` is the real gate: the job is skipped unless the
+#   `ready-for-ci` label is currently on the PR, so pushes made before the label
+#   is added never spend a runner.
+#
+# YOUR CI COMMAND
+#   The Buddhi setup wizard wires this gate FOR you: it detects your repo's test /
+#   lint / build command, confirms it with you, and substitutes it into the single
+#   `run:` step below at install time. If you instead copy this file in by hand,
+#   replace that one `run:` line with your own command (for example `make ci`,
+#   `npm test`, or `go test ./...`). Leave the `on:` block and the job-level `if:`
+#   guard unchanged — they are what make the label gate work and what the merge
+#   automation detects before it trusts the gate.
 # ──────────────────────────────────────────────────────────────────────────────
 name: Ready-for-CI
 
@@ -20,26 +39,32 @@ on:
     types: [labeled, synchronize]
 
 permissions:
-  contents: read
+  contents: read          # checkout only — widen if your CI needs more scopes
 
 jobs:
   ci:
-    # The gate: the job is skipped unless the `ready-for-ci` label is on the PR, so
-    # pushes made before the label is added never spend a runner. SKIPPED-IS-SUCCESS
-    # is intentional — the GATE is the merge automation (it adds the label, which
-    # fires a fresh run of this job, and waits for THAT run to go green). Do NOT mark
-    # this check as a REQUIRED status check in branch protection — that is the one
-    # posture where a pre-label skipped-success could satisfy the merge before the
-    # real labeled run executes.
+    # The gate. Do NOT remove this guard: without it CI runs on every push and
+    # the whole point of label-gating (running CI once, at merge) is lost.
+    #
+    # SKIPPED-IS-SUCCESS IS INTENTIONAL HERE. On a push without the label this
+    # job is skipped, and GitHub reports a skipped job as success. That is safe
+    # in this design because the GATE is the merge automation, not branch
+    # protection: at merge time the automation adds the `ready-for-ci` label,
+    # which fires a FRESH run of this job (the `labeled` trigger above), and it
+    # waits for THAT run to go green before it merges. So do NOT mark this job's
+    # check as a REQUIRED status check in branch protection — a required-check
+    # posture is the one configuration where a pre-label skipped-success could
+    # satisfy the merge before the real labeled run executes. Let the merge
+    # automation own the gate.
     if: contains(github.event.pull_request.labels.*.name, 'ready-for-ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: '3.11'
-      # buddhi-review's real CI: the full pytest suite + the fail-closed
-      # publish-readiness gate (the repo's only full-suite + publish-gate run).
-      - run: pip install -e '.[test]' build setuptools wheel
-      - run: python -m pytest -q
-      - run: python tools/publish_gate.py scan
+      - uses: actions/checkout@v4
+      # ── Your CI command ──────────────────────────────────────────────────────
+      # The setup wizard substitutes your detected+confirmed CI command into the
+      # `run:` step below at install time. By hand: replace that one line with your
+      # real test / lint / build command (e.g. `make ci`, `npm test`,
+      # `go test ./...`).
+      - name: CI
+        run: |
+          python -m pip install -e . && python -m pytest
