@@ -15,6 +15,103 @@ questions right in your terminal.
 New here? **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
 walks you from `pip install` through your first reviewed PR.
 
+## Why a panel, and why rounds
+
+Buddhi doesn't hand your PR to one reviewer. It fans it out to a panel of models from
+*different* labs — Claude, Copilot, Codex, Gemini — and keeps flying review rounds
+until a whole round comes back clean. Three reasons that beats one strong reviewer
+running once.
+
+**Different labs, different blind spots.** You have probably watched one reviewer flag
+a real bug another signed off on. Across many PRs that stops being luck and becomes the
+whole point: models trained by different labs, on different data, fail *differently* —
+so where one is blind, another tends to see. This is the ensemble-diversity result (a
+panel's misses shrink the less its members' errors overlap), and it has been measured
+on today's models: same-vendor models make *more correlated* errors than cross-vendor
+ones [[1](https://arxiv.org/abs/2506.07962)]. A model is also soft on its own work — it
+rates its own output more favorably than another model's
+[[2](https://arxiv.org/abs/2404.13076)] — so a reviewer from a *different* family is not
+just a second pair of eyes, it is a less self-flattering one.
+
+**A fix is a new change — so it needs a fresh look.** When a fixer resolves a round-1
+comment, it edits the code, and an edit can be wrong or introduce a new bug that exists
+*only because* of the fix. Re-reading the *fixed* code catches regressions the first
+pass could not have seen — and the review that counts most is by a *different* model
+than the one that wrote the fix, for the self-preference reason above. That is the real
+answer to "the bots already fixed round 1, so why loop?": a model re-reading its own fix
+is grading its own homework.
+
+**Stop at a clean round — not at a fixed count, and not at "zero findings."** More
+rounds are not automatically better: repeated review tends to plateau within a few
+rounds, and pushing past that entrenches noise instead of removing it
+[[3](https://arxiv.org/abs/2305.14325)]. So Buddhi does not loop a set number of times.
+Each round it re-summons the reviewers on the *fixed* code and waits for every one to
+post a definitive signal — a clean bill of health, or an "out of quota / diff too
+large." Convergence is the moment a **whole round comes back clean** — every reviewer
+signalling it has nothing left to raise — not a counter hitting zero. Two guardrails
+keep it honest: there is always at least one confirmation round after the last fix, so a
+fix never lands unreviewed; and the round budget scales with the size of the change (a
+one-line tweak gets a couple of rounds, a thousand-line diff earns more). If the loop
+*cannot* reach a clean round — a fix keeps failing, or a reviewer raises a question only
+you can answer — it stops and hands the PR back rather than circling a settled diff.
+(Buddhi claims nothing more: no model here is superhuman, and agreement between models is
+not proof of correctness — a diverse panel reviewing to a clean round simply catches more
+than one reviewer running once.)
+
+```mermaid
+flowchart LR
+  PR[Pull request] --> R{Panel review<br/>of the current code}
+  R --> C1[Claude]
+  R --> C2[Copilot]
+  R --> C3[Codex]
+  R --> C4[Gemini]
+  C1 & C2 & C3 & C4 --> F[Collect + dedupe findings]
+  F --> Q{Whole round clean?}
+  Q -- "no — findings remain" --> FIX[Fix, then re-review the FIXED code]
+  FIX --> R
+  Q -- "yes — every reviewer clean" --> DONE[Converged — clear to land]
+```
+
+A real run converging — new findings per review round in
+[buddhikernel/buddhi-review#22](https://github.com/buddhikernel/buddhi-review/pull/22),
+which merged clean after five rounds:
+
+```mermaid
+xychart-beta
+  title "New findings per round (real run, PR 22)"
+  x-axis [R1, R2, R3, R4, R5]
+  y-axis "New actionable findings" 0 --> 7
+  bar [6, 1, 1, 1, 0]
+```
+
+<details>
+<summary><b>The research behind this</b></summary>
+
+- **Ensemble diversity / error decorrelation** — a group's error shrinks in proportion
+  to how *uncorrelated* its members' mistakes are. Classical roots: Krogh & Vedelsby,
+  *Neural Network Ensembles* (NeurIPS 1995); the Condorcet Jury Theorem; Surowiecki,
+  *The Wisdom of Crowds* (2004).
+- **[1] Same-vendor models are more error-correlated than cross-vendor ones** — Kim et
+  al., [*Correlated Errors in Large Language Models*](https://arxiv.org/abs/2506.07962).
+  Honest caveat from the same paper: that decorrelation *shrinks* for the largest,
+  most-accurate models — cross-vendor diversity helps, but it is not a free lunch at the
+  frontier, which is part of why Buddhi does not just stack rounds forever.
+- **[2] Self-preference bias** — Panickssery et al.,
+  [*LLM Evaluators Recognize and Favor Their Own Generations*](https://arxiv.org/abs/2404.13076):
+  an LLM rates text it wrote more favorably than another model's.
+- **[3] Rounds plateau** — multi-agent debate gains saturate after a few rounds (Du et
+  al., [*Improving Factuality and Reasoning through Multiagent Debate*](https://arxiv.org/abs/2305.14325));
+  pushing further tends to entrench errors rather than remove them.
+- **Why Buddhi *unions and dedupes* findings rather than making models vote** — voting
+  correlated judges caps out fast (even ~9 diverse LLM judges behave like ~2 independent
+  votes: Kohli, [*Nine Judges, Two Effective Votes*](https://arxiv.org/abs/2605.29800)),
+  whereas a diverse cross-vendor panel beats a single strong judge in LLM *evaluation*
+  (Cohere, [*Replacing Judges with Juries* / PoLL](https://arxiv.org/abs/2404.18796)).
+  Finding bugs is a *coverage* problem — keep every reviewer's real catch — not a
+  majority vote, so Buddhi takes the union and skips the voting ceiling.
+
+</details>
+
 ## What it is
 
 Buddhi splits a PR review into two halves: the decision, and the I/O around it. The
