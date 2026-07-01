@@ -17,10 +17,9 @@ walks you from `pip install` through your first reviewed PR.
 
 ## Why a panel, and why rounds
 
-Buddhi doesn't hand your PR to one reviewer. It fans it out to a panel of models from
-*different* labs — Claude, Copilot, Codex, Gemini — and keeps flying review rounds
-until a whole round comes back clean. Three reasons that beats one strong reviewer
-running once.
+Buddhi doesn't hand your PR to one reviewer. It fans it out to a panel of independent
+models from *different* labs, and keeps flying review rounds until a round comes back
+clean. Three reasons that beats one strong reviewer running once.
 
 **Different labs, different blind spots.** You have probably watched one reviewer flag
 a real bug another signed off on. Across many PRs that stops being luck and becomes the
@@ -41,35 +40,35 @@ than the one that wrote the fix, for the self-preference reason above. That is t
 answer to "the bots already fixed round 1, so why loop?": a model re-reading its own fix
 is grading its own homework.
 
-**Stop at a clean round — not at a fixed count, and not at "zero findings."** More
-rounds are not automatically better: repeated review tends to plateau within a few
+**It converges on a clean round — not on a fixed count, and not on "zero findings."**
+More rounds are not automatically better: repeated review tends to plateau within a few
 rounds, and pushing past that entrenches noise instead of removing it
 [[3](https://arxiv.org/abs/2305.14325)]. So Buddhi does not loop a set number of times.
-Each round it re-summons the reviewers on the *fixed* code and waits for every one to
-post a definitive signal — a clean bill of health, or an "out of quota / diff too
-large." Convergence is the moment a **whole round comes back clean** — every reviewer
-signalling it has nothing left to raise — not a counter hitting zero. Two guardrails
-keep it honest: there is always at least one confirmation round after the last fix, so a
-fix never lands unreviewed; and the round budget scales with the size of the change (a
-one-line tweak gets a couple of rounds, a thousand-line diff earns more). If the loop
-*cannot* reach a clean round — a fix keeps failing, or a reviewer raises a question only
-you can answer — it stops and hands the PR back rather than circling a settled diff.
-(Buddhi claims nothing more: no model here is superhuman, and agreement between models is
-not proof of correctness — a diverse panel reviewing to a clean round simply catches more
+Each round it re-summons the reviewers on the *fixed* code, acts on the findings they
+raise — fixing the substantive and the cosmetic ones alike — and goes again. Convergence
+is the round that comes back with **no new findings to act on**: not the reviewers
+falling silent, and not a count that started at zero, but the loop having resolved
+everything actionable, cosmetic nits included. Two guardrails keep it honest: there is
+always at least one confirmation round after the last fix, so a fix never lands
+unreviewed, and the round budget scales with the size of the change (a one-line tweak
+gets a couple of rounds, a thousand-line diff earns more). Convergence is not the same as
+escalation: when a comment genuinely needs your judgment, Buddhi asks you instead — a
+separate mechanism, described in [*When it asks you*](#when-it-asks-you) below. (Buddhi
+claims nothing more: no model here is superhuman, and agreement between models is not
+proof of correctness — a diverse panel reviewing to a clean round simply catches more
 than one reviewer running once.)
 
 ```mermaid
 flowchart LR
   PR[Pull request] --> R{Panel review<br/>of the current code}
-  R --> C1[Claude]
-  R --> C2[Copilot]
-  R --> C3[Codex]
-  R --> C4[Gemini]
-  C1 & C2 & C3 & C4 --> F[Collect + dedupe findings]
-  F --> Q{Whole round clean?}
-  Q -- "no — findings remain" --> FIX[Fix, then re-review the FIXED code]
+  R --> C1[Reviewer<br/>lab A]
+  R --> C2[Reviewer<br/>lab B]
+  R --> C3[Reviewer<br/>lab C]
+  C1 & C2 & C3 --> F[Collect + dedupe findings]
+  F --> Q{New findings<br/>to act on?}
+  Q -- "yes" --> FIX[Fix, then re-review the FIXED code]
   FIX --> R
-  Q -- "yes — every reviewer clean" --> DONE[Converged — clear to land]
+  Q -- "no — clean round" --> DONE[Converged — clear to land]
 ```
 
 A real run converging — new findings per review round in
