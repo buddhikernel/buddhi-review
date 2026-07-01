@@ -859,11 +859,14 @@ def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
         # run opened it) — the branch push above still succeeds, so this is not a real
         # failure. Detect the existing PR and return it, mirroring create-pr.sh's
         # idempotent gh-pr-view fallback, instead of a scary "opening the PR failed".
-        existing = run(["gh", "pr", "view", branch, "--repo", repo,
-                        "--json", "url", "--jq", ".url"], timeout=20)
-        ex_url = (getattr(existing, "stdout", "") or "").strip()
-        if getattr(existing, "returncode", 1) == 0 and ex_url:
-            return (True, ex_url)
+        try:
+            existing = run(["gh", "pr", "view", branch, "--repo", repo,
+                            "--json", "url", "--jq", ".url"], timeout=20)
+            ex_url = (getattr(existing, "stdout", "") or "").strip()
+            if getattr(existing, "returncode", 1) == 0 and ex_url:
+                return (True, ex_url)
+        except Exception:
+            pass
         return (False, "branch pushed but opening the PR failed")
     out = (getattr(pr, "stdout", "") or "").strip()
     url = out.splitlines()[-1] if out else "(PR opened)"
