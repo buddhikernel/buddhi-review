@@ -120,7 +120,7 @@ python3 -m buddhi_review self-check
 ```
 
 ```text
-buddhi_review 0.1.0 — kernel-driven self-check
+buddhi_review <version> — kernel-driven self-check
 
 
 [Clearance — a decision the loop needs from you] How should item 'c4' be handled?
@@ -192,7 +192,7 @@ fix calls run on your machine against your Claude subscription:
 | Surface | Whose meter it spends |
 |---|---|
 | **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
-| **`claude[bot]` review** | Your **GitHub Actions minutes** (the bundled `claude-code-review.yml` workflow runs on each summon) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
+| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
 | **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
 | **Gemini review** | Your **Gemini Code Assist** entitlement. |
 | **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |

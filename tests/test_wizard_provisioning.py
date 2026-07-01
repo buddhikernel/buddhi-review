@@ -14,6 +14,7 @@ import types
 import pytest
 
 from buddhi_review import wizard
+from conftest import _yn_bridge
 
 
 def _R(returncode=0, stdout="", stderr=""):
@@ -398,6 +399,7 @@ def test_set_claude_secret_personal_repo_never_offers_org(monkeypatch):
 
 def test_offer_install_feature_branch_opens_server_side_pr(monkeypatch, tmp_path):
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
 
     def router(argv, _inp):
         if argv[:2] == ["git", "-C"] and "rev-parse" in argv:
@@ -420,6 +422,7 @@ def test_offer_install_feature_branch_opens_server_side_pr(monkeypatch, tmp_path
 
 def test_offer_install_default_branch_writes_local(monkeypatch, tmp_path):
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
 
     def router(argv, _inp):
         if argv[:2] == ["git", "-C"] and "rev-parse" in argv:
@@ -777,6 +780,7 @@ def test_offer_gh_token_stores_after_valid_probe(monkeypatch):
     # the ✓ row names the authenticated login, and the probe authenticated as the
     # PASTED token in env (never on argv).
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     run, calls = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
     seen = _capture_upsert(monkeypatch)
     pal, buf = wizard._Palette(False), io.StringIO()
@@ -796,6 +800,7 @@ def test_offer_gh_token_invalid_never_stored_bounded_reprompt(monkeypatch):
     # is NEVER stored, guidance is shown, and getpass is called exactly twice (bounded
     # re-prompt, then skip — never an unbounded loop).
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     run, calls = _gh_probe_run(_R(returncode=1, stderr="gh: Bad credentials (HTTP 401)"),
                                _R(returncode=1, stderr="gh: Bad credentials (HTTP 401)"))
     seen = _capture_upsert(monkeypatch)
@@ -818,6 +823,7 @@ def test_offer_gh_token_invalid_never_stored_bounded_reprompt(monkeypatch):
 def test_offer_gh_token_invalid_then_valid_stores(monkeypatch):
     # Re-prompt recovery: a rejected paste, then an accepted one → stored on the second.
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     run, calls = _gh_probe_run(_R(returncode=1, stderr="HTTP 401"),
                                _R(returncode=0, stdout="octocat\n"))
     seen = _capture_upsert(monkeypatch)
@@ -832,6 +838,7 @@ def test_offer_gh_token_network_failure_not_stored(monkeypatch):
     # A spawn / network failure (run raises) → not verifiable → fail CLOSED: not stored,
     # guidance shown. The rc-written token must never be persisted unverified.
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     run, calls = _gh_probe_run(OSError("gh: network unreachable"),
                                OSError("gh: network unreachable"))
     seen = _capture_upsert(monkeypatch)
@@ -846,6 +853,7 @@ def test_offer_gh_token_network_failure_not_stored(monkeypatch):
 def test_offer_gh_token_blank_paste_skips(monkeypatch):
     # A blank paste → skip immediately: NO probe, NO store (the existing early-return).
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     run, calls = _gh_probe_run()
     seen = _capture_upsert(monkeypatch)
     pal, buf = wizard._Palette(False), io.StringIO()
@@ -870,6 +878,7 @@ def test_offer_gh_token_non_tty_noop(monkeypatch):
 def test_offer_gh_token_declined_noop(monkeypatch):
     # The user declines the GH_TOKEN prompt → no probe, no store.
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     run, calls = _gh_probe_run()
     seen = _capture_upsert(monkeypatch)
     pal, buf = wizard._Palette(False), io.StringIO()
@@ -886,6 +895,7 @@ def test_offer_gh_token_probe_forces_pasted_token_over_ambient(monkeypatch):
     # GITHUB_TOKEN, per its documented precedence — that resolution lives in gh, not
     # here). If the code stopped forcing GH_TOKEN, this fails.
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     monkeypatch.setenv("GITHUB_TOKEN", "ambient-WRONG")
     run, calls = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
     _capture_upsert(monkeypatch)
@@ -902,6 +912,7 @@ def test_offer_gh_token_value_never_logged(monkeypatch):
     # code prints the login + rc path, never the token) — on BOTH success and failure.
     secret = "ghp_SUPER_SECRET_VALUE"
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     run_ok, _ = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
     _capture_upsert(monkeypatch)
     pal, buf = wizard._Palette(False), io.StringIO()

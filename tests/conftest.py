@@ -13,6 +13,20 @@ import pytest
 from buddhi_review import fix_apply
 
 
+def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
+    """Bridge single_select for _ask_yes_no on a forced TTY: reads the test's
+    input_fn (which supplies 'y'/'n'/'') and maps to an option index."""
+    try:
+        raw = (input_fn(prompt) or "").strip().lower()
+    except EOFError:
+        raw = ""
+    if raw in ("y", "yes", "1"):
+        return 0
+    if raw in ("n", "no", "2"):
+        return 1
+    return preselect
+
+
 @pytest.fixture(autouse=True)
 def _hermetic_pr_intent(monkeypatch):
     fix_apply.reset_pr_intent()

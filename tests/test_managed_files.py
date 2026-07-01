@@ -15,6 +15,7 @@ import types
 import pytest
 
 from buddhi_review import managed_files, wizard
+from conftest import _yn_bridge
 
 
 def _R(returncode=0, stdout="", stderr=""):
@@ -111,6 +112,8 @@ def _update_router(*, head_sha="cafe", pr_url="https://github.com/o/r/pull/5",
 
 def _offer_update(installed_text, *, is_tty, monkeypatch, run=None, accept=True):
     monkeypatch.setattr(wizard, "_is_tty", lambda: is_tty)
+    if is_tty:
+        monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     buf = io.StringIO()
     calls = []
 

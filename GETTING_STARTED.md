@@ -106,6 +106,11 @@ gh secret set CLAUDE_CODE_OAUTH_TOKEN   # or: gh secret set ANTHROPIC_API_KEY
 Ship the workflow verbatim: its prompt emits a literal `No issues found.` line on a
 clean review, and the loop's clean-review detector is coupled to that exact string.
 
+**Re-running `/review-pr setup` keeps this current.** If Claude's reviews go silent,
+its stored token may have expired or been mis-pasted — setup checks the repo's last
+run and offers to re-mint the secret. It also offers to update the bundled workflow
+when a newer version has shipped (your old copy stays in the update PR's history).
+
 The full per-reviewer how-to (apps, plans, triggers, and the `auto_on_open` setting
 for each) is in
 [`references/reviewer-setup.md`](https://github.com/buddhikernel/buddhi-review/blob/main/buddhi_review/skills/review-pr/references/reviewer-setup.md).
@@ -181,7 +186,7 @@ fix calls run on your machine against your Claude subscription:
 | Surface | Whose meter it spends |
 |---|---|
 | **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
-| **`claude[bot]` review** | Your **GitHub Actions minutes** (the bundled `claude-code-review.yml` workflow runs on each summon) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
+| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
 | **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
 | **Gemini review** | Your **Gemini Code Assist** entitlement. |
 | **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |

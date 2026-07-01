@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from buddhi_review import config, managed_files, wizard
+from conftest import _yn_bridge
 
 # The version the bundled ready-for-ci template currently ships at — an installed
 # copy at this version is "up to date" and must NOT be offered an update.
@@ -249,14 +250,23 @@ class _tty:
     def __init__(self, value):
         self.value = value
         self._orig = None
+        self._orig_ss = None
 
     def __enter__(self):
         self._orig = wizard._is_tty
         wizard._is_tty = lambda: self.value
+        if self.value:
+            # On a forced TTY, _ask_yes_no routes through the module-level
+            # single_select (which requires _read_key / a real TTY).  Replace it
+            # with a bridge that reads the test's input_fn instead.
+            self._orig_ss = wizard.single_select
+            wizard.single_select = _yn_bridge
         return self
 
     def __exit__(self, *a):
         wizard._is_tty = self._orig
+        if self.value:
+            wizard.single_select = self._orig_ss
 
 
 def test_offer_skips_when_already_present_and_current(tmp_path):

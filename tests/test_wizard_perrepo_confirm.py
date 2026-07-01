@@ -14,6 +14,8 @@ import types
 import pytest
 
 from buddhi_review import config, wizard
+from conftest import _yn_bridge
+
 
 REPO = "octocat/Hello-World"
 # Reviewer indices in wizard._REVIEWERS == ("copilot", "gemini", "codex", "claude").
@@ -26,6 +28,10 @@ def _interactive(monkeypatch):
     F1 fail-closed install-confirmation gate can obtain its explicit Yes. Without
     this the gate (correctly) drops every reviewer for lack of a TTY to confirm on."""
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    # On a forced TTY, _ask_yes_no routes through the module-level single_select
+    # (which requires _read_key / a real TTY).  Replace it with a bridge that reads
+    # the test's input_fn instead, so yes/no questions are driveable from tests.
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
 
 
 # ── Injected seams ─────────────────────────────────────────────────────────────────
