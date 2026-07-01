@@ -224,8 +224,8 @@ def single_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselect:
         elif key == "enter":
             print("", file=stream)
             return cursor
-        elif shortcuts and key in shortcuts:
-            cursor = shortcuts[key]
+        elif shortcuts and key.lower() in shortcuts:
+            cursor = shortcuts[key.lower()]
             _clear_choices(len(options), stream)
             _render_choices(options, cursor, {cursor}, True, pal, stream)
             print("", file=stream)
