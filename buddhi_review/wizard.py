@@ -195,13 +195,16 @@ def _numbered_select(prompt: str, options: Sequence[Tuple[str, str]], preselect:
 def single_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselect: int = 0,
                   pal: Optional[_Palette] = None, stream=None, input_fn=input) -> int:
     """A radio selector → the chosen index. Raw-mode arrows on a TTY; a numbered
-    prompt otherwise."""
+    prompt otherwise. Emits a trailing blank line so the answered question is set off
+    from whatever the wizard prints next (consistent vertical rhythm)."""
     stream = stream or sys.stdout
     pal = pal or _Palette(_colour_enabled(stream))
     if not options:
         return preselect
     if not _is_tty():
-        return _numbered_select(prompt, options, preselect, pal, stream, input_fn)
+        idx = _numbered_select(prompt, options, preselect, pal, stream, input_fn)
+        print("", file=stream)
+        return idx
     cursor = max(0, min(preselect, len(options) - 1))
     print(prompt, file=stream)
     _render_choices(options, cursor, {cursor}, True, pal, stream)
@@ -209,12 +212,14 @@ def single_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselect:
         try:
             key = _read_key()
         except EOFError:
+            print("", file=stream)
             return cursor
         if key == "up":
             cursor = (cursor - 1) % len(options)
         elif key == "down":
             cursor = (cursor + 1) % len(options)
         elif key == "enter":
+            print("", file=stream)
             return cursor
         else:
             continue
@@ -255,7 +260,9 @@ def multi_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselected
     if not options:
         return selected
     if not _is_tty():
-        return _numbered_multiselect(prompt, options, selected, pal, stream, input_fn)
+        chosen = _numbered_multiselect(prompt, options, selected, pal, stream, input_fn)
+        print("", file=stream)
+        return chosen
     cursor = 0
     print(prompt, file=stream)
     print(f"  {pal.DIM}↑/↓ move · Space toggle · Enter confirm{pal.RESET}", file=stream)
@@ -264,6 +271,7 @@ def multi_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselected
         try:
             key = _read_key()
         except EOFError:
+            print("", file=stream)
             return selected
         if key == "up":
             cursor = (cursor - 1) % len(options)
@@ -272,6 +280,7 @@ def multi_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselected
         elif key == "space":
             selected.symmetric_difference_update({cursor})
         elif key == "enter":
+            print("", file=stream)
             return selected
         else:
             continue
@@ -279,12 +288,26 @@ def multi_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselected
         _render_choices(options, cursor, selected, False, pal, stream)
 
 
-def _ask_yes_no(prompt: str, *, default: bool, input_fn, stream) -> bool:
+def _ask_yes_no(prompt: str, *, default: bool, input_fn=input, stream=None,
+                pal: Optional[_Palette] = None) -> bool:
+    """A Yes/No question. On a real TTY it renders as the SAME arrow radio selector
+    as every other prompt (↑/↓ + Enter over Yes / No) — one consistent pattern, never
+    a bare ``[Y/n]`` text line. Off a TTY (pipes / CI) it falls back to the plain text
+    prompt, exactly like the other selectors' numbered fallback. Either way it leaves
+    a trailing blank line so consecutive prompts breathe. ``default`` pre-selects
+    Yes (True) or No (False)."""
+    stream = stream or sys.stdout
+    if _is_tty():
+        idx = single_select(prompt, [("Yes", ""), ("No", "")],
+                            preselect=0 if default else 1,
+                            pal=pal, stream=stream, input_fn=input_fn)
+        return idx == 0
     suffix = "[Y/n]" if default else "[y/N]"
     try:
         raw = input_fn(f"  {prompt} {suffix}: ").strip().lower()
     except EOFError:
-        return default
+        raw = ""
+    print("", file=stream)
     if not raw:
         return default
     return raw in ("y", "yes")

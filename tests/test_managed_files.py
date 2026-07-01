@@ -17,6 +17,20 @@ import pytest
 from buddhi_review import managed_files, wizard
 
 
+def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
+    """Bridge single_select for _ask_yes_no on a forced TTY: reads the test's
+    input_fn (which supplies 'y'/'n'/'') and maps to an option index."""
+    try:
+        raw = (input_fn(prompt) or "").strip().lower()
+    except EOFError:
+        raw = ""
+    if raw in ("y", "yes", "1"):
+        return 0
+    if raw in ("n", "no", "2"):
+        return 1
+    return preselect
+
+
 def _R(returncode=0, stdout="", stderr=""):
     return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
@@ -111,6 +125,8 @@ def _update_router(*, head_sha="cafe", pr_url="https://github.com/o/r/pull/5",
 
 def _offer_update(installed_text, *, is_tty, monkeypatch, run=None, accept=True):
     monkeypatch.setattr(wizard, "_is_tty", lambda: is_tty)
+    if is_tty:
+        monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     buf = io.StringIO()
     calls = []
 

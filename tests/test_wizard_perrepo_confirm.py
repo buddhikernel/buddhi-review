@@ -15,6 +15,21 @@ import pytest
 
 from buddhi_review import config, wizard
 
+
+def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
+    """Bridge single_select for _ask_yes_no on a forced TTY: reads the test's
+    input_fn (which supplies 'y'/'n'/'') and maps to an option index."""
+    try:
+        raw = (input_fn(prompt) or "").strip().lower()
+    except EOFError:
+        raw = ""
+    if raw in ("y", "yes", "1"):
+        return 0
+    if raw in ("n", "no", "2"):
+        return 1
+    return preselect
+
+
 REPO = "octocat/Hello-World"
 # Reviewer indices in wizard._REVIEWERS == ("copilot", "gemini", "codex", "claude").
 COPILOT, GEMINI, CODEX, CLAUDE = 0, 1, 2, 3
@@ -26,6 +41,10 @@ def _interactive(monkeypatch):
     F1 fail-closed install-confirmation gate can obtain its explicit Yes. Without
     this the gate (correctly) drops every reviewer for lack of a TTY to confirm on."""
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    # On a forced TTY, _ask_yes_no routes through the module-level single_select
+    # (which requires _read_key / a real TTY).  Replace it with a bridge that reads
+    # the test's input_fn instead, so yes/no questions are driveable from tests.
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
 
 
 # ── Injected seams ─────────────────────────────────────────────────────────────────

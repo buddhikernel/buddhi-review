@@ -7,6 +7,21 @@ import pytest
 
 from buddhi_review import wizard
 
+
+def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
+    """Bridge single_select for _ask_yes_no on a forced TTY: reads the test's
+    input_fn (which supplies 'y'/'n'/'') and maps to an option index."""
+    try:
+        raw = (input_fn(prompt) or "").strip().lower()
+    except EOFError:
+        raw = ""
+    if raw in ("y", "yes", "1"):
+        return 0
+    if raw in ("n", "no", "2"):
+        return 1
+    return preselect
+
+
 # Keys that must NEVER appear in a free config (they are paid surface).
 _PAID_KEYS = (
     "telegram_bot_token", "telegram_chat_id", "github_account_plan",
@@ -426,6 +441,7 @@ def test_install_gate_enables_app_reviewers_on_explicit_yes(monkeypatch, tmp_pat
     through the same gate; on confirm they are enabled and their auto_on_open default
     (True — they auto-review on PR open) is captured."""
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     enabled, aoo, _ = _run_step_reviewers(
         bots=["copilot", "gemini", "codex"], single_select=_ss_yes, tmp_path=tmp_path)
     assert enabled == ["copilot", "gemini", "codex"]
@@ -449,6 +465,7 @@ def test_install_gate_partial_confirmation_drops_only_the_declined(monkeypatch, 
     prompt carries the lowercase bot id) drops it from BOTH the fleet and auto_on_open
     while Copilot/Codex stay."""
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
 
     def ss(prompt, options, *, preselect=0, **kw):
         return 0 if "'gemini'" in prompt else 1   # decline gemini, confirm the rest
@@ -466,6 +483,7 @@ def test_offer_first_review_prints_command_on_yes(monkeypatch):
     """At Done the wizard offers to start the first review; an explicit Yes prints the
     EXACT launch command (with the repo) so the user goes straight into a review."""
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     buf = io.StringIO()
     wizard._offer_first_review("acme/widgets", pal=wizard._Palette(False), stream=buf,
                                input_fn=lambda *a: "y")
@@ -476,6 +494,7 @@ def test_offer_first_review_silent_on_decline_or_non_tty(monkeypatch):
     """Decline or no TTY → nothing printed and nothing launched (setup already
     succeeded; the offer is a convenience, never a gate)."""
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     buf = io.StringIO()
     wizard._offer_first_review("acme/widgets", pal=wizard._Palette(False), stream=buf,
                                input_fn=lambda *a: "")
@@ -492,6 +511,7 @@ def test_full_run_offers_first_review_at_done(monkeypatch, tmp_path):
     'Review an open PR now?' prints the launch command."""
     monkeypatch.delenv("BUDDHI_NO_UPSELL", raising=False)
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     # Neuter the Claude secret / update sub-prompts so only the prompts under test run.
     monkeypatch.setattr(wizard, "_set_claude_secret", lambda *a, **k: "present")
     monkeypatch.setattr(wizard, "_offer_update_managed_file", lambda *a, **k: None)
