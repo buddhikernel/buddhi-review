@@ -193,10 +193,13 @@ def _numbered_select(prompt: str, options: Sequence[Tuple[str, str]], preselect:
 
 
 def single_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselect: int = 0,
-                  pal: Optional[_Palette] = None, stream=None, input_fn=input) -> int:
+                  pal: Optional[_Palette] = None, stream=None, input_fn=input,
+                  shortcuts: Optional[dict] = None) -> int:
     """A radio selector → the chosen index. Raw-mode arrows on a TTY; a numbered
     prompt otherwise. Emits a trailing blank line so the answered question is set off
-    from whatever the wizard prints next (consistent vertical rhythm)."""
+    from whatever the wizard prints next (consistent vertical rhythm).
+    ``shortcuts`` maps a literal keystroke (e.g. ``'y'``) to the index it should
+    select immediately, bypassing the arrow loop."""
     stream = stream or sys.stdout
     pal = pal or _Palette(_colour_enabled(stream))
     if not options:
@@ -221,6 +224,9 @@ def single_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselect:
         elif key == "enter":
             print("", file=stream)
             return cursor
+        elif shortcuts and key in shortcuts:
+            print("", file=stream)
+            return shortcuts[key]
         else:
             continue
         _clear_choices(len(options), stream)
@@ -302,7 +308,8 @@ def _ask_yes_no(prompt: str, *, default: bool, input_fn=input, stream=None,
         _ss = single_select_fn if single_select_fn is not None else single_select
         idx = _ss(prompt, [("Yes", ""), ("No", "")],
                   preselect=0 if default else 1,
-                  pal=pal, stream=stream, input_fn=input_fn)
+                  pal=pal, stream=stream, input_fn=input_fn,
+                  shortcuts={"y": 0, "n": 1})
         return idx == 0
     suffix = "[Y/n]" if default else "[y/N]"
     try:
