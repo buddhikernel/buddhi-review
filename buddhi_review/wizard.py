@@ -225,8 +225,11 @@ def single_select(prompt: str, options: Sequence[Tuple[str, str]], *, preselect:
             print("", file=stream)
             return cursor
         elif shortcuts and key in shortcuts:
+            cursor = shortcuts[key]
+            _clear_choices(len(options), stream)
+            _render_choices(options, cursor, {cursor}, True, pal, stream)
             print("", file=stream)
-            return shortcuts[key]
+            return cursor
         else:
             continue
         _clear_choices(len(options), stream)
