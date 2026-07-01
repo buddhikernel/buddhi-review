@@ -162,6 +162,59 @@ def test_create_file_pr_failure_modes(kwargs, frag):
     assert frag in detail
 
 
+def test_create_file_pr_returns_existing_pr_when_create_fails_on_duplicate():
+    """A re-run whose branch already has an OPEN PR: the branch push succeeds but
+    `gh pr create` fails on the duplicate. Instead of a scary failure, detect the
+    existing PR (`gh pr view <branch>`) and return it — idempotent, like create-pr.sh."""
+    def router(argv, _inp):
+        if argv[:3] == ["gh", "pr", "create"]:
+            return _R(returncode=1, stdout="")                       # duplicate → fails
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _R(returncode=0, stdout="https://github.com/acme/widgets/pull/20\n")
+        if argv[:2] == ["gh", "api"]:
+            if "-X" in argv and "PUT" in argv:
+                return _R(returncode=0)
+            if argv[2].endswith("/git/refs"):
+                return _R(returncode=0)
+            if "/git/ref/heads/" in argv[2] and "--jq" in argv:
+                return _R(returncode=0, stdout="deadbeef\n")
+            if "/contents/" in argv[2] and "--jq" in argv:
+                return _R(returncode=1)
+        return _R()
+    run, calls = _recorder(router)
+    ok, detail = wizard._create_file_pr(
+        "acme/widgets", "main", "p", "c", "m", "t", "buddhi/update-x", run=run)
+    assert ok is True
+    assert detail == "https://github.com/acme/widgets/pull/20"
+    # it queried the existing PR for THIS branch (not some other selector)
+    view = next(c["argv"] for c in calls if c["argv"][:3] == ["gh", "pr", "view"])
+    assert "buddhi/update-x" in view
+
+
+def test_create_file_pr_still_fails_when_create_fails_and_no_existing_pr():
+    """gh pr create fails AND no PR exists for the branch → still a real failure."""
+    def router(argv, _inp):
+        if argv[:3] == ["gh", "pr", "create"]:
+            return _R(returncode=1, stdout="")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _R(returncode=1, stdout="")                       # no PR for the branch
+        if argv[:2] == ["gh", "api"]:
+            if "-X" in argv and "PUT" in argv:
+                return _R(returncode=0)
+            if argv[2].endswith("/git/refs"):
+                return _R(returncode=0)
+            if "/git/ref/heads/" in argv[2] and "--jq" in argv:
+                return _R(returncode=0, stdout="deadbeef\n")
+            if "/contents/" in argv[2] and "--jq" in argv:
+                return _R(returncode=1)
+        return _R()
+    run, _ = _recorder(router)
+    ok, detail = wizard._create_file_pr(
+        "acme/widgets", "main", "p", "c", "m", "t", "b", run=run)
+    assert ok is False
+    assert "opening the PR failed" in detail
+
+
 def test_create_file_pr_recovery_path_defaults_to_path():
     # When the branch already exists, the file probed for its blob sha is `path`
     # itself (recovery_path defaults to path) — not some other file.
@@ -509,6 +562,19 @@ def test_validate_claude_token_unknown_on_timeout():
         raise subprocess.TimeoutExpired(cmd="claude", timeout=25)
     assert wizard._validate_claude_token(
         "oat", run=run, which=lambda _b: "/usr/bin/claude") == "unknown"
+
+
+def test_validate_claude_token_strips_wrapped_whitespace():
+    """A token copied from a wrapped / small terminal window carries an internal
+    newline (+ indent space); a real sk-ant-oat token has none. The validator strips
+    ALL whitespace before the ping, so the intended token is what gets tested — the
+    env carries the reconstructed token, no whitespace."""
+    run, cap = _validating_run(returncode=0)
+    wrapped = "sk-ant-oat01-Q1bZ...c0\n SddG...wAA"  # newline + leading space from the wrap
+    assert wizard._validate_claude_token(
+        wrapped, run=run, which=lambda _b: "/usr/bin/claude") == "valid"
+    assert cap["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-Q1bZ...c0SddG...wAA"
+    assert not any(ch.isspace() for ch in cap["env"]["CLAUDE_CODE_OAUTH_TOKEN"])
 
 
 def test_validate_claude_token_unknown_on_ambiguous_failure():
