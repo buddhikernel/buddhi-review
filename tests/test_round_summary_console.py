@@ -241,10 +241,11 @@ def test_store_excluded_without_signal_reads_as_excluded_not_unexpected():
 
 def test_bot_status_text_per_cause():
     d = _bare_driver()
-    # done / clean
+    # done / clean — the one done-for-the-run label, shared by an explicit clean
+    # sentinel and a summary-only genuine review (R2)
     d.done.add("claude")
     d._bot_state("claude").signal = detectors.SIGNAL_CLEAN
-    assert d._bot_status_text("claude") == "done"
+    assert d._bot_status_text("claude") == "reviewed — no findings"
     # quota / errored
     d._bot_state("copilot").signal = detectors.SIGNAL_QUOTA
     d.store.exclude_quota("copilot")
