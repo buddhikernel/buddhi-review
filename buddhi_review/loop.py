@@ -52,6 +52,9 @@ class Comment:
     path: Optional[str] = None       # file path from pulls/<pr>/comments, if present
     diff_hunk: Optional[str] = None  # diff context from pulls/<pr>/comments, if present
     created_at: Optional[str] = None  # ISO-8601 stamp — drives the errored comeback
+    updated_at: Optional[str] = None  # ISO-8601 edit stamp; the errored-comeback
+    # candidate is updated_at-then-created_at, so an EDITED substantive comment can
+    # prove recovery by its edit time (the recorded error stamp stays created_at).
     from_issue_channel: bool = False  # True for issues/<pr>/comments (the PR
     # conversation timeline). Per the claude-code-review.yml contract the loop
     # only fixes INLINE findings; the issue channel is scanned for the clean

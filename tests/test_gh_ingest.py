@@ -149,3 +149,57 @@ def test_ingest_source_yields_raw_items(monkeypatch):
     assert items[0].id == "4"
     assert items[0].payload == "claim"
     assert items[0].source == "gemini"
+
+
+def test_updated_at_is_read_into_the_comment(monkeypatch):
+    """The errored-comeback candidate reads updated_at (edit time) before
+    created_at, so the ingest must thread updated_at through."""
+    monkeypatch.setenv(
+        gh_ingest.COMMENTS_JSON_ENV,
+        json.dumps([
+            {"id": 1, "body": "edited finding", "user": {"login": "claude"},
+             "created_at": "2026-06-10T00:00:00Z",
+             "updated_at": "2026-06-10T00:10:00Z"},
+            {"id": 2, "body": "never edited", "user": {"login": "claude"},
+             "created_at": "2026-06-10T00:00:00Z"},
+        ]),
+    )
+    by_id = {c.id: c for c in gh_ingest.fetch_comments("7", repo="o/r")}
+    assert by_id["1"].updated_at == "2026-06-10T00:10:00Z"
+    assert by_id["1"].created_at == "2026-06-10T00:00:00Z"
+    assert by_id["2"].updated_at is None  # absent → None
+
+
+# --------------------------------------------------------------- diff-size probe
+
+def test_fetch_pr_diff_lines_sums_additions_and_deletions():
+    def fake_run(argv, *, cwd=None):
+        assert argv[:4] == ["gh", "pr", "view", "7"]
+        assert "additions,deletions" in argv
+        assert argv[-2:] == ["-R", "o/r"]
+        return _proc(json.dumps({"additions": 120, "deletions": 30}))
+
+    assert gh_ingest.fetch_pr_diff_lines("7", repo="o/r", run=fake_run) == 150
+
+
+def test_fetch_pr_diff_lines_no_repo_omits_flag():
+    def fake_run(argv, *, cwd=None):
+        assert "-R" not in argv
+        return _proc(json.dumps({"additions": 1, "deletions": 1}))
+
+    assert gh_ingest.fetch_pr_diff_lines("7", run=fake_run) == 2
+
+
+def test_fetch_pr_diff_lines_returns_none_on_failure():
+    # non-zero exit, unparseable JSON, missing/ill-typed counts, and a raising run
+    # all fail soft to None so the caller uses the default budget.
+    assert gh_ingest.fetch_pr_diff_lines("7", run=lambda a, **k: _proc(rc=1)) is None
+    assert gh_ingest.fetch_pr_diff_lines("7", run=lambda a, **k: _proc("not json")) is None
+    assert gh_ingest.fetch_pr_diff_lines(
+        "7", run=lambda a, **k: _proc(json.dumps({"additions": 5}))) is None
+    assert gh_ingest.fetch_pr_diff_lines(
+        "7", run=lambda a, **k: _proc(json.dumps({"additions": "x", "deletions": 1}))) is None
+
+    def boom(argv, *, cwd=None):
+        raise OSError("gh missing")
+    assert gh_ingest.fetch_pr_diff_lines("7", run=boom) is None

@@ -45,7 +45,9 @@ from buddhi_review.notifier import Ask, ConsoleNotifier, Notifier
 from buddhi_review.transparency import automation_notice, _colour_enabled
 
 _GIT_TIMEOUT = 120
-_TEST_TIMEOUT = 1800
+# Hard timeout (seconds) on the pre-push test-gate subprocess. Env-overridable via
+# BUDDHI_TEST_GATE_TIMEOUT_SECS; a non-positive / unparseable value uses the default.
+_TEST_TIMEOUT_DEFAULT = 600
 
 # Cap on consecutive "I've fixed it — re-run" turns before the loop hands over.
 # Each turn blocks on a human answer, so this is a termination safety net (a
@@ -92,6 +94,18 @@ def _rerun_limit() -> int:
                                          str(_RERUN_LIMIT_DEFAULT))))
     except (TypeError, ValueError):
         return _RERUN_LIMIT_DEFAULT
+
+
+def _test_gate_timeout() -> int:
+    """The pre-push test-gate timeout (seconds): ``BUDDHI_TEST_GATE_TIMEOUT_SECS``
+    when set to a positive int, else :data:`_TEST_TIMEOUT_DEFAULT`. A non-positive
+    or unparseable value falls back to the default (an infinite/zero gate is
+    meaningless)."""
+    try:
+        value = int(os.environ.get("BUDDHI_TEST_GATE_TIMEOUT_SECS", ""))
+    except (TypeError, ValueError):
+        return _TEST_TIMEOUT_DEFAULT
+    return value if value > 0 else _TEST_TIMEOUT_DEFAULT
 
 
 def resolve_test_command(cwd: str) -> Optional[List[str]]:
@@ -266,7 +280,7 @@ def run_test_gate(
                    status="skip", hint="set BUDDHI_TEST_COMMAND to enable the gate")
             return "skipped", ""
         print(f"[local-tests] running {' '.join(cmd)} before push …", flush=True)
-        proc = run(cmd, cwd=cwd, timeout=_TEST_TIMEOUT)
+        proc = run(cmd, cwd=cwd, timeout=_test_gate_timeout())
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
         return "red", f"test command failed to run: {exc}"
     tail = (proc.stdout or "") + "\n" + (proc.stderr or "")
@@ -370,6 +384,30 @@ def _push_argv(cwd: Optional[str], *, run: Run = _default_run) -> List[str]:
     return ["git", "push"]
 
 
+def _diagnose_commit_failure(
+    cwd: str, head_before: Optional[str], *, run: Run = _default_run,
+    notice: Callable[..., str] = automation_notice,
+) -> None:
+    """Diagnose a non-zero ``git commit``. When HEAD did NOT move and the tree is
+    still dirty, the commit was almost certainly REJECTED by a local pre-commit
+    hook — surface that with a distinct, actionable message instead of the bare
+    generic error. Best-effort (any probe error is swallowed); the caller's return
+    contract is unchanged (still ``"error"``)."""
+    try:
+        head_after = _git_rev_parse(cwd, "HEAD", run=run)
+        st = run(["git", "status", "--porcelain"], cwd=cwd)
+        still_dirty = bool((getattr(st, "stdout", "") or "").strip())
+    except Exception:
+        return
+    if head_before == head_after and still_dirty:
+        notice(
+            "commit",
+            "commit rejected by a pre-commit hook — HEAD did not move and the "
+            "worktree is still dirty, so this round's fixes are NOT committed. Fix "
+            "what the hook flagged (or bypass the hook), then re-run.",
+            status="stop", hint="a local pre-commit hook blocked the commit")
+
+
 def commit_and_push(
     cwd: str,
     *,
@@ -469,7 +507,9 @@ def commit_and_push(
     # the tree; a no-op `git commit` exits nonzero and must NOT be misread as an
     # error (the push below still ships the existing commit).
     if run(["git", "diff", "--cached", "--quiet"], cwd=cwd).returncode != 0:
+        head_before = _git_rev_parse(cwd, "HEAD", run=run)
         if run(["git", "commit", "-m", message], cwd=cwd).returncode != 0:
+            _diagnose_commit_failure(cwd, head_before, run=run, notice=notice)
             return "error"
     print(flush=True)  # phase break — the push is its own block
     # Push by EXPLICIT refspec (via _push_argv) so a mismatched-named or dangling
