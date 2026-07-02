@@ -60,8 +60,25 @@ def test_mixed_feedback_never_silently_excludes():
         "No comments to address, but the null check on line 42 needs to be added.",
         "No issues found. You must add tests.",                         # strong "must add"
         "No problems detected. This must be fixed before merging.",     # "must be fixed"
+        # Bullet / numbered lists — unambiguous review findings
+        "Overall looks good.\n- Line 3: the null check is missing\n- Line 10: this is a bug",
+        "Looks good.\n1. The error handler is missing\n2. This logic is incorrect",
+        # Cross-sentence bare finding markers the intra-sentence lookahead misses
+        "Looks good overall. However, the null check on line 3 is missing.",
+        "No comments generated. However, this logic is incorrect.",
+        "LGTM. This has a bug in the edge case.",
+        "No issues found. The todo comment on line 5 was left in.",
     ):
         assert not detectors.is_clean_review(msg), msg
+
+
+def test_suggestion_fence_after_clean_phrase_is_not_clean():
+    # A GitHub suggestion block is concrete actionable content — a clean phrase
+    # followed by one must NOT be promoted to a voluntary all-clear.
+    assert not detectors.is_clean_review(
+        "No issues found.\n```suggestion\n-old line\n+new line\n```")
+    assert not detectors.is_clean_review(
+        "LGTM.\n```suggestion\nreturn x + 1\n```")
 
 
 def test_empty_body_never_promotes_to_no_issues():
@@ -83,6 +100,11 @@ def test_negated_approval_is_not_clean():
         "This is not LGTM to me.",
         "This does not look good and needs rework.",
         "This is not looks good territory.",
+        # whitespace variants: tab and newline between "not" and LGTM/looks-good
+        "not\tLGTM",
+        "not\nLGTM",
+        "not\tlooks good",
+        "not\nlooks good",
     ):
         assert not detectors.is_clean_review(msg), msg
 
@@ -183,11 +205,20 @@ def test_bare_no_concerns_not_deterministically_clean():
 # are still caught above.
 # ---------------------------------------------------------------------------
 
-def test_narrow_guard_defers_bare_trailing_prose():
-    # These read clean at the deterministic tier — documenting the contract.
-    assert detectors.is_clean_review("LGTM. One nit: the docstring is missing.")
-    assert detectors.is_clean_review(
+def test_bare_nit_blocks_clean_verdict():
+    # "nit" is a review finding marker — a clean phrase followed by a nit must NOT
+    # be promoted to a voluntary all-clear; tier-1 must reject it.
+    assert not detectors.is_clean_review("LGTM. One nit: the docstring is missing.")
+    assert not detectors.is_clean_review("No issues found. Nit: rename this variable.")
+
+
+def test_you_should_blocks_clean_verdict():
+    # Subject-first "you should" / "we should" is actionable recommendation form
+    # and must block a clean verdict even when a clean phrase precedes it.
+    assert not detectors.is_clean_review(
         "No comments to address. Separately, you should rename foo.")
+    assert not detectors.is_clean_review(
+        "No issues found. We should add a null check here.")
 
 
 def test_actionable_prefix_blocks_clean_verdict():
@@ -655,9 +686,11 @@ def test_probe_clean_result_short_circuits_over_quoted_401():
     # working token).
     run = _probe_run(log_failed="", log_full=_CLEAN_RESULT_WITH_401_QUOTE)
     assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is False
-    # and the guard is present as a reusable module constant
-    assert detectors.CLEAN_RESULT_RE.search('{"is_error": false}')
-    assert detectors.CLEAN_RESULT_RE.search('{"is_error":false}')
+    # CLEAN_RESULT_RE matches the full SDK result object shape (requires "type":"result"
+    # on the same line as "is_error":false) — bare "is_error":false alone does NOT match.
+    assert detectors.CLEAN_RESULT_RE.search('{"type":"result","is_error":false}')
+    assert detectors.CLEAN_RESULT_RE.search('{"type": "result", "is_error": false}')
+    assert not detectors.CLEAN_RESULT_RE.search('{"is_error":false}')
 
 
 def test_probe_clean_run_not_flagged():

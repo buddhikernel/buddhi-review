@@ -75,14 +75,16 @@ _NOT_MIXED_OR_PENDING = (
 # sentinel "No issues found." still matches: the period terminates the
 # lookahead's [^.!?\n]* scan window before any trailing "yet"/"so far" appears.
 #
-# A leading ``(?<!not )`` guard on the two bare-approval patterns (LGTM / looks
-# good) keeps an inverted verdict ("not LGTM", "not looks good") from reading as
-# clean — the only word a leading negation would flip.
+# Three chained fixed-width lookbehinds on the two bare-approval patterns (LGTM /
+# looks good) keep any whitespace-separated negation ("not LGTM", "not\tLGTM",
+# "not\nLGTM") from reading as clean — the only word a leading negation would
+# flip. Python re requires fixed-width lookbehinds, so each whitespace variant is
+# a separate ``(?<!not<char>)`` clause rather than a variable-width alternative.
 CLEAN_REVIEW_PATTERNS = (
     r"no (issues?|comments?|suggestions?|problems?) (found|detected|to report)"
     + _NOT_MIXED_OR_PENDING,
-    r"(?<!not )\blgtm\b" + _NOT_MIXED_OR_PENDING,
-    r"(?<!not )\blooks good( to me)?\b" + _NOT_MIXED_OR_PENDING,
+    r"(?<!not )(?<!not\t)(?<!not\n)\blgtm\b" + _NOT_MIXED_OR_PENDING,
+    r"(?<!not )(?<!not\t)(?<!not\n)\blooks good( to me)?\b" + _NOT_MIXED_OR_PENDING,
     r"no (further|additional|new) (issues?|comments?|concerns?)"
     + _NOT_MIXED_OR_PENDING,
     r"nothing (to flag|further to add|else to add)" + _NOT_MIXED_OR_PENDING,
@@ -132,28 +134,37 @@ CLEAN_REVIEW_PATTERNS = (
 )
 _CLEAN_RES = tuple(re.compile(p, re.IGNORECASE) for p in CLEAN_REVIEW_PATTERNS)
 
-# Actionable-prose guard: the recommendation vocabulary a reviewer uses to
-# introduce a real request. When any of these FOLLOWS a matched clean sentence
-# (see :func:`_has_actionable_prose_after`), the clean verdict is rejected — a
+# Actionable-prose guard: signals a reviewer uses to introduce real feedback.
+# When any of these appears BEFORE or AFTER a matched clean sentence (see
+# :func:`_has_actionable_prose_after`), the clean verdict is rejected — a
 # multi-sentence "Generated no comments. Consider adding a test." is mixed
-# feedback, not a voluntary all-clear. The word list is deliberately narrow:
-# only verbs / phrasings reviewers actually use to introduce a recommendation.
+# feedback, not a voluntary all-clear.
+#
+# Bullet / numbered list items are unambiguous review findings and are detected
+# first (requires MULTILINE for ^). Bare finding markers (however, missing,
+# incorrect, wrong, bug, nit, todo) cover the cross-sentence cases the
+# _NOT_MIXED_OR_PENDING intra-sentence lookahead cannot reach: "Looks good.
+# However, the null check is missing." ends the lookahead window at the first
+# period, so "however" in the next sentence must be caught here.
 # "should be" / "could be" are gated by a negative look-ahead that excludes
 # benign approval-reinforcing footers ("should be merged after CI passes",
 # "could be fine as-is"), which are not recommendations about the code.
 _ACTIONABLE_PROSE_RE = re.compile(
-    r"\b(?:"
+    r"(?mi)"
+    r"(?:^\s*(?:[-*•]|\d+[.)])\s+\S)"          # bullet / numbered list item
+    r"|\b(?:"
     r"consider(?:ing|ed)?|recommend(?:ed|ing|ation)?|suggest(?:ed|ing|ion)?|"
     r"please\s+(?:add|fix|change|update|remove|use|rename|refactor|move)|"
+    r"(?:you|we)\s+should\s+|"
     r"should\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|you\s+|we\s+|probably\s+|also\s+)|"
     r"could\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|you\s+|we\s+|probably\s+|also\s+)|"
     r"need(?:s)?\s+to\s+(?:be\s+)?(?:add|fix|change|update|remove|use|rename|refactor|move|handle|cover|test)|"
     # "must" as a strong obligation marker ("you must add tests", "must be fixed").
     # Negative lookahead on "be" mirrors the should/could guard so approval footers
     # like "must be merged after CI" are not mistaken for a recommendation.
-    r"must\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|(?:add|fix|change|update|remove|use|rename|refactor|move|handle|cover|test))"
-    r")\b",
-    re.IGNORECASE,
+    r"must\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|(?:add|fix|change|update|remove|use|rename|refactor|move|handle|cover|test))|"
+    r"however|missing|incorrect|wrong|bug|nit|todo"
+    r")\b"
 )
 
 
@@ -166,6 +177,10 @@ def _has_actionable_prose_after(text: str, start: int) -> bool:
     from ``start`` (it does NOT skip to the next sentence terminator) so a
     same-sentence "Generated no comments, consider a test." is caught too."""
     tail = text[start:]
+    # A GitHub suggestion fence (```suggestion) is always actionable — return True
+    # immediately so the generic fenced-block strip below cannot discard it.
+    if re.search(r"```suggestion\b", tail, re.IGNORECASE):
+        return True
     tail = re.sub(r"```[\s\S]*?```", "", tail)               # fenced code
     tail = re.sub(r"<[^>]+>", "", tail)                      # HTML tags
     tail = re.sub(r"`[^`]*`", "", tail)                      # inline code
@@ -274,7 +289,16 @@ AUTH_FAILED_RE = re.compile(
 # in that same log came from quoted diff / tool output (a review OF auth code),
 # not a real token 401 — so both auth probes short-circuit to "not failing" when
 # it is present, before the 401 signature is even considered.
-CLEAN_RESULT_RE = re.compile(r'"is_error"\s*:\s*false', re.IGNORECASE)
+#
+# Both keys must appear on the SAME log line (no ``\n`` between them) to anchor
+# the match to actual SDK result objects. A diff or tool output that happens to
+# contain a bare ``"is_error": false`` on its own line does NOT match, preventing
+# reviewed auth-code content from silently masking a real 401 failure.
+CLEAN_RESULT_RE = re.compile(
+    r'"type"\s*:\s*"result"[^\n]*"is_error"\s*:\s*false'
+    r'|"is_error"\s*:\s*false[^\n]*"type"\s*:\s*"result"',
+    re.IGNORECASE,
+)
 
 SIGNAL_CLEAN = "clean"
 SIGNAL_QUOTA = "quota"
@@ -313,8 +337,8 @@ def is_clean_review(text: str) -> bool:
     Markdown emphasis is stripped first so "no **new** comments" reads the same
     as "no new comments". Each clean pattern is tried in turn; a match counts
     only when :func:`_has_actionable_prose_after` finds no recommendation in the
-    text before OR after it — guarding both "Fix typo. LGTM" (feedback precedes
-    the clean phrase) and "…no comments. Consider a test." (feedback follows)."""
+    text before OR after it — guarding both "Please rename foo. LGTM" (feedback
+    precedes the clean phrase) and "…no comments. Consider a test." (follows)."""
     if not text or not text.strip():
         return False  # an empty body NEVER promotes a bot to no-issues
     # Strip *…* / _…_ emphasis on a working copy before the scan.

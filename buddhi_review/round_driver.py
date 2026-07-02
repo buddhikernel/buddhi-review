@@ -819,7 +819,10 @@ class RoundDriver:
         # (below) → classified → `_maybe_errored_comeback` retracts iff it is
         # SUBSTANTIVE + strictly newer. A cosmetic / OUTDATED / INVALID /
         # question comment is NOT proof of recovery, so it never brings the bot back.
-        pr_title, pr_body = self._fetch_pr_title_body()
+        if self.quota_llm is not None:
+            pr_title, pr_body = self._fetch_pr_title_body()
+        else:
+            pr_title, pr_body = None, None
         signal = detectors.detect_signal(
             comment.text, quota_llm=self.quota_llm,
             pr_title=pr_title, pr_body=pr_body,
