@@ -111,6 +111,69 @@ xychart-beta
 
 </details>
 
+## Seen in real runs — not just in papers
+
+The research above predicts two things: reviewers are less effective at evaluating
+their own work, and many bugs emerge only through repeated fix-and-review rounds. Six
+real Buddhi runs — covering changes authored with Claude Code and measured using the
+review loop's per-bug ledger — show both effects clearly.
+
+### "Just have Claude review it again" is not adversarial review
+
+When Claude reviewed Claude-written code as one member of a multi-model panel, it
+caught 13 of 178 valid bugs (7.3%). The reviewers from other vendors collectively
+caught 92.7%, and more than 90% of the high- or critical-severity bugs found in round
+2 or later were caught by a non-Claude reviewer.
+
+This is the self-preference effect described in
+[[2](https://arxiv.org/abs/2404.13076)], made visible in real review runs: a model
+reviewing its own work misses most of what a diverse panel catches.
+
+![Who catches the bugs in Claude-written code — per-run and aggregate reviewer shares](docs/assets/who-catches-the-bugs.svg)
+
+### One round is not a complete review
+
+Across the six runs, 77% of valid bugs — and 76% of high- or critical-severity bugs —
+were discovered only in round 2 or later, after the initial fixes had been applied and
+the changed code reviewed again. Depending on the run, the share found after round 1
+ranged from 50% to 81%.
+
+Built-in review features that post one round of comments and stop cannot catch issues
+that become visible only after earlier findings have been fixed.
+
+![When do the bugs surface — round 1 vs round 2+ split per run](docs/assets/when-bugs-surface.svg)
+
+<details>
+<summary><b>The data behind the charts</b></summary>
+
+| Run | Valid bugs | Caught by Claude | Claude % | Caught in R2+ | R2+ % | High/critical | High/crit in R2+ |
+|---|---|---|---|---|---|---|---|
+| A | 42 | 2 | 4.8% | 34 | 81.0% | 19 | 14 (73.7%) |
+| B | 26 | 7 | 26.9% | 20 | 76.9% | 16 | 12 (75.0%) |
+| C | 29 | 1 | 3.4% | 22 | 75.9% | 8 | 8 (100%) |
+| D | 24 | 0 | 0.0% | 19 | 79.2% | 6 | 5 (83.3%) |
+| E | 12 | 1 | 8.3% | 6 | 50.0% | 8 | 5 (62.5%) |
+| F | 45 | 2 | 4.4% | 36 | 80.0% | 18 | 13 (72.2%) |
+| **All** | **178** | **13** | **7.3%** | **137** | **77.0%** | **75** | **57 (76.0%)** |
+
+How to read this honestly:
+
+- The six runs are merged review loops on one private repository (anonymized); the
+  numbers come from the loop's own per-bug ledger, which records each verified, fixed
+  bug with its severity, the reviewer that caught it, and the round it was caught in.
+- Severity is assigned by the loop's classifier — which itself runs on Claude — so the
+  low Claude share cannot be an anti-Claude bias in the rater.
+- Each bug is credited to one catching reviewer. Claude's raw comment counts on the
+  underlying PRs corroborate the ledger's counts, so attribution is not hiding Claude
+  catches.
+- Reviewer fleets vary per run (not every vendor reviewed every run). One additional
+  run was excluded because Claude was disabled by configuration and never reviewed.
+- This is an illustrative sample from real usage, not a controlled benchmark. As this
+  repository accumulates its own public review loops, these charts will be replaced
+  with runs anyone can inspect on GitHub.
+
+</details>
+
 ## What it is
 
 Buddhi splits a PR review into two halves: the decision, and the I/O around it. The
