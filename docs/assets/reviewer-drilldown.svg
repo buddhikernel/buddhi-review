@@ -9,13 +9,13 @@
 <text x="367.9" y="110" font-size="11" font-weight="700" fill="#fff" text-anchor="middle">9</text>
 <rect x="490.0" y="92" width="190.0" height="26" fill="#8B95A5"/>
 <text x="585.0" y="110" font-size="11" font-weight="700" fill="#fff" text-anchor="middle">7</text>
-<text x="692" y="110" font-size="11.5" font-weight="700" fill="#C2410C">Claude: 0 of 21</text>
+<text x="692" y="110" font-size="11.5" font-weight="700" fill="#C2410C">Claude: 0 of 21, no all-clear</text>
 <text x="98" y="154" font-size="12.5" font-weight="700" fill="#333" text-anchor="end">Run B</text>
 <rect x="110.0" y="136" width="303.2" height="26" fill="#1BAF7A"/>
 <text x="261.6" y="154" font-size="11" font-weight="700" fill="#fff" text-anchor="middle">25</text>
 <rect x="413.2" y="136" width="266.8" height="26" fill="#8B95A5"/>
 <text x="546.6" y="154" font-size="11" font-weight="700" fill="#fff" text-anchor="middle">22</text>
-<text x="692" y="154" font-size="11.5" font-weight="700" fill="#C2410C">Claude: 0 of 47</text>
+<text x="692" y="154" font-size="11.5" font-weight="700" fill="#C2410C">Claude: 0 of 47, no all-clear</text>
 <text x="98" y="198" font-size="12.5" font-weight="700" fill="#333" text-anchor="end">Run C</text>
 <rect x="110.0" y="180" width="362.7" height="26" fill="#1BAF7A"/>
 <text x="291.4" y="198" font-size="11" font-weight="700" fill="#fff" text-anchor="middle">14</text>
@@ -59,6 +59,6 @@
 <text x="303" y="414" font-size="11.5" fill="#444">Gemini</text>
 <rect x="379" y="404" width="11" height="11" rx="2" fill="#8B95A5"/>
 <text x="395" y="414" font-size="11.5" fill="#444">Copilot</text>
-<text x="110" y="432" font-size="10.5" fill="#999">On runs C, F, and G, Claude posted an explicit all-clear (&#8220;No issues found.&#8221;). On runs A and B it commented, but no comment</text>
+<text x="110" y="432" font-size="10.5" fill="#999">On runs C, F, and G, Claude posted an explicit all-clear (&#8220;No issues found.&#8221;). On runs A and B it did not post an all-clear; it commented, but no comment</text>
 <text x="110" y="446" font-size="10.5" fill="#999">produced a valid bug. Each bug is credited to one catching reviewer. Ledger data, repo anonymized.</text>
 </svg>

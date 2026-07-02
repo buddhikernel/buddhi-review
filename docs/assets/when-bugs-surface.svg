@@ -36,7 +36,7 @@
 <line x1="110" y1="279.7" x2="810" y2="279.7" stroke="#111" stroke-width="2.5"/>
 <rect x="560" y="249.7" width="250" height="20" rx="4" fill="#111"/>
 <text x="685" y="263.7" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">all 88 qualifying runs: 50.1% in round 2+</text>
-<text x="110" y="472" font-size="11" fill="#777">Larger changes tend to earn more review rounds, so most of these 10+ bug runs sit above the all-runs line.</text>
+<text x="110" y="472" font-size="11" fill="#777">Runs with more bugs tend to earn more review rounds, so most of these bars sit above the all-runs line.</text>
 <text x="110" y="500" font-size="13" font-weight="700" fill="#B01722">Across all 88 qualifying runs, 50.1% of valid bugs, and 49.2% of the 189 high or critical ones, were caught only in round 2 or later.</text>
 <text x="110" y="522" font-size="10.5" fill="#999">On the 20 runs shown as bars, the round 2+ share is 65.4%. A reviewer that stops after one round would have shipped every bug counted in these bars.</text>
 </svg>
