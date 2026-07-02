@@ -519,7 +519,7 @@ def diff_tripwire(
             elif p == "/dev/null":
                 current_file = old_file
                 # A whole test file being deleted (``+++ /dev/null``) removes a test.
-                if "test" in os.path.basename(old_file).lower():
+                if _is_test_path(old_file):
                     test_removed = True
             else:
                 current_file = p
@@ -1070,9 +1070,10 @@ def apply_fix(
 
     When the worktree snapshot cannot be captured the fix DEGRADES rather than
     refusing: it proceeds without a rollback safety net (see
-    :func:`_restore_or_degrade`). The degrade path never arms
-    ``rollback_failed`` — the poisoned-worktree halt stays reserved for a real
-    snapshot whose restore FAILED."""
+    :func:`_restore_or_degrade`). On the degrade path, ``rollback_failed`` is
+    NOT armed for normal outcomes (timeout, non-zero exit) — but a fix-verify
+    REJECT still arms it so the round driver halts before any push rather than
+    letting the rejected edits leak silently."""
     snap = snapshot_worktree(cwd)
     # No snapshot ⇒ no provable rollback. Degrade (proceed) instead of refusing;
     # ``ref`` falls back to HEAD so the attempt diff can still be computed.
