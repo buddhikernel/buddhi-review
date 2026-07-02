@@ -75,16 +75,19 @@ _NOT_MIXED_OR_PENDING = (
 # sentinel "No issues found." still matches: the period terminates the
 # lookahead's [^.!?\n]* scan window before any trailing "yet"/"so far" appears.
 #
-# Three chained fixed-width lookbehinds on the two bare-approval patterns (LGTM /
-# looks good) keep any whitespace-separated negation ("not LGTM", "not\tLGTM",
-# "not\nLGTM") from reading as clean — the only word a leading negation would
-# flip. Python re requires fixed-width lookbehinds, so each whitespace variant is
-# a separate ``(?<!not<char>)`` clause rather than a variable-width alternative.
+# Fixed-width lookbehinds on the two bare-approval patterns (LGTM / looks good)
+# keep any whitespace-separated negation from reading as clean.  Python re
+# requires fixed-width lookbehinds, so each whitespace variant (space, tab, LF,
+# CR, CRLF, double-space) is its own ``(?<!not<chars>)`` clause.  The set
+# covers the realistic encoding variants; pathological repetitions (triple space
+# etc.) are not enumerable but are vanishingly unlikely in bot output.
 CLEAN_REVIEW_PATTERNS = (
     r"no (issues?|comments?|suggestions?|problems?) (found|detected|to report)"
     + _NOT_MIXED_OR_PENDING,
-    r"(?<!not )(?<!not\t)(?<!not\n)\blgtm\b" + _NOT_MIXED_OR_PENDING,
-    r"(?<!not )(?<!not\t)(?<!not\n)\blooks good( to me)?\b" + _NOT_MIXED_OR_PENDING,
+    r"(?<!not )(?<!not\t)(?<!not\n)(?<!not\r)(?<!not\r\n)(?<!not  )\blgtm\b"
+    + _NOT_MIXED_OR_PENDING,
+    r"(?<!not )(?<!not\t)(?<!not\n)(?<!not\r)(?<!not\r\n)(?<!not  )\blooks good( to me)?\b"
+    + _NOT_MIXED_OR_PENDING,
     r"no (further|additional|new) (issues?|comments?|concerns?)"
     + _NOT_MIXED_OR_PENDING,
     r"nothing (to flag|further to add|else to add)" + _NOT_MIXED_OR_PENDING,
@@ -255,8 +258,16 @@ _ERR_ANCHOR = (
     r"[\s\S]{0,80}\b(?:review|pull\s+request|\bpr\b|comment|feedback|response|"
     r"generat|process|complet|post|try\s+again)"
 )
+# Same keywords as _ERR_ANCHOR but as a prefix — the anchor word precedes the
+# error phrase ("The PR review encountered an unexpected error.").  Kept
+# separate from _ERR_ANCHOR so neither variant is widened for the other's use.
+_ERR_ANCHOR_PREFIX = (
+    r"\b(?:review|pull\s+request|pr|comment|feedback|response|"
+    r"generat|process|complet|post|try\s+again)\b[\s\S]{0,80}"
+)
 ERRORED_RE = re.compile(
     r"(?i)(?:\bencountered an? (?:unexpected |internal )?error\b" + _ERR_ANCHOR + r")"
+    r"|(?:" + _ERR_ANCHOR_PREFIX + r"\bencountered an? (?:unexpected |internal )?error\b)"
     r"|(?:\bfailed to (?:generate|complete|process)\b.{0,40}\breview\b)"
     r"|(?:\bsomething went wrong\b" + _ERR_ANCHOR + r")"
     r"|(?:\breview (?:run )?failed\b)"

@@ -105,6 +105,13 @@ def test_negated_approval_is_not_clean():
         "not\nLGTM",
         "not\tlooks good",
         "not\nlooks good",
+        # additional whitespace variants: CR, CRLF, and double-space
+        "not\rLGTM",
+        "not\r\nLGTM",
+        "not  LGTM",
+        "not\rlooks good",
+        "not\r\nlooks good",
+        "not  looks good",
     ):
         assert not detectors.is_clean_review(msg), msg
 
@@ -422,6 +429,14 @@ def test_errored_something_went_wrong_is_anchored():
         "Something went wrong while generating the review.") == detectors.SIGNAL_ERRORED
     assert detectors.detect_signal(
         "Copilot encountered an error and was unable to review this pull request."
+    ) == detectors.SIGNAL_ERRORED
+    # Anchor word BEFORE the error phrase ("The PR review encountered an
+    # unexpected error.") — the prefix-anchor alternative must catch this.
+    assert detectors.detect_signal(
+        "The PR review encountered an unexpected error."
+    ) == detectors.SIGNAL_ERRORED
+    assert detectors.detect_signal(
+        "The review process encountered an error."
     ) == detectors.SIGNAL_ERRORED
 
 
