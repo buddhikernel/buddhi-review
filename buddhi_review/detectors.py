@@ -161,6 +161,12 @@ _ACTIONABLE_PROSE_RE = re.compile(
     r"(?:you|we)\s+should\s+|"
     r"should\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|you\s+|we\s+|probably\s+|also\s+)|"
     r"could\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|you\s+|we\s+|probably\s+|also\s+)|"
+    # Subject-first "should/could <verb>" — "The handler should return 400" /
+    # "This could use a regression test." The existing should/could branches only
+    # catch "you/we should", "should be", "should probably" etc.; this catches the
+    # remaining cases where the subject is neither "you" nor "we" and the verb is
+    # not an approval-footer word (be/you/we/probably/also already covered above).
+    r"(?:should|could)\s+(?!be\b|you\b|we\b|probably\b|also\b)\w+|"
     r"need(?:s)?\s+to\s+(?:be\s+)?(?:add|fix|change|update|remove|use|rename|refactor|move|handle|cover|test)|"
     # "must" as a strong obligation marker ("you must add tests", "must be fixed").
     # Negative lookahead on "be" mirrors the should/could guard so approval footers
@@ -256,7 +262,7 @@ PR_TOO_LARGE_RE = re.compile(
     # before a domain noun ("review payload", "review response", "review api"),
     # so a finding about the reviewed code's own API limits ("the review payload
     # exceeds the maximum number of tokens the API accepts") is not a refusal.
-    r"|(?:\breview\b(?!\s+(?:payload|response|request|body|endpoint|call|method|api|function|logic|code|handler)\b)[\s\S]{0,80}\bexceeds?\b[\s\S]{0,40}\bmaximum\s+(?:number\s+of\s+)?(?:files?|changes?|tokens?|diff)\b)"
+    r"|(?:\breview\b(?!\s+(?:payload|response|request|body|endpoint|call|method|api|function|logic|code|handler|context|window|scope|output|result|session|stream|buffer)\b)[\s\S]{0,80}\bexceeds?\b[\s\S]{0,40}\bmaximum\s+(?:number\s+of\s+)?(?:files?|changes?|tokens?|diff)\b)"
 )
 # The loose alternatives ("something went wrong", "encountered an error") are
 # anchored to a review-process word within a short window so substantive prose
