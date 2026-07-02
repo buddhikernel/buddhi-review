@@ -53,6 +53,9 @@ def _comment_from_raw(raw: dict, *, from_issue_channel: Optional[bool] = None) -
     # pulls/<pr>/comments carries created_at; pulls/<pr>/reviews carries
     # submitted_at. Either drives the strictly-newer errored comeback.
     created = raw.get("created_at") or raw.get("submitted_at")
+    # updated_at (when the payload carries it) lets an EDITED comment prove an
+    # errored-reviewer comeback by its edit time; absent → None.
+    updated = raw.get("updated_at")
     # The loop passes from_issue_channel explicitly per endpoint. The seeded
     # (BUDDHI_REVIEW_COMMENTS_JSON) path has no endpoint, so infer it from the
     # payload: an issues/<pr>/comments object carries `issue_url` and lacks the
@@ -66,6 +69,7 @@ def _comment_from_raw(raw: dict, *, from_issue_channel: Optional[bool] = None) -
         path=str(path) if isinstance(path, str) and path else None,
         diff_hunk=str(diff_hunk) if isinstance(diff_hunk, str) and diff_hunk else None,
         created_at=str(created) if isinstance(created, str) and created else None,
+        updated_at=str(updated) if isinstance(updated, str) and updated else None,
         from_issue_channel=from_issue_channel,
     )
 
@@ -131,6 +135,39 @@ def fetch_comments(
         except ValueError as exc:
             raise RuntimeError(f"failed to parse gh api response for {endpoint}: {exc}") from exc
     return comments
+
+
+def fetch_pr_diff_lines(
+    pr: str,
+    *,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[[Sequence[str], Optional[str]], "subprocess.CompletedProcess[str]"] = _default_run,
+) -> Optional[int]:
+    """Best-effort PR diff size (additions + deletions) via ``gh pr view``, used to
+    auto-size the review→fix round budget. Returns ``None`` on ANY failure —
+    missing ``gh``, a non-zero exit, unparseable JSON, or missing/ill-typed
+    counts — so the caller falls back to the default budget (fail-soft)."""
+    argv = ["gh", "pr", "view", str(pr), "--json", "additions,deletions"]
+    if repo:
+        argv += ["-R", repo]
+    try:
+        proc = run(argv, cwd=cwd)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    try:
+        data = json.loads((getattr(proc, "stdout", "") or "").strip() or "{}")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    additions = data.get("additions")
+    deletions = data.get("deletions")
+    if not isinstance(additions, int) or not isinstance(deletions, int):
+        return None
+    return additions + deletions
 
 
 def _decode_concatenated(text: str) -> Iterable[dict]:

@@ -9,8 +9,10 @@ are sane; the skill works with no env vars at all.
 | `BUDDHI_CONFIG` | Path to the config file the skill reads/writes (test/CI seam; normally `~/.config/review-loop/config.yaml`) | `~/.config/review-loop/config.yaml` | uses the default path |
 | `BUDDHI_LOOP_PLAN` | Active plan tier override (test/CI seam; normally set via `~/.config/review-loop/config.yaml`) | config → `max-5x` | uses config/default |
 | `CLAUDE_BIN` | Claude CLI path override | PATH + common dirs | hard exit if unresolved |
-| `BUDDHI_MAX_ROUNDS` | Max fix/review rounds | auto-size 2–10 → 10 | silent fallback |
+| `BUDDHI_MAX_ROUNDS` | Max fix/review rounds | auto-size from the PR diff → 10 | positive int wins; else auto-size, else a stderr-warned fallback of 10 |
+| `BUDDHI_BOT_QUIESCENCE_SECS` | Silence window (seconds) after a bot's last comment before it is done for the round | 60 | positive int wins; `0`/negative/garbage/blank → default |
 | `BUDDHI_MAX_WAIT_TOTAL` | Hard ceiling (seconds) on how long one round waits for reviewer bots | 1800 (30 min) | clamped ≥ 1; garbage/blank → default |
+| `BUDDHI_TEST_GATE_TIMEOUT_SECS` | Hard timeout (seconds) on the pre-push local test-gate subprocess | 600 (10 min) | positive int wins; `0`/negative/garbage/blank → default |
 | `BUDDHI_CLASSIFY_TIMEOUT` | Per-comment classify subprocess timeout (seconds) | 120 | clamped ≥ 1; garbage/blank → default |
 | `BUDDHI_CLASSIFY_RETRIES` | Retries on a failed comment classification (`0` disables the retry) | 1 | clamped ≥ 0; garbage/blank → default |
 | `BUDDHI_FIX_RETRIES` | Retries on a transient per-comment fix failure (timeout / non-zero rc; `0` disables; SKIP/success are never retried) | 1 | clamped ≥ 0; garbage/blank → default |

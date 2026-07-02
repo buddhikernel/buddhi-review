@@ -1,26 +1,46 @@
 """The quiescence polling round-loop + the re-request exclusion wiring.
 
-One round = summon/re-request the expected reviewers → hold the round open
-until **every expected bot has quiesced** → classify + kernel-decide + act on
-the round's new comments → commit/push the applied fixes → next round, until a
-clean round or ``max_rounds``.
+One round = summon/re-request the expected reviewers → wait a short beat for the
+triggers to register → hold the round open until **every expected bot has
+quiesced** → classify + kernel-decide + act on the round's new comments →
+commit/push the applied fixes → decide whether to run another round. The run
+ends **clean** the moment a round produces no substantive progress; a round that
+did land a substantive fix earns another review round, up to ``max_rounds``.
+
+**Termination.** Another review round is requested ONLY when the round produced
+real substantive progress — at least one ``SUBSTANTIVE`` comment whose fix
+actually landed AND changed files. A cosmetic / PR-description / outdated /
+invalid-only round — or a substantive comment the fixer skipped, or a
+substantive fix that changed nothing — is a clean finish: any applied fixes are
+committed/pushed, then the run exits clean without re-summoning anyone. When the
+round budget is spent and the final round completed cleanly (no unanswered
+escalation, no poisoned worktree, no failed push, no operator stop), the exit
+routes through the same clean-exit gates as a naturally-clean finish rather than
+an unconditional hand-back.
 
 **Quiescence.** A bot is done for the round once it posts a definitive
 single-shot signal (clean / quota-exhausted / PR-too-large / errored) OR has
 been silent for ``BUDDHI_BOT_QUIESCENCE_SECS`` since its LAST contribution —
 the timer resets on every contribution from the same bot, so the window slides
-with a bursting bot. A bot that never contributes is not declared silent-done
-before ``MIN_BOT_WAIT``. Hard outer bounds: ``IDLE_TIMEOUT`` (no activity from
-anyone) and ``BUDDHI_MAX_WAIT_TOTAL`` (per-round ceiling). An empty-body review
-never promotes a bot to no-issues (empty bodies are dropped at ingest).
+with a bursting bot. A bot that has NOT been seen this round never self-quiesces;
+it holds the round open, bounded only by ``IDLE_TIMEOUT`` (no activity from
+anyone, after ``MIN_BOT_WAIT``) and ``BUDDHI_MAX_WAIT_TOTAL`` (per-round
+ceiling). ``BUDDHI_BOT_QUIESCENCE_SECS`` of 0 or a negative value falls back to
+the default, not a 1s floor. An empty-body review never promotes a bot to
+no-issues (empty bodies are dropped at ingest).
 
-**Exclusion.** Three independent cause-buckets ride
-``ReviewStore``: quota and PR-too-large are permanent; errored is transient and
-retractable — a bot whose comment is **strictly newer** than its recorded error
-signal comes back (an unparseable/equal/missing timestamp keeps it excluded,
-conservatively). Every summon / poll / merge gate subtracts the derived union.
-``--rr`` / ``--rr-active`` never clear any bucket; they only widen the round-1
-summon set (``--rr``) or exit clean when nothing is active (``--rr-active``).
+**Exclusion.** Three independent cause-buckets ride ``ReviewStore``: quota and
+PR-too-large are permanent; errored is transient and retractable — a bot whose
+comment is **strictly newer** than its recorded error signal comes back (an
+unparseable/equal/missing timestamp keeps it excluded, conservatively). Two soft,
+run-scoped driver sets ride alongside: a reviewer whose round posted only
+non-substantive comments is dropped as **polish-only**, and a reviewer expected
+yet silent for a full round is **dropped from re-request** (silence is not
+approval). Every summon / poll / merge gate subtracts the derived union.
+``--rr`` re-pings everyone: it clears the soft buckets (voluntarily-done +
+polish) at run start; the hard buckets are never cleared. ``--rr`` /
+``--rr-active`` also widen the round-1 summon set (``--rr``) or exit clean when
+nothing is active (``--rr-active``).
 
 Clock, sleep, the comment fetch, and the ``gh`` runner are all injectable —
 the test suite drives rounds with a fake clock and never sleeps or touches the
@@ -57,6 +77,18 @@ def _env_int(name: str, default: int, floor: int = 1) -> int:
         return max(floor, int(os.environ.get(name, "")))
     except (TypeError, ValueError):
         return default
+
+
+def _env_positive_or_default(name: str, default: int) -> int:
+    """``name`` as a POSITIVE int, else ``default``. Unlike :func:`_env_int`
+    (which floors to 1), a 0 or negative value falls back to ``default`` — a
+    non-positive quiescence window is meaningless, so it means "use the default",
+    not "poll every second"."""
+    try:
+        value = int(os.environ.get(name, ""))
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 def _env_trigger(name: str, default: str) -> str:
@@ -109,7 +141,8 @@ def _env_max_rounds() -> Optional[int]:
     if raw in (None, ""):
         return None
     try:
-        return max(1, int(raw))
+        val = int(raw)
+        return val if val > 0 else None  # 0/negative → treat as invalid → auto-size
     except (TypeError, ValueError):
         return None
 
@@ -155,11 +188,15 @@ def _strictly_newer(new: Optional[str], old: Optional[str]) -> bool:
 @dataclass
 class RoundTimes:
     """Round wait bounds — these defaults are the authoritative ones."""
-    quiescence: float = float(_env_int("BUDDHI_BOT_QUIESCENCE_SECS", 60))
+    quiescence: float = float(_env_positive_or_default("BUDDHI_BOT_QUIESCENCE_SECS", 60))
     poll_interval: float = 30.0
     min_bot_wait: float = 420.0
     idle_timeout: float = 900.0
     max_wait_total: float = float(_env_int("BUDDHI_MAX_WAIT_TOTAL", 1800))
+    # Beat between posting the round's re-requests and opening the poll window, so
+    # the review triggers have time to register before the loop starts polling for
+    # their output. Applied only when a summon actually landed.
+    register_delay: float = 60.0
 
 
 # Vendor re-request triggers — env-seamed so a vendor slug rename is config,
@@ -280,6 +317,13 @@ _TABLE_COUNT_KEYS: Tuple[str, ...] = (
     "posted", "sub", "cosm", "prdesc", "outd", "inval", "biz", "fail",
 )
 
+# The classification labels that count as a "real finding" — a round in which a
+# reviewer posted at least one of these keeps that reviewer in the re-request
+# gate; a reviewer whose whole round was other labels is dropped as polish-only.
+_REAL_FINDING_LABELS = frozenset({
+    "SUBSTANTIVE", "BUSINESS_QUESTION", "CLASSIFICATION_FAILED",
+})
+
 # Why a reviewer is not in a round's expected set, keyed by a stable reason code.
 # The long form is the honest skip-log line; the short form is the table cell.
 _SKIP_LONG: Dict[str, str] = {
@@ -287,6 +331,8 @@ _SKIP_LONG: Dict[str, str] = {
     "quota": "quota exhausted",
     "pr-too-large": "PR too large",
     "errored": "errored (retractable on a newer comment)",
+    "polish": "polishing only — no substantive findings left",
+    "silent": "silent for a full round — dropped from re-request",
     "excluded": "excluded",
 }
 _STATUS_SHORT: Dict[str, str] = {
@@ -294,6 +340,8 @@ _STATUS_SHORT: Dict[str, str] = {
     "quota": "quota",
     "pr-too-large": "PR too large",
     "errored": "errored",
+    "polish": "polishing",
+    "silent": "silent (dropped)",
     "excluded": "excluded",
 }
 
@@ -620,6 +668,17 @@ class RoundDriver:
 
         self.store = self.adapter.store
         self.done: Set[str] = set()           # voluntarily-done (clean review)
+        # Soft, run-scoped exclusion sets kept on the driver (NOT the ReviewStore
+        # hard buckets), so they never touch the SAFETY / hard-cause reporting.
+        # Cleared by --rr (re-requests everyone):
+        #   polishing     — a reviewer whose round posted only non-substantive
+        #                   comments (nothing left to fix); dropped from re-request.
+        self.polishing: Set[str] = set()
+        # NOT cleared by --rr — a silent drop persists for the run; re-inclusion
+        # fires in _classify_signal() when the bot posts a new comment mid-run:
+        #   silent_dropped — a reviewer expected yet silent for a full round;
+        #                   silence is not approval, so it is dropped mid-run.
+        self.silent_dropped: Set[str] = set()
         self.bots: Dict[str, BotState] = {}
         self.processed_ids: Set[str] = set()
         self.actions: List[ActionResult] = []
@@ -655,11 +714,15 @@ class RoundDriver:
     # ------------------------------------------------------------------ state
 
     def expected_bots(self) -> List[str]:
-        """The expected-bot gate: enabled reviewers minus voluntarily-done minus
-        the derived union of the three exclusion buckets."""
+        """The expected-bot gate: enabled reviewers minus voluntarily-done, minus
+        the soft driver drops (polish-only + silent), minus the derived union of
+        the three hard exclusion buckets."""
         return [
             b for b in active_reviewers(self.cfg, self.repo)
-            if b not in self.done and not self.store.is_excluded(b)
+            if b not in self.done
+            and b not in self.polishing
+            and b not in self.silent_dropped
+            and not self.store.is_excluded(b)
         ]
 
     def _bot_state(self, bot: str) -> BotState:
@@ -679,6 +742,10 @@ class RoundDriver:
             return "pr-too-large"
         if st.signal == detectors.SIGNAL_ERRORED:
             return "errored"
+        if bot in self.polishing:
+            return "polish"
+        if bot in self.silent_dropped:
+            return "silent"
         if self.store.is_excluded(bot):
             return "excluded"
         return None
@@ -744,7 +811,12 @@ class RoundDriver:
         bots don't re-review an existing PR spontaneously, so the flag's
         re-request half must actually fire (``--rr-active`` additionally exits
         clean when nothing is active, handled in ``run``). Rounds ≥2 re-request
-        every still-expected bot."""
+        every still-expected bot.
+
+        After the re-requests are posted, wait ``register_delay`` for the review
+        triggers to register before the caller opens the poll window — but only
+        when a summon actually landed (an all-``auto_on_open`` round-1 with no
+        summon does not wait)."""
         if round_no == 1:
             targets = [
                 b for b in expected
@@ -752,10 +824,16 @@ class RoundDriver:
             ]
         else:
             targets = list(expected)
-        for bot in targets:
-            self._request_review(bot)
+        # NB: a list comprehension, not any(...) — every target must be summoned;
+        # any() would short-circuit on the first success and skip the rest.
+        summoned = [self._request_review(bot) for bot in targets]
+        if any(summoned) and self.times.register_delay > 0:
+            self.sleep(self.times.register_delay)
 
-    def _request_review(self, bot: str) -> None:
+    def _request_review(self, bot: str) -> bool:
+        """Post ``bot``'s re-request trigger. Returns True iff the trigger
+        actually landed (so the caller knows whether to wait out the register
+        delay)."""
         if bot == "copilot":
             argv = [
                 "gh", "api", "-X", "POST",
@@ -765,7 +843,7 @@ class RoundDriver:
         else:
             trigger = TRIGGER_COMMENTS.get(bot)
             if not trigger:
-                return
+                return False
             argv = ["gh", "pr", "comment", self.pr, "--body", trigger]
             if self.repo:
                 argv += ["-R", self.repo]
@@ -774,12 +852,14 @@ class RoundDriver:
             if proc.returncode != 0:
                 self.notice("re-request", f"{bot} re-request failed: "
                             f"{(proc.stderr or '').strip()[:120]}", status="fallback")
-            else:
-                # The summon landed — so a later silence is the reviewer's, not a
-                # failed request (never flag a bot we could not actually summon).
-                self.requested_ever.add(bot)
+                return False
+            # The summon landed — so a later silence is the reviewer's, not a
+            # failed request (never flag a bot we could not actually summon).
+            self.requested_ever.add(bot)
+            return True
         except (subprocess.SubprocessError, OSError) as exc:
             self.notice("re-request", f"{bot} re-request failed: {exc}", status="fallback")
+            return False
 
     # ------------------------------------------------------------- quiescence
 
@@ -789,7 +869,11 @@ class RoundDriver:
             return True
         if st.last_seen is not None:
             return (now - st.last_seen) >= self.times.quiescence
-        return (now - round_start) >= self.times.min_bot_wait
+        # A bot NOT seen this round never self-quiesces — it holds the round open
+        # so a slow reviewer's output is never skipped past. The round is bounded
+        # instead by the idle-timeout (after MIN_BOT_WAIT) and the max-wait
+        # ceiling in _wait_for_quiescence.
+        return False
 
     def _ingest_new(self) -> List[Comment]:
         comments = self.fetch(self.pr, repo=self.repo, cwd=self.cwd)
@@ -806,6 +890,13 @@ class RoundDriver:
             return None  # humans and unknown logins don't drive bot state or rounds
         st = self._bot_state(bot)
         st.last_seen = now
+        # Re-include immediately on any new comment — _record_round_attendance()
+        # only iterates over expected_bots(), which excludes silent_dropped, so
+        # the discard() there never fires for a dropped bot.
+        if bot in self.silent_dropped:
+            self.silent_dropped.discard(bot)
+            self.notice("silent-reinclusion", f"{bot} posted a new comment — re-included",
+                        status="done")
 
         # The errored comeback is NOT decided here: a bot is retracted only
         # on a SUBSTANTIVE comment strictly newer than the error signal, and the
@@ -867,7 +958,11 @@ class RoundDriver:
             return
         if result.classification.label != "SUBSTANTIVE":
             return
-        if _strictly_newer(comment.created_at, st.error_created_at):
+        # An EDITED substantive comment can prove recovery by its edit time, so the
+        # candidate stamp is updated_at-then-created_at; the recorded error stamp
+        # stays created_at. The strictly-newer rule is unchanged (conservative).
+        candidate = comment.updated_at or comment.created_at
+        if _strictly_newer(candidate, st.error_created_at):
             self.store.errored_comeback(bot)
             st.signal = None
             st.error_created_at = None
@@ -895,7 +990,12 @@ class RoundDriver:
                 last_activity = now
             if all(self._quiesced(b, now, round_start) for b in expected):
                 return actionable
-            if (now - last_activity) >= self.times.idle_timeout:
+            # The idle-timeout only bounds the round AFTER MIN_BOT_WAIT — a
+            # never-seen bot (which now holds the round open) still gets its
+            # minimum wait before an idle window can close the round out from
+            # under it.
+            if ((now - round_start) >= self.times.min_bot_wait
+                    and (now - last_activity) >= self.times.idle_timeout):
                 self.notice("round-wait", "idle timeout — closing the round", status="fallback")
                 return actionable
             if (now - round_start) >= self.times.max_wait_total:
@@ -904,12 +1004,53 @@ class RoundDriver:
                 return actionable
             self.sleep(self.times.poll_interval)
 
+    def _update_polishing(self, actionable: Sequence[Comment],
+                          results: Sequence[CommentResult]) -> None:
+        """Round-end: a reviewer whose comments this round were ALL non-substantive
+        (none SUBSTANTIVE / BUSINESS_QUESTION / CLASSIFICATION_FAILED) has nothing
+        left to fix — drop it from re-request for the rest of the run (soft,
+        --rr-clearable). A reviewer that posted a real finding this round, one that
+        went voluntarily-done, or one hard-excluded (quota / PR-too-large /
+        errored) is never demoted to polish."""
+        commented: Set[str] = set()
+        real_finding: Set[str] = set()
+        for c, r in zip(actionable, results):
+            bot = detectors.bot_for_login(c.source)
+            if bot is None:
+                continue
+            commented.add(bot)
+            if r.classification.label in _REAL_FINDING_LABELS:
+                real_finding.add(bot)
+        for bot in commented - real_finding:
+            if bot in self.done or self.store.is_excluded(bot):
+                continue  # a clean / hard-cause reason already owns this reviewer
+            self.polishing.add(bot)
+
+    def _worktree_has_changes(self) -> bool:
+        """True when ``git status --porcelain`` reports any change in the loop's
+        worktree — the has-file-changes probe for the substantive re-review gate
+        when pushing is off (with pushing on, the commit step's result is
+        authoritative). Any git error → False (no change proven, conservatively)."""
+        try:
+            proc = self.gh_run(["git", "status", "--porcelain"], cwd=self.cwd)
+        except (subprocess.SubprocessError, OSError):
+            return False
+        if getattr(proc, "returncode", 1) != 0:
+            return False
+        return bool((getattr(proc, "stdout", "") or "").strip())
+
     # ------------------------------------------------------------------- run
 
     def run(self) -> RunOutcome:
         """Snapshot the run-start fleet (for the SAFETY gate's empty-vs-silent
         distinction), drive the round loop, and ALWAYS emit the persistent
         silent-reviewer warning at run end (every exit path, via ``finally``)."""
+        if self.rr:
+            # --rr re-pings everyone: clear the SOFT exclusions (voluntarily-done
+            # + polish-only) so a previously-satisfied reviewer is summoned again.
+            # The hard buckets (quota / PR-too-large / errored) are never cleared.
+            self.done.clear()
+            self.polishing.clear()
         self._run_start_fleet = set(self.expected_bots())
         try:
             outcome = self._run_loop()
@@ -982,6 +1123,13 @@ class RoundDriver:
                 return RunOutcome("needs-human", round_no, False, self.actions,
                                   rebase_skip=True)
 
+            # A reviewer whose whole round was non-substantive (cosmetic / PR-desc
+            # / outdated / invalid — nothing SUBSTANTIVE / BUSINESS_QUESTION /
+            # CLASSIFICATION_FAILED) has nothing left to fix: drop it from
+            # re-request for the rest of the run.
+            self._update_polishing(actionable, results)
+
+            committed_changes = False
             if any(a.final == "fixed" for a in round_actions) and self.push:
                 pushed = commit_push.commit_and_push(
                     self.cwd,
@@ -1004,9 +1152,36 @@ class RoundDriver:
                     # Bucket C: local/remote diverged — never rebase/force-push it.
                     return RunOutcome("needs-human", round_no, False, self.actions,
                                       rebase_skip=True)
+                committed_changes = (pushed == "pushed")
 
-        print(f"[round] max rounds ({self.max_rounds}) reached — not merging")
-        return RunOutcome("max-rounds", self.max_rounds, False, self.actions)
+            # ── Substantive-progress gate ─────────────────────────────────────
+            # Request another review round ONLY when this round produced real
+            # substantive progress: at least one SUBSTANTIVE-labeled comment whose
+            # fix actually LANDED (final == "fixed") AND changed files. A cosmetic
+            # / PR-description / outdated / invalid-only round — or a substantive
+            # comment the fixer skipped, or a substantive fix that changed nothing
+            # — is a clean finish: the applied fixes were committed above, so exit
+            # clean without re-summoning anyone. The file-change check reads the
+            # commit result when pushing (``pushed`` = real changes committed);
+            # with pushing off it probes the worktree directly.
+            round_substantive = any(
+                r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
+                for r, a in zip(results, round_actions)
+            )
+            if round_substantive and (committed_changes or self._worktree_has_changes()):
+                continue
+            return self._clean_exit(round_no)
+
+        # The round budget is spent and the final round completed cleanly — no
+        # unanswered escalation, no poisoned worktree, no failed push, no operator
+        # stop (each of those returns above). Route the exit through the normal
+        # clean-exit gates (SAFETY + optional CI + merge) rather than an
+        # unconditional hand-back: a run that did its budgeted work and left
+        # nothing outstanding is merge-eligible exactly like a naturally-clean
+        # finish.
+        print(f"[round] round budget ({self.max_rounds}) reached with the final "
+              f"round clean — routing through the clean-exit gates")
+        return self._clean_exit(self.max_rounds)
 
     def _clean_exit(self, rounds: int) -> RunOutcome:
         print("[round] clean — every expected reviewer is done/excluded and "
@@ -1288,17 +1463,27 @@ class RoundDriver:
     # ------------------------------------------------- silent-reviewer warning
 
     def _record_round_attendance(self, expected: Sequence[str]) -> None:
-        """Round-end bookkeeping for the persistent-silent-reviewer warning. For
-        every reviewer EXPECTED this round: if it posted anything (its round-scoped
-        ``last_seen`` is set — a comment, clean approval, OR a quota/error
-        placeholder all count) it has responded and is permanently protected from
-        the warning; otherwise its consecutive-silent round count is bumped.
+        """Round-end bookkeeping for the persistent-silent-reviewer warning AND the
+        mid-run silent drop. For every reviewer EXPECTED this round: if it posted
+        anything (its round-scoped ``last_seen`` is set — a comment, clean
+        approval, OR a quota/error placeholder all count) it has responded, is
+        permanently protected from the warning, and is re-included if it had been
+        dropped; otherwise its consecutive-silent round count is bumped and — if
+        the loop genuinely expected it (summoned, or auto_on_open) — it is dropped
+        from re-request for the rest of the run (silence is not approval).
         Reviewers not expected this round (done / excluded) are left untouched."""
         for bot in expected:
             if self._bot_state(bot).last_seen is not None:
                 self.responded_ever.add(bot)
+                self.silent_rounds[bot] = 0        # responded → the streak resets
+                # Defensive no-op for silent_dropped bots: expected_bots() already
+                # filters them out, so they are never in `expected` — real
+                # re-inclusion fires in _classify_signal() when they post again.
+                self.silent_dropped.discard(bot)
             else:
                 self.silent_rounds[bot] = self.silent_rounds.get(bot, 0) + 1
+                if self._was_review_expected(bot):
+                    self.silent_dropped.add(bot)
 
     def _was_review_expected(self, bot: str) -> bool:
         """True iff the loop genuinely EXPECTED a review from ``bot`` — it was

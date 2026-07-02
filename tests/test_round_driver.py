@@ -64,9 +64,12 @@ def make_driver(timeline, *, cfg, clock=None, gh=None, times=None, classify=None
         fix_dispatch=fix,
         fetch=fetch, gh_run=gh, clock=clock, sleep=clock.sleep,
         notice=lambda *a, **k: "",
+        # register_delay=0 by default so the existing timing tests isolate the
+        # quiescence / gating behaviour from the post-summon register delay; the
+        # dedicated register-delay tests below set it explicitly.
         times=times or RoundTimes(quiescence=60, poll_interval=30,
                                   min_bot_wait=420, idle_timeout=900,
-                                  max_wait_total=1800),
+                                  max_wait_total=1800, register_delay=0),
         answer_waiter=answer_waiter,
         **kw,
     )
@@ -80,12 +83,16 @@ CLAUDE_ONLY = {"active_reviewers": ["claude"], "auto_on_open": {"claude": False}
 # Quiescence semantics
 # ---------------------------------------------------------------------------
 
-def test_silent_unseen_bot_waits_min_bot_wait():
+def test_silent_unseen_bot_holds_round_then_is_dropped():
+    # A never-seen expected bot does NOT self-quiesce — it holds the round open
+    # until the idle-timeout (after MIN_BOT_WAIT) closes it. Having then been
+    # silent a full round, it is dropped from re-request for the rest of the run.
     cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
     driver, clock, gh = make_driver([], cfg=cfg)
     outcome = driver.run()
-    assert outcome.status == "clean"          # nothing actionable ever arrived
-    assert clock.t >= 420                      # never declared quiet before MIN_BOT_WAIT
+    assert outcome.status == "clean"           # nothing actionable ever arrived
+    assert clock.t >= 900                       # held open to the idle timeout, not 420
+    assert "copilot" in driver.silent_dropped   # silent a full round → dropped
     assert gh.matching("requested_reviewers") == []  # auto_on_open: no round-1 summon
 
 
@@ -137,16 +144,17 @@ def test_issue_channel_sentinel_and_signals_still_fire():
 
 def test_max_wait_total_ceiling():
     # a bot that bursts forever: a fresh comment every 50s keeps both the
-    # quiescence window and the idle timer alive — only the ceiling closes the
-    # round (max_rounds=1 isolates round 1's wait).
+    # quiescence window and the idle timer alive — only the max-wait ceiling closes
+    # the round (max_rounds=1 isolates round 1's wait). The comments are INVALID, so
+    # the round yields no substantive progress and the run exits clean.
     timeline = [
         (i * 50, Comment(id=f"c{i}", text=f"more prose {i}", source="claude[bot]"))
         for i in range(60)
     ]
     driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY, max_rounds=1)
     outcome = driver.run()
-    assert outcome.status == "max-rounds"
-    assert 1800 <= clock.t < 1900
+    assert outcome.status == "clean"          # INVALID-only round → clean finish
+    assert 1800 <= clock.t < 1900             # closed by the max-wait ceiling
 
 
 def test_idle_timeout_closes_a_stuck_round():
@@ -331,8 +339,9 @@ def test_fix_flow_pushes_then_next_round_goes_clean():
 
 def test_round2_holds_open_for_rerequested_bot_no_instant_quiesce():
     # Regression: round 1's last_seen must NOT leak into round 2. A bot that
-    # contributed in round 1 but is silent in round 2 is held to MIN_BOT_WAIT,
-    # never declared done on its first round-2 poll.
+    # contributed in round 1 but is silent in round 2 is never-seen THAT round, so
+    # it holds the round open to the idle-timeout (after MIN_BOT_WAIT) — never
+    # declared done on its first round-2 poll off a stale round-1 last_seen.
     timeline = [
         (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
     ]
@@ -342,9 +351,9 @@ def test_round2_holds_open_for_rerequested_bot_no_instant_quiesce():
         max_rounds=2, answer_waiter=lambda esc, **k: {},
     )
     outcome = driver.run()
-    # round 1 closes ~t=60; round 2 then holds the silent re-requested bot a
-    # FULL MIN_BOT_WAIT (420s) before clean-exit — so total ≫ 60.
-    assert clock.t >= 60 + 420
+    # round 1 closes ~t=60; round 2 then holds the silent re-requested bot open to
+    # the idle-timeout before clean-exit — so total ≫ 60.
+    assert clock.t >= 60 + 900
     assert outcome.rounds == 2
 
 
@@ -461,8 +470,11 @@ def test_push_error_hands_over_without_merging():
     assert not gh.matching("gh", "merge")
 
 
-def test_max_rounds_exhaustion_does_not_merge():
-    # an endless stream of substantive comments — every round has work.
+def test_max_rounds_clean_final_round_routes_to_merge():
+    # Every budgeted round lands a substantive fix and pushes cleanly; the budget
+    # is spent with the final round clean (no escalation / poison / push failure).
+    # The exhaustion exit routes through the normal clean-exit gates, so with
+    # auto-merge on and a genuine review it MERGES — not an unconditional hand-back.
     timeline = [
         (i * 10, Comment(id=f"c{i}", text=f"missing check {i}", source="claude[bot]"))
         for i in range(2000)
@@ -473,7 +485,31 @@ def test_max_rounds_exhaustion_does_not_merge():
         auto_merge=True, max_rounds=2, answer_waiter=lambda esc, **k: {},
     )
     outcome = driver.run()
-    assert outcome.status == "max-rounds" and outcome.rounds == 2
+    assert outcome.status == "clean" and outcome.rounds == 2
+    assert outcome.merged is True
+    assert gh.matching("gh", "merge", "--squash")
+
+
+def test_max_rounds_final_round_unanswered_escalation_hands_back():
+    # A final budgeted round with an UNRESOLVED problem must still hand back
+    # unmerged: round 1 lands a substantive fix (→ another round), and the last
+    # round raises a business question that goes unanswered — the escalation gate
+    # returns needs-human BEFORE the exhaustion routing, so the run never merges.
+    def classify(prompt):
+        if "should we" in prompt:
+            return json.dumps({"label": "BUSINESS_QUESTION", "reason": "t"})
+        return json.dumps({"label": "SUBSTANTIVE", "reason": "t"})
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+        (90, Comment(id="b", text="should we drop this column?", source="claude[bot]")),
+    ]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=classify, fix=fix,
+        auto_merge=True, max_rounds=2, answer_waiter=lambda esc, **k: {"b": None},
+    )
+    outcome = driver.run()
+    assert outcome.status == "needs-human"
     assert not gh.matching("gh", "merge")
 
 
@@ -702,3 +738,257 @@ def test_no_auth_banner_on_normal_review_round(capsys):
     )
     driver.run()
     assert "REVIEWER AUTH FAILED" not in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# Substantive-progress gate: only a landed SUBSTANTIVE fix that changed files
+# earns another round; everything else is a clean finish.
+# ---------------------------------------------------------------------------
+
+def test_cosmetic_only_round_ends_the_run_clean():
+    # A round whose only fix is COSMETIC produces no substantive progress: the
+    # cosmetic fix is committed/pushed, then the run ends clean (merges under
+    # auto-merge) with NO re-request round.
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]"))]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        auto_merge=True, answer_waiter=lambda esc, **k: {},
+    )
+    outcome = driver.run()
+    assert outcome.status == "clean" and outcome.rounds == 1
+    assert outcome.merged is True
+    assert [a.final for a in outcome.actions] == ["fixed"]  # cosmetic fix applied
+    assert gh.matching("git", "push")                       # …committed + pushed
+    assert len(gh.matching("@claude review")) == 1          # but NO round-2 re-request
+    assert gh.matching("gh", "merge", "--squash")
+
+
+def test_substantive_fix_with_no_file_change_ends_clean():
+    # A SUBSTANTIVE fix that applied but changed NO files (commit_and_push returns
+    # "nothing"; the worktree probe is clean) is not substantive PROGRESS → the run
+    # ends clean without a re-request round.
+    timeline = [(0, Comment(id="a", text="this null check is missing", source="claude[bot]"))]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+
+    class CleanTreeGh(GhRecorder):
+        # git status is always CLEAN → commit_and_push returns "nothing".
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            self.calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+
+    gh = CleanTreeGh()
+    driver, clock, _ = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        gh=gh, max_rounds=3, answer_waiter=lambda esc, **k: {},
+    )
+    outcome = driver.run()
+    assert outcome.status == "clean" and outcome.rounds == 1
+    assert len(gh.matching("@claude review")) == 1  # no confirmation round requested
+
+
+def test_substantive_fix_earns_another_round():
+    # The positive control: a landed SUBSTANTIVE fix that DID change files earns a
+    # re-request round, which then comes in clean.
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+        (90, Comment(id="b", text="No issues found.", source="claude[bot]")),
+    ]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        auto_merge=True, answer_waiter=lambda esc, **k: {},
+    )
+    outcome = driver.run()
+    assert outcome.status == "clean" and outcome.rounds == 2
+    assert len(gh.matching("@claude review")) == 2   # summon + confirmation round
+    assert outcome.merged is True
+
+
+# ---------------------------------------------------------------------------
+# Sticky polish-exclusion + soft-reset on --rr
+# ---------------------------------------------------------------------------
+
+def test_polish_only_reviewer_dropped_from_rerequest():
+    # copilot posts only a cosmetic nit (no real finding) → dropped as polish-only;
+    # claude's substantive fix drives round 2, where copilot is no longer summoned.
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": False}}
+
+    def classify(prompt):
+        label = "COSMETIC" if "nit:" in prompt else "SUBSTANTIVE"
+        return json.dumps({"label": label, "reason": "t"})
+
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+        (0, Comment(id="b", text="nit: rename tmp", source="copilot[bot]")),
+        (90, Comment(id="c", text="No issues found.", source="claude[bot]")),
+    ]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=classify, fix=fix,
+        max_rounds=3, answer_waiter=lambda esc, **k: {},
+    )
+    driver.run()
+    assert "copilot" in driver.polishing                 # cosmetic-only → polish-dropped
+    assert len(gh.matching("requested_reviewers")) == 1  # copilot summoned round 1 only
+    assert len(gh.matching("@claude review")) == 2       # claude re-requested in round 2
+
+
+def test_reviewer_with_a_real_finding_is_not_polished():
+    # A reviewer that posts a SUBSTANTIVE finding this round is never demoted to
+    # polish, even if the fix landed and it has "nothing left" — it earns re-review.
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+        (90, Comment(id="b", text="No issues found.", source="claude[bot]")),
+    ]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        answer_waiter=lambda esc, **k: {},
+    )
+    driver.run()
+    assert "claude" not in driver.polishing
+
+
+def test_rr_clears_soft_exclusions_but_keeps_hard_buckets():
+    # --rr re-pings everyone: the soft buckets (voluntarily-done + polish) are
+    # cleared at run start so a previously-satisfied reviewer is summoned again; a
+    # hard bucket (quota) survives.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY, rr=True)
+    driver.done.add("claude")               # a stale voluntarily-done…
+    driver.polishing.add("claude")          # …and a stale polish drop
+    driver.store.exclude_quota("copilot")   # a HARD bucket that must survive
+    driver.run()
+    assert "claude" not in driver.done          # soft buckets cleared by --rr
+    assert "claude" not in driver.polishing
+    assert driver.store.is_excluded("copilot")  # hard bucket untouched
+    assert gh.matching("@claude review")        # claude summoned (soft exclusion cleared)
+
+
+# ---------------------------------------------------------------------------
+# Mid-run silent drop + never-seen bot holds the round open
+# ---------------------------------------------------------------------------
+
+def test_silent_reviewer_dropped_mid_run():
+    # copilot is expected but silent for the whole round; claude's substantive fix
+    # keeps the run going. copilot is dropped from re-request (silence ≠ approval)
+    # and no longer appears in the expected set or the round-2 summon.
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": False}}
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+        # claude's clean re-review lands only AFTER round 1's idle close (copilot
+        # holds round 1 open as a never-seen bot), so it belongs to round 2.
+        (1000, Comment(id="c", text="No issues found.", source="claude[bot]")),
+    ]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        max_rounds=3, answer_waiter=lambda esc, **k: {},
+    )
+    driver.run()
+    assert "copilot" in driver.silent_dropped             # silent a full round → dropped
+    assert "copilot" not in driver.expected_bots()        # …and out of the expected set
+    assert len(gh.matching("requested_reviewers")) == 1   # summoned round 1 only, not round 2
+    assert len(gh.matching("@claude review")) == 2        # claude re-requested in round 2
+
+
+def test_silent_reviewer_that_comes_back_is_reincluded():
+    # A reviewer dropped for silence is re-included the moment it responds again.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    driver.silent_dropped.add("claude")
+    driver.silent_rounds["claude"] = 1
+    driver.bots.setdefault("claude", round_driver.BotState()).last_seen = 5.0  # responded
+    driver._record_round_attendance(["claude"])
+    assert "claude" not in driver.silent_dropped
+    assert driver.silent_rounds["claude"] == 0
+
+
+def test_silent_dropped_bot_reincluded_via_classify_signal():
+    # _record_round_attendance() only iterates expected_bots(), which excludes
+    # silent_dropped — so a dropped bot that posts a new comment must be
+    # re-included via _classify_signal(), not via round-end bookkeeping.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    driver.silent_dropped.add("claude")
+    comment = Comment(id="x", text="this looks wrong", source="claude[bot]")
+    driver._classify_signal(comment, clock.t)
+    assert "claude" not in driver.silent_dropped
+    assert "claude" in driver.expected_bots()
+
+
+# ---------------------------------------------------------------------------
+# Post-summon register delay
+# ---------------------------------------------------------------------------
+
+def test_register_delay_waits_before_polling_when_a_summon_lands():
+    # After a summon actually lands, the loop waits register_delay before opening
+    # the poll window, so the round can't close before the delay elapses.
+    times = RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
+                       idle_timeout=900, max_wait_total=1800, register_delay=60)
+    timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]"))]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY, times=times, auto_merge=True)
+    driver.run()
+    assert clock.t >= 60          # the register delay elapsed before the round closed
+
+
+def test_no_register_delay_when_no_summon_lands():
+    # An all-auto_on_open fleet is not summoned in round 1, so no re-request lands
+    # and the register delay is skipped — the poll window opens immediately.
+    times = RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
+                       idle_timeout=900, max_wait_total=1800, register_delay=60)
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    timeline = [(0, Comment(id="a", text="No issues found.", source="copilot[bot]"))]
+    driver, clock, gh = make_driver(timeline, cfg=cfg, times=times, auto_merge=True)
+    driver.run()
+    assert clock.t < 60                              # no summon → no register delay
+    assert gh.matching("requested_reviewers") == []
+
+
+# ---------------------------------------------------------------------------
+# BUDDHI_BOT_QUIESCENCE_SECS env clamp
+# ---------------------------------------------------------------------------
+
+def test_env_positive_or_default_clamps_nonpositive(monkeypatch):
+    f = round_driver._env_positive_or_default
+    monkeypatch.setenv("X_Q", "0"); assert f("X_Q", 60) == 60      # zero → default
+    monkeypatch.setenv("X_Q", "-5"); assert f("X_Q", 60) == 60     # negative → default
+    monkeypatch.setenv("X_Q", "garbage"); assert f("X_Q", 60) == 60  # unparseable → default
+    monkeypatch.setenv("X_Q", "45"); assert f("X_Q", 60) == 45     # positive → honoured
+    monkeypatch.delenv("X_Q", raising=False); assert f("X_Q", 60) == 60  # unset → default
+
+
+# ---------------------------------------------------------------------------
+# Errored comeback reads updated_at (edit time) before created_at
+# ---------------------------------------------------------------------------
+
+def test_errored_comeback_uses_updated_at_when_created_at_is_older():
+    # An EDITED substantive comment proves recovery by its updated_at, even though
+    # its created_at is NOT newer than the recorded error stamp.
+    timeline = [
+        (0, Comment(id="a", text="I encountered an internal error while reviewing.",
+                    source="claude[bot]", created_at="2026-06-10T00:05:00Z")),
+        (30, Comment(id="b", text="this null check is missing", source="claude[bot]",
+                     created_at="2026-06-10T00:00:00Z",     # created BEFORE the error…
+                     updated_at="2026-06-10T00:10:00Z")),    # …but edited AFTER it
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=TWO_BOTS,
+                                    classify=label_runner("SUBSTANTIVE"))
+    driver.run()
+    assert not driver.store.is_excluded("claude")   # came back on the edit time
+
+
+def test_errored_comeback_updated_at_takes_precedence_over_created_at():
+    # updated_at is the primary candidate: an edit stamp OLDER than the error keeps
+    # the bot excluded even when created_at alone would be newer.
+    timeline = [
+        (0, Comment(id="a", text="I encountered an internal error while reviewing.",
+                    source="claude[bot]", created_at="2026-06-10T00:05:00Z")),
+        (30, Comment(id="b", text="this null check is missing", source="claude[bot]",
+                     created_at="2026-06-10T00:06:00Z",     # created after the error…
+                     updated_at="2026-06-10T00:04:00Z")),    # …but updated_at is OLDER → wins
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=TWO_BOTS,
+                                    classify=label_runner("SUBSTANTIVE"))
+    driver.run()
+    assert driver.store.is_excluded("claude")   # updated_at (older) → no comeback

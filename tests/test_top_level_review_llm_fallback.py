@@ -105,8 +105,10 @@ def test_round_driver_consults_llm_seam_on_a_review_body():
         clean_llm=clean_llm,
         fetch=lambda pr, repo=None, cwd=None: [review],
         gh_run=_gh, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
+        # register_delay=0 isolates the definitive-signal timing from the
+        # post-summon register delay (which this test isn't exercising).
         times=RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
-                         idle_timeout=900, max_wait_total=1800),
+                         idle_timeout=900, max_wait_total=1800, register_delay=0),
     )
 
     outcome = driver.run()

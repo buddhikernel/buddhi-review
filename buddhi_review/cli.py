@@ -130,6 +130,17 @@ def _run_loop(args: argparse.Namespace) -> int:
     if round_driver.refuse_primary_checkout(args.pr, args.repo, cwd):
         return 2
     round_driver.enforce_repo_confirmation_gate(args.repo, cfg)
+    # Auto-size the round budget from the PR diff when neither --max-rounds nor
+    # BUDDHI_MAX_ROUNDS is set (best-effort; a fetch failure falls back to the
+    # default budget, with a one-line stderr warning so the fallback is never
+    # silent). resolve_max_rounds inside RoundDriver consumes diff_lines.
+    diff_lines = None
+    if args.max_rounds is None and round_driver._env_max_rounds() is None:
+        diff_lines = gh_ingest.fetch_pr_diff_lines(args.pr, repo=args.repo, cwd=cwd)
+        if diff_lines is None:
+            print(f"[setup] could not measure PR #{args.pr} diff size — falling "
+                  f"back to --max-rounds={round_driver.MAX_ROUNDS_FALLBACK}",
+                  file=sys.stderr)
     # Resolve the plan ONCE and thread it into every model call, so a per-comment
     # call never re-reads config.yaml (and never re-warns a config-less user).
     plan_name = plan(cfg)
@@ -158,6 +169,7 @@ def _run_loop(args: argparse.Namespace) -> int:
             verify_mode=args.verify_fixes,
         ),
         max_rounds=args.max_rounds,
+        diff_lines=diff_lines,
         auto_merge=args.auto_merge,
         rr=args.rr,
         rr_active=args.rr_active,
@@ -240,7 +252,8 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                         "off: skip the gate (loud ⊘ notice)")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--rr", action="store_true",
-                   help="round 1: re-request EVERY enabled reviewer (never clears exclusions)")
+                   help="round 1: re-request EVERY enabled reviewer; clears the soft "
+                        "exclusions (voluntarily-done + polish), keeps the hard ones")
     g.add_argument("--rr-active", action="store_true",
                    help="round 1: only still-active reviewers; exit clean if none")
 

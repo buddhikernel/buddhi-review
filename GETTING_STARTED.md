@@ -147,7 +147,7 @@ back to you. Here is what you see while it flies:
 
 - **A per-round summary table**: one row per enabled reviewer, with what each posted
   and its status (`reviewed`, `active`, `done`, `quota`, `PR too large`, `errored`,
-  `excluded`, or `not configured (repo)`),
+  `polishing`, `silent (dropped)`, `excluded`, or `not configured (repo)`),
   so a reviewer that drops out of the expected set never disappears without a reason:
 
   ```text
@@ -172,9 +172,12 @@ back to you. Here is what you see while it flies:
   squash-merge on a clean exit, when you opt into auto-merge). Every autonomous action
   is logged so the trail is greppable.
 
-The loop runs review→fix rounds until a clean round or it hits the round ceiling, then
-exits. It **never merges unless you opt in** (`--auto-merge`); by default it stops on
-a clean pass and leaves the merge to you.
+The loop runs review→fix rounds and ends the moment a round produces no substantive
+progress — a round that lands a real fix earns another review round, but a cosmetic-only
+(or nothing-to-fix) round finishes clean. If the round budget runs out with the final
+round clean, that exit is treated like any other clean finish. It **never merges unless
+you opt in** (`--auto-merge`); by default it stops on a clean pass and leaves the merge
+to you.
 
 ### Drive the CLI directly
 

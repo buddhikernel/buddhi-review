@@ -320,8 +320,11 @@ def _run_capture(timeline, cfg, **kw):
         fix_dispatch=lambda c, r: FixOutcome(status="applied"),
         fetch=fetch, gh_run=_Gh(), clock=clock, sleep=clock.sleep,
         notice=lambda *a, **k: "",
+        # register_delay=0 keeps these console-render tests on the tight timing
+        # they were written for (the post-summon register delay is exercised in
+        # test_round_driver).
         times=RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
-                         idle_timeout=900, max_wait_total=1800),
+                         idle_timeout=900, max_wait_total=1800, register_delay=0),
         answer_waiter=lambda esc, **k: {}, **kw,
     )
     buf = io.StringIO()
@@ -331,10 +334,12 @@ def _run_capture(timeline, cfg, **kw):
 
 
 def test_expecting_line_is_canonical_and_table_renders_each_round():
-    # codex hits quota in round 1; round 2 logs the honest skip + canonical order.
+    # codex hits quota in round 1 (gemini comes in clean); claude's substantive fix
+    # earns a round 2, whose skip-log names codex's quota exclusion + canonical order.
     timeline = [
         (0, Comment(id="a", text="Rate limit exceeded for this model.", source="codex[bot]")),
         (0, Comment(id="b", text="this null check is missing", source="claude[bot]")),
+        (0, Comment(id="g", text="No issues found.", source="gemini-code-assist[bot]")),
         (90, Comment(id="c", text="No issues found.", source="claude[bot]")),
     ]
     cfg = {"active_reviewers": ["gemini", "codex", "claude"],
@@ -364,3 +369,8 @@ def test_max_rounds_auto_size_seam_via_diff_lines():
     d_explicit = RoundDriver("7", cfg=CFG, classify_runner=lambda p: "{}",
                              max_rounds=3, diff_lines=204_800)
     assert d_explicit.max_rounds == 3  # explicit wins over diff auto-size
+
+    # diff_lines=None (the diff-size probe failed) → the default fallback budget.
+    d_fallback = RoundDriver("7", cfg=CFG, classify_runner=lambda p: "{}",
+                             max_rounds=None, diff_lines=None)
+    assert d_fallback.max_rounds == round_driver.MAX_ROUNDS_FALLBACK == 10
