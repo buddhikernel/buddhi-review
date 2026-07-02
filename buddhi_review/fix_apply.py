@@ -589,7 +589,7 @@ def touches_contract_surface(diff: Optional[str]) -> bool:
     return False
 
 
-def should_verify(mode: str, diff: str, *, tripwired: bool, label: Optional[str] = None) -> bool:
+def should_verify(mode: str, diff: Optional[str], *, tripwired: bool, label: Optional[str] = None) -> bool:
     """Decide whether an applied fix runs the pre-commit verify pass.
 
     * The dangerous-change tripwire FORCES the pass regardless of mode/label.
@@ -1233,7 +1233,7 @@ def _attempt_diff(cwd: str, tracked_ref: str) -> str:
         d = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", tracked_ref)
         tracked = d.stdout if d.returncode == 0 else ""
         parts = [tracked]
-        total = len(tracked)
+        total = len(tracked.encode('utf-8'))
         # Only pull untracked-file chunks while under the budget; stop once the
         # accumulated diff reaches it (an over-budget tracked diff skips them all).
         if total < _ATTEMPT_DIFF_MAX_BYTES:
@@ -1247,10 +1247,11 @@ def _attempt_diff(cwd: str, tracked_ref: str) -> str:
                               "--", "/dev/null", rel)
                     if nd.stdout:
                         parts.append(nd.stdout)
-                        total += len(nd.stdout)
+                        total += len(nd.stdout.encode('utf-8'))
         joined = "".join(parts)
-        if len(joined) > _ATTEMPT_DIFF_MAX_BYTES:
-            joined = joined[:_ATTEMPT_DIFF_MAX_BYTES] + _DIFF_TRUNCATED_SENTINEL
+        encoded = joined.encode('utf-8')
+        if len(encoded) > _ATTEMPT_DIFF_MAX_BYTES:
+            joined = encoded[:_ATTEMPT_DIFF_MAX_BYTES].decode('utf-8', errors='ignore') + _DIFF_TRUNCATED_SENTINEL
         return joined
     except (subprocess.TimeoutExpired, OSError):
         return ""
