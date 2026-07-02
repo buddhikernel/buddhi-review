@@ -71,18 +71,6 @@ flowchart LR
   Q -- "no — clean round" --> DONE[Converged — clear to land]
 ```
 
-A real run converging — new findings per review round in
-[buddhikernel/buddhi-review#22](https://github.com/buddhikernel/buddhi-review/pull/22),
-which merged clean after five rounds:
-
-```mermaid
-xychart-beta
-  title "New findings per round (real run, PR 22)"
-  x-axis [R1, R2, R3, R4, R5]
-  y-axis "New actionable findings" 0 --> 7
-  bar [6, 1, 1, 1, 0]
-```
-
 <details>
 <summary><b>The research behind this</b></summary>
 
@@ -151,10 +139,14 @@ that become visible only after earlier findings have been fixed.
 | A | 42 | 2 | 4.8% | 34 | 81.0% | 19 | 14 (73.7%) |
 | B | 26 | 7 | 26.9% | 20 | 76.9% | 16 | 12 (75.0%) |
 | C | 29 | 1 | 3.4% | 22 | 75.9% | 8 | 8 (100%) |
-| D | 24 | 0 | 0.0% | 19 | 79.2% | 6 | 5 (83.3%) |
+| D | 24 | 0&dagger; | 0.0% | 19 | 79.2% | 6 | 5 (83.3%) |
 | E | 12 | 1 | 8.3% | 6 | 50.0% | 8 | 5 (62.5%) |
 | F | 45 | 2 | 4.4% | 36 | 80.0% | 18 | 13 (72.2%) |
 | **All** | **178** | **13** | **7.3%** | **137** | **77.0%** | **75** | **57 (76.0%)** |
+
+&dagger; In Run D, Claude reviewed and posted an explicit all-clear ("No issues
+found.") in round 1 — the panel then caught 24 valid bugs, six of them
+high-severity.
 
 How to read this honestly:
 
