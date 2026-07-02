@@ -128,6 +128,21 @@ def test_emphasis_stripped_before_matching():
         assert detectors.is_clean_review(msg), msg
 
 
+def test_star_bullet_survives_emphasis_strip():
+    # A `* item` Markdown bullet after a clean phrase must NOT be destroyed by
+    # the emphasis-strip pass — the `*` is a list marker, not emphasis, and the
+    # bullet-detector in _ACTIONABLE_PROSE_RE must still fire on it.
+    assert not detectors.is_clean_review(
+        "LGTM\n* line 42 has an off-by-one here")
+    assert not detectors.is_clean_review(
+        "No issues found.\n* Add a null check on the input parameter.")
+    # `-` and numbered bullets were never affected; confirm they still work.
+    assert not detectors.is_clean_review(
+        "LGTM\n- rename foo to something clearer")
+    assert not detectors.is_clean_review(
+        "No issues found.\n1. The error handler is missing")
+
+
 # ---------------------------------------------------------------------------
 # Completion phrasing: "didn't / did not find any [major] issues"
 # ---------------------------------------------------------------------------
@@ -210,6 +225,16 @@ def test_bare_nit_blocks_clean_verdict():
     # be promoted to a voluntary all-clear; tier-1 must reject it.
     assert not detectors.is_clean_review("LGTM. One nit: the docstring is missing.")
     assert not detectors.is_clean_review("No issues found. Nit: rename this variable.")
+
+
+def test_bare_imperative_blocks_clean_verdict():
+    # A bare imperative action verb (without "please") after a clean phrase is
+    # still a real review request and must NOT read as a voluntary all-clear.
+    assert not detectors.is_clean_review("No issues found. Fix the typo in line 3.")
+    assert not detectors.is_clean_review("Looks good. Rename the helper function.")
+    # Bare imperative BEFORE the clean phrase must also be caught.
+    assert not detectors.is_clean_review("Fix the typo on line 3. No issues found.")
+    assert not detectors.is_clean_review("Rename this helper. LGTM.")
 
 
 def test_you_should_blocks_clean_verdict():

@@ -163,7 +163,13 @@ _ACTIONABLE_PROSE_RE = re.compile(
     # Negative lookahead on "be" mirrors the should/could guard so approval footers
     # like "must be merged after CI" are not mistaken for a recommendation.
     r"must\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|(?:add|fix|change|update|remove|use|rename|refactor|move|handle|cover|test))|"
-    r"however|missing|incorrect|wrong|bug|nit|todo"
+    r"however|missing|incorrect|wrong|bug|nit|todo|"
+    # Bare imperative action verbs that unambiguously signal a review request
+    # even without a "please" prefix ("Fix the typo." / "Rename the helper.").
+    # Only the narrowest set is listed here: words like "change" or "use" appear
+    # constantly as nouns in clean-review prose ("on this change", "good use of")
+    # and cannot be bare-matched without too many false positives.
+    r"fix|rename"
     r")\b"
 )
 
@@ -342,7 +348,10 @@ def is_clean_review(text: str) -> bool:
     if not text or not text.strip():
         return False  # an empty body NEVER promotes a bot to no-issues
     # Strip *…* / _…_ emphasis on a working copy before the scan.
-    t = re.sub(r"[*_]{1,3}", "", text)
+    # Only strip markers that touch a non-whitespace character so `* item`
+    # list bullets (asterisk followed by a space) survive as bullet-detector
+    # triggers; bare `*` at line-start is deliberately NOT emphasis.
+    t = re.sub(r"[*_]{1,3}(?=\S)|(?<=\S)[*_]{1,3}", "", text)
     for rx in _CLEAN_RES:
         m = rx.search(t)
         if m and not _has_actionable_prose_after(t, m.end()) and not _has_actionable_prose_after(t[: m.start()], 0):
