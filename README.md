@@ -1,23 +1,260 @@
 # buddhi-review
 
-A **free, MIT-licensed PR review-and-fix loop for Claude Code**, built on the public
-[Buddhi kernel](https://github.com/buddhikernel/buddhi). It fans out your review
-bots, classifies every comment, applies the fixes, re-reviews until the PR is clean,
-and merges it when you opt in.
+A **free, MIT-licensed PR review-and-fix loop for Claude Code** (alpha), built on the
+public [Buddhi kernel](https://github.com/buddhikernel/buddhi). It fans out your
+review bots, classifies every comment, applies the fixes, re-reviews until the PR is
+clean, and merges it when you opt in — your pull request takes off, flies the review
+rounds, and lands.
 
-**Buddhi lands your PRs.** Think of a pull request as a flight: it takes off, flies
-the review rounds, and comes in clean, ready to land (merge) on the base branch.
-Along the way Buddhi reads the review comments left by your bots, classifies each
-one, and lets the kernel decide what to do with it: apply a fix, ask you a question,
-skip it, or defer it when the day's interrupt budget is spent. You answer any
-questions right in your terminal.
+**Across 122 verified review runs, Claude reviewing Claude-written code caught 5.1%
+of the valid bugs — reviewers from other vendors caught the rest — and across all 123
+runs, half the bugs surfaced only after round 1.**
 
-New here? **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
-walks you from `pip install` through your first reviewed PR.
+New here? `pip install buddhi-review`, then
+**[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
+walks you to your first reviewed PR.
+
+## Seen in real runs — not just in papers
+
+Every merged review loop on the source repository — 123 runs, 967 verified fixed
+bugs, measured with the loop's per-bug ledger — shows two effects the research
+predicts (see [Why a panel, and why rounds](#why-a-panel-and-why-rounds) below): a
+model is soft on its own work, and many bugs surface only after earlier fixes land.
+
+### "Just have Claude review it again" is not adversarial review
+
+Across all 122 merged runs where Claude is verified — from each PR's review record,
+not assumed from configuration — to have reviewed Claude-written code (944 valid
+bugs), Claude caught 48 (5.1%); reviewers from other vendors caught the remaining
+94.9%. Of the high- or critical-severity bugs found in round 2 or later, 91.3% were
+caught by a non-Claude reviewer.
+
+This is the self-preference effect described in
+[[2](https://arxiv.org/abs/2404.13076)], made visible in real review runs: a model
+reviewing its own work misses most of what a diverse panel catches.
+
+![Who catches the bugs in Claude-written code — Claude's per-run share with the all-runs aggregate line](docs/assets/who-catches-the-bugs.svg)
+
+*Selection rule: the bars are every verified run with ten or more valid bugs — all
+28 of them, chosen by that one threshold and nothing else. The bold line is all 122
+verified runs (944 bugs). In 18 of the 28 bar runs, Claude reviewed and caught
+nothing. The one run where Claude was disabled by configuration is excluded from
+this section only.*
+
+### One round is not a complete review
+
+Across all 123 merged review loops with at least one valid bug — 967 verified, fixed
+bugs in total — **52.6% of valid bugs, and 53.6% of the 291 high- or
+critical-severity bugs, were caught only in round 2 or later**, after round-1 fixes
+had been applied and the changed code reviewed again. A reviewer that posts one round
+of comments and stops would have shipped half the real bugs, including half the
+critical ones. The effect grows with change size: across all 29 runs with ten or more
+valid bugs, the round-2+ share rises to 68.9%. Even a median-sized run (5 valid bugs)
+hides half its bugs from a one-round review.
+
+Built-in review features that post one round of comments and stop cannot catch issues
+that become visible only after earlier findings have been fixed.
+
+![When do the bugs surface — per-run round-2+ share with the all-runs population line](docs/assets/when-bugs-surface.svg)
+
+*Selection rule: the bars are every merged run with ten or more valid bugs in the
+loop's per-bug ledger — all 29, chosen by that one threshold and nothing else; none
+were excluded. The bold line is the whole population: all 123 merged runs with at
+least one valid bug (967 bugs; the median run has 5). Larger changes earn more review
+rounds, so most — not all — of the large-run bars sit above the all-runs line. Quote
+the line, not the bars, as the typical case.*
+
+<details>
+<summary><b>The data behind the charts</b></summary>
+
+A closer look at six of those runs, reviewer by reviewer:
+
+![Six illustrative runs — who caught what, by reviewer and severity](docs/assets/six-runs-drilldown.svg)
+
+| Run | Valid bugs | Caught by Claude | Claude % | Caught in R2+ | R2+ % | High/critical | High/crit in R2+ |
+|---|---|---|---|---|---|---|---|
+| A | 42 | 2 | 4.8% | 34 | 81.0% | 19 | 14 (73.7%) |
+| B | 26 | 7 | 26.9% | 20 | 76.9% | 16 | 12 (75.0%) |
+| C | 29 | 1 | 3.4% | 22 | 75.9% | 8 | 8 (100%) |
+| D | 24 | 0&dagger; | 0.0% | 19 | 79.2% | 6 | 5 (83.3%) |
+| E | 12 | 1 | 8.3% | 6 | 50.0% | 8 | 5 (62.5%) |
+| F | 45 | 2 | 4.4% | 36 | 80.0% | 18 | 13 (72.2%) |
+| **These 6 runs** | **178** | **13** | **7.3%** | **137** | **77.0%** | **75** | **57 (76.0%)** |
+| **All 123 runs** | **967** | **48**&Dagger; | **5.1%**&Dagger; | **509** | **52.6%** | **291** | **156 (53.6%)** |
+
+&dagger; In Run D, Claude reviewed and posted an explicit all-clear ("No issues
+found.") in round 1 — the panel then caught 24 valid bugs, six of them
+high-severity.
+
+&Dagger; The Claude columns on the all-runs row count the 122 runs where Claude's
+participation is verified from each PR's review record (944 bugs); the one
+config-disabled run is excluded from those two columns only.
+
+How to read this honestly:
+
+- The runs are merged review loops on one private repository (anonymized); the
+  numbers come from the loop's own per-bug ledger, which records each verified, fixed
+  bug with its severity, the reviewer that caught it, and the round it was caught in.
+- Severity is assigned by the loop's classifier — which itself runs on Claude — so the
+  low Claude share cannot be an anti-Claude bias in the rater.
+- Each bug is credited to one catching reviewer. Claude's raw comment counts on the
+  underlying PRs corroborate the ledger's counts, so attribution is not hiding Claude
+  catches.
+- Reviewer fleets vary per run (not every vendor reviewed every run).
+- These runs live on a private repository, so you cannot re-count them; read this
+  section as a stated method plus a falsifiable prediction — the same charts will be
+  regenerated from this repo's own public review loops, PR links included, and those
+  numbers will replace these whether they come back better or worse.
+
+</details>
+
+## Install
+
+```bash
+pip install buddhi-review
+```
+
+This pulls the kernel ([`buddhikernel`](https://github.com/buddhikernel/buddhi)) and
+`PyYAML`, and installs the `buddhi-review` command. The two slash-command skills it
+backs — **`/review-pr`** (review an open PR) and **`/create-pr`** (open a PR, then
+review it) — ship inside the package but are **not** added to Claude Code
+automatically; install them as Claude Code **skills** (each becomes
+`~/.claude/skills/<name>/SKILL.md`):
+
+<details>
+<summary><b>Install the /review-pr and /create-pr skills</b></summary>
+
+```bash
+SKILLS=$(python3 -c "import buddhi_review, os; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'skills'))" 2>/dev/null)
+if [ -d "$SKILLS" ]; then
+  mkdir -p ~/.claude/skills/
+  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/create-pr
+  cp -R "$SKILLS"/review-pr "$SKILLS"/create-pr ~/.claude/skills/
+  echo "✓ Skills installed to ~/.claude/skills/ — restart Claude Code to load them"
+else
+  echo "✗ Error: Could not locate buddhi_review skills. Ensure buddhi-review is installed in the active Python environment."
+fi
+```
+
+</details>
+
+**Restart Claude Code** so it loads the new skills, then run **`/review-pr setup`**
+once to onboard (see [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)).
+If a slash-command of the same name already exists, the skill takes precedence.
+
+Each skill's `SKILL.md` frontmatter includes a **git-guardrail hook** that stops the
+agent from hand-running history-rewriting git (rebase / merge / reset --hard /
+cherry-pick / force-push) while a review is in flight; it activates only when the
+skill runs and leaves your everyday git untouched.
+
+To work from a clone instead (for development or to run the tests):
+
+```bash
+pip install -e ".[test]"
+python3 -m pytest -q
+```
+
+## Quickstart
+
+```bash
+# 1. Health check — runs the kernel-driven pipeline on built-in fixtures.
+#    No network, no `claude`; proves the kernel decides every disposition.
+python3 -m buddhi_review self-check
+```
+
+```text
+  [ok ] SUBSTANTIVE          kernel=MODEL_HANDLED disposition=fix            (want fix)
+  [ok ] COSMETIC             kernel=MODEL_HANDLED disposition=fix            (want fix)
+  …
+SELF-CHECK OK — the kernel decided every disposition.
+```
+
+<details>
+<summary><b>Full self-check output</b></summary>
+
+```text
+buddhi_review <version> — kernel-driven self-check
+
+
+[Clearance — a decision the loop needs from you] How should item 'c4' be handled?
+  1. Apply the suggested change
+  2. Skip — the suggestion is not valid here
+  3. Defer — this needs your judgment
+  answer here → file:///…/review-answer-local-c4.md
+
+[Clearance — a decision the loop needs from you] How should item 'c5' be handled?
+  1. Apply the suggested change
+  2. Skip — the suggestion is not valid here
+  3. Defer — this needs your judgment
+  answer here → file:///…/review-answer-local-c5.md
+
+[Clearance — a decision the loop needs from you] How should item 'c6' be handled?
+  1. Apply the suggested change
+  2. Skip — the suggestion is not valid here
+  3. Defer — this needs your judgment
+  answer here → file:///…/review-answer-local-c6.md
+  [ok ] SUBSTANTIVE          kernel=MODEL_HANDLED disposition=fix            (want fix)
+  [ok ] COSMETIC             kernel=MODEL_HANDLED disposition=fix            (want fix)
+  [ok ] OUTDATED             kernel=DISCARDED     disposition=skip           (want skip)
+  [ok ] INVALID              kernel=DISCARDED     disposition=skip           (want skip)
+  [ok ] BUSINESS_QUESTION    kernel=ESCALATED     disposition=escalate       (want escalate)
+  [ok ] PR_DESCRIPTION       kernel=ESCALATED     disposition=escalate       (want escalate)
+  [ok ] CLASSIFICATION_FAILED kernel=ESCALATED     disposition=escalate       (want escalate)
+
+SELF-CHECK OK — the kernel decided every disposition.
+```
+
+</details>
+
+The `[Clearance …]` panels in the full output are expected: the self-check feeds the
+kernel its escalation fixtures (`BUSINESS_QUESTION`, `PR_DESCRIPTION`, and a forced
+classifier failure), so it writes each one's answer file (and immediately cleans it
+up) before printing the results table. A clean run still ends with `SELF-CHECK OK`.
+
+```bash
+# 2. One-time onboarding (plan, repo, reviewer fleet).
+/review-pr setup
+
+# 3. Review an open PR.
+/review-pr <pr>
+
+# 4. Open a PR from your local work and review it in one step.
+/create-pr
+```
+
+To drive the CLI directly or detach the loop as a background process, see
+[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#4-review-a-pr).
+
+## What a review costs you
+
+Buddhi is free and MIT-licensed, but **the reviews it runs spend your own provider
+quotas.** Buddhi never bills you and never proxies a review through an account of its
+own. Each reviewer draws on a plan you already hold, and the loop's own classify and
+fix calls run on your machine against your Claude subscription:
+
+| Surface | Whose meter it spends |
+|---|---|
+| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
+| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
+| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
+| **Gemini review** | Your **Gemini Code Assist** entitlement. |
+| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
+
+Minimum viable setup: a Claude subscription (which powers the loop's own
+classify/fix calls) plus at least one reviewer plan you already hold —
+`/review-pr setup` disables the rest.
+
+Check or cap your GitHub-side spend at
+**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
+Enable only the reviewers whose plans you hold. `/review-pr setup` subtracts the rest,
+so no trigger fires into a void and nothing is spent on a reviewer you do not run. See
+[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)
+for the full breakdown.
 
 ## Why a panel, and why rounds
 
-Buddhi doesn't hand your PR to one reviewer. It fans it out to a panel of independent
+The numbers at the top of this page are the output of a deliberate design: Buddhi
+doesn't hand your PR to one reviewer — it fans it out to a panel of independent
 models from *different* labs, and keeps flying review rounds until a round comes back
 clean. Three reasons that beats one strong reviewer running once.
 
@@ -99,74 +336,7 @@ flowchart LR
 
 </details>
 
-## Seen in real runs — not just in papers
-
-The research above predicts two things: reviewers are less effective at evaluating
-their own work, and many bugs emerge only through repeated fix-and-review rounds. Six
-real Buddhi runs — covering changes authored with Claude Code and measured using the
-review loop's per-bug ledger — show both effects clearly.
-
-### "Just have Claude review it again" is not adversarial review
-
-When Claude reviewed Claude-written code as one member of a multi-model panel, it
-caught 13 of 178 valid bugs (7.3%). The reviewers from other vendors collectively
-caught 92.7%, and more than 90% of the high- or critical-severity bugs found in round
-2 or later were caught by a non-Claude reviewer.
-
-This is the self-preference effect described in
-[[2](https://arxiv.org/abs/2404.13076)], made visible in real review runs: a model
-reviewing its own work misses most of what a diverse panel catches.
-
-![Who catches the bugs in Claude-written code — per-run and aggregate reviewer shares](docs/assets/who-catches-the-bugs.svg)
-
-### One round is not a complete review
-
-Across the six runs, 77% of valid bugs — and 76% of high- or critical-severity bugs —
-were discovered only in round 2 or later, after the initial fixes had been applied and
-the changed code reviewed again. Depending on the run, the share found after round 1
-ranged from 50% to 81%.
-
-Built-in review features that post one round of comments and stop cannot catch issues
-that become visible only after earlier findings have been fixed.
-
-![When do the bugs surface — round 1 vs round 2+ split per run](docs/assets/when-bugs-surface.svg)
-
-<details>
-<summary><b>The data behind the charts</b></summary>
-
-| Run | Valid bugs | Caught by Claude | Claude % | Caught in R2+ | R2+ % | High/critical | High/crit in R2+ |
-|---|---|---|---|---|---|---|---|
-| A | 42 | 2 | 4.8% | 34 | 81.0% | 19 | 14 (73.7%) |
-| B | 26 | 7 | 26.9% | 20 | 76.9% | 16 | 12 (75.0%) |
-| C | 29 | 1 | 3.4% | 22 | 75.9% | 8 | 8 (100%) |
-| D | 24 | 0&dagger; | 0.0% | 19 | 79.2% | 6 | 5 (83.3%) |
-| E | 12 | 1 | 8.3% | 6 | 50.0% | 8 | 5 (62.5%) |
-| F | 45 | 2 | 4.4% | 36 | 80.0% | 18 | 13 (72.2%) |
-| **All** | **178** | **13** | **7.3%** | **137** | **77.0%** | **75** | **57 (76.0%)** |
-
-&dagger; In Run D, Claude reviewed and posted an explicit all-clear ("No issues
-found.") in round 1 — the panel then caught 24 valid bugs, six of them
-high-severity.
-
-How to read this honestly:
-
-- The six runs are merged review loops on one private repository (anonymized); the
-  numbers come from the loop's own per-bug ledger, which records each verified, fixed
-  bug with its severity, the reviewer that caught it, and the round it was caught in.
-- Severity is assigned by the loop's classifier — which itself runs on Claude — so the
-  low Claude share cannot be an anti-Claude bias in the rater.
-- Each bug is credited to one catching reviewer. Claude's raw comment counts on the
-  underlying PRs corroborate the ledger's counts, so attribution is not hiding Claude
-  catches.
-- Reviewer fleets vary per run (not every vendor reviewed every run). One additional
-  run was excluded because Claude was disabled by configuration and never reviewed.
-- This is an illustrative sample from real usage, not a controlled benchmark. As this
-  repository accumulates its own public review loops, these charts will be replaced
-  with runs anyone can inspect on GitHub.
-
-</details>
-
-## What it is
+## How it works
 
 Buddhi splits a PR review into two halves: the decision, and the I/O around it. The
 [Buddhi kernel](https://github.com/buddhikernel/buddhi) makes the decision — for each
@@ -221,140 +391,6 @@ and the loop picks it up. Everything happens locally.
 The notifier is a small, swappable interface, so an alternative delivery channel
 can be wired in later without touching the review loop.
 
-## Install
-
-```bash
-pip install buddhi-review
-```
-
-This pulls the kernel ([`buddhikernel`](https://github.com/buddhikernel/buddhi)) and
-`PyYAML`, and installs the `buddhi-review` command. The two slash-command skills it
-backs — **`/review-pr`** (review an open PR) and **`/create-pr`** (open a PR, then
-review it) — ship inside the package but are **not** added to Claude Code
-automatically; install them as Claude Code **skills** (each becomes
-`~/.claude/skills/<name>/SKILL.md`):
-
-```bash
-SKILLS=$(python3 -c "import buddhi_review, os; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'skills'))" 2>/dev/null)
-if [ -d "$SKILLS" ]; then
-  mkdir -p ~/.claude/skills/
-  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/create-pr
-  cp -R "$SKILLS"/review-pr "$SKILLS"/create-pr ~/.claude/skills/
-  echo "✓ Skills installed to ~/.claude/skills/ — restart Claude Code to load them"
-else
-  echo "✗ Error: Could not locate buddhi_review skills. Ensure buddhi-review is installed in the active Python environment."
-fi
-```
-
-**Restart Claude Code** so it loads the new skills, then run **`/review-pr setup`**
-once to onboard (see [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)).
-If a slash-command of the same name already exists, the skill takes precedence.
-
-Each skill's `SKILL.md` frontmatter includes a **git-guardrail hook** that stops the
-agent from hand-running history-rewriting git (rebase / merge / reset --hard /
-cherry-pick / force-push) while a review is in flight; it activates only when the
-skill runs and leaves your everyday git untouched.
-
-To work from a clone instead (for development or to run the tests):
-
-```bash
-pip install -e ".[test]"
-python3 -m pytest -q
-```
-
-## Quickstart
-
-```bash
-# 1. Health check — runs the kernel-driven pipeline on built-in fixtures.
-#    No network, no `claude`; proves the kernel decides every disposition.
-python3 -m buddhi_review self-check
-```
-
-```text
-buddhi_review <version> — kernel-driven self-check
-
-
-[Clearance — a decision the loop needs from you] How should item 'c4' be handled?
-  1. Apply the suggested change
-  2. Skip — the suggestion is not valid here
-  3. Defer — this needs your judgment
-  answer here → file:///…/review-answer-local-c4.md
-
-[Clearance — a decision the loop needs from you] How should item 'c5' be handled?
-  1. Apply the suggested change
-  2. Skip — the suggestion is not valid here
-  3. Defer — this needs your judgment
-  answer here → file:///…/review-answer-local-c5.md
-
-[Clearance — a decision the loop needs from you] How should item 'c6' be handled?
-  1. Apply the suggested change
-  2. Skip — the suggestion is not valid here
-  3. Defer — this needs your judgment
-  answer here → file:///…/review-answer-local-c6.md
-  [ok ] SUBSTANTIVE          kernel=MODEL_HANDLED disposition=fix            (want fix)
-  [ok ] COSMETIC             kernel=MODEL_HANDLED disposition=fix            (want fix)
-  [ok ] OUTDATED             kernel=DISCARDED     disposition=skip           (want skip)
-  [ok ] INVALID              kernel=DISCARDED     disposition=skip           (want skip)
-  [ok ] BUSINESS_QUESTION    kernel=ESCALATED     disposition=escalate       (want escalate)
-  [ok ] PR_DESCRIPTION       kernel=ESCALATED     disposition=escalate       (want escalate)
-  [ok ] CLASSIFICATION_FAILED kernel=ESCALATED     disposition=escalate       (want escalate)
-
-SELF-CHECK OK — the kernel decided every disposition.
-```
-
-The three `[Clearance …]` panels are expected: the self-check feeds the kernel its
-escalation fixtures (`BUSINESS_QUESTION`, `PR_DESCRIPTION`, and a forced classifier
-failure), so it writes each one's answer file (and immediately cleans it up) before
-printing the results table. A clean run still ends with `SELF-CHECK OK`.
-
-```bash
-# 2. One-time onboarding (plan, repo, reviewer fleet).
-/review-pr setup
-
-# 3. Review an open PR.
-/review-pr <pr>
-
-# 4. Open a PR from your local work and review it in one step.
-/create-pr
-```
-
-You can also drive the CLI directly:
-
-```bash
-python3 -m buddhi_review review-pr 123 --repo OWNER/REPO --cwd /path/to/checkout
-```
-
-or detach it as a background loop and follow its log:
-
-```bash
-LAUNCHER=$(python3 -c "import os, buddhi_review; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'launch-review.sh'))" 2>/dev/null)
-if [ -f "$LAUNCHER" ]; then
-  bash "$LAUNCHER" 123 --repo OWNER/REPO --cwd /path/to/checkout
-fi
-```
-
-## What a review costs you
-
-Buddhi is free and MIT-licensed, but **the reviews it runs spend your own provider
-quotas.** Buddhi never bills you and never proxies a review through an account of its
-own. Each reviewer draws on a plan you already hold, and the loop's own classify and
-fix calls run on your machine against your Claude subscription:
-
-| Surface | Whose meter it spends |
-|---|---|
-| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
-| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
-| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
-| **Gemini review** | Your **Gemini Code Assist** entitlement. |
-| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
-
-Check or cap your GitHub-side spend at
-**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
-Enable only the reviewers whose plans you hold. `/review-pr setup` subtracts the rest,
-so no trigger fires into a void and nothing is spent on a reviewer you do not run. See
-[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)
-for the full breakdown.
-
 ## Status
 
 buddhi-review is in **alpha**: the CLI flags, output format, and Python API may
@@ -366,29 +402,10 @@ Run the test suite with `pip install -e ".[test]" && python3 -m pytest -q`.
 
 ## Architecture
 
-`buddhi-review` is an adapter of the Buddhi kernel onto the GitHub PR-review substrate.
-
-- **The four-verb adapter** (`buddhi_review/adapter.py`) implements the kernel's
-  `Adapter` contract: `ingest` (yield the PR's raw comments), `run_embedded`
-  (Stage-0 condition one item, then run the seven decisions), `escalate_async`
-  (deliver a pre-reasoned ask), and `detect_resolved` (observe a *signaled*
-  out-of-band resolution).
-- **The five seams** (`buddhi_review/seams.py` + `policy.py`) are the concrete
-  implementations the kernel calls back through:
-  - **Store**: interrupt counters plus the two-tier exclusion lattice (quota and
-    PR-too-large are permanent; an errored bot is transient and comes back on its
-    next substantive comment).
-  - **Router**: a stakes-based effort recommendation.
-  - **Escalation**: translates the kernel's pre-reasoned ask into a
-    channel-agnostic ask and delivers it over the console channel.
-  - **OOB source**: declares the substrate can observe a *signaled* resolution.
-  - **PolicyPack**: the single policy contract, bundling the discard predicate, the
-    effort taxonomy, the judgment threshold, the validity rule, the ask phrasings,
-    and the bounded interrupt budget.
-
-Nothing domain-specific lives in the kernel; it all enters through the policy pack
-and the seams. See the [Buddhi kernel](https://github.com/buddhikernel/buddhi) for
-the kernel's own design.
+`buddhi-review` is a thin adapter over the
+[Buddhi kernel](https://github.com/buddhikernel/buddhi): four verbs, five seams, and
+every decision stays in the kernel. Full design in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## License
 
