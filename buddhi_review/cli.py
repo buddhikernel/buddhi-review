@@ -163,6 +163,8 @@ def _run_loop(args: argparse.Namespace) -> int:
         classify_runner=model_call.text_runner("classifier", plan=plan_name, cwd=cwd),
         clean_llm=lambda prompt: model_call.run_model_json(
             prompt, role="clean-review-detector", plan=plan_name),
+        quota_llm=lambda prompt: model_call.run_model_json(
+            prompt, role="quota-detector", plan=plan_name),
         fix_dispatch=default_fix_dispatch(
             cwd=cwd,
             plan=plan_name,

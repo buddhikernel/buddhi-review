@@ -614,6 +614,7 @@ class RoundDriver:
         classify_runner: Callable[[str], str],
         fix_dispatch: Optional[FixDispatch] = None,
         clean_llm: Optional[Callable[[str], Optional[dict]]] = None,
+        quota_llm: Optional[Callable[[str], Optional[dict]]] = None,
         fetch: Optional[Callable[..., List[Comment]]] = None,
         gh_run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
         clock: Callable[[], float] = time.monotonic,
@@ -648,6 +649,10 @@ class RoundDriver:
         self.classify_runner = classify_runner
         self.fix_dispatch = fix_dispatch
         self.clean_llm = clean_llm
+        # The quota-detector seam (same shape as clean_llm): enables the tier-2
+        # quota check for wording the deterministic regex misses. Left None in
+        # tests → deterministic-only classification.
+        self.quota_llm = quota_llm
         self.fetch = fetch or gh_ingest.fetch_comments
         # commit_push's runner accepts both cwd= and timeout=, so one injected
         # fake covers every gh/git/test spawn the driver makes.
@@ -905,7 +910,14 @@ class RoundDriver:
         # (below) → classified → `_maybe_errored_comeback` retracts iff it is
         # SUBSTANTIVE + strictly newer. A cosmetic / OUTDATED / INVALID /
         # question comment is NOT proof of recovery, so it never brings the bot back.
-        signal = detectors.detect_signal(comment.text)
+        if self.quota_llm is not None:
+            pr_title, pr_body = self._fetch_pr_title_body()
+        else:
+            pr_title, pr_body = None, None
+        signal = detectors.detect_signal(
+            comment.text, quota_llm=self.quota_llm,
+            pr_title=pr_title, pr_body=pr_body,
+        )
         if signal == detectors.SIGNAL_QUOTA:
             self.store.exclude_quota(bot)
             st.signal = signal
@@ -1227,6 +1239,29 @@ class RoundDriver:
         )
         return RunOutcome("clean", rounds, merged, self.actions)
 
+    # --------------------------------------------------- PR metadata (lazy, cached)
+
+    def _fetch_pr_title_body(self) -> Tuple[Optional[str], Optional[str]]:
+        """Best-effort (pr_title, pr_body) from ``gh pr view``, fetched at most
+        once per run. Returns (None, None) on any failure so the quota
+        second-pass simply doesn't arm (deterministic verdict holds)."""
+        if not hasattr(self, "_pr_meta_cache"):
+            title = body = None
+            try:
+                argv = ["gh", "pr", "view", str(self.pr), "--json", "title,body"]
+                if self.repo:
+                    argv += ["-R", self.repo]
+                proc = self.gh_run(argv, cwd=self.cwd)
+                if getattr(proc, "returncode", 1) == 0:
+                    data = json.loads(getattr(proc, "stdout", "") or "{}")
+                    if isinstance(data, dict):
+                        title = data.get("title") or None
+                        body = data.get("body") or None
+            except Exception:
+                pass
+            self._pr_meta_cache: Tuple[Optional[str], Optional[str]] = (title, body)
+        return self._pr_meta_cache
+
     # --------------------------------------------------- manual-landing exit-rebase
 
     def _base_branch(self) -> Optional[str]:
@@ -1456,7 +1491,12 @@ class RoundDriver:
             if run_id is None:
                 return False
             log = self._fetch_run_log(run_id)
-            return bool(log) and bool(detectors.AUTH_FAILED_RE.search(log))
+            # A cleanly-successful result in the log (``"is_error": false``) means
+            # the run worked and any 401 phrase is quoted review content, not a
+            # real auth failure — short-circuit before the signature test.
+            return (bool(log)
+                    and not detectors.CLEAN_RESULT_RE.search(log)
+                    and bool(detectors.AUTH_FAILED_RE.search(log)))
         except Exception:
             return False
 

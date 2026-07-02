@@ -238,6 +238,31 @@ def test_pr_too_large_signal_excludes_permanently():
     assert driver.store.is_excluded("claude")
 
 
+def test_quota_second_pass_wires_pr_context_through_classify_signal():
+    """_classify_signal fetches pr_title/pr_body from gh pr view and passes them
+    to detect_signal so a reviewer summarizing a quota-themed PR is not excluded."""
+    pr_json = json.dumps({"title": "Add monthly quota / rate-limit handling",
+                          "body": "Implements the daily limit reset and quota accounting."})
+    quota_echo = ("This PR adds monthly quota limit handling; the quota is reset "
+                  "each cycle and the usage limit is enforced per account.")
+
+    class QuotaPrGh(GhRecorder):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            if "title,body" in " ".join(argv):
+                return subprocess.CompletedProcess(argv, 0, stdout=pr_json, stderr="")
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+    gh = QuotaPrGh()
+    # quota_llm says the bot is describing the PR's own content (not self-reporting)
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh,
+                                   quota_llm=lambda p: {"self_reporting": False})
+    comment = Comment(id="x", text=quota_echo, source="claude[bot]")
+    driver._classify_signal(comment, clock.t)
+    assert not driver.store.is_excluded("claude"), (
+        "reviewer echoing quota vocab on a quota-themed PR must not be excluded"
+    )
+
+
 # A comeback is only observable while the loop is still polling, so these
 # timelines carry a second, silent bot (copilot) whose MIN_BOT_WAIT keeps the
 # round open past the comeback comment — the comeback lands during later polls
@@ -537,6 +562,13 @@ _NONAUTH_LOG = (
     "review\tRun anthropics/claude-code-action@v1\n"
     "review\tError: Could not fetch an OIDC token from the GitHub provider.\n"
 )
+# A SUCCEEDED run (clean SDK result, ``"is_error": false``) whose reviewed diff
+# quoted the 401 signature — a review OF auth code, not a real token failure.
+_CLEAN_RESULT_LOG = (
+    "review\tRun anthropics/claude-code-action@v1\n"
+    'review\t{"type":"result","is_error":false} — the review confirmed the code '
+    "returns 401 (Invalid bearer token) on a bad token.\n"
+)
 
 
 class AuthProbeGh(GhRecorder):
@@ -583,6 +615,20 @@ def test_silent_claude_non_auth_failure_emits_generic_banner(capsys):
     # no token-invalid signature, so this must NOT misfire the re-mint banner.
     gh = AuthProbeGh(checks_json=_CLAUDE_FAILED_CHECK, run_log=_NONAUTH_LOG)
     driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "REVIEWER AUTH FAILED" not in out
+    assert "REVIEWER SILENT" in out
+
+
+def test_silent_claude_clean_result_log_is_not_an_auth_failure(capsys):
+    # The run SUCCEEDED (``"is_error": false`` in the log) but the reviewed diff
+    # quoted the 401 signature. The clean-result guard must short-circuit so this
+    # takes the generic silent path, NOT the re-mint banner (which would tell the
+    # user to re-mint a working token).
+    gh = AuthProbeGh(checks_json=_CLAUDE_FAILED_CHECK, run_log=_CLEAN_RESULT_LOG)
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+    assert driver._detect_auth_failure("claude") is False
     driver.run()
     out = capsys.readouterr().out
     assert "REVIEWER AUTH FAILED" not in out
