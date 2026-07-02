@@ -19,12 +19,12 @@ walks you to your first reviewed PR.
 
 The data in this section comes from real Buddhi review loops on a large private
 repository, reviewing changes written with Claude Code. The loop records every
-verified, fixed bug in a ledger, with its severity, the reviewer that caught it, and
-the round it was caught in. Across the 88 merged runs that meet the selection rules
-below, that ledger holds 681 bugs. Two patterns stand out in that data: a model is
+verified, fixed bug in a ledger, along with its severity, the reviewer that caught
+it, and the round it was caught in. The 88 merged runs that meet the selection rules
+below contain 681 verified fixed bugs in total. Two patterns stand out: a model is
 soft on its own work, and many bugs surface only after earlier fixes land. The
-research in [Why a panel, and why rounds](#why-a-panel-and-why-rounds) further down
-predicts both.
+research in [Why a panel, and why rounds](#why-a-panel-and-why-rounds) predicts
+both effects.
 
 <details>
 <summary>How runs qualify (the selection rules)</summary>
@@ -36,9 +36,9 @@ A run is counted when all three rules hold:
 - no reviewer was budget-throttled, errored, or refused the PR as too large at any
   point in the run.
 
-88 of 123 merged runs qualify. The 35 exclusions break down as 2 micro changes, 7
-runs missing a reviewer, and 26 runs where a reviewer was throttled, errored, or
-refused the PR. Each rule was checked against the PR's own review record: diff size
+88 of 123 merged runs qualify. The 35 excluded runs are 2 micro changes, 7 runs
+missing a reviewer, and 26 runs where a reviewer was throttled, errored, or refused
+the PR. Each rule was checked against the PR's own review record: diff size
 from the PR itself, participation from posted reviews and comments, and throttle,
 error, or refusal notices detected with the loop's own signal patterns.
 
