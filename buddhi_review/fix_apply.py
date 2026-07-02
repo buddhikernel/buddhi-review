@@ -1080,6 +1080,10 @@ def apply_fix(
     prompt = build_fix_prompt(comment_text, reason=reason, diff_hunk=diff_hunk)
     timeout = EFFORT_TIMEOUTS.get(effort, EFFORT_TIMEOUTS["high"])
     max_attempts = (FIX_RETRIES if retries is None else max(0, retries)) + 1
+    # No snapshot ⇒ no rollback between retries; each attempt compounds the
+    # previous one's partial edits. One shot only to bound the residue risk.
+    if snap is None:
+        max_attempts = min(max_attempts, 1)
 
     attempt = 0
     for attempt in range(1, max_attempts + 1):
@@ -1122,14 +1126,21 @@ def apply_fix(
                 # unlike the REJECT path (which keeps its terminal "rejected"),
                 # this escalates as "transient-failed" for a per-comment Ask.
                 # Either way, rollback_failed=True arms the round-level poisoned-
-                # worktree gate (round_driver) that halts before the push. (Only a
-                # REAL snapshot whose restore FAILED reaches here — the no-snapshot
-                # degrade returns trustworthy and falls through to "skipped".)
+                # worktree gate (round_driver) that halts before the push.
                 return FixOutcome(
                     status="transient-failed",
                     detail="rollback failed after SKIP — stray edits may remain",
                     attempts=attempt,
                     rollback_failed=True,
+                )
+            # No snapshot: degrade returned trustworthy=True but no actual rollback
+            # occurred. We cannot prove the worktree is clean, so escalate rather
+            # than letting "skipped" imply a clean state to the round driver.
+            if snap is None:
+                return FixOutcome(
+                    status="transient-failed",
+                    detail="SKIP received without snapshot — cannot verify worktree is clean",
+                    attempts=attempt,
                 )
             return FixOutcome(status="skipped", detail=skip_line.strip(), attempts=attempt)
         # Clean success → deterministic pre-commit Unicode cleanup, then tripwire +
@@ -1174,15 +1185,20 @@ def apply_fix(
                 # would re-run a fixer verify already rejected, on top of the
                 # un-rolled-back edits, compounding the residue.
                 trustworthy = _restore_or_degrade(cwd, snap, "after fix-verify REJECT")
+                # No snapshot: degrade returns trustworthy=True but no rollback
+                # occurred — arm rollback_failed so the round driver halts before
+                # any push rather than letting rejected edits leak silently.
+                rollback_failed = not trustworthy or snap is None
                 return FixOutcome(
                     status="rejected",
                     detail=f"fix-verify REJECT: {reason}"
                     + (f" (tripwire: {trip})" if trip else "")
-                    + ("" if trustworthy
-                       else " — rollback FAILED, stray edits may ride the next push"),
+                    + ("" if not rollback_failed
+                       else (" — no snapshot; rejected edits may remain" if snap is None
+                             else " — rollback FAILED, stray edits may ride the next push")),
                     diff=diff,
                     attempts=attempt,
-                    rollback_failed=not trustworthy,
+                    rollback_failed=rollback_failed,
                 )
             if verdict.get("fail_open"):  # fail-open must never read as "verified"
                 _status_line(
