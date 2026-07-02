@@ -123,10 +123,6 @@ Notes and caveats:
   diff size from the PR itself, reviewer participation from posted reviews and
   comments, and quota, error, or refusal notices detected with the loop's own
   signal patterns.
-- The underlying PRs are private, so these numbers are not independently verifiable
-  yet. The same charts will be regenerated from this repo's own public review loops,
-  with PR links included, and the public numbers will replace these, whether they
-  come back better or worse.
 
 </details>
 
