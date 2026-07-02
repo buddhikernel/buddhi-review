@@ -176,6 +176,23 @@ The loop runs review→fix rounds until a clean round or it hits the round ceili
 exits. It **never merges unless you opt in** (`--auto-merge`); by default it stops on
 a clean pass and leaves the merge to you.
 
+### Drive the CLI directly
+
+You can skip the slash commands and drive the loop yourself:
+
+```bash
+python3 -m buddhi_review review-pr 123 --repo OWNER/REPO --cwd /path/to/checkout
+```
+
+or detach it as a background loop and follow its log:
+
+```bash
+LAUNCHER=$(python3 -c "import os, buddhi_review; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'launch-review.sh'))" 2>/dev/null)
+if [ -f "$LAUNCHER" ]; then
+  bash "$LAUNCHER" 123 --repo OWNER/REPO --cwd /path/to/checkout
+fi
+```
+
 ## What a review costs you
 
 Buddhi is free and MIT-licensed, but **the reviews it runs spend your own provider
