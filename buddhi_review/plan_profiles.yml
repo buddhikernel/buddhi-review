@@ -17,6 +17,7 @@ roles:
   fix-verify:            {model: haiku,  effort: low}
   fix-substantive:       {model: sonnet, effort: high}
   fix-cosmetic:          {model: haiku,  effort: low}
+  pr-description-rewriter: {model: sonnet, effort: low}
 
 plans:
   pro:

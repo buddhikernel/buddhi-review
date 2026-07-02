@@ -106,7 +106,7 @@ buddhi_review <version> — kernel-driven self-check
   [ok ] OUTDATED             kernel=DISCARDED     disposition=skip           (want skip)
   [ok ] INVALID              kernel=DISCARDED     disposition=skip           (want skip)
   [ok ] BUSINESS_QUESTION    kernel=ESCALATED     disposition=escalate       (want escalate)
-  [ok ] PR_DESCRIPTION       kernel=ESCALATED     disposition=escalate       (want escalate)
+  [ok ] PR_DESCRIPTION       kernel=MODEL_HANDLED disposition=fix            (want fix)
   [ok ] CLASSIFICATION_FAILED kernel=ESCALATED     disposition=escalate       (want escalate)
 
 SELF-CHECK OK — the kernel decided every disposition.
@@ -114,10 +114,11 @@ SELF-CHECK OK — the kernel decided every disposition.
 
 </details>
 
-The `[Clearance …]` prompts are expected. The self-check includes three cases that
-require human escalation: `BUSINESS_QUESTION`, `PR_DESCRIPTION`, and a forced
-classifier failure. It briefly creates and then removes the answer files that a real
-run would use. A successful check still ends with `SELF-CHECK OK`.
+The `[Clearance …]` prompts are expected. The self-check includes two cases that
+require human escalation: `BUSINESS_QUESTION` and a forced classifier failure
+(`PR_DESCRIPTION` is model-handled — its body is rewritten in place). It briefly
+creates and then removes the answer files that a real run would use. A successful
+check still ends with `SELF-CHECK OK`.
 
 ```bash
 # 2. One-time onboarding (plan, repo, reviewer fleet).
@@ -364,8 +365,8 @@ for each comment the loop:
 
    | Kernel disposition | What happens |
    |---|---|
-   | fix | dispatch a fixer (SUBSTANTIVE / COSMETIC) |
-   | escalate | ask you via the console answer-file channel (BUSINESS_QUESTION / PR_DESCRIPTION / classifier failure) |
+   | fix | dispatch a code fixer (SUBSTANTIVE / COSMETIC), or rewrite the PR body in place (PR_DESCRIPTION) |
+   | escalate | ask you via the console answer-file channel (BUSINESS_QUESTION / classifier failure) |
    | skip | do nothing (OUTDATED / INVALID) |
    | defer | the daily interruption budget is exhausted; retain the item for later |
    | already-resolved | the comment was already resolved before the loop reached it — no action taken |
@@ -385,11 +386,15 @@ resolve a comment. Typical cases include:
 Anything the code and docs already settle, the loop handles on its own without
 interrupting you.
 
-Two additional cases always route to you regardless of the docs: a `PR_DESCRIPTION`
-comment (a reviewer asked you to update the PR body itself) and a
-`CLASSIFICATION_FAILED` comment (the classifier could not produce a usable label).
-Both are escalated when the interruption budget allows and deferred—not
-dropped—when it does not.
+A `PR_DESCRIPTION` comment (a reviewer noted the PR body itself is inaccurate or out
+of date) is handled automatically: the loop rewrites the PR description in place to
+address the comment. Turn this off with `--no-fix-pr-description`, which leaves the
+body untouched for you to update. A rewrite that cannot complete (the body can't be
+fetched, or the edit fails) escalates like any failed fix.
+
+A `CLASSIFICATION_FAILED` comment (the classifier could not produce a usable label)
+always routes to you: it is escalated when the interruption budget allows and
+deferred—not dropped—when it does not.
 
 When the kernel needs your input, it writes the question to an editable answer file
 and prints a `file://` link. Enter a number or free-text answer on the `>` line and

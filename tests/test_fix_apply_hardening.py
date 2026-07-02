@@ -196,7 +196,7 @@ def test_a4_confirm_prints_verified_line(repo, capsys, monkeypatch):
         (repo / "tracked.py").write_text("fixed\n")
         return 0, "done"
     out = apply_fix(
-        "claim", cwd=str(repo), runner=fixer,
+        "claim", cwd=str(repo), runner=fixer, label="SUBSTANTIVE",
         verify_runner=lambda p: '{"verdict": "CONFIRM", "reason": "addresses it"}',
         verify_mode="on", retries=0,
     )
@@ -211,7 +211,7 @@ def test_a4_fail_open_prints_unverified_line(repo, capsys, monkeypatch):
         (repo / "tracked.py").write_text("fixed\n")
         return 0, "done"
     out = apply_fix(
-        "claim", cwd=str(repo), runner=fixer,
+        "claim", cwd=str(repo), runner=fixer, label="SUBSTANTIVE",
         verify_runner=lambda p: "garbage not json", verify_mode="on", retries=0,
     )
     captured = capsys.readouterr().out
@@ -243,7 +243,7 @@ def test_a4_reject_prints_line_and_rolls_back(repo, capsys, monkeypatch):
         (repo / "tracked.py").write_text("bad fix\n")
         return 0, "done"
     out = apply_fix(
-        "claim", cwd=str(repo), runner=fixer,
+        "claim", cwd=str(repo), runner=fixer, label="SUBSTANTIVE",
         verify_runner=lambda p: '{"verdict": "REJECT", "reason": "does not address it"}',
         verify_mode="on", retries=0,
     )
@@ -261,7 +261,7 @@ def test_rollback_failure_prints_warning(repo, capsys, monkeypatch):
         (repo / "tracked.py").write_text("bad fix\n")
         return 0, "done"
     out = apply_fix(
-        "claim", cwd=str(repo), runner=fixer,
+        "claim", cwd=str(repo), runner=fixer, label="SUBSTANTIVE",
         verify_runner=lambda p: '{"verdict": "REJECT", "reason": "no"}',
         verify_mode="on", retries=0,
     )
@@ -281,7 +281,7 @@ def test_reject_rollback_failure_sets_rollback_failed_flag(repo, monkeypatch):
         (repo / "tracked.py").write_text("bad fix\n")
         return 0, "done"
     out = apply_fix(
-        "claim", cwd=str(repo), runner=fixer,
+        "claim", cwd=str(repo), runner=fixer, label="SUBSTANTIVE",
         verify_runner=lambda p: '{"verdict": "REJECT", "reason": "no"}',
         verify_mode="on", retries=0,
     )
@@ -296,7 +296,7 @@ def test_reject_clean_rollback_clears_rollback_failed_flag(repo, monkeypatch):
         (repo / "tracked.py").write_text("bad fix\n")
         return 0, "done"
     out = apply_fix(
-        "claim", cwd=str(repo), runner=fixer,
+        "claim", cwd=str(repo), runner=fixer, label="SUBSTANTIVE",
         verify_runner=lambda p: '{"verdict": "REJECT", "reason": "no"}',
         verify_mode="on", retries=0,
     )

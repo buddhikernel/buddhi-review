@@ -51,7 +51,7 @@ _SELF_CHECK = [
     ("OUTDATED", "this refers to code that no longer exists", "skip"),
     ("INVALID", "this suggestion is simply wrong", "skip"),
     ("BUSINESS_QUESTION", "should we drop this column?", "escalate"),
-    ("PR_DESCRIPTION", "the PR body is out of date", "escalate"),
+    ("PR_DESCRIPTION", "the PR body is out of date", "fix"),  # → PR-body rewriter
     ("__GARBAGE__", "force a classifier failure", "escalate"),  # → CLASSIFICATION_FAILED
 ]
 
@@ -103,6 +103,7 @@ def _review_pr(args: argparse.Namespace) -> int:
         verify_fixes=args.verify_fixes,
         max_rounds=args.max_rounds,
         test_failure_mode=args.test_failure_mode,
+        fix_pr_description=args.fix_pr_description,
         rr=args.rr,
         rr_active=args.rr_active,
     )
@@ -156,6 +157,13 @@ def _run_loop(args: argparse.Namespace) -> int:
             plan=plan_name,
             verify_runner=model_call.text_runner("fix-verify", plan=plan_name),
             verify_mode=args.verify_fixes,
+            # A PR_DESCRIPTION comment rewrites the PR body in place (on by
+            # default); the rewriter model is cwd-pinned like the classifier.
+            pr=args.pr,
+            repo=args.repo,
+            fix_pr_description=args.fix_pr_description,
+            rewrite_runner=model_call.text_runner(
+                "pr-description-rewriter", plan=plan_name, cwd=cwd),
         ),
         max_rounds=args.max_rounds,
         auto_merge=args.auto_merge,
@@ -224,6 +232,12 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                    help="squash-merge + delete branch on a clean pass (default: off)")
     p.add_argument("--verify-fixes", choices=VERIFY_MODES, default="auto",
                    help="pre-commit fix verification (tripwire always forces it)")
+    # A PR_DESCRIPTION comment auto-rewrites the PR body in place (default: on).
+    # Off leaves the body untouched and logs a skip for a manual update.
+    p.add_argument("--fix-pr-description", action=argparse.BooleanOptionalAction,
+                   default=True,
+                   help="rewrite the PR body to address a PR-description comment "
+                        "(default: on; --no-fix-pr-description leaves it for a human)")
     p.add_argument("--max-rounds", type=int, default=None,
                    help="maximum review→fix rounds (default: BUDDHI_MAX_ROUNDS env → diff auto-size → 10)")
     # Test-failure handling is escalate-only: on a red gate the handler asks the

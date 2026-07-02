@@ -10,8 +10,11 @@ branch:
   OUTDATED / INVALID                          → ``out_of_scope`` → DISCARDED (skip)
   SUBSTANTIVE / COSMETIC                       → high model_confidence, substantive
                                                  change → MODEL_HANDLED (dispatch fixer)
-  BUSINESS_QUESTION / PR_DESCRIPTION /
-  CLASSIFICATION_FAILED                        → low model_confidence → HUMAN route
+  PR_DESCRIPTION                               → high model_confidence, substantive
+                                                 change → MODEL_HANDLED; the label in
+                                                 ``meta`` steers the actuator to the
+                                                 PR-body rewriter (not the code fixer)
+  BUSINESS_QUESTION / CLASSIFICATION_FAILED    → low model_confidence → HUMAN route
                                                  → ESCALATED (console ask) [or DENIED
                                                  if the interrupt budget is spent]
 """
@@ -19,7 +22,7 @@ from __future__ import annotations
 
 from buddhi.stage0.conditioning import RawItem
 
-from buddhi_review.classify import DISCARD_LABELS, FIX_LABELS
+from buddhi_review.classify import DISCARD_LABELS, FIX_LABELS, REWRITE_LABELS
 
 _SEVERITY_STAKES = {"critical": 0.9, "high": 0.7, "medium": 0.5, "low": 0.3}
 
@@ -41,8 +44,10 @@ def raw_item_for(
             source=source,
             meta={"out_of_scope": True, "review_label": label},
         )
-    if label in FIX_LABELS:
+    if label in FIX_LABELS or label in REWRITE_LABELS:
         # The model can handle it: high confidence + a substantive change → MODEL_HANDLED.
+        # PR_DESCRIPTION rides the same "act" branch; ``review_label`` in meta tells
+        # the actuator to rewrite the PR body rather than run the code fixer.
         return RawItem(
             id=comment_id,
             payload=payload,
@@ -52,7 +57,7 @@ def raw_item_for(
             changes=("substantive",),
             meta={"review_label": label},
         )
-    # BUSINESS_QUESTION / PR_DESCRIPTION / CLASSIFICATION_FAILED → ask a human.
+    # BUSINESS_QUESTION / CLASSIFICATION_FAILED → ask a human.
     return RawItem(
         id=comment_id,
         payload=payload,

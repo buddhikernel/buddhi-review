@@ -105,11 +105,22 @@ def test_tripwire_clean_diff_passes():
 def test_should_verify_modes():
     plain = "+++ b/a.py\n+    x = compute()\n"
     contract = "+++ b/a.py\n+def changed_signature(a, b):\n"
-    assert should_verify("on", plain, tripwired=False)
-    assert not should_verify("off", plain, tripwired=False)
-    assert should_verify("off", plain, tripwired=True)  # tripwire FORCES the pass
-    assert should_verify("auto", contract, tripwired=False)
-    assert not should_verify("auto", plain, tripwired=False)
+    S = "SUBSTANTIVE"
+    assert should_verify("on", plain, tripwired=False, label=S)
+    assert not should_verify("off", plain, tripwired=False, label=S)
+    assert should_verify("off", plain, tripwired=True, label=S)  # tripwire FORCES the pass
+    assert should_verify("auto", contract, tripwired=False, label=S)
+    assert not should_verify("auto", plain, tripwired=False, label=S)
+
+
+def test_should_verify_label_gate():
+    # Only a SUBSTANTIVE fix verifies in on/auto; a COSMETIC (or unlabelled) fix
+    # skips the pass — unless the tripwire forces it regardless of label.
+    contract = "+++ b/a.py\n+def changed_signature(a, b):\n"
+    assert not should_verify("on", contract, tripwired=False, label="COSMETIC")
+    assert not should_verify("auto", contract, tripwired=False, label="COSMETIC")
+    assert not should_verify("on", contract, tripwired=False, label=None)
+    assert should_verify("on", contract, tripwired=True, label="COSMETIC")  # tripwire overrides
 
 
 def test_contract_surface_detection():
@@ -117,6 +128,11 @@ def test_contract_surface_detection():
     assert touches_contract_surface("+import os\n")
     assert touches_contract_surface("+MAX_ROUNDS = 10\n")
     assert not touches_contract_surface("+++ b/a.py\n+    y = 1\n")
+    # None/"" degrade to "no contract surface" instead of raising (mirrors the
+    # tripwire's None guard), so should_verify never raises on a diff-less call.
+    assert not touches_contract_surface(None)
+    assert not touches_contract_surface("")
+    assert not should_verify("auto", None, tripwired=False, label="SUBSTANTIVE")
 
 
 def test_verify_confirm_and_reject():
@@ -251,7 +267,7 @@ def test_apply_fix_verify_reject_rolls_back(repo):
         (repo / "tracked.py").write_text("bad fix\n")
         return 0, "done"
     out = apply_fix(
-        "claim", cwd=str(repo), runner=fixer,
+        "claim", cwd=str(repo), runner=fixer, label="SUBSTANTIVE",
         verify_runner=lambda p: '{"verdict": "REJECT", "reason": "does not address it"}',
         verify_mode="on", retries=0,
     )
@@ -264,20 +280,107 @@ def test_apply_fix_verify_fail_open_keeps_fix(repo):
         (repo / "tracked.py").write_text("fixed\n")
         return 0, "done"
     out = apply_fix(
-        "claim", cwd=str(repo), runner=fixer,
+        "claim", cwd=str(repo), runner=fixer, label="SUBSTANTIVE",
         verify_runner=lambda p: "unparseable", verify_mode="on", retries=0,
     )
     assert out.status == "applied"
     assert (repo / "tracked.py").read_text() == "fixed\n"
 
 
-def test_apply_fix_refuses_without_snapshot(tmp_path):
-    # not a git repo → no provable rollback → refuse, never run the fixer
+def test_apply_fix_no_snapshot_degrades_and_proceeds(tmp_path, capsys):
+    # #33 (a): no snapshot (not a git repo) + a failed fix → the fixer STILL RUNS
+    # (no longer refused), the run proceeds with the "advancing without rollback"
+    # warning, and the outcome does NOT arm the poisoned-worktree halt.
+    ran = []
     def fixer(prompt, *, model, effort, timeout, cwd):
-        raise AssertionError("fixer ran without a snapshot")
-    out = apply_fix("claim", cwd=str(tmp_path), runner=fixer)
+        ran.append(1)
+        return 1, "boom"  # fixer runs but fails
+    out = apply_fix("claim", cwd=str(tmp_path), runner=fixer, retries=0)
+    assert ran == [1]                       # degrade, not refuse — the fixer ran
     assert out.status == "transient-failed"
-    assert "snapshot unavailable" in out.detail
+    assert out.rollback_failed is False     # no snapshot ⇒ no halt (degrade)
+    assert "advancing without rollback" in capsys.readouterr().out
+
+
+def test_apply_fix_real_snapshot_failed_restore_halts(repo, monkeypatch, capsys):
+    # #33 (b): a REAL snapshot whose restore FAILS still arms the poisoned-worktree
+    # halt (rollback_failed=True) — the #33 degrade must not have widened past the
+    # snapshot-None case.
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setattr(fix_apply, "restore_worktree", lambda cwd, snap: False)
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "tracked.py").write_text("corrupt\n")
+        return 1, "boom"
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
+    assert out.status == "transient-failed"
+    assert out.rollback_failed is True      # real snapshot + failed restore → HALT
+    assert "could not roll back" in capsys.readouterr().out
+
+
+def test_apply_fix_no_snapshot_clean_success_applies(tmp_path):
+    # A no-snapshot run whose fixer SUCCEEDS still applies (degrade is not refuse).
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (tmp_path / "note.txt").write_text("done\n")
+        return 0, "ok"
+    out = apply_fix("claim", cwd=str(tmp_path), runner=fixer, retries=0)
+    assert out.status == "applied" and out.rollback_failed is False
+
+
+# ---------------------------------------------------------------------------
+# Tripwire — region window (#34), per-hunk flags marker (#35), whole-test-file (#36)
+# ---------------------------------------------------------------------------
+
+def test_tripwire_region_window_counts_far_lines_in_commented_file():
+    # A change far (>window) from the commented line, in the commented file, counts
+    # as outside the region even though it is the same file.
+    far = "+++ b/main.py\n@@ -1,0 +200,3 @@\n+a\n+b\n+c\n"
+    assert diff_tripwire(far, commented_files=("main.py",),
+                         commented_line=10, outside_limit=2) is not None
+    # A change near the commented line is in-region and does NOT count as outside.
+    near = "+++ b/main.py\n@@ -1,0 +12,3 @@\n+a\n+b\n+c\n"
+    assert diff_tripwire(near, commented_files=("main.py",),
+                         commented_line=10, outside_limit=2) is None
+
+
+def test_tripwire_flags_marker_on_context_line_in_changed_hunk():
+    # #35: the *_FLAGS marker sits on a CONTEXT line (the tuple opener), the change
+    # is an added element — the hunk both marks AND changes, so it trips.
+    diff = ("+++ b/tools.py\n@@ -10,3 +10,4 @@ AVAILABLE_FLAGS = (\n"
+            "     'read',\n+    'write',\n     'exec',\n")
+    assert diff_tripwire(diff) is not None
+
+
+def test_tripwire_flags_marker_without_change_does_not_trip():
+    # #35: a hunk whose only marker is on a context line and carries NO +/- change
+    # does not trip — the marker must sit inside a CHANGED hunk.
+    diff = ("+++ b/tools.py\n@@ -10,2 +10,2 @@ AVAILABLE_FLAGS = (\n"
+            "     'read',\n     'exec',\n")
+    assert diff_tripwire(diff) is None
+
+
+def test_tripwire_removed_bare_assert_not_self_assert():
+    # #36: a bare `-    assert x` trips; a deleted `-    self.assertEqual(...)` does
+    # NOT read as a removed bare-assert statement (aligned to the narrower regex).
+    assert diff_tripwire("-    assert x == 1") is not None
+    assert diff_tripwire("-    self.assertEqual(x, 1)") is None
+
+
+def test_attempt_diff_caps_at_max_bytes(repo):
+    # #39: a huge tracked change is capped to the byte budget with the sentinel.
+    big = "y = 1\n" + "\n".join(f"line{i} = {i}" for i in range(20000)) + "\n"
+    (repo / "tracked.py").write_text(big)
+    diff = fix_apply._attempt_diff(str(repo), "HEAD")
+    assert len(diff) <= fix_apply._ATTEMPT_DIFF_MAX_BYTES + len(fix_apply._DIFF_TRUNCATED_SENTINEL)
+    assert "[diff truncated]" in diff
+
+
+def test_attempt_diff_stops_appending_untracked_over_budget(repo):
+    # #39: once the tracked diff already exceeds the budget, untracked chunks are
+    # not appended at all.
+    (repo / "tracked.py").write_text("z = 1\n" + "q" * 70000 + "\n")
+    (repo / "untracked_marker.py").write_text("SHOULD_NOT_APPEAR = 1\n")
+    diff = fix_apply._attempt_diff(str(repo), "HEAD")
+    assert "SHOULD_NOT_APPEAR" not in diff
 
 
 def test_apply_fix_forwards_phase1_stamps(repo):
