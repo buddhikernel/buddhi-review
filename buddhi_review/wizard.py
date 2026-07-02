@@ -431,6 +431,10 @@ def _validate_claude_token(token, *, run, which=shutil.which) -> str:
     The OAuth token minted by ``claude setup-token`` IS valid for this path — do NOT
     switch to ANTHROPIC_API_KEY. No public token-introspection endpoint exists, so a
     tiny model round-trip is the only reliable check."""
+    # Defence in depth: a token copied from a wrapped terminal can carry internal
+    # whitespace (newline + indent); a real sk-ant-oat token has none, so strip ALL
+    # whitespace before the round-trip regardless of how the caller cleaned it.
+    token = "".join((token or "").split())
     claude_bin = which("claude")
     if not claude_bin:
         return "unknown"
@@ -851,6 +855,18 @@ def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
     except Exception as exc:
         return (False, type(exc).__name__)
     if getattr(pr, "returncode", 1) != 0:
+        # gh pr create fails when a PR for this branch ALREADY exists (a prior setup
+        # run opened it) — the branch push above still succeeds, so this is not a real
+        # failure. Detect the existing PR and return it, mirroring create-pr.sh's
+        # idempotent gh-pr-view fallback, instead of a scary "opening the PR failed".
+        try:
+            existing = run(["gh", "pr", "view", branch, "--repo", repo,
+                            "--json", "url", "--jq", ".url"], timeout=20)
+            ex_url = (getattr(existing, "stdout", "") or "").strip()
+            if getattr(existing, "returncode", 1) == 0 and ex_url:
+                return (True, ex_url)
+        except Exception:
+            pass
         return (False, "branch pushed but opening the PR failed")
     out = (getattr(pr, "stdout", "") or "").strip()
     url = out.splitlines()[-1] if out else "(PR opened)"
@@ -1462,7 +1478,12 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
-            token = getpass_fn(f"  Paste the {name} (input hidden), or blank to skip: ").strip()
+            # Strip ALL whitespace, not just the ends: a token copied from a wrapped /
+            # small terminal window carries an internal newline (+ indent space), and a
+            # real sk-ant-oat OAuth token contains no whitespace — so joining the split
+            # pieces reconstructs the intended token instead of failing validation.
+            token = "".join(getpass_fn(
+                f"  Paste the {name} (input hidden), or blank to skip: ").split())
         except (EOFError, KeyboardInterrupt):
             token = ""
         if not token:
@@ -1559,7 +1580,10 @@ def _offer_gh_token(*, run, getpass_fn, pal, stream, input_fn=input) -> None:
     max_attempts = 2  # one paste + one bounded re-prompt, then skip (never loop)
     for attempt in range(1, max_attempts + 1):
         try:
-            token = getpass_fn("  Paste a GitHub token (input hidden), or blank to skip: ").strip()
+            # Strip ALL whitespace (not just the ends): a token copied from a wrapped
+            # terminal carries an internal newline; a real token contains none.
+            token = "".join(getpass_fn(
+                "  Paste a GitHub token (input hidden), or blank to skip: ").split())
         except (EOFError, KeyboardInterrupt):
             token = ""
         if not token:
