@@ -141,7 +141,8 @@ def _env_max_rounds() -> Optional[int]:
     if raw in (None, ""):
         return None
     try:
-        return max(1, int(raw))
+        val = int(raw)
+        return val if val > 0 else None  # 0/negative → treat as invalid → auto-size
     except (TypeError, ValueError):
         return None
 
@@ -668,13 +669,15 @@ class RoundDriver:
         self.store = self.adapter.store
         self.done: Set[str] = set()           # voluntarily-done (clean review)
         # Soft, run-scoped exclusion sets kept on the driver (NOT the ReviewStore
-        # hard buckets), so they never touch the SAFETY / hard-cause reporting and
-        # are cleared by --rr:
+        # hard buckets), so they never touch the SAFETY / hard-cause reporting.
+        # Cleared by --rr (re-requests everyone):
         #   polishing     — a reviewer whose round posted only non-substantive
         #                   comments (nothing left to fix); dropped from re-request.
+        self.polishing: Set[str] = set()
+        # NOT cleared by --rr — a silent drop persists for the run; re-inclusion
+        # fires in _classify_signal() when the bot posts a new comment mid-run:
         #   silent_dropped — a reviewer expected yet silent for a full round;
         #                   silence is not approval, so it is dropped mid-run.
-        self.polishing: Set[str] = set()
         self.silent_dropped: Set[str] = set()
         self.bots: Dict[str, BotState] = {}
         self.processed_ids: Set[str] = set()
@@ -887,6 +890,13 @@ class RoundDriver:
             return None  # humans and unknown logins don't drive bot state or rounds
         st = self._bot_state(bot)
         st.last_seen = now
+        # Re-include immediately on any new comment — _record_round_attendance()
+        # only iterates over expected_bots(), which excludes silent_dropped, so
+        # the discard() there never fires for a dropped bot.
+        if bot in self.silent_dropped:
+            self.silent_dropped.discard(bot)
+            self.notice("silent-reinclusion", f"{bot} posted a new comment — re-included",
+                        status="done")
 
         # The errored comeback is NOT decided here: a bot is retracted only
         # on a SUBSTANTIVE comment strictly newer than the error signal, and the
@@ -1466,7 +1476,10 @@ class RoundDriver:
             if self._bot_state(bot).last_seen is not None:
                 self.responded_ever.add(bot)
                 self.silent_rounds[bot] = 0        # responded → the streak resets
-                self.silent_dropped.discard(bot)   # a reviewer that came back is re-included
+                # Defensive no-op for silent_dropped bots: expected_bots() already
+                # filters them out, so they are never in `expected` — real
+                # re-inclusion fires in _classify_signal() when they post again.
+                self.silent_dropped.discard(bot)
             else:
                 self.silent_rounds[bot] = self.silent_rounds.get(bot, 0) + 1
                 if self._was_review_expected(bot):

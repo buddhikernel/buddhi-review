@@ -905,6 +905,18 @@ def test_silent_reviewer_that_comes_back_is_reincluded():
     assert driver.silent_rounds["claude"] == 0
 
 
+def test_silent_dropped_bot_reincluded_via_classify_signal():
+    # _record_round_attendance() only iterates expected_bots(), which excludes
+    # silent_dropped — so a dropped bot that posts a new comment must be
+    # re-included via _classify_signal(), not via round-end bookkeeping.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    driver.silent_dropped.add("claude")
+    comment = Comment(id="x", text="this looks wrong", source="claude[bot]")
+    driver._classify_signal(comment, clock.t)
+    assert "claude" not in driver.silent_dropped
+    assert "claude" in driver.expected_bots()
+
+
 # ---------------------------------------------------------------------------
 # Post-summon register delay
 # ---------------------------------------------------------------------------

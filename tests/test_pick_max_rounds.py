@@ -119,3 +119,21 @@ def test_diff_auto_size_when_no_explicit_or_env(monkeypatch):
 def test_fallback_when_diff_size_unknown(monkeypatch):
     monkeypatch.delenv("BUDDHI_MAX_ROUNDS", raising=False)
     assert resolve_max_rounds(None, diff_lines=None) == round_driver.MAX_ROUNDS_FALLBACK == 10
+
+
+def test_env_zero_falls_through_to_auto_size(monkeypatch):
+    # 0 is not a positive int → treated as invalid → auto-size from diff, not clamped to 1
+    monkeypatch.setenv("BUDDHI_MAX_ROUNDS", "0")
+    assert resolve_max_rounds(None, diff_lines=800) == pick_max_rounds(800) == 7
+
+
+def test_env_negative_falls_through_to_auto_size(monkeypatch):
+    # Negative values are not positive ints → auto-size from diff
+    monkeypatch.setenv("BUDDHI_MAX_ROUNDS", "-5")
+    assert resolve_max_rounds(None, diff_lines=800) == pick_max_rounds(800) == 7
+
+
+def test_env_negative_no_diff_falls_through_to_fallback(monkeypatch):
+    # Negative env with no diff → fallback constant
+    monkeypatch.setenv("BUDDHI_MAX_ROUNDS", "-1")
+    assert resolve_max_rounds(None, diff_lines=None) == round_driver.MAX_ROUNDS_FALLBACK

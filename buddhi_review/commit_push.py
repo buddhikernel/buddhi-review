@@ -402,10 +402,11 @@ def _diagnose_commit_failure(
     if head_before == head_after and still_dirty:
         notice(
             "commit",
-            "commit rejected by a pre-commit hook — HEAD did not move and the "
-            "worktree is still dirty, so this round's fixes are NOT committed. Fix "
-            "what the hook flagged (or bypass the hook), then re-run.",
-            status="stop", hint="a local pre-commit hook blocked the commit")
+            "commit likely rejected by a pre-commit hook (or another git-level "
+            "failure) — HEAD did not move and the worktree is still dirty, so this "
+            "round's fixes are NOT committed. Check git output above for the cause, "
+            "fix it (or bypass the hook), then re-run.",
+            status="stop", hint="a local pre-commit hook or git-level failure blocked the commit")
 
 
 def commit_and_push(
