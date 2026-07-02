@@ -6,10 +6,10 @@ sends each PR to a cross-vendor panel of AI reviewers, classifies their findings
 applies fixes, and repeats until the pull request is ready to land. It merges only
 when you opt in.
 
-**In our internal testing, across 88 qualifying runs on one Claude-written codebase,
-the panel of 4 AI reviewers (Claude, Codex, Gemini and Copilot) identified 681 valid
-bugs. Claude found 26 of them—3.8%—while half of all valid bugs were found only in
-round 2 or later.**
+**In internal testing across 88 qualifying runs on a single codebase written with
+Claude Code, four AI reviewers—Claude, Codex, Gemini, and Copilot—identified 681
+valid bugs. Claude found 26 of them, or 3.8%, while half were found only in round 2
+or later.**
 
 New here? Run `pip install buddhi-review`, then follow
 **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
@@ -22,11 +22,11 @@ pip install buddhi-review
 ```
 
 This pulls the kernel ([`buddhikernel`](https://github.com/buddhikernel/buddhi)) and
-`PyYAML`, and installs the `buddhi-review` command. The two slash-command skills it
-backs — **`/review-pr`** (review an open PR) and **`/create-pr`** (open a PR, then
-review it) — ship inside the package but are **not** added to Claude Code
-automatically; install them as Claude Code **skills** (each becomes
-`~/.claude/skills/<name>/SKILL.md`):
+`PyYAML`, and installs the `buddhi-review` command. The package also includes two
+Claude Code skills: `/review-pr`, which reviews an open PR, and `/create-pr`, which
+opens and then reviews a PR. They are included in the package but are not added to
+Claude Code automatically. Install them by copying each skill to
+`~/.claude/skills/<name>/SKILL.md`:
 
 <details>
 <summary><b>Install the /review-pr and /create-pr skills</b></summary>
@@ -49,10 +49,10 @@ fi
 once to onboard (see [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)).
 If a slash-command of the same name already exists, the skill takes precedence.
 
-Each skill's `SKILL.md` frontmatter includes a **git-guardrail hook** that stops the
-agent from hand-running history-rewriting git (rebase / merge / reset --hard /
-cherry-pick / force-push) while a review is in flight; it activates only when the
-skill runs and leaves your everyday git untouched.
+Each skill's `SKILL.md` frontmatter includes a Git guardrail hook. While a review is
+in progress, it prevents the agent from manually invoking potentially disruptive
+operations such as rebase, merge, `reset --hard`, cherry-pick, and force-push. The
+hook is active only while the skill is running and does not affect normal Git use.
 
 To work from a clone instead (for development or to run the tests):
 
@@ -114,11 +114,10 @@ SELF-CHECK OK — the kernel decided every disposition.
 
 </details>
 
-The `[Clearance …]` panels in the full output are expected: the self-check includes
-cases that must be escalated to a human (`BUSINESS_QUESTION`, `PR_DESCRIPTION`, and a
-forced classifier failure), so the check briefly creates, then removes, the answer
-files a real run would use to ask you (see [When it asks you](#when-it-asks-you)).
-A clean run still ends with `SELF-CHECK OK`.
+The `[Clearance …]` prompts are expected. The self-check includes three cases that
+require human escalation: `BUSINESS_QUESTION`, `PR_DESCRIPTION`, and a forced
+classifier failure. It briefly creates and then removes the answer files that a real
+run would use. A successful check still ends with `SELF-CHECK OK`.
 
 ```bash
 # 2. One-time onboarding (plan, repo, reviewer fleet).
@@ -141,8 +140,9 @@ the code under review was written with Claude Code. For every bug that was verif
 and fixed, the loop recorded its severity, the reviewer that found it, and the round
 in which it was found. The 88 runs that meet the selection criteria below contain
 681 such bugs. Two patterns stand out: models are less critical of their own output,
-and many bugs surface only after earlier fixes land. The research in
-[Why a panel, and why rounds](#why-a-panel-and-why-rounds) predicts both effects.
+and many bugs surface only after earlier fixes are applied. The research discussed
+in [Why a panel and why rounds](#why-a-panel-and-why-rounds) helps explain both
+patterns.
 
 <details>
 <summary>How runs qualify (the selection criteria)</summary>
@@ -198,7 +198,7 @@ so they cannot catch bugs introduced or exposed by those fixes.
 <img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%">
 
 - **Bars:** the same 20 runs as the chart above, here showing the share of each
-  run's bugs that was caught in round 2 or later.
+  run's bugs that was found in round 2 or later.
 - **Line:** the aggregate share across all 88 qualifying runs, which is 50.1%. The
   selected larger runs generally have a higher round-2-or-later share.
 
@@ -210,7 +210,7 @@ in total, reviewer by reviewer.
 
 <img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
 
-| Run | Valid bugs | Caught by Claude | Claude % | Caught in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
+| Run | Valid bugs | Found by Claude | Claude % | Found in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
 |---|---|---|---|---|---|---|---|
 | A | 21 | 0&Dagger; | 0.0% | 17 | 81.0% | 7 | 5 (71.4%) |
 | B | 47 | 0&Dagger; | 0.0% | 41 | 87.2% | 14 | 10 (71.4%) |
@@ -234,10 +234,11 @@ Notes and caveats:
   numbers are taken from the loop's per-bug ledger, which records each verified,
   fixed bug with its severity, the reviewer that caught it, and the round it was
   caught in.
-- Severity is assigned by the loop's classifier, which itself runs on Claude, so
-  the severity ratings do not disfavor Claude.
-- Each bug is credited to one catching reviewer. Claude's raw comment counts on
-  the underlying PRs match the ledger's counts, so every Claude catch is credited.
+- Severity is assigned by the loop's classifier, which also runs on Claude; the
+  severity labels therefore do not introduce an obvious anti-Claude bias.
+- Each bug is credited to the reviewer recorded as having found it. Claude's raw
+  comment counts on the underlying PRs match the ledger's counts, so every bug
+  Claude found is credited.
 - The qualifying rules were checked run by run against each PR's review record:
   diff size from the PR itself, reviewer participation from posted reviews and
   comments, and quota, error, or refusal notices detected with the loop's own
@@ -269,13 +270,12 @@ Check or cap your GitHub-side spend at
 See [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)
 for the full breakdown.
 
-## Why a panel, and why rounds
+## Why a panel and why rounds
 
-The numbers in [What real review runs show](#what-real-review-runs-show) are the
-result of a deliberate design: Buddhi does not hand your PR to one reviewer; it fans
-the review out to a panel of independent models from *different* labs and keeps
-flying rounds until a round comes back clean. There are three reasons this beats
-one strong reviewer running once.
+These results reflect Buddhi's design: it sends each PR to models from different
+labs and reviews the code again after fixes are applied. The loop continues until a
+post-fix round returns clean or reaches its configured round budget. Three design
+choices explain why this can outperform a single review pass.
 
 **Different labs have different blind spots.** Models from different labs do not
 fail in exactly the same ways. A panel becomes more useful when its reviewers'
@@ -290,7 +290,7 @@ reviews the updated code again rather than trusting the fixer's first attempt.
 Using reviewers from different model families also provides a more independent
 check on the fix: a model re-reading its own fix is grading its own homework.
 
-**It stops on a clean post-fix round, not after a fixed number of rounds.** Buddhi
+**Buddhi stops on a clean post-fix round, not after a fixed number of rounds.** Buddhi
 reviews the current code, acts on every actionable finding, and then reviews the
 updated code again. It converges when a post-fix review returns no new findings that
 require action.
@@ -325,7 +325,7 @@ flowchart LR
   *The Wisdom of Crowds* (2004).
 - **[1] Same-vendor models are more error-correlated than cross-vendor ones.** Kim
   et al., [*Correlated Errors in Large Language Models*](https://arxiv.org/abs/2506.07962).
-  The same paper carries an honest caveat: that decorrelation *shrinks* for the
+  The paper also notes an important caveat: error decorrelation decreases among the
   largest, most accurate models. Cross-vendor diversity helps, but the benefit is
   smaller at the frontier, which is one reason Buddhi caps its review rounds.
 - **[2] Self-preference bias.** Panickssery et al.,
@@ -335,30 +335,30 @@ flowchart LR
   al., [*Improving Factuality and Reasoning through Multiagent Debate*](https://arxiv.org/abs/2305.14325));
   pushing further tends to entrench errors rather than remove them.
 - **[4] Why Buddhi *unions and dedupes* findings rather than making models vote.**
-  Voting correlated judges caps out fast (even ~9 diverse LLM judges behave like ~2
-  independent votes: Kohli, [*Nine Judges, Two Effective Votes*](https://arxiv.org/abs/2605.29800)),
+  Voting among correlated judges quickly reaches diminishing returns (even ~9
+  diverse LLM judges behave like ~2 independent votes: Kohli, [*Nine Judges, Two Effective Votes*](https://arxiv.org/abs/2605.29800)),
   whereas a diverse cross-vendor panel beats a single strong judge in LLM
   *evaluation* (Cohere, [*Replacing Judges with Juries* / PoLL](https://arxiv.org/abs/2404.18796)).
-  Finding bugs is a *coverage* problem: every reviewer's real find should be kept,
-  not put to a majority vote, so Buddhi keeps the union of the panel's findings.
+  Finding bugs is a coverage problem: every valid finding from any reviewer should
+  be retained rather than subjected to a majority vote. Buddhi therefore takes the
+  union of the panel's findings and deduplicates overlapping reports.
 
 </details>
 
 ## How it works
 
-Buddhi splits PR review into two parts: the decision logic and the I/O around it. The
-[Buddhi kernel](https://github.com/buddhikernel/buddhi) makes the decision — for each
-review comment it decides whether to fix it, ask you, skip it, or defer it.
-`buddhi-review` is the **adapter** that does everything around that decision on the
-GitHub side: it reads the comments off your PR, hands each one to the kernel, and
-carries out whatever the kernel returns. Concretely, for each comment the loop:
+Buddhi separates decision-making from GitHub I/O. For each review comment, the
+[Buddhi kernel](https://github.com/buddhikernel/buddhi) determines whether to fix,
+escalate, skip, or defer it. The `buddhi-review` adapter reads comments from the PR,
+submits them to the kernel, and carries out the resulting disposition. Concretely,
+for each comment the loop:
 
 1. **Classifies** it into one of six labels: `SUBSTANTIVE`, `COSMETIC`,
    `BUSINESS_QUESTION`, `PR_DESCRIPTION`, `OUTDATED`, `INVALID`. If the classifier
    cannot produce a usable label, the comment becomes a synthetic
-   `CLASSIFICATION_FAILED` item. It is escalated when the interrupt budget (a daily
-   cap on how many times the loop may interrupt you) allows and deferred when the
-   budget has been exhausted.
+   `CLASSIFICATION_FAILED` item. It is escalated when the interruption budget (a
+   daily cap on how many times the loop may interrupt you) allows and deferred when
+   the budget has been exhausted.
 2. **Maps** the label onto a kernel work item and runs it through the kernel's
    decision pipeline, a fixed set of seven checks (see the
    [Buddhi kernel](https://github.com/buddhikernel/buddhi)).
@@ -369,12 +369,11 @@ carries out whatever the kernel returns. Concretely, for each comment the loop:
    | fix | dispatch a fixer (SUBSTANTIVE / COSMETIC) |
    | escalate | ask you via the console answer-file channel (BUSINESS_QUESTION / PR_DESCRIPTION / classifier failure) |
    | skip | do nothing (OUTDATED / INVALID) |
-   | defer | the day's human-interrupt budget is spent: hold the item, never drop it |
+   | defer | the daily interruption budget is exhausted; retain the item for later |
    | already-resolved | the comment was already resolved before the loop reached it — no action taken |
 
-The disposition is the **kernel's** call, not a pile of hand-tuned `if` branches in
-the adapter — `buddhi-review` only carries out the I/O; every decision stays in the
-kernel.
+The adapter does not reimplement these decisions through hand-written conditional
+logic; it only carries out the kernel's disposition.
 
 ## When it asks you
 
@@ -391,12 +390,12 @@ interrupting you.
 Two additional cases always route to you regardless of the docs: a `PR_DESCRIPTION`
 comment (a reviewer asked you to update the PR body itself) and a
 `CLASSIFICATION_FAILED` comment (the classifier could not produce a usable label).
-Both escalate when your interrupt budget allows, and defer rather than drop if it
-doesn't.
+Both are escalated when the interruption budget allows and deferred—not
+dropped—when it does not.
 
-When it does need you, the question is written to an editable answer file: the loop
-prints a `file://` link, you type a number (or free text) on the `>` line and save,
-and the loop picks it up. Everything happens locally.
+When the kernel needs your input, it writes the question to an editable answer file
+and prints a `file://` link. Enter a number or free-text answer on the `>` line and
+save the file; the loop then picks up the response locally.
 
 This answer-file prompt sits behind a small notifier interface, so other delivery
 channels can be added later without touching the review loop.
