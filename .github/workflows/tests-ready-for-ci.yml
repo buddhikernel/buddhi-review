@@ -65,6 +65,12 @@ jobs:
       # `run:` step below at install time. By hand: replace that one line with your
       # real test / lint / build command (e.g. `make ci`, `npm test`,
       # `go test ./...`).
+      #
+      # buddhi-review's REAL CI (restored after #21's re-bake dropped it): the full
+      # pytest suite needs the `[test]` extra, and the fail-closed publish-readiness
+      # gate (tools/publish_gate.py — the OSS-purity scan) needs build+setuptools+
+      # wheel. This is the repo's ONLY full-suite + publish-gate run (label-gated,
+      # at merge), per F7 (#16).
       - name: CI
         run: |
-          python -m pip install -e . && python -m pytest
+          pip install -e '.[test]' build setuptools wheel && python -m pytest -q && python tools/publish_gate.py scan
