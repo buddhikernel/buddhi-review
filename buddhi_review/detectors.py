@@ -147,7 +147,11 @@ _ACTIONABLE_PROSE_RE = re.compile(
     r"please\s+(?:add|fix|change|update|remove|use|rename|refactor|move)|"
     r"should\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|you\s+|we\s+|probably\s+|also\s+)|"
     r"could\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|you\s+|we\s+|probably\s+|also\s+)|"
-    r"need(?:s)?\s+to\s+(?:be\s+)?(?:add|fix|change|update|remove|use|rename|refactor|move|handle|cover|test)"
+    r"need(?:s)?\s+to\s+(?:be\s+)?(?:add|fix|change|update|remove|use|rename|refactor|move|handle|cover|test)|"
+    # "must" as a strong obligation marker ("you must add tests", "must be fixed").
+    # Negative lookahead on "be" mirrors the should/could guard so approval footers
+    # like "must be merged after CI" are not mistaken for a recommendation.
+    r"must\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|(?:add|fix|change|update|remove|use|rename|refactor|move|handle|cover|test))"
     r")\b",
     re.IGNORECASE,
 )
@@ -309,15 +313,15 @@ def is_clean_review(text: str) -> bool:
     Markdown emphasis is stripped first so "no **new** comments" reads the same
     as "no new comments". Each clean pattern is tried in turn; a match counts
     only when :func:`_has_actionable_prose_after` finds no recommendation in the
-    text after it — guarding the multi-sentence "…no comments. Consider a test."
-    mixed case the per-pattern intra-sentence look-ahead cannot see."""
+    text before OR after it — guarding both "Fix typo. LGTM" (feedback precedes
+    the clean phrase) and "…no comments. Consider a test." (feedback follows)."""
     if not text or not text.strip():
         return False  # an empty body NEVER promotes a bot to no-issues
     # Strip *…* / _…_ emphasis on a working copy before the scan.
     t = re.sub(r"[*_]{1,3}", "", text)
     for rx in _CLEAN_RES:
         m = rx.search(t)
-        if m and not _has_actionable_prose_after(t, m.end()):
+        if m and not _has_actionable_prose_after(t, m.end()) and not _has_actionable_prose_after(t[: m.start()], 0):
             return True
     return False
 

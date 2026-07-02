@@ -230,6 +230,31 @@ def test_pr_too_large_signal_excludes_permanently():
     assert driver.store.is_excluded("claude")
 
 
+def test_quota_second_pass_wires_pr_context_through_classify_signal():
+    """_classify_signal fetches pr_title/pr_body from gh pr view and passes them
+    to detect_signal so a reviewer summarizing a quota-themed PR is not excluded."""
+    pr_json = json.dumps({"title": "Add monthly quota / rate-limit handling",
+                          "body": "Implements the daily limit reset and quota accounting."})
+    quota_echo = ("This PR adds monthly quota limit handling; the quota is reset "
+                  "each cycle and the usage limit is enforced per account.")
+
+    class QuotaPrGh(GhRecorder):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            if "title,body" in " ".join(argv):
+                return subprocess.CompletedProcess(argv, 0, stdout=pr_json, stderr="")
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+    gh = QuotaPrGh()
+    # quota_llm says the bot is describing the PR's own content (not self-reporting)
+    driver, clock, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh,
+                                   quota_llm=lambda p: {"self_reporting": False})
+    comment = Comment(id="x", text=quota_echo, source="claude[bot]")
+    driver._classify_signal(comment, clock.t)
+    assert not driver.store.is_excluded("claude"), (
+        "reviewer echoing quota vocab on a quota-themed PR must not be excluded"
+    )
+
+
 # A comeback is only observable while the loop is still polling, so these
 # timelines carry a second, silent bot (copilot) whose MIN_BOT_WAIT keeps the
 # round open past the comeback comment — the comeback lands during later polls

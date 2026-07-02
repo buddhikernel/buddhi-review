@@ -819,7 +819,11 @@ class RoundDriver:
         # (below) → classified → `_maybe_errored_comeback` retracts iff it is
         # SUBSTANTIVE + strictly newer. A cosmetic / OUTDATED / INVALID /
         # question comment is NOT proof of recovery, so it never brings the bot back.
-        signal = detectors.detect_signal(comment.text, quota_llm=self.quota_llm)
+        pr_title, pr_body = self._fetch_pr_title_body()
+        signal = detectors.detect_signal(
+            comment.text, quota_llm=self.quota_llm,
+            pr_title=pr_title, pr_body=pr_body,
+        )
         if signal == detectors.SIGNAL_QUOTA:
             self.store.exclude_quota(bot)
             st.signal = signal
@@ -1056,6 +1060,29 @@ class RoundDriver:
             run=self.gh_run, notice=self.notice,
         )
         return RunOutcome("clean", rounds, merged, self.actions)
+
+    # --------------------------------------------------- PR metadata (lazy, cached)
+
+    def _fetch_pr_title_body(self) -> Tuple[Optional[str], Optional[str]]:
+        """Best-effort (pr_title, pr_body) from ``gh pr view``, fetched at most
+        once per run. Returns (None, None) on any failure so the quota
+        second-pass simply doesn't arm (deterministic verdict holds)."""
+        if not hasattr(self, "_pr_meta_cache"):
+            title = body = None
+            try:
+                argv = ["gh", "pr", "view", str(self.pr), "--json", "title,body"]
+                if self.repo:
+                    argv += ["-R", self.repo]
+                proc = self.gh_run(argv, cwd=self.cwd)
+                if getattr(proc, "returncode", 1) == 0:
+                    data = json.loads(getattr(proc, "stdout", "") or "{}")
+                    if isinstance(data, dict):
+                        title = data.get("title") or None
+                        body = data.get("body") or None
+            except Exception:
+                pass
+            self._pr_meta_cache: Tuple[Optional[str], Optional[str]] = (title, body)
+        return self._pr_meta_cache
 
     # --------------------------------------------------- manual-landing exit-rebase
 

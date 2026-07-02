@@ -58,6 +58,8 @@ def test_mixed_feedback_never_silently_excludes():
         "LGTM. One nit: consider renaming the variable.",              # trailing "consider"
         "No issues found. Please update the error handling.",          # trailing "please update"
         "No comments to address, but the null check on line 42 needs to be added.",
+        "No issues found. You must add tests.",                         # strong "must add"
+        "No problems detected. This must be fixed before merging.",     # "must be fixed"
     ):
         assert not detectors.is_clean_review(msg), msg
 
@@ -186,6 +188,20 @@ def test_narrow_guard_defers_bare_trailing_prose():
     assert detectors.is_clean_review("LGTM. One nit: the docstring is missing.")
     assert detectors.is_clean_review(
         "No comments to address. Separately, you should rename foo.")
+
+
+def test_actionable_prefix_blocks_clean_verdict():
+    # Feedback BEFORE the clean phrase must also be caught — "Fix typo. LGTM"
+    # should not pass as a clean review.
+    assert not detectors.is_clean_review("Consider adding a test. LGTM")
+    assert not detectors.is_clean_review("Please fix the typo. No issues found.")
+    assert not detectors.is_clean_review(
+        "I recommend renaming this variable. Overall looks good, no comments.")
+    # Genuine clean messages without a prefix recommendation must still pass.
+    assert detectors.is_clean_review("LGTM")
+    assert detectors.is_clean_review("No issues found.")
+    # "must be merged" is an approval footer, not a recommendation — guard must not fire.
+    assert detectors.is_clean_review("No issues found. This must be merged after CI.")
 
 
 # ---------------------------------------------------------------------------
