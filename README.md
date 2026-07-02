@@ -6,9 +6,10 @@ sends each PR to a cross-vendor panel of AI reviewers, classifies their findings
 applies fixes, and repeats until the pull request is ready to land. It merges only
 when you opt in.
 
-**Across 88 qualifying runs on one Claude-written codebase, the panel identified 681
-valid bugs. Claude found 26 of them—3.8%—while half of all valid bugs were found
-only in round 2 or later.**
+**In our internal testing, across 88 qualifying runs on one Claude-written codebase,
+the panel of 4 AI reviewers (Claude, Codex, Gemini and Copilot) identified 681 valid
+bugs. Claude found 26 of them—3.8%—while half of all valid bugs were found only in
+round 2 or later.**
 
 New here? Run `pip install buddhi-review`, then follow
 **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
