@@ -426,8 +426,11 @@ def _restore_or_degrade(cwd: str, snapshot: Optional[Snapshot], when: str) -> bo
     * **No snapshot** (``None``) — there is nothing to roll back and nothing to
       poison: no snapshot was ever taken, so no promise was broken. Emit the
       degrade note ("advancing without rollback") and return ``True`` so the run
-      proceeds. This path must NEVER arm ``rollback_failed`` — the poisoned-
-      worktree halt stays reserved for a real snapshot whose restore FAILED."""
+      proceeds. This helper never sets ``rollback_failed`` — it only signals
+      trustworthiness via its return value. Callers may still decide to arm
+      ``rollback_failed`` for certain no-rollback terminal outcomes (e.g. a
+      fix-verify REJECT with no snapshot, where rejected edits may remain in
+      the worktree and should not ride the next push)."""
     if snapshot is None:
         _emit_degraded_no_rollback(when)
         return True
@@ -447,7 +450,7 @@ _FLAGS_RE = re.compile(r"\b[A-Z0-9_]*_FLAGS\b|\bISOLATION\b")
 # against the CONTENT (sign already stripped), so a deleted ``self.assert…``
 # unittest call is deliberately NOT treated as a removed bare-assert statement.
 _ASSERT_RE = re.compile(r"^\s*assert\b")
-_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+test")
+_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+test_")
 _FILE_HEADER_RE = re.compile(r"^\+\+\+ b/(.+)$")
 # The ``+`` new-file start line in a ``@@ -a,b +c,d @@`` hunk header.
 _HUNK_NEWSTART_RE = re.compile(r"\+(\d+)")
