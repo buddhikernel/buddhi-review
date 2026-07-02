@@ -1,0 +1,37 @@
+{
+  "name": "pr_description_rewrite_merge",
+  "description": "A PR_DESCRIPTION comment (the body still names a stale endpoint) is auto-rewritten in place; the next round is clean and the loop merges. The kernel acts (MODEL_HANDLED) and the label routes it to the PR-body rewriter, not the code fixer.",
+  "pr": "107",
+  "repo": "example-org/widget",
+  "auto_merge": true,
+  "config": {"active_reviewers": ["claude"], "auto_on_open": {"claude": false}},
+  "answer_mode": "none",
+  "rounds": [
+    [
+      {
+        "id": "c1",
+        "login": "claude[bot]",
+        "body": "the PR description still lists the old /v1/upload endpoint; the diff moved it to /v2/upload",
+        "created_at": "2026-01-10T10:00:00Z",
+        "from_issue_channel": false,
+        "classifier_response": "{\"label\": \"PR_DESCRIPTION\", \"bot\": \"claude\", \"model\": \"sonnet\", \"effort\": \"low\", \"severity\": \"low\", \"reason\": \"PR body names the old endpoint; update the description\"}",
+        "fix_outcome": "applied"
+      }
+    ],
+    [
+      {
+        "id": "c2",
+        "login": "claude[bot]",
+        "body": "No issues found.",
+        "from_issue_channel": true,
+        "created_at": "2026-01-10T10:20:00Z"
+      }
+    ]
+  ],
+  "expected": {
+    "labels": {"c1": "PR_DESCRIPTION"},
+    "terminal_disposition": "merge",
+    "per_comment": {"c1": "fixed"},
+    "auto_actions": [["squash-merge", "do"], ["squash-merge", "done"]]
+  }
+}

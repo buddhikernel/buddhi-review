@@ -69,6 +69,9 @@ def _env_int(name: str, default: int, floor: int = 0) -> int:
 
 FIX_RETRIES = _env_int("BUDDHI_FIX_RETRIES", 1)
 TRIPWIRE_OUTSIDE_LINES = _env_int("BUDDHI_FIX_TRIPWIRE_OUTSIDE_LINES", 40, floor=1)
+# Lines around the commented line still counted "in region" for the outside-lines
+# tripwire condition — a ±window within the commented file itself.
+TRIPWIRE_REGION_WINDOW = 60
 # Effort → wall-clock budget for one agentic fix attempt. THE single source for
 # the fixer attempt timeout — there is no second copy to drift against. `medium`
 # is 600s: a substantive fix on a large file routinely needs more than 5 minutes,
@@ -105,6 +108,19 @@ def _emit_rollback_failure(when: str, *, stream: Optional[TextIO] = None) -> str
         "⚠",
         f"could not roll back failed-attempt edits ({when}) — partial edits "
         f"may ride the next push",
+        colour=_YELLOW, stream=stream,
+    )
+
+
+def _emit_degraded_no_rollback(when: str, *, stream: Optional[TextIO] = None) -> str:
+    """No worktree snapshot could be captured, so there is nothing to roll back —
+    a best-effort DEGRADE, not a poisoning. The attempt's partial edits cannot be
+    undone and may ride the next push, so it sounds a ⚠ note; but unlike a real
+    failed restore it does NOT arm the poisoned-worktree halt, because a snapshot
+    that never existed cannot have left un-rolled-back residue behind a promise."""
+    return _status_line(
+        "⚠",
+        f"advancing without rollback ({when}); partial edits may ride the next push",
         colour=_YELLOW, stream=stream,
     )
 
@@ -289,8 +305,8 @@ def snapshot_worktree(cwd: str) -> Optional[Snapshot]:
     file's content is written to the object store (``hash-object -w``) along
     with its type/mode — a symlink is captured as its target (hash-object would
     follow it), a regular file as (blob sha, mode). Returns None when the state
-    cannot be captured — callers treat that as "cannot prove a safe rollback"
-    and refuse to fix."""
+    cannot be captured — the fix then proceeds WITHOUT a rollback safety net
+    (a degrade, not a refusal): see :func:`_restore_or_degrade`."""
     try:
         s = _git(cwd, "stash", "create")
         u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard")
@@ -397,55 +413,159 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         return False
 
 
+def _restore_or_degrade(cwd: str, snapshot: Optional[Snapshot], when: str) -> bool:
+    """Clean up after a failed/rejected attempt and report whether the worktree
+    can still be trusted afterwards.
+
+    * **Real snapshot** — attempt the restore. ``True`` on success; on failure
+      sound the ⚠ rollback-failure alarm and return ``False``. A ``False`` here
+      is the load-bearing signal the caller turns into ``rollback_failed`` so the
+      round driver HALTS before the push (a snapshot promised a clean rollback
+      and could not deliver → un-rolled-back residue may be sitting in the shared
+      worktree).
+    * **No snapshot** (``None``) — there is nothing to roll back and nothing to
+      poison: no snapshot was ever taken, so no promise was broken. Emit the
+      degrade note ("advancing without rollback") and return ``True`` so the run
+      proceeds. This helper never sets ``rollback_failed`` — it only signals
+      trustworthiness via its return value. Callers may still decide to arm
+      ``rollback_failed`` for certain no-rollback terminal outcomes (e.g. a
+      fix-verify REJECT with no snapshot, where rejected edits may remain in
+      the worktree and should not ride the next push)."""
+    if snapshot is None:
+        _emit_degraded_no_rollback(when)
+        return True
+    if restore_worktree(cwd, snapshot):
+        return True
+    _emit_rollback_failure(when)
+    return False
+
+
 # ---------------------------------------------------------------------------
 # The dangerous-change tripwire (pure predicate over the applied diff)
 # ---------------------------------------------------------------------------
 
 _FLAGS_RE = re.compile(r"\b[A-Z0-9_]*_FLAGS\b|\bISOLATION\b")
-_ASSERT_RE = re.compile(r"^\-\s*(self\.)?assert", re.IGNORECASE)
-_TEST_DEF_RE = re.compile(r"^\-\s*def\s+test_")
+# A bare ``assert`` statement on the sign-stripped content of a ``-`` line, and a
+# removed test function (``def test…`` / ``async def test…``). Both are matched
+# against the CONTENT (sign already stripped), so a deleted ``self.assert…``
+# unittest call is deliberately NOT treated as a removed bare-assert statement.
+_ASSERT_RE = re.compile(r"^\s*assert\b")
+_TEST_DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+test_")
 _FILE_HEADER_RE = re.compile(r"^\+\+\+ b/(.+)$")
+# The ``+`` new-file start line in a ``@@ -a,b +c,d @@`` hunk header.
+_HUNK_NEWSTART_RE = re.compile(r"\+(\d+)")
 
 
 def diff_tripwire(
     diff: Optional[str],
     *,
     commented_files: Sequence[str] = (),
+    commented_line: Optional[int] = None,
     outside_limit: Optional[int] = None,
+    region_window: int = TRIPWIRE_REGION_WINDOW,
 ) -> Optional[str]:
-    """Return the tripping reason, or None for a clean diff. Flags: edits that
-    touch ``*_FLAGS``/``ISOLATION`` constants, deleted assertions, removed
-    tests, or more than N changed lines outside the commented file(s)."""
+    """Return the tripping reason(s), or None for a clean diff. Trips on edits
+    that touch ``*_FLAGS``/``ISOLATION`` constants, delete an assertion, remove a
+    test, or change more than N lines OUTSIDE the commented region.
+
+    The commented region is the commented file(s) AND, when ``commented_line`` is
+    known, only a ``±region_window`` band around that line within the file — a
+    changed line in a commented file but far from the commented line still counts
+    as outside (a single-comment fix has no business rewriting a distant part of
+    the same file).
+
+    The ``*_FLAGS``/``ISOLATION`` trip is PER-HUNK: it fires only when the marker
+    sits inside a hunk that also carries a ``+``/``-`` change (the marker often
+    lives on the surrounding CONTEXT line or the ``@@`` construct header, not the
+    changed line itself), never merely because the token appears somewhere in a
+    touched file."""
     limit = outside_limit if outside_limit is not None else TRIPWIRE_OUTSIDE_LINES
+    try:
+        cline = int(commented_line) if commented_line is not None else None
+    except (TypeError, ValueError):
+        cline = None
+
     current_file = ""
     old_file = ""
+    new_lineno = 0            # new-file line number tracked across hunk content
     outside = 0
+    flags_touched = assert_deleted = test_removed = False
+    # Per-hunk accumulators, reset on each new file (``diff --git``) and each
+    # ``@@`` header: a marker anywhere in the hunk sets ``hunk_marker``; any
+    # ``+``/``-`` content line sets ``hunk_change``; a hunk with BOTH edits a
+    # flags/isolation construct.
+    hunk_marker = hunk_change = False
+
+    def _close_hunk() -> None:
+        nonlocal flags_touched
+        if hunk_marker and hunk_change:
+            flags_touched = True
+
     # An empty / None / "(diff unavailable)" string has no +/- content lines, so
     # it can never trip — but guard None explicitly so a caller that can't produce
     # a diff degrades to "no alarm" instead of raising into the fix path.
     for line in (diff or "").splitlines():
-        if line.startswith("--- a/"):
-            old_file = line[6:]
+        if line.startswith("diff --git "):
+            _close_hunk()
+            hunk_marker = hunk_change = False
+            current_file = old_file = ""
+            new_lineno = 0
+            continue
+        if line.startswith("--- "):
+            p = line[4:].strip()
+            old_file = "" if p == "/dev/null" else (p[2:] if p.startswith(("a/", "b/")) else p)
             continue
         if line.startswith("+++ "):
+            p = line[4:].strip()
             if line.startswith("+++ b/"):
                 current_file = line[6:]
-            elif line == "+++ /dev/null":
+            elif p == "/dev/null":
                 current_file = old_file
+                # A whole test file being deleted (``+++ /dev/null``) removes a test.
+                if _is_test_path(old_file):
+                    test_removed = True
+            else:
+                current_file = p
             continue
-        if not line or line[0] not in "+-" or line.startswith(("+++", "---")):
+        if line.startswith("@@"):
+            _close_hunk()
+            hunk_marker = hunk_change = False
+            m = _HUNK_NEWSTART_RE.search(line)
+            new_lineno = int(m.group(1)) if m else 0
+            # git appends the enclosing construct after the second ``@@`` — a
+            # ``*_FLAGS = (`` there is the marker for a tuple-element edit below.
+            if _FLAGS_RE.search(line):
+                hunk_marker = True
             continue
-        if _FLAGS_RE.search(line):
-            return f"edits a *_FLAGS/ISOLATION constant: {line.strip()[:120]}"
-        if _ASSERT_RE.match(line):
-            return f"deletes an assertion: {line.strip()[:120]}"
-        if _TEST_DEF_RE.match(line):
-            return f"removes a test: {line.strip()[:120]}"
-        if commented_files and current_file not in commented_files:
-            outside += 1
-            if outside > limit:
-                return f">{limit} changed lines outside the commented region"
-    return None
+        if not line or line[0] not in "+- ":
+            continue
+        sign, content = line[0], line[1:]
+        if _FLAGS_RE.search(content):
+            hunk_marker = True
+        in_region = (current_file in commented_files) and (
+            cline is None or abs(new_lineno - cline) <= region_window)
+        if sign in "+-":
+            hunk_change = True
+            if sign == "-" and _ASSERT_RE.search(content):
+                assert_deleted = True
+            if sign == "-" and _TEST_DEF_RE.search(content):
+                test_removed = True
+            if commented_files and not in_region:
+                outside += 1
+        if sign in "+ ":
+            new_lineno += 1
+    _close_hunk()
+
+    reasons = []
+    if flags_touched:
+        reasons.append("edits a *_FLAGS/ISOLATION constant")
+    if assert_deleted:
+        reasons.append("deletes an assertion")
+    if test_removed:
+        reasons.append("removes a test")
+    if outside > limit:
+        reasons.append(f">{limit} changed lines outside the commented region")
+    return "; ".join(reasons) if reasons else None
 
 
 # ---------------------------------------------------------------------------
@@ -457,8 +577,11 @@ _CONTRACT_LINE_RE = re.compile(r"^[+-]\s*(def |class |import |from |[A-Z][A-Z0-9
 _CONTRACT_FILE_RE = re.compile(r"\.(ya?ml|toml|ini|cfg)$|(^|/)\.github/workflows/")
 
 
-def touches_contract_surface(diff: str) -> bool:
-    for line in diff.splitlines():
+def touches_contract_surface(diff: Optional[str]) -> bool:
+    # Guard None like diff_tripwire does, so a caller that can't produce a diff
+    # (and should_verify's auto branch) degrades to "no contract surface" instead
+    # of raising into the fix path.
+    for line in (diff or "").splitlines():
         m = _FILE_HEADER_RE.match(line)
         if m and _CONTRACT_FILE_RE.search(m.group(1)):
             return True
@@ -469,14 +592,23 @@ def touches_contract_surface(diff: str) -> bool:
     return False
 
 
-def should_verify(mode: str, diff: str, *, tripwired: bool) -> bool:
-    """The dangerous-change tripwire FORCES the pass regardless of mode."""
+def should_verify(mode: str, diff: Optional[str], *, tripwired: bool, label: Optional[str] = None) -> bool:
+    """Decide whether an applied fix runs the pre-commit verify pass.
+
+    * The dangerous-change tripwire FORCES the pass regardless of mode/label.
+    * ``off`` never verifies (short of a tripwire).
+    * Otherwise only a SUBSTANTIVE fix is verified — a COSMETIC (or unlabelled)
+      fix is low-stakes and skips the pass unless it tripped the wire. On top of
+      the label gate: ``on`` always verifies a SUBSTANTIVE fix; ``auto`` verifies
+      a SUBSTANTIVE fix that also touches a contract surface."""
     if tripwired:
-        return True
-    if mode == "on":
         return True
     if mode == "off":
         return False
+    if str(label or "").upper() != "SUBSTANTIVE":
+        return False
+    if mode == "on":
+        return True
     return touches_contract_surface(diff)  # auto
 
 
@@ -929,22 +1061,33 @@ def apply_fix(
     reason: str = "",
     diff_hunk: str = "",
     commented_files: Sequence[str] = (),
+    commented_line: Optional[int] = None,
+    label: str = "",
     runner: FixerRunner = default_fixer_runner,
     verify_runner: Optional[Callable[[str], str]] = None,
     verify_mode: str = "auto",
     retries: Optional[int] = None,
 ) -> FixOutcome:
     """Dispatch one guided fix under the snapshot/rollback + safety-floor
-    contracts. The caller maps a ``transient-failed`` outcome to an escalation."""
+    contracts. The caller maps a ``transient-failed`` outcome to an escalation.
+
+    When the worktree snapshot cannot be captured the fix DEGRADES rather than
+    refusing: it proceeds without a rollback safety net (see
+    :func:`_restore_or_degrade`). On the degrade path, ``rollback_failed`` is
+    NOT armed for normal outcomes (timeout, non-zero exit) — but a fix-verify
+    REJECT still arms it so the round driver halts before any push rather than
+    letting the rejected edits leak silently."""
     snap = snapshot_worktree(cwd)
-    if snap is None:
-        return FixOutcome(
-            status="transient-failed",
-            detail="worktree snapshot unavailable — refusing to fix without a provable rollback",
-        )
+    # No snapshot ⇒ no provable rollback. Degrade (proceed) instead of refusing;
+    # ``ref`` falls back to HEAD so the attempt diff can still be computed.
+    ref = snap[0] if snap is not None else "HEAD"
     prompt = build_fix_prompt(comment_text, reason=reason, diff_hunk=diff_hunk)
     timeout = EFFORT_TIMEOUTS.get(effort, EFFORT_TIMEOUTS["high"])
     max_attempts = (FIX_RETRIES if retries is None else max(0, retries)) + 1
+    # No snapshot ⇒ no rollback between retries; each attempt compounds the
+    # previous one's partial edits. One shot only to bound the residue risk.
+    if snap is None:
+        max_attempts = min(max_attempts, 1)
 
     attempt = 0
     for attempt in range(1, max_attempts + 1):
@@ -953,8 +1096,7 @@ def apply_fix(
         except subprocess.TimeoutExpired:
             # A timeout is transient infra → restore and retry the SAME model.
             if attempt < max_attempts:
-                if not restore_worktree(cwd, snap):
-                    _emit_rollback_failure("after timeout")
+                if not _restore_or_degrade(cwd, snap, "after timeout"):
                     return FixOutcome(
                         status="transient-failed",
                         detail="rollback failed after timeout — aborting to avoid corrupt state",
@@ -963,17 +1105,14 @@ def apply_fix(
                     )
             continue
         except OSError as exc:
-            rolled_back = restore_worktree(cwd, snap)
-            if not rolled_back:
-                _emit_rollback_failure("after fixer spawn failure")
+            trustworthy = _restore_or_degrade(cwd, snap, "after fixer spawn failure")
             return FixOutcome(
                 status="transient-failed", detail=f"fixer spawn failed: {exc}", attempts=attempt,
-                rollback_failed=not rolled_back,
+                rollback_failed=not trustworthy,
             )
         if rc != 0:  # restore, then retry the SAME model/effort/timeout within the bound
             if attempt < max_attempts:
-                if not restore_worktree(cwd, snap):
-                    _emit_rollback_failure("after non-zero exit")
+                if not _restore_or_degrade(cwd, snap, "after non-zero exit"):
                     return FixOutcome(
                         status="transient-failed",
                         detail="rollback failed after non-zero exit — aborting to avoid corrupt state",
@@ -985,24 +1124,35 @@ def apply_fix(
             (ln for ln in (stdout or "").splitlines() if ln.strip().startswith("SKIP:")), None
         )
         if skip_line:  # terminal: the fixer's own verification said don't apply
-            if not restore_worktree(cwd, snap):  # guarantee no stray edits leak
+            if not _restore_or_degrade(cwd, snap, "after SKIP"):  # guarantee no stray edits leak
                 # SKIP swore a no-op; an UNDOABLE edit here means the fixer
                 # violated that claim, leaving untrusted, uncaptured residue — so
                 # unlike the REJECT path (which keeps its terminal "rejected"),
                 # this escalates as "transient-failed" for a per-comment Ask.
                 # Either way, rollback_failed=True arms the round-level poisoned-
                 # worktree gate (round_driver) that halts before the push.
-                _emit_rollback_failure("after SKIP")
                 return FixOutcome(
                     status="transient-failed",
                     detail="rollback failed after SKIP — stray edits may remain",
                     attempts=attempt,
                     rollback_failed=True,
                 )
+            # No snapshot: degrade returned trustworthy=True but no actual rollback
+            # occurred. We cannot prove the worktree is clean, so escalate rather
+            # than letting "skipped" imply a clean state to the round driver.
+            # rollback_failed=True arms the poisoned-worktree gate in round_driver
+            # so it halts before any push — matching the REJECT path (line 1195).
+            if snap is None:
+                return FixOutcome(
+                    status="transient-failed",
+                    detail="SKIP received without snapshot — cannot verify worktree is clean",
+                    attempts=attempt,
+                    rollback_failed=True,
+                )
             return FixOutcome(status="skipped", detail=skip_line.strip(), attempts=attempt)
         # Clean success → deterministic pre-commit Unicode cleanup, then tripwire +
         # verify over this attempt's diff.
-        diff = _attempt_diff(cwd, snap[0])
+        diff = _attempt_diff(cwd, ref)
         if _unicode_cleanup_enabled():
             files_n, chars_n = deterministic_unicode_cleanup(
                 cwd, added_lines_by_file(diff))
@@ -1013,10 +1163,10 @@ def apply_fix(
                     f"({chars_n} char(s)) before commit",
                     colour=_DIM,
                 )
-                diff = _attempt_diff(cwd, snap[0])  # recompute so tripwire/verify see the cleaned diff
-        trip = diff_tripwire(diff, commented_files=commented_files)
+                diff = _attempt_diff(cwd, ref)  # recompute so tripwire/verify see the cleaned diff
+        trip = diff_tripwire(diff, commented_files=commented_files, commented_line=commented_line)
         run_verify = verify_runner is not None and should_verify(
-            verify_mode, diff, tripwired=bool(trip))
+            verify_mode, diff, tripwired=bool(trip), label=label)
         if trip:  # tripwire alarm — the firing reason belongs on stdout, not a strip layer
             _status_line(
                 "⚠",
@@ -1041,18 +1191,21 @@ def apply_fix(
                 # transient-failed, which the caller maps to retry/escalation: that
                 # would re-run a fixer verify already rejected, on top of the
                 # un-rolled-back edits, compounding the residue.
-                rolled_back = restore_worktree(cwd, snap)
-                if not rolled_back:
-                    _emit_rollback_failure("after fix-verify REJECT")
+                trustworthy = _restore_or_degrade(cwd, snap, "after fix-verify REJECT")
+                # No snapshot: degrade returns trustworthy=True but no rollback
+                # occurred — arm rollback_failed so the round driver halts before
+                # any push rather than letting rejected edits leak silently.
+                rollback_failed = not trustworthy or snap is None
                 return FixOutcome(
                     status="rejected",
                     detail=f"fix-verify REJECT: {reason}"
                     + (f" (tripwire: {trip})" if trip else "")
-                    + ("" if rolled_back
-                       else " — rollback FAILED, stray edits may ride the next push"),
+                    + ("" if not rollback_failed
+                       else (" — no snapshot; rejected edits may remain" if snap is None
+                             else " — rollback FAILED, stray edits may ride the next push")),
                     diff=diff,
                     attempts=attempt,
-                    rollback_failed=not rolled_back,
+                    rollback_failed=rollback_failed,
                 )
             if verdict.get("fail_open"):  # fail-open must never read as "verified"
                 _status_line(
@@ -1067,8 +1220,7 @@ def apply_fix(
 
     # The give-up tail runs exactly once per comment — reached when any transient
     # failure (timeout or non-zero exit) exhausts the bounded retry budget.
-    if not restore_worktree(cwd, snap):
-        _emit_rollback_failure("after the final attempt")
+    if not _restore_or_degrade(cwd, snap, "after the final attempt"):
         return FixOutcome(
             status="transient-failed",
             detail=f"fixer failed after {max_attempts} attempt(s) and final rollback failed — worktree may be corrupt",
@@ -1091,21 +1243,38 @@ _DIFF_HEADER_FLAGS = ("-c", "core.quotepath=false",
                       "-c", "diff.noprefix=false",
                       "-c", "diff.mnemonicPrefix=false")
 
+# Cap the attempt diff fed to the tripwire scan and the A4 verify prompt: an
+# unbounded diff (a huge fix, a giant untracked file) would blow the verify
+# prompt and slow the scan. Once the accumulated diff reaches the budget, stop
+# appending untracked-file chunks and truncate the whole string with a sentinel.
+_ATTEMPT_DIFF_MAX_BYTES = 60000
+_DIFF_TRUNCATED_SENTINEL = "\n... [diff truncated]\n"
+
 
 def _attempt_diff(cwd: str, tracked_ref: str) -> str:
     try:
         d = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", tracked_ref)
         tracked = d.stdout if d.returncode == 0 else ""
-        u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard")
-        if u.returncode != 0:
-            return tracked
         parts = [tracked]
-        for rel in (p for p in u.stdout.split("\0") if p):
-            # git diff --no-index exits 1 when files differ (normal); capture stdout regardless
-            nd = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", "--no-index",
-                      "--", "/dev/null", rel)
-            if nd.stdout:
-                parts.append(nd.stdout)
-        return "".join(parts)
+        total = len(tracked.encode('utf-8'))
+        # Only pull untracked-file chunks while under the budget; stop once the
+        # accumulated diff reaches it (an over-budget tracked diff skips them all).
+        if total < _ATTEMPT_DIFF_MAX_BYTES:
+            u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard")
+            if u.returncode == 0:
+                for rel in (p for p in u.stdout.split("\0") if p):
+                    if total >= _ATTEMPT_DIFF_MAX_BYTES:
+                        break
+                    # git diff --no-index exits 1 when files differ (normal); capture stdout regardless
+                    nd = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", "--no-index",
+                              "--", "/dev/null", rel)
+                    if nd.stdout:
+                        parts.append(nd.stdout)
+                        total += len(nd.stdout.encode('utf-8'))
+        joined = "".join(parts)
+        encoded = joined.encode('utf-8')
+        if len(encoded) > _ATTEMPT_DIFF_MAX_BYTES:
+            joined = encoded[:_ATTEMPT_DIFF_MAX_BYTES].decode('utf-8', errors='ignore') + _DIFF_TRUNCATED_SENTINEL
+        return joined
     except (subprocess.TimeoutExpired, OSError):
         return ""

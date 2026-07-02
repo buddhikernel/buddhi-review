@@ -48,10 +48,14 @@ DEFAULT_FIX_EFFORT = "high"
 
 CLASSIFICATION_FAILED = "CLASSIFICATION_FAILED"
 
-# Labels whose disposition is "act on it" (dispatch a fixer).
+# Labels whose disposition is "act on it" (dispatch a fixer over the worktree).
 FIX_LABELS = frozenset({"SUBSTANTIVE", "COSMETIC"})
+# Labels whose disposition is "act on it, but via the PR-body rewriter (not the
+# code fixer)". The kernel treats these as high-confidence, model-handled items;
+# the actuator reads the label and rewrites the PR description in place.
+REWRITE_LABELS = frozenset({"PR_DESCRIPTION"})
 # Labels whose disposition is "ask a human".
-ESCALATE_LABELS = frozenset({"BUSINESS_QUESTION", "PR_DESCRIPTION", CLASSIFICATION_FAILED})
+ESCALATE_LABELS = frozenset({"BUSINESS_QUESTION", CLASSIFICATION_FAILED})
 # Labels whose disposition is "skip — do not act".
 DISCARD_LABELS = frozenset({"OUTDATED", "INVALID"})
 

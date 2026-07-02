@@ -23,7 +23,9 @@ CASES = [
     ("OUTDATED", "refers to deleted code", DISCARDED, "skip"),
     ("INVALID", "this is just wrong", DISCARDED, "skip"),
     ("BUSINESS_QUESTION", "should we drop this column", ESCALATED, "escalate"),
-    ("PR_DESCRIPTION", "the body is stale", ESCALATED, "escalate"),
+    # PR_DESCRIPTION is model-handled now — the kernel acts and the label routes
+    # it to the PR-body rewriter in the actuator (not the code fixer).
+    ("PR_DESCRIPTION", "the body is stale", MODEL_HANDLED, "fix"),
 ]
 
 

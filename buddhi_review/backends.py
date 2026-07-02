@@ -107,6 +107,9 @@ def _loop_argv(pr: str, repo: Optional[str], cwd: Optional[str], opts: dict) -> 
     tfm = opts.get("test_failure_mode")
     if tfm:
         argv += ["--test-failure-mode", str(tfm)]
+    fpd = opts.get("fix_pr_description")
+    if fpd is not None:
+        argv.append("--fix-pr-description" if fpd else "--no-fix-pr-description")
     if opts.get("rr"):
         argv.append("--rr")
     if opts.get("rr_active"):
