@@ -403,6 +403,8 @@ def test_pr_too_large_exceeds_maximum_without_refusal_is_a_finding():
         "deploy tool will apply atomically.",
         "This function exceeds the maximum number of changes we allow per commit; "
         "split it.",
+        # "review" used as an adjective modifying "payload" — NOT a size-refusal.
+        "The review payload exceeds the maximum number of tokens the API accepts.",
     ):
         assert detectors.detect_signal(msg) is None, msg
 
@@ -495,10 +497,10 @@ def test_throttle_defers_to_tier2_not_deterministic():
 
 _QUOTA_PR_TITLE = "Add monthly quota / rate-limit handling"
 _QUOTA_PR_BODY = "Implements the daily limit reset and quota accounting."
-# A healthy reviewer summarizing that PR — echoes the quota vocabulary and trips
-# the deterministic QUOTA_RE.
-_QUOTA_ECHO = ("This PR adds monthly quota limit handling; the quota is reset "
-               "each cycle and the usage limit is enforced per account.")
+# A healthy reviewer summarizing that PR — uses exhaustion-verb language that
+# trips the deterministic QUOTA_RE even though it is describing PR content.
+_QUOTA_ECHO = ("This PR adds monthly quota-limit tracking; the limit is hit once "
+               "the monthly quota is exhausted, then resets at the billing cycle.")
 
 
 def test_quota_gate_suppresses_finding_on_quota_pr():

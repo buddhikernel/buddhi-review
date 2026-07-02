@@ -212,15 +212,19 @@ CLEAN_LLM_SHORT_LIMIT = 800
 # (keyword-gated) and the PR-subject second-pass in ``detect_signal``.
 QUOTA_RE = re.compile(
     r"(?i)(?:"
-    # quota paired with a limit word (either order) — "daily quota limit"
-    r"\bquota\b(?:\s+\w+){0,2}\s+\blimit\b"
-    r"|\blimit\b(?:\s+\w+){0,2}\s+\bquota\b"
     # an exhaustion verb near a limit/quota/cap/allowance/tokens noun (either
-    # order) — "rate limit exceeded", "exhausted your quota", "hit the cap"
-    r"|\b(?:exceeded|exhausted|reached|hit|maxed)\b[\s\S]{0,40}\b(?:limit|quota|cap|allowance|tokens?)\b"
+    # order) — "rate limit exceeded", "exhausted your quota", "hit the cap".
+    # Bare quota/limit noun-pairs (e.g. "quota limit") are NOT matched here:
+    # every reviewer comment is classified — inline findings like "the quota
+    # limit is off by one" must not exclude a healthy reviewer for the run.
+    r"\b(?:exceeded|exhausted|reached|hit|maxed)\b[\s\S]{0,40}\b(?:limit|quota|cap|allowance|tokens?)\b"
     r"|\b(?:limit|quota|cap|allowance|tokens?)\b[\s\S]{0,30}\b(?:exceeded|exhausted|reached|hit|maxed)\b"
-    # explicit cool-down: "wait / try again / come back ... N <time-unit>"
-    r"|\b(?:wait|come back|try again|retry|check back|resume)\b[\s\S]{0,60}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b"
+    # explicit cool-down: "wait / try again / come back ... N <time-unit>" — requires
+    # quota/rate-limit vocabulary to co-occur nearby (either order, within ~80 chars)
+    # so temporal engineering advice ("Retry in 5 minutes with exponential backoff")
+    # never fires this branch.
+    r"|\b(?:quota|rate[\s-]?limit(?:ed|ing)?|throttl(?:e|ed|ing)|allowance|tokens?|credits?)\b[\s\S]{0,80}?\b(?:wait|come back|try again|retry|check back|resume)\b[\s\S]{0,60}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b"
+    r"|\b(?:wait|come back|try again|retry|check back|resume)\b[\s\S]{0,60}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b[\s\S]{0,40}\b(?:quota|rate[\s-]?limit(?:ed|ing)?|throttl(?:e|ed|ing)|allowance|tokens?|credits?)\b"
     r"|\bunavailable\b[\s\S]{0,40}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b"
     # unambiguous self-report phrases
     r"|\btoo many requests\b"
@@ -236,11 +240,12 @@ PR_TOO_LARGE_RE = re.compile(
     # anchored branch below.)
     r"|(?:\bexceeds?\b.{0,40}\b(?:size|file|diff) limits?\b)"
     # "... review ... exceeds the maximum number of files/changes/tokens/diff" —
-    # the size-refusal signature, anchored to "review" so a finding about the
-    # reviewed code's OWN token/file maximums ("the context exceeds the maximum
-    # number of tokens the endpoint accepts") is not read as a refusal. Restricted
-    # to PR-scale nouns (not characters/lines, which are lint-style feedback).
-    r"|(?:\breview\b[\s\S]{0,80}\bexceeds?\b[\s\S]{0,40}\bmaximum\s+(?:number\s+of\s+)?(?:files?|changes?|tokens?|diff)\b)"
+    # the size-refusal signature, anchored to "review" as a process noun/verb.
+    # A negative lookahead excludes "review" used as an adjective immediately
+    # before a domain noun ("review payload", "review response", "review api"),
+    # so a finding about the reviewed code's own API limits ("the review payload
+    # exceeds the maximum number of tokens the API accepts") is not a refusal.
+    r"|(?:\breview\b(?!\s+(?:payload|response|request|body|endpoint|call|method|api|function|logic|code|handler)\b)[\s\S]{0,80}\bexceeds?\b[\s\S]{0,40}\bmaximum\s+(?:number\s+of\s+)?(?:files?|changes?|tokens?|diff)\b)"
 )
 # The loose alternatives ("something went wrong", "encountered an error") are
 # anchored to a review-process word within a short window so substantive prose
@@ -351,7 +356,7 @@ def is_clean_review(text: str) -> bool:
     # Only strip markers that touch a non-whitespace character so `* item`
     # list bullets (asterisk followed by a space) survive as bullet-detector
     # triggers; bare `*` at line-start is deliberately NOT emphasis.
-    t = re.sub(r"[*_]{1,3}(?=\S)|(?<=\S)[*_]{1,3}", "", text)
+    t = re.sub(r"(?<!\w)[*_]{1,3}(?=\S)|(?<=\S)[*_]{1,3}(?!\w)", "", text)
     for rx in _CLEAN_RES:
         m = rx.search(t)
         if m and not _has_actionable_prose_after(t, m.end()) and not _has_actionable_prose_after(t[: m.start()], 0):
