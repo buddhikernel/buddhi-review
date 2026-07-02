@@ -3,9 +3,8 @@
 `buddhi-review` is a **free, MIT-licensed PR review-and-fix loop for Claude Code**,
 built on the public [Buddhi kernel](https://github.com/buddhikernel/buddhi). It
 sends each PR to a cross-vendor panel of AI reviewers, classifies their findings,
-applies fixes, and repeats the process until a review round returns clean. It merges
-only when you opt in. Buddhi takes your pull request through repeated review-and-fix
-rounds until it is ready to land.
+applies fixes, and repeats until the pull request is ready to land. It merges only
+when you opt in.
 
 **Across 88 qualifying runs on one Claude-written codebase, the panel identified 681
 valid bugs. Claude found 26 of them—3.8%—while half of all valid bugs were found
@@ -170,10 +169,10 @@ Reviewers from other vendors found the remaining 96.2%. Claude found 18 of the 1
 high- or critical-severity bugs (9.5%), and of the high- or critical-severity bugs
 found in round 2 or later, 93.5% came from a reviewer other than Claude.
 
-This pattern is consistent with the self-preference effect described in
-[[LLM Evaluators Recognize and Favor Their Own Generations](https://arxiv.org/abs/2404.13076)]:
-models tend to evaluate their own output more favorably. In these runs, Claude
-missed most of the valid bugs found by the cross-vendor panel.
+This pattern is consistent with the self-preference effect
+[[2]](https://arxiv.org/abs/2404.13076): models tend to evaluate their own output
+more favorably. In these runs, Claude missed most of the valid bugs found by the
+cross-vendor panel.
 
 <img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
 
@@ -251,7 +250,7 @@ Buddhi is free and MIT-licensed, but **each review consumes quota from the provi
 accounts you connect.** Buddhi does not bill you or proxy reviews through its own
 accounts. Each reviewer draws on a plan you already hold:
 
-| Surface | Whose meter it spends |
+| Surface | Account or quota used |
 |---|---|
 | **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
 | **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
@@ -280,11 +279,10 @@ one strong reviewer running once.
 **Different labs have different blind spots.** Models from different labs do not
 fail in exactly the same ways. A panel becomes more useful when its reviewers'
 errors overlap less, and recent research finds that same-vendor models make more
-correlated errors than cross-vendor models
-[[Correlated Errors in Large Language Models](https://arxiv.org/abs/2506.07962)].
+correlated errors than cross-vendor models [[1]](https://arxiv.org/abs/2506.07962).
 A cross-vendor reviewer also provides a more independent check on model-generated
 code, because models tend to evaluate their own output more favorably
-[[LLM Evaluators Recognize and Favor Their Own Generations](https://arxiv.org/abs/2404.13076)].
+[[2]](https://arxiv.org/abs/2404.13076).
 
 **Every fix changes the code and can introduce a regression.** Buddhi therefore
 reviews the updated code again rather than trusting the fixer's first attempt.
@@ -324,25 +322,24 @@ flowchart LR
   to how *uncorrelated* its members' mistakes are. Classical roots: Krogh & Vedelsby,
   *Neural Network Ensembles* (NeurIPS 1995); the Condorcet Jury Theorem; Surowiecki,
   *The Wisdom of Crowds* (2004).
-- **Same-vendor models are more error-correlated than cross-vendor ones.** Kim et
-  al., [*Correlated Errors in Large Language Models*](https://arxiv.org/abs/2506.07962).
-  The same paper carries an honest caveat: that decorrelation *shrinks* for the largest,
-  most accurate models. Cross-vendor diversity helps, but it is not a free lunch at the
-  frontier, which is part of why Buddhi does not just stack rounds forever.
-- **Self-preference bias.** Panickssery et al.,
+- **[1] Same-vendor models are more error-correlated than cross-vendor ones.** Kim
+  et al., [*Correlated Errors in Large Language Models*](https://arxiv.org/abs/2506.07962).
+  The same paper carries an honest caveat: that decorrelation *shrinks* for the
+  largest, most accurate models. Cross-vendor diversity helps, but the benefit is
+  smaller at the frontier, which is one reason Buddhi caps its review rounds.
+- **[2] Self-preference bias.** Panickssery et al.,
   [*LLM Evaluators Recognize and Favor Their Own Generations*](https://arxiv.org/abs/2404.13076):
   an LLM rates text it wrote more favorably than another model's.
-- **Rounds plateau.** Multi-agent debate gains saturate after a few rounds (Du et
+- **[3] Rounds plateau.** Multi-agent debate gains saturate after a few rounds (Du et
   al., [*Improving Factuality and Reasoning through Multiagent Debate*](https://arxiv.org/abs/2305.14325));
   pushing further tends to entrench errors rather than remove them.
-- **Why Buddhi *unions and dedupes* findings rather than making models vote.** Voting
-  correlated judges caps out fast (even ~9 diverse LLM judges behave like ~2 independent
-  votes: Kohli, [*Nine Judges, Two Effective Votes*](https://arxiv.org/abs/2605.29800)),
-  whereas a diverse cross-vendor panel beats a single strong judge in LLM *evaluation*
-  (Cohere, [*Replacing Judges with Juries* / PoLL](https://arxiv.org/abs/2404.18796)).
-  Finding bugs is a *coverage* problem, where every reviewer's real catch is kept
-  rather than put to a majority vote, so Buddhi takes the union and skips the voting
-  ceiling.
+- **[4] Why Buddhi *unions and dedupes* findings rather than making models vote.**
+  Voting correlated judges caps out fast (even ~9 diverse LLM judges behave like ~2
+  independent votes: Kohli, [*Nine Judges, Two Effective Votes*](https://arxiv.org/abs/2605.29800)),
+  whereas a diverse cross-vendor panel beats a single strong judge in LLM
+  *evaluation* (Cohere, [*Replacing Judges with Juries* / PoLL](https://arxiv.org/abs/2404.18796)).
+  Finding bugs is a *coverage* problem: every reviewer's real find should be kept,
+  not put to a majority vote, so Buddhi keeps the union of the panel's findings.
 
 </details>
 
@@ -405,7 +402,7 @@ channels can be added later without touching the review loop.
 
 ## Status
 
-buddhi-review is in **alpha**: the CLI flags, output format, and Python API may
+`buddhi-review` is in **alpha**: the CLI flags, output format, and Python API may
 change between releases, with no semantic-versioning guarantees before v1.0. It has
 been exercised end to end but not yet hardened across a wide range of repositories,
 so expect rough edges. Issues and PRs are welcome.
