@@ -1,130 +1,19 @@
 # buddhi-review
 
-buddhi-review is a **free, MIT-licensed PR review-and-fix loop for Claude Code**,
-currently in alpha, built on the public
-[Buddhi kernel](https://github.com/buddhikernel/buddhi). It fans a PR review out to
-a panel of AI reviewers from different vendors, such as Copilot, Codex, Gemini, and
-Claude, then classifies every comment, applies the fixes, re-reviews until the PR is
-clean, and merges it when you opt in. Your pull request takes off, flies the review
-rounds, and lands.
+`buddhi-review` is a **free, MIT-licensed PR review-and-fix loop for Claude Code**,
+built on the public [Buddhi kernel](https://github.com/buddhikernel/buddhi). It
+sends each PR to a cross-vendor panel of AI reviewers, classifies their findings,
+applies fixes, and repeats the process until a review round returns clean. It merges
+only when you opt in. Buddhi takes your pull request through repeated review-and-fix
+rounds until it is ready to land.
 
-**Across 88 real review runs on Claude-written code, Claude caught 3.8% of the valid
-bugs. Reviewers from other vendors caught the rest, and half of all bugs surfaced
-only after the first round of fixes.**
+**Across 88 qualifying runs on one Claude-written codebase, the panel identified 681
+valid bugs. Claude found 26 of them—3.8%—while half of all valid bugs were found
+only in round 2 or later.**
 
 New here? Run `pip install buddhi-review`, then follow
 **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
 to your first reviewed PR.
-
-## What real review runs show
-
-The data in this section comes from real Buddhi review loops run on a large private
-repository, where the code under review was written with Claude Code. The loop records every
-verified, fixed bug in a ledger, along with its severity, the reviewer that caught
-it, and the round it was caught in. The 88 merged runs that meet the selection rules
-below contain 681 verified fixed bugs in total. Two patterns stand out: a model is
-soft on its own work, and many bugs surface only after earlier fixes land. The
-research in [Why a panel, and why rounds](#why-a-panel-and-why-rounds) predicts
-both effects.
-
-<details>
-<summary>How runs qualify (the selection rules)</summary>
-
-A run is counted when all three rules hold:
-
-- the change is larger than 50 lines, which excludes micro PRs;
-- all four reviewers (Claude, Codex, Gemini, Copilot) actually reviewed the PR;
-- no reviewer ran out of quota, failed with an error, or refused the PR as too large
-  at any point in the run.
-
-88 of 123 merged runs qualify. The 35 excluded runs consist of 2 micro changes, 7
-runs where a reviewer was missing, and 26 runs where a reviewer ran out of quota,
-failed, or refused the PR. Each rule was checked against the PR record itself: the
-diff size comes from the PR, participation comes from posted reviews and comments,
-and quota, error, and refusal notices were detected with the loop's own signal
-patterns.
-
-</details>
-
-### "Just have Claude review it again" is not adversarial review
-
-Across the 88 qualifying runs, Claude caught 26 of the 681 valid bugs (3.8%).
-Reviewers from other vendors caught the remaining 96.2%. Claude caught 18 of the 189
-high or critical bugs (9.5%), and of the high or critical bugs found in round 2 or
-later, 93.5% came from a reviewer other than Claude.
-
-This is the self-preference effect described in
-[[LLM Evaluators Recognize and Favor Their Own Generations](https://arxiv.org/abs/2404.13076)],
-visible in real review runs: a model reviewing its own work misses most of what a
-diverse panel catches.
-
-<img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
-
-- **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
-  such runs. Runs with fewer bugs are left out of the bars, because a percentage
-  computed over a handful of bugs swings too widely to read.
-- **Line:** Claude's share across all 88 qualifying runs, which is 3.8%.
-
-### One round is not a complete review
-
-Across the same 88 runs, **50.1% of the valid bugs, and 49.2% of the 189 high or
-critical ones, were caught only in round 2 or later**, after the round-1 fixes had
-been applied and the changed code was reviewed again. A reviewer that posts one round
-of comments and stops would have shipped half the real bugs, including half the
-high or critical ones. The effect grows with the number of bugs in a run: on the 20
-runs with 10 or more valid bugs, the round 2+ share rises to 65.4%.
-
-Built-in review features that post one round of comments and stop cannot catch issues
-that become visible only after earlier findings have been fixed.
-
-<img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%">
-
-- **Bars:** the same 20 runs as the chart above, here showing the share of each
-  run's bugs that was caught in round 2 or later.
-- **Line:** the share across all 88 qualifying runs, which is 50.1%. The line is
-  the typical case; the bars are the larger runs, where the share is higher.
-
-<details>
-<summary><b>The data behind the charts</b></summary>
-
-The chart below breaks down every qualifying run with 20 or more valid bugs, seven
-in total, reviewer by reviewer.
-
-<img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
-
-| Run | Valid bugs | Caught by Claude | Claude % | Caught in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
-|---|---|---|---|---|---|---|---|
-| A | 21 | 0&Dagger; | 0.0% | 17 | 81.0% | 7 | 5 (71.4%) |
-| B | 47 | 0&Dagger; | 0.0% | 41 | 87.2% | 14 | 10 (71.4%) |
-| C | 22 | 0&dagger; | 0.0% | 15 | 68.2% | 12 | 7 (58.3%) |
-| D | 42 | 2 | 4.8% | 34 | 81.0% | 19 | 14 (73.7%) |
-| E | 29 | 1 | 3.4% | 22 | 75.9% | 8 | 8 (100%) |
-| F | 24 | 0&dagger; | 0.0% | 19 | 79.2% | 6 | 5 (83.3%) |
-| G | 20 | 0&dagger; | 0.0% | 4 | 20.0% | 2 | 0 (0.0%) |
-| **All 88 qualifying runs** | **681** | **26** | **3.8%** | **341** | **50.1%** | **189** | **93 (49.2%)** |
-
-&dagger; On Runs C, F, and G, Claude reviewed and posted an explicit all-clear ("No
-issues found."), and the panel then caught 22, 24, and 20 valid bugs respectively.
-
-&Dagger; On Runs A and B, Claude did not post an all-clear. It reviewed and left
-comments, but none of them produced a valid bug.
-
-Notes and caveats:
-
-- The runs come from merged PRs on one private repository (anonymized). The
-  numbers are taken from the loop's per-bug ledger, which records each verified,
-  fixed bug with its severity, the reviewer that caught it, and the round it was
-  caught in.
-- Severity is assigned by the loop's classifier, which itself runs on Claude, so
-  the severity ratings do not disfavor Claude.
-- Each bug is credited to one catching reviewer. Claude's raw comment counts on
-  the underlying PRs match the ledger's counts, so every Claude catch is credited.
-- The qualifying rules were checked run by run against each PR's review record:
-  diff size from the PR itself, reviewer participation from posted reviews and
-  comments, and quota, error, or refusal notices detected with the loop's own
-  signal patterns.
-
-</details>
 
 ## Install
 
@@ -245,11 +134,122 @@ A clean run still ends with `SELF-CHECK OK`.
 To drive the CLI directly or detach the loop as a background process, see
 [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#4-review-a-pr).
 
+## What real review runs show
+
+These results come from Buddhi review loops on a large private repository, where
+the code under review was written with Claude Code. For every bug that was verified
+and fixed, the loop recorded its severity, the reviewer that found it, and the round
+in which it was found. The 88 runs that meet the selection criteria below contain
+681 such bugs. Two patterns stand out: models are less critical of their own output,
+and many bugs surface only after earlier fixes land. The research in
+[Why a panel, and why rounds](#why-a-panel-and-why-rounds) predicts both effects.
+
+<details>
+<summary>How runs qualify (the selection criteria)</summary>
+
+A run is counted when all three rules hold:
+
+- the change is larger than 50 lines, which excludes micro PRs;
+- all four reviewers (Claude, Codex, Gemini, Copilot) actually reviewed the PR;
+- no reviewer ran out of quota, failed with an error, or refused the PR as too large
+  at any point in the run.
+
+88 of 123 merged runs qualify. The 35 excluded runs consist of 2 micro changes, 7
+runs where a reviewer was missing, and 26 runs where a reviewer ran out of quota,
+failed, or refused the PR. Each rule was checked against the PR record itself: the
+diff size comes from the PR, participation comes from posted reviews and comments,
+and quota, error, and refusal notices were detected with the loop's own signal
+patterns.
+
+</details>
+
+### "Just have Claude review it again" is not adversarial review
+
+Across the 88 qualifying runs, Claude found 26 of the 681 valid bugs (3.8%).
+Reviewers from other vendors found the remaining 96.2%. Claude found 18 of the 189
+high- or critical-severity bugs (9.5%), and of the high- or critical-severity bugs
+found in round 2 or later, 93.5% came from a reviewer other than Claude.
+
+This pattern is consistent with the self-preference effect described in
+[[LLM Evaluators Recognize and Favor Their Own Generations](https://arxiv.org/abs/2404.13076)]:
+models tend to evaluate their own output more favorably. In these runs, Claude
+missed most of the valid bugs found by the cross-vendor panel.
+
+<img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
+
+- **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
+  such runs. Runs with fewer bugs are left out of the bars, because a percentage
+  computed over a handful of bugs swings too widely to read.
+- **Line:** Claude's share across all 88 qualifying runs, which is 3.8%.
+
+### One round is not a complete review
+
+Across the same 88 runs, **50.1% of the valid bugs, and 49.2% of the 189 high- or
+critical-severity bugs, were found only in round 2 or later**, after the round-1
+fixes had been applied and the changed code was reviewed again. A review process
+limited to one round would have left half of these bugs undiscovered, including
+roughly half of the high- or critical-severity bugs. The effect grows with the
+number of bugs in a run: on the 20 runs with 10 or more valid bugs, the
+round-2-or-later share rises to 65.4%.
+
+Built-in review features that stop after one round never inspect the post-fix code,
+so they cannot catch bugs introduced or exposed by those fixes.
+
+<img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%">
+
+- **Bars:** the same 20 runs as the chart above, here showing the share of each
+  run's bugs that was caught in round 2 or later.
+- **Line:** the aggregate share across all 88 qualifying runs, which is 50.1%. The
+  selected larger runs generally have a higher round-2-or-later share.
+
+<details>
+<summary><b>The data behind the charts</b></summary>
+
+The chart below breaks down every qualifying run with 20 or more valid bugs, seven
+in total, reviewer by reviewer.
+
+<img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
+
+| Run | Valid bugs | Caught by Claude | Claude % | Caught in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
+|---|---|---|---|---|---|---|---|
+| A | 21 | 0&Dagger; | 0.0% | 17 | 81.0% | 7 | 5 (71.4%) |
+| B | 47 | 0&Dagger; | 0.0% | 41 | 87.2% | 14 | 10 (71.4%) |
+| C | 22 | 0&dagger; | 0.0% | 15 | 68.2% | 12 | 7 (58.3%) |
+| D | 42 | 2 | 4.8% | 34 | 81.0% | 19 | 14 (73.7%) |
+| E | 29 | 1 | 3.4% | 22 | 75.9% | 8 | 8 (100%) |
+| F | 24 | 0&dagger; | 0.0% | 19 | 79.2% | 6 | 5 (83.3%) |
+| G | 20 | 0&dagger; | 0.0% | 4 | 20.0% | 2 | 0 (0.0%) |
+| **All 88 qualifying runs** | **681** | **26** | **3.8%** | **341** | **50.1%** | **189** | **93 (49.2%)** |
+
+&dagger; On Runs C, F, and G, Claude reviewed and posted an explicit all-clear ("No
+issues found."), and the panel went on to find 22, 24, and 20 valid bugs
+respectively.
+
+&Dagger; On Runs A and B, Claude did not post an all-clear. It reviewed and left
+comments, but none of them produced a valid bug.
+
+Notes and caveats:
+
+- The runs come from merged PRs on one private repository (anonymized). The
+  numbers are taken from the loop's per-bug ledger, which records each verified,
+  fixed bug with its severity, the reviewer that caught it, and the round it was
+  caught in.
+- Severity is assigned by the loop's classifier, which itself runs on Claude, so
+  the severity ratings do not disfavor Claude.
+- Each bug is credited to one catching reviewer. Claude's raw comment counts on
+  the underlying PRs match the ledger's counts, so every Claude catch is credited.
+- The qualifying rules were checked run by run against each PR's review record:
+  diff size from the PR itself, reviewer participation from posted reviews and
+  comments, and quota, error, or refusal notices detected with the loop's own
+  signal patterns.
+
+</details>
+
 ## What a review costs you
 
-Buddhi is free and MIT-licensed, but **the reviews it runs spend your own provider
-quotas.** Buddhi never bills you and never proxies a review through an account of its
-own. Each reviewer draws on a plan you already hold:
+Buddhi is free and MIT-licensed, but **each review consumes quota from the provider
+accounts you connect.** Buddhi does not bill you or proxy reviews through its own
+accounts. Each reviewer draws on a plan you already hold:
 
 | Surface | Whose meter it spends |
 |---|---|
@@ -277,44 +277,32 @@ the review out to a panel of independent models from *different* labs and keeps
 flying rounds until a round comes back clean. There are three reasons this beats
 one strong reviewer running once.
 
-**Different labs, different blind spots.** You have probably watched one reviewer flag
-a real bug another signed off on. Across many PRs that stops being luck and becomes the
-whole point: models trained by different labs, on different data, fail *differently*,
-so where one is blind, another tends to see. This is the ensemble-diversity result (a
-panel's misses shrink the less its members' errors overlap), and it has been measured
-on today's models: same-vendor models make *more correlated* errors than cross-vendor
-ones [[Correlated Errors in Large Language Models](https://arxiv.org/abs/2506.07962)].
-A model is also soft on its own work: it rates its own output more favorably than
-another model's
-[[LLM Evaluators Recognize and Favor Their Own Generations](https://arxiv.org/abs/2404.13076)],
-so a reviewer from a *different* family is not just a second pair of eyes; it is a
-less self-flattering one.
+**Different labs have different blind spots.** Models from different labs do not
+fail in exactly the same ways. A panel becomes more useful when its reviewers'
+errors overlap less, and recent research finds that same-vendor models make more
+correlated errors than cross-vendor models
+[[Correlated Errors in Large Language Models](https://arxiv.org/abs/2506.07962)].
+A cross-vendor reviewer also provides a more independent check on model-generated
+code, because models tend to evaluate their own output more favorably
+[[LLM Evaluators Recognize and Favor Their Own Generations](https://arxiv.org/abs/2404.13076)].
 
-**A fix is a new change, so it needs a fresh look.** When a fixer resolves a round-1
-comment, it edits the code, and an edit can be wrong or introduce a new bug that exists
-*only because* of the fix. Re-reading the *fixed* code catches regressions the first
-pass could not have seen, and the review that counts most is by a *different* model
-than the one that wrote the fix, for the self-preference reason above. This is why
-the loop re-reviews after every fix rather than trusting the fixer: a model
-re-reading its own fix is grading its own homework.
+**Every fix changes the code and can introduce a regression.** Buddhi therefore
+reviews the updated code again rather than trusting the fixer's first attempt.
+Using reviewers from different model families also provides a more independent
+check on the fix: a model re-reading its own fix is grading its own homework.
 
-**It converges on a clean round, not on a fixed count, and not on "zero findings."**
-More rounds are not automatically better: repeated review tends to plateau within a few
-rounds, and pushing past that entrenches noise instead of removing it
-[[Improving Factuality and Reasoning in Language Models through Multiagent Debate](https://arxiv.org/abs/2305.14325)]. So Buddhi does not loop a set number of times.
-Each round it re-summons the reviewers on the *fixed* code, acts on the findings they
-raise (fixing the substantive and the cosmetic ones alike), and goes again. Convergence
-is the round that comes back with **no new findings to act on**: not the reviewers
-falling silent, and not a finding count that was zero from the start, but the loop
-having resolved everything actionable, cosmetic nits included. Two guardrails keep it honest: there is
-always at least one confirmation round after the last fix, so a fix never lands
-unreviewed, and the round budget scales with the size of the change (a one-line tweak
-gets a couple of rounds, a thousand-line diff earns more). Convergence is not the same as
-escalation: when a comment genuinely needs your judgment, Buddhi asks you instead, a
-separate mechanism described in [*When it asks you*](#when-it-asks-you) below. (Buddhi
-claims nothing more: no model here is superhuman, and agreement between models is not
-proof of correctness. A diverse panel reviewing to a clean round simply catches more
-than one reviewer running once.)
+**It stops on a clean post-fix round, not after a fixed number of rounds.** Buddhi
+reviews the current code, acts on every actionable finding, and then reviews the
+updated code again. It converges when a post-fix review returns no new findings that
+require action.
+
+Two guardrails apply. First, every fix is followed by at least one confirmation
+round, so no fix lands unreviewed. Second, the round budget scales with the size of
+the change. Questions that genuinely require human judgment follow the separate
+escalation path described in [When it asks you](#when-it-asks-you).
+
+A clean round is not proof that the code is correct. It means only that the panel
+found nothing further to act on within the configured review budget.
 
 ```mermaid
 flowchart LR
@@ -360,7 +348,7 @@ flowchart LR
 
 ## How it works
 
-Buddhi splits a PR review into two halves: the decision, and the I/O around it. The
+Buddhi splits PR review into two parts: the decision logic and the I/O around it. The
 [Buddhi kernel](https://github.com/buddhikernel/buddhi) makes the decision — for each
 review comment it decides whether to fix it, ask you, skip it, or defer it.
 `buddhi-review` is the **adapter** that does everything around that decision on the
@@ -369,11 +357,10 @@ carries out whatever the kernel returns. Concretely, for each comment the loop:
 
 1. **Classifies** it into one of six labels: `SUBSTANTIVE`, `COSMETIC`,
    `BUSINESS_QUESTION`, `PR_DESCRIPTION`, `OUTDATED`, `INVALID`. If the classifier
-   can't produce a usable label, the comment becomes a synthetic
-   `CLASSIFICATION_FAILED` and is escalated to you when the interrupt budget (a
-   daily cap on how many times the loop may interrupt you) allows, otherwise
-   deferred — so a comment is never silently lost just because it could not be
-   classified.
+   cannot produce a usable label, the comment becomes a synthetic
+   `CLASSIFICATION_FAILED` item. It is escalated when the interrupt budget (a daily
+   cap on how many times the loop may interrupt you) allows and deferred when the
+   budget has been exhausted.
 2. **Maps** the label onto a kernel work item and runs it through the kernel's
    decision pipeline, a fixed set of seven checks (see the
    [Buddhi kernel](https://github.com/buddhikernel/buddhi)).
@@ -393,12 +380,13 @@ kernel.
 
 ## When it asks you
 
-The kernel asks you only when a review comment can't be settled by the code plus your
-project's own docs, conventions, and PR description — when resolving it would mean
-making a call that is really yours. In practice that is a question about product
-direction, scope, or a business rule the docs don't answer; a genuinely ambiguous
-technical fork with more than one defensible answer and nothing in the repo to choose
-between; or a taste call about user-facing wording or design that the docs leave open.
+The kernel asks you only when the repository does not contain enough information to
+resolve a comment. Typical cases include:
+
+- product, scope, or business-rule decisions;
+- ambiguous technical choices with more than one defensible answer;
+- user-facing wording or design decisions not settled by the project documentation.
+
 Anything the code and docs already settle, the loop handles on its own without
 interrupting you.
 
