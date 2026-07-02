@@ -75,6 +75,8 @@ def _commented_line_from_hunk(diff_hunk: Optional[str]) -> Optional[int]:
             continue
         if line[:1] == "-":
             continue          # removed from the new file → does not advance
+        if line[:1] == "\\":
+            continue          # "\ No newline at end of file" pseudo-line — not a source line
         new_lineno += 1       # a + or context line advances the new-file counter
     # new_lineno now points one PAST the last hunk line; the anchor is the last.
     return (new_lineno - 1) if (new_lineno is not None and new_lineno > 0) else None
@@ -164,6 +166,9 @@ def rewrite_pr_description(
     except Exception:
         return FixOutcome(status="transient-failed",
                           detail="pr-description: rewrite model unreachable")
+    if not isinstance(new_body, str):
+        return FixOutcome(status="transient-failed",
+                          detail="pr-description: rewrite returned non-string")
     new_body = (new_body or "").strip()
     if not new_body:
         return FixOutcome(status="transient-failed",
