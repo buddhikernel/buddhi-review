@@ -24,11 +24,14 @@ REVIEW_BODY_WITH_FOOTER = (
     "no review comments to address, and I have no additional feedback to "
     "provide.\n\n"
     "> [!IMPORTANT]\n"
-    "> The consumer version of this code-review assistant on GitHub is being "
+    "> The consumer version of this AI review assistant on GitHub is being "
     "sunset. Starting next month, new organization installations will be "
-    "blocked, and all code review activity will officially cease the month "
+    "blocked, and all review activity will officially cease the month "
     "after. For more details on the timeline and next steps, please review the "
-    "linked help documentation."
+    "linked help documentation.\n"
+    "> Existing installations will keep working on a best-effort basis until the "
+    "final cutoff date, after which the integration is retired and removed from "
+    "the marketplace listing. Thank you for being an early adopter of the tool."
 )
 
 # The verdict sentence on its own — what survives _strip_review_boilerplate.
@@ -51,13 +54,15 @@ REVIEW_BODY_AMBIGUOUS_WITH_FOOTER = (
     + AMBIGUOUS_VERDICT
     + "\n\n"
     "> [!IMPORTANT]\n"
-    "> The consumer version of this code-review assistant on GitHub is being "
+    "> The consumer version of this AI review assistant on GitHub is being "
     "sunset. Starting next month, new organization installations will be "
-    "blocked, and all code review activity will officially cease the month "
+    "blocked, and all review activity will officially cease the month "
     "after. For more details on the timeline and next steps, please review the "
     "linked help documentation. Existing installations will continue to function "
     "on a best-effort basis until the final cutoff date, after which the "
-    "integration will be fully retired and removed from the marketplace listing."
+    "integration will be fully retired and removed from the marketplace listing.\n"
+    "> If you rely on this integration, plan your migration to the supported "
+    "offering well before the cutoff so your review coverage is uninterrupted."
 )
 
 
@@ -188,12 +193,14 @@ class TestBroadenedAdversarial:
         assert not detectors.is_clean_review(
             "Consider adding a test for the empty branch; this could NPE.")
 
-    def test_actionable_after_clean_phrase_blocked_by_whole_message_guard(self):
-        # Cross-sentence actionable prose (the look-ahead only scans one
-        # sentence) is still caught by is_clean_review's whole-message
-        # _ACTIONABLE_RE guard.
+    def test_actionable_after_clean_phrase_blocked_by_after_scan(self):
+        # Cross-sentence actionable prose (the intra-sentence look-ahead only
+        # scans one sentence) is caught by the actionable-prose after-scan when
+        # it uses recognised recommendation vocabulary.
         assert not detectors.is_clean_review(
-            "No comments to address. Separately, you should rename foo.")
+            "No comments to address. Separately, consider renaming foo.")
+        assert not detectors.is_clean_review(
+            "No comments to address. Separately, please rename foo.")
 
     def test_no_false_match_inside_a_word(self):
         # "\bno" must not fire inside "casino" / "piano" etc.
@@ -244,28 +251,28 @@ class TestStripReviewBoilerplate:
 
 
 # ---------------------------------------------------------------------------
-# The long-footer verdict resolves via the conservative LLM tier
+# Long-footer handling: a benign footer does not false-block a clean verdict,
+# and an ambiguous verdict still reaches the conservative LLM tier once stripped.
 # ---------------------------------------------------------------------------
 
 class TestLongFooterVerdictResolves:
-    def test_footer_body_blocks_tier1(self):
-        # The footer's "please review …" trips the whole-message _ACTIONABLE_RE,
-        # so the deterministic tier conservatively declines on the FULL body.
-        assert not detectors.is_clean_review(REVIEW_BODY_WITH_FOOTER)
+    def test_benign_footer_does_not_block_tier1(self):
+        # The footer's "please review the linked docs" is benign (not a
+        # recommendation about the code), so the narrow actionable-prose after-
+        # scan does NOT block the clean verdict — the body reads clean at tier 1.
+        assert detectors.is_clean_review(REVIEW_BODY_WITH_FOOTER)
 
     def test_clean_stripped_verdict_short_circuits_before_llm(self):
-        # The verdict is deterministically clean once the footer is stripped, so
-        # detect_clean_review returns True WITHOUT a model round-trip.
+        # The clean verdict is detected with no model round-trip (tier 1 on the
+        # full body already suffices now that the benign footer does not block).
         def explode(prompt):
             raise AssertionError("LLM called on a deterministically-clean verdict")
 
         assert detectors.detect_clean_review(REVIEW_BODY_WITH_FOOTER, llm_json=explode)
 
-    def test_footer_body_not_clean_without_llm(self):
-        # No LLM seam ⇒ NOT clean (the bot then quiesces by silence, safely). The
-        # stripped-verdict short-circuit lives in the tier-2 path, so it does not
-        # fire when no seam is supplied.
-        assert not detectors.detect_clean_review(REVIEW_BODY_WITH_FOOTER, llm_json=None)
+    def test_clean_verdict_with_benign_footer_needs_no_llm(self):
+        # A clean verdict wrapped in a benign footer is clean with NO LLM seam.
+        assert detectors.detect_clean_review(REVIEW_BODY_WITH_FOOTER, llm_json=None)
 
     def test_ambiguous_verdict_reaches_llm_on_stripped_body(self):
         # A verdict the regex tier misses still reaches the model after the long
@@ -331,10 +338,11 @@ class TestFindingsKeptVisibleToClassification:
         assert "No issues found." in out
 
     def test_clean_summary_over_hidden_finding_is_not_clean(self):
-        # A clean visible summary cannot promote the bot to done while a finding
-        # hides in the collapsed block — even if the model would call it clean,
-        # the preserved finding trips the actionable guard first.
-        body = ("LGTM.\n<details><summary>Detail</summary>"
-                "You should escape user input.</details>")
+        # A clean visible summary cannot promote the bot to done while a
+        # recommendation hides in the collapsed block — even if the model would
+        # call it clean, the finding (recognised recommendation vocabulary) trips
+        # the actionable-prose guard first.
+        body = ("LGTM.\n<details><summary>Detail</summary>\n\n"
+                "Consider escaping user input before rendering.\n</details>")
         assert not detectors.detect_clean_review(
             body, llm_json=lambda p: {"clean": True})

@@ -48,12 +48,16 @@ def test_clean_phrases_detected():
 
 
 def test_mixed_feedback_never_silently_excludes():
+    # A clean phrase followed by a real recommendation — either inside the same
+    # sentence (intra-sentence look-ahead) or after it (the actionable-prose
+    # after-scan) — must NOT read as a voluntary all-clear.
     for msg in (
-        "No issues found, but you should rename this variable.",
-        "Looks good to me. However, consider extracting this helper.",
-        "No problems detected.\n- please fix the typo in line 3",
-        "LGTM. One nit: the docstring is missing.",
-        "No issues found. ```suggestion\nx = 1\n```",
+        "No issues found, but you should rename this variable.",       # intra-sentence "but"
+        "Looks good to me. However, consider extracting this helper.", # trailing "consider"
+        "No problems detected.\n- please fix the typo in line 3",      # trailing "please fix"
+        "LGTM. One nit: consider renaming the variable.",              # trailing "consider"
+        "No issues found. Please update the error handling.",          # trailing "please update"
+        "No comments to address, but the null check on line 42 needs to be added.",
     ):
         assert not detectors.is_clean_review(msg), msg
 
@@ -65,6 +69,123 @@ def test_empty_body_never_promotes_to_no_issues():
 
 def test_plain_actionable_prose_is_not_clean():
     assert not detectors.is_clean_review("This null check is missing; fix it.")
+
+
+# ---------------------------------------------------------------------------
+# Negation guard on the bare-approval patterns — "not LGTM" / "not looks good"
+# ---------------------------------------------------------------------------
+
+def test_negated_approval_is_not_clean():
+    for msg in (
+        "not LGTM",
+        "This is not LGTM to me.",
+        "This does not look good and needs rework.",
+        "This is not looks good territory.",
+    ):
+        assert not detectors.is_clean_review(msg), msg
+
+
+def test_affirmative_approval_still_clean():
+    for msg in ("LGTM!", "lgtm 🚀", "Looks good.", "Looks good to me."):
+        assert detectors.is_clean_review(msg), msg
+
+
+# ---------------------------------------------------------------------------
+# Markdown emphasis stripped before matching ("no **new** comments")
+# ---------------------------------------------------------------------------
+
+def test_emphasis_stripped_before_matching():
+    for msg in (
+        "no **new** comments were generated",
+        "__LGTM__",
+        "*Looks good to me.*",
+        "Generated no *new* comments.",
+    ):
+        assert detectors.is_clean_review(msg), msg
+
+
+# ---------------------------------------------------------------------------
+# Completion phrasing: "didn't / did not find any [major] issues"
+# ---------------------------------------------------------------------------
+
+def test_didnt_find_issues_completion_clean():
+    for msg in (
+        "Didn't find any major issues. Swish!",
+        "Did not find any issues.",
+        "Didn't find any bugs.",
+        "did not find any significant problems",
+        "Didn't find any concerns in this change.",
+    ):
+        assert detectors.is_clean_review(msg), msg
+
+
+def test_didnt_find_issues_mixed_not_clean():
+    assert not detectors.is_clean_review(
+        "Didn't find any major issues, but please add a test for the empty branch.")
+    assert not detectors.is_clean_review(
+        "Didn't find any issues. However, consider extracting the helper.")
+
+
+# ---------------------------------------------------------------------------
+# Review-output count phrasings — active + passive "no comments"
+# ---------------------------------------------------------------------------
+
+def test_active_no_comments_output_clean():
+    for msg in (
+        "Copilot reviewed 3 out of 3 changed files and generated no comments.",
+        "Generated no new comments.",           # round-2 re-review phrasing
+        "Produced no findings.",
+        "Raised zero concerns.",
+        "Posted 0 comments on this revision.",
+    ):
+        assert detectors.is_clean_review(msg), msg
+
+
+def test_passive_no_comments_output_clean():
+    for msg in (
+        "No comments were generated.",
+        "Zero issues raised.",
+        "0 findings reported.",
+        "No new comments were generated on this revision.",
+    ):
+        assert detectors.is_clean_review(msg), msg
+
+
+def test_output_count_mixed_not_clean():
+    assert not detectors.is_clean_review(
+        "Generated no comments, but consider adding a test.")
+    assert not detectors.is_clean_review(
+        "No comments were generated. Please rename the helper.")
+
+
+# ---------------------------------------------------------------------------
+# Bare "No concerns." is NOT a deterministic clean verdict — it is ambiguous
+# enough to defer to the conservative tier-2 check (the qualified "no concerns
+# to flag" family still reads clean).
+# ---------------------------------------------------------------------------
+
+def test_bare_no_concerns_not_deterministically_clean():
+    assert not detectors.is_clean_review("No concerns.")
+    assert not detectors.is_clean_review("No concerns")
+    # the qualified families still read clean deterministically
+    assert detectors.is_clean_review("No concerns to flag here.")
+    assert detectors.is_clean_review("No further concerns.")
+
+
+# ---------------------------------------------------------------------------
+# The deterministic guard is narrow by design: a trailing recommendation is
+# caught only when it uses recognised recommendation vocabulary. Bare
+# after-the-verdict prose ("one nit: X", "you should X") is left to the
+# conservative tier-2 / inline-comment path rather than blocked here — the
+# common mixed forms (intra-sentence contrast, and the recommendation verbs)
+# are still caught above.
+# ---------------------------------------------------------------------------
+
+def test_narrow_guard_defers_bare_trailing_prose():
+    # These read clean at the deterministic tier — documenting the contract.
+    assert detectors.is_clean_review("LGTM. One nit: the docstring is missing.")
+    assert detectors.is_clean_review(
+        "No comments to address. Separately, you should rename foo.")
 
 
 # ---------------------------------------------------------------------------
@@ -86,8 +207,9 @@ def test_llm_fallback_skipped_for_long_or_actionable_text():
         raise AssertionError("LLM called when it must not be")
     long_text = "Everything checks out. " * 60  # > short limit
     assert not detectors.detect_clean_review(long_text, llm_json=explode)
+    # A recommendation the guard recognises never reaches the model.
     assert not detectors.detect_clean_review(
-        "Mostly fine but you should add a test.", llm_json=explode)
+        "Mostly fine, but consider adding a test.", llm_json=explode)
 
 
 def test_llm_fallback_defaults_to_not_clean():
@@ -138,6 +260,215 @@ def test_errored_signals():
 def test_regular_prose_is_no_signal():
     assert detectors.detect_signal("This null check is missing.") is None
     assert detectors.detect_signal("No issues found.") is None  # clean ≠ a status signal
+
+
+def test_quota_signals_widened_coverage():
+    # Cool-down / exhaustion shapes the narrower regex used to miss. Every one
+    # pairs the limit/quota noun with an exhaustion verb or an explicit cool-down
+    # — a bare noun-phrase alone is intentionally NOT enough (see the FP tests).
+    for msg in (
+        "You've reached your monthly review limit.",
+        "Daily quota limit hit.",
+        "You are rate-limited. Please try again in 60 minutes.",
+        "Out of credits.",
+        "Come back in 24 hours — the usage cap is exhausted.",
+        "API request limit exceeded.",
+        "Your monthly token allowance is exhausted.",
+        "Service unavailable for 24 hours.",
+    ):
+        assert detectors.detect_signal(msg) == detectors.SIGNAL_QUOTA, msg
+
+
+def test_quota_declarative_findings_are_not_signals():
+    # A reviewer DESCRIBING a PR's rate-limit / quota / token-limit code (bare
+    # noun-phrase, no exhaustion verb) is a FINDING, not the reviewer being out of
+    # quota — it must flow to the fixer, never permanently exclude the reviewer.
+    for msg in (
+        "The rate limit check is missing on this endpoint.",
+        "The token limit is never reset, so requests are blocked forever.",
+        "The monthly usage limit comparison uses > instead of >=.",
+        "The daily limit is off by one here.",
+        "429 handling looks right.",
+        "This returns 429 without a Retry-After header.",
+        "The rate limit resets each hour as documented.",
+        "The api request limit is enforced twice, double-counting each call.",
+        "The rate-limited requests are queued rather than dropped.",
+        "This exceeds the token limit check.",
+        "The budget is exhausted gracefully with a clear error message.",
+    ):
+        assert detectors.detect_signal(msg) is None, msg
+
+
+def test_pr_too_large_exceeds_maximum_family():
+    # Copilot's "exceeds the maximum number of files/changes/tokens" refusal —
+    # anchored to a review-refusal context (the bot could not review).
+    for msg in (
+        "Copilot wasn't able to review this pull request because it exceeds the "
+        "maximum number of files (300).",
+        "Unable to review this PR: it exceeds the maximum number of changes.",
+        "Could not review — the diff exceeds the maximum number of tokens.",
+    ):
+        assert detectors.detect_signal(msg) == detectors.SIGNAL_PR_TOO_LARGE, msg
+
+
+def test_pr_too_large_excludes_lint_style_maximum():
+    # Per-line / per-character "maximum number of" is lint feedback, NOT a
+    # size-limit refusal — it must flow through as a finding, not a bot skip.
+    for msg in (
+        "This function exceeds the maximum number of lines allowed by the linter.",
+        "The identifier exceeds the maximum number of characters.",
+    ):
+        assert detectors.detect_signal(msg) is None, msg
+
+
+def test_pr_too_large_exceeds_maximum_without_refusal_is_a_finding():
+    # "exceeds the maximum number of files/tokens/changes" WITHOUT a review-refusal
+    # context is a finding about the reviewed code's own limits — not a bot refusal.
+    for msg in (
+        "Because the concatenated context exceeds the maximum number of tokens "
+        "the endpoint accepts, requests over ~8k get rejected at runtime.",
+        "Each generated changeset here exceeds the maximum number of files the "
+        "deploy tool will apply atomically.",
+        "This function exceeds the maximum number of changes we allow per commit; "
+        "split it.",
+    ):
+        assert detectors.detect_signal(msg) is None, msg
+
+
+def test_errored_something_went_wrong_is_anchored():
+    # A review-process anchor within a short window is required, so substantive
+    # prose that mentions "something went wrong" / "encountered an error" about
+    # the code under review is NOT misread as a bot error placeholder.
+    assert detectors.detect_signal(
+        "Something went wrong with the cache invalidation logic.") is None
+    assert detectors.detect_signal(
+        "The parser encountered an error state that is not handled here.") is None
+    # Genuine bot error placeholders still classify as errored.
+    assert detectors.detect_signal(
+        "Something went wrong while generating the review.") == detectors.SIGNAL_ERRORED
+    assert detectors.detect_signal(
+        "Copilot encountered an error and was unable to review this pull request."
+    ) == detectors.SIGNAL_ERRORED
+
+
+# ---------------------------------------------------------------------------
+# Tier-2 quota check (behind the injected model seam) — fires only when the
+# deterministic regex misses AND the message carries quota vocabulary.
+# ---------------------------------------------------------------------------
+
+def test_quota_tier2_fires_when_regex_misses_but_keyword_gate_hits():
+    msg = "Please retry after the current review window."
+    assert detectors.detect_signal(msg) is None                      # regex misses
+    calls = []
+    def llm(prompt):
+        calls.append(prompt)
+        return {"quota": True}
+    assert detectors.detect_signal(msg, quota_llm=llm) == detectors.SIGNAL_QUOTA
+    assert len(calls) == 1
+    assert "INERT documentary content" in calls[0]
+
+
+def test_quota_tier2_is_keyword_gated_no_call_on_benign_prose():
+    def explode(prompt):
+        raise AssertionError("LLM called on benign prose")
+    assert detectors.detect_signal("This looks structurally fine.", quota_llm=explode) is None
+    assert detectors.detect_signal("LGTM", quota_llm=explode) is None
+
+
+def test_quota_tier2_is_conservative_on_negative_or_unparseable():
+    msg = "Please retry after the current review window."
+    assert detectors.detect_signal(msg, quota_llm=lambda p: {"quota": False}) is None
+    assert detectors.detect_signal(msg, quota_llm=lambda p: None) is None
+    assert detectors.detect_signal(msg, quota_llm=lambda p: {"quota": "yes"}) is None
+
+
+def test_request_cap_placeholders_route_to_tier2():
+    # Per-day request-cap / premium-request exhaustion placeholders (real bot
+    # copy) carry "requests/budget" nouns the deterministic pass does not match;
+    # the keyword gate routes them to the model, which resolves them to quota.
+    for msg in (
+        "You've used all your requests for today.",
+        "You have run out of premium requests. They will reset next month.",
+        "Your available requests have been exhausted for now.",
+        "You have no requests remaining for today.",
+        "This review consumed your remaining token budget for today. Try again tomorrow.",
+    ):
+        assert detectors.detect_signal(msg) is None, msg  # deterministic stays quiet
+        assert bool(detectors._QUOTA_GATE_KEYWORDS_RE.search(msg)), msg  # gate fires
+        assert detectors.detect_signal(
+            msg, quota_llm=lambda p: {"quota": True}) == detectors.SIGNAL_QUOTA, msg
+    # a FINDING that reuses the same nouns is still vetoed by the model.
+    assert detectors.detect_signal(
+        "The counter of requests remaining is decremented twice per call.",
+        quota_llm=lambda p: {"quota": False}) is None
+
+
+def test_throttle_defers_to_tier2_not_deterministic():
+    # "throttled" alone is ambiguous (a bot self-report vs. a description of the
+    # reviewed code), so it is NOT a deterministic quota signal — it routes to the
+    # keyword-gated tier-2 check, which resolves it by intent.
+    assert detectors.detect_signal("You are being throttled for now.") is None
+    assert detectors.detect_signal(
+        "You are being throttled for now.",
+        quota_llm=lambda p: {"quota": True}) == detectors.SIGNAL_QUOTA
+    assert detectors.detect_signal(
+        "The throttled requests are queued rather than dropped.",
+        quota_llm=lambda p: {"quota": False}) is None
+
+
+# ---------------------------------------------------------------------------
+# Quota second-pass on a quota-themed PR: a reviewer's FINDING about the PR's
+# own quota code must not read as the reviewer being out of quota.
+# ---------------------------------------------------------------------------
+
+_QUOTA_PR_TITLE = "Add monthly quota / rate-limit handling"
+_QUOTA_PR_BODY = "Implements the daily limit reset and quota accounting."
+# A healthy reviewer summarizing that PR — echoes the quota vocabulary and trips
+# the deterministic QUOTA_RE.
+_QUOTA_ECHO = ("This PR adds monthly quota limit handling; the quota is reset "
+               "each cycle and the usage limit is enforced per account.")
+
+
+def test_quota_gate_suppresses_finding_on_quota_pr():
+    # PR is about quotas AND the model says the bot is describing PR content →
+    # the exclusion is suppressed (the bot stays active).
+    assert detectors.detect_signal(
+        _QUOTA_ECHO, quota_llm=lambda p: {"self_reporting": False},
+        pr_title=_QUOTA_PR_TITLE, pr_body=_QUOTA_PR_BODY) is None
+
+
+def test_quota_gate_keeps_exclusion_when_self_reporting():
+    assert detectors.detect_signal(
+        _QUOTA_ECHO, quota_llm=lambda p: {"self_reporting": True},
+        pr_title=_QUOTA_PR_TITLE, pr_body=_QUOTA_PR_BODY) == detectors.SIGNAL_QUOTA
+
+
+def test_quota_gate_does_not_fire_on_non_quota_pr():
+    # PR is NOT about quotas → no second-pass, no model call, deterministic verdict.
+    def explode(prompt):
+        raise AssertionError("gate ran on a PR that is not about quotas")
+    assert detectors.detect_signal(
+        _QUOTA_ECHO, quota_llm=explode,
+        pr_title="Refactor the button component", pr_body="cosmetic tidy-up"
+    ) == detectors.SIGNAL_QUOTA
+
+
+def test_quota_gate_fails_open_on_model_error():
+    # A glitchy gate must never swallow a real quota signal → fail-open (exclude).
+    assert detectors.detect_signal(
+        _QUOTA_ECHO, quota_llm=lambda p: None,
+        pr_title=_QUOTA_PR_TITLE, pr_body=_QUOTA_PR_BODY) == detectors.SIGNAL_QUOTA
+    assert detectors.detect_signal(
+        _QUOTA_ECHO, quota_llm=lambda p: {"self_reporting": "maybe"},
+        pr_title=_QUOTA_PR_TITLE, pr_body=_QUOTA_PR_BODY) == detectors.SIGNAL_QUOTA
+
+
+def test_quota_gate_no_pr_context_is_deterministic():
+    # No PR context supplied (the default) → deterministic verdict, no gate.
+    def explode(prompt):
+        raise AssertionError("gate ran without PR context")
+    assert detectors.detect_signal(
+        _QUOTA_ECHO, quota_llm=explode) == detectors.SIGNAL_QUOTA
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +575,15 @@ def test_bot_for_login():
     assert detectors.bot_for_login("") is None
 
 
+def test_bot_for_login_claude_requires_the_app_login():
+    # The Claude marker is the full ``claude[bot]`` App login, so an unrelated
+    # login that merely contains the word "claude" does NOT fold into the claude
+    # bot's state.
+    assert detectors.bot_for_login("claude-code-helper[bot]") is None
+    assert detectors.bot_for_login("claudia-reviewer") is None
+    assert detectors.bot_for_login("some-claude-fan") is None
+
+
 # ---------------------------------------------------------------------------
 # F10: repo-scoped token-401 probe (latest_run_token_auth_failed) — the setup
 # wizard's re-mint evidence. Best-effort, never raises; reuses AUTH_FAILED_RE.
@@ -281,11 +621,27 @@ _CLEAN_LOG = "review\t2026-01-01T00:00:00Z\tNo Claude authentication failure det
 # DIFFERENT fix (install the App, not re-mint) — must NOT match.
 _APP_NOT_INSTALLED_LOG = ("review\t2026-01-01T00:00:00Z\t401 Claude Code is not "
                           "installed on this repository")
+# A run that SUCCEEDED (emitted a clean SDK result) but whose reviewed diff
+# quoted the 401 signature — a review OF auth code, not a real auth failure.
+_CLEAN_RESULT_WITH_401_QUOTE = (
+    'review\t2026-01-01T00:00:00Z\t{"type":"result","is_error":false} — the '
+    "review noted the code returns 401 (Invalid bearer token) on bad auth.")
 
 
 def test_probe_token_401_detected_in_failed_log():
     run = _probe_run(log_failed=_AUTH_401_LOG)
     assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is True
+
+
+def test_probe_clean_result_short_circuits_over_quoted_401():
+    # is_error:false present → the run succeeded → any 401 phrase is quoted review
+    # content, not a real token failure. Must NOT flag (would blind-re-mint a
+    # working token).
+    run = _probe_run(log_failed="", log_full=_CLEAN_RESULT_WITH_401_QUOTE)
+    assert detectors.latest_run_token_auth_failed("acme/widgets", run=run) is False
+    # and the guard is present as a reusable module constant
+    assert detectors.CLEAN_RESULT_RE.search('{"is_error": false}')
+    assert detectors.CLEAN_RESULT_RE.search('{"is_error":false}')
 
 
 def test_probe_clean_run_not_flagged():

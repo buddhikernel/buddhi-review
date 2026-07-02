@@ -566,6 +566,7 @@ class RoundDriver:
         classify_runner: Callable[[str], str],
         fix_dispatch: Optional[FixDispatch] = None,
         clean_llm: Optional[Callable[[str], Optional[dict]]] = None,
+        quota_llm: Optional[Callable[[str], Optional[dict]]] = None,
         fetch: Optional[Callable[..., List[Comment]]] = None,
         gh_run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
         clock: Callable[[], float] = time.monotonic,
@@ -600,6 +601,10 @@ class RoundDriver:
         self.classify_runner = classify_runner
         self.fix_dispatch = fix_dispatch
         self.clean_llm = clean_llm
+        # The quota-detector seam (same shape as clean_llm): enables the tier-2
+        # quota check for wording the deterministic regex misses. Left None in
+        # tests → deterministic-only classification.
+        self.quota_llm = quota_llm
         self.fetch = fetch or gh_ingest.fetch_comments
         # commit_push's runner accepts both cwd= and timeout=, so one injected
         # fake covers every gh/git/test spawn the driver makes.
@@ -814,7 +819,7 @@ class RoundDriver:
         # (below) → classified → `_maybe_errored_comeback` retracts iff it is
         # SUBSTANTIVE + strictly newer. A cosmetic / OUTDATED / INVALID /
         # question comment is NOT proof of recovery, so it never brings the bot back.
-        signal = detectors.detect_signal(comment.text)
+        signal = detectors.detect_signal(comment.text, quota_llm=self.quota_llm)
         if signal == detectors.SIGNAL_QUOTA:
             self.store.exclude_quota(bot)
             st.signal = signal
@@ -1281,7 +1286,12 @@ class RoundDriver:
             if run_id is None:
                 return False
             log = self._fetch_run_log(run_id)
-            return bool(log) and bool(detectors.AUTH_FAILED_RE.search(log))
+            # A cleanly-successful result in the log (``"is_error": false``) means
+            # the run worked and any 401 phrase is quoted review content, not a
+            # real auth failure — short-circuit before the signature test.
+            return (bool(log)
+                    and not detectors.CLEAN_RESULT_RE.search(log)
+                    and bool(detectors.AUTH_FAILED_RE.search(log)))
         except Exception:
             return False
 
