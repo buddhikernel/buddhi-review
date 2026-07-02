@@ -332,11 +332,17 @@ def _ss_no(prompt, options, *, preselect=0, **kw):
     return preselect
 
 
+def _ss_gate_yes(prompt, options, *, preselect=0, **kw):
+    """Confirm the install gate (option 1 = Yes); every OTHER select — including the
+    G3 auto-on-open labeled select — takes its preselect (auto-on-open → Yes)."""
+    return 1 if "ready to review PRs" in prompt else preselect
+
+
 def _run_step_reviewers(*, bots, tmp_path, single_select=_ss_no, input_fn=None,
                         gh_auth=True, repo="acme/widgets"):
     """Drive step_reviewers for a chosen reviewer subset → (enabled, auto_on_open, output).
-    ``single_select`` drives the install-confirmation gate; ``input_fn`` drives the
-    per-bot auto-on-open question (default blank → its [Y/n] default)."""
+    ``single_select`` drives BOTH the install-confirmation gate and the per-bot
+    auto-on-open labeled select (route by prompt substring to answer them apart)."""
     idxs = {wizard._REVIEWERS.index(b) for b in bots}
     buf = io.StringIO()
     enabled, aoo = wizard.step_reviewers(
@@ -426,11 +432,11 @@ def test_install_gate_fails_closed_on_preselect_no_even_with_a_tty(monkeypatch, 
 def test_install_gate_enables_app_reviewers_on_explicit_yes(monkeypatch, tmp_path):
     """Explicit Yes (with a TTY) keeps the reviewer. The three GitHub-App reviewers go
     through the same gate; on confirm they are enabled and their auto_on_open default
-    (True — they auto-review on PR open) is captured."""
+    (True — they auto-review on PR open) is captured via the labeled select's
+    preselect."""
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
-    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     enabled, aoo, _ = _run_step_reviewers(
-        bots=["copilot", "gemini", "codex"], single_select=_ss_yes, tmp_path=tmp_path)
+        bots=["copilot", "gemini", "codex"], single_select=_ss_gate_yes, tmp_path=tmp_path)
     assert enabled == ["copilot", "gemini", "codex"]
     assert aoo == {"copilot": True, "gemini": True, "codex": True}
 
@@ -452,16 +458,122 @@ def test_install_gate_partial_confirmation_drops_only_the_declined(monkeypatch, 
     prompt carries the lowercase bot id) drops it from BOTH the fleet and auto_on_open
     while Copilot/Codex stay."""
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
-    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
 
     def ss(prompt, options, *, preselect=0, **kw):
-        return 0 if "'gemini'" in prompt else 1   # decline gemini, confirm the rest
+        if "ready to review PRs" in prompt:       # the install gate …
+            return 0 if "'gemini'" in prompt else 1   # … decline gemini, confirm the rest
+        return preselect                          # auto-on-open keeps its Yes default
 
     enabled, aoo, _ = _run_step_reviewers(
         bots=["copilot", "gemini", "codex"], single_select=ss, tmp_path=tmp_path)
     assert enabled == ["copilot", "codex"]
     assert "gemini" not in aoo
     assert aoo == {"copilot": True, "codex": True}
+
+
+# ── G3: the per-bot auto-on-open question is a labeled select, not a bare [Y/n] ─────
+#
+# The question wording stays OSS's canonical "Does {Bot} auto-review when a PR is
+# opened?"; the OPTIONS carry the canonical labels + consequence details
+# (byte-for-byte from setup-ux-parity.md `per_reviewer_auto_on_open_prompt`).
+
+def test_auto_on_open_prompt_and_options_are_canonical(monkeypatch, tmp_path):
+    """The auto-on-open capture renders the canonical labeled select — question +
+    both option labels + consequence details — with Yes preselected. What mutation
+    this catches: reverting to the bare [Y/n] prompt (no options rendered), editing
+    a label, or flipping the preselect to No."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    captured = []
+
+    def ss(prompt, options, *, preselect=0, **kw):
+        captured.append((prompt, list(options), preselect, kw.get("shortcuts")))
+        return 1 if "ready to review PRs" in prompt else preselect
+
+    _, aoo, out = _run_step_reviewers(bots=["copilot"], single_select=ss,
+                                      tmp_path=tmp_path)
+    aoo_calls = [c for c in captured if "auto-review when a PR is opened" in c[0]]
+    assert len(aoo_calls) == 1, "the auto-on-open question must ride the labeled select"
+    prompt, options, preselect, shortcuts = aoo_calls[0]
+    assert "Does Copilot auto-review when a PR is opened?" in prompt
+    assert preselect == 0                    # default = Yes (auto-review)
+    assert shortcuts == {"y": 0, "n": 1}     # the old prompt's keystrokes still work
+    labels = [lbl for lbl, _ in options]
+    details = [d for _, d in options]
+    assert labels[0] == "Yes — reviews automatically when a PR is opened"
+    assert details[0] == "the loop won't re-summon it in round 1 (avoids a duplicate review)"
+    assert labels[1] == "No — must be triggered/requested to review"
+    assert details[1] == "the loop posts its round-1 request so its review still arrives"
+    assert "[Y/n]" not in out                # the bare text prompt is gone
+    assert aoo == {"copilot": True}          # accepting the preselect records Yes
+
+
+def test_auto_on_open_no_option_records_false(monkeypatch, tmp_path):
+    """Choosing option 1 (No — must be triggered/requested) records
+    auto_on_open=False, so the loop will summon the bot in round 1."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+
+    def ss(prompt, options, *, preselect=0, **kw):
+        if "auto-review when a PR is opened" in prompt:
+            return 1                          # No — must be triggered/requested
+        return 1 if "ready to review PRs" in prompt else preselect
+
+    _, aoo, _ = _run_step_reviewers(bots=["codex"], single_select=ss, tmp_path=tmp_path)
+    assert aoo == {"codex": False}
+
+
+def test_auto_on_open_non_tty_keeps_the_yes_default(monkeypatch):
+    """Off a TTY the labeled select falls back to the numbered prompt, and a blank
+    or EOF answer resolves to the SAME default the old bare [Y/n] prompt had: Yes.
+    (In the full step a non-TTY run never reaches this question — the F1 gate drops
+    every unconfirmed reviewer first — so the helper is asserted directly.)"""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: False)
+
+    def eof(*a):
+        raise EOFError
+
+    for input_fn in (lambda *a: "", eof):
+        buf = io.StringIO()
+        assert wizard._ask_auto_on_open(
+            "copilot", single_select=wizard.single_select,
+            pal=wizard._Palette(False), stream=buf, input_fn=input_fn) is True
+        out = buf.getvalue()
+        assert "Does Copilot auto-review when a PR is opened?" in out
+        assert "Yes — reviews automatically when a PR is opened" in out
+        assert "[Y/n]" not in out
+
+
+def test_auto_on_open_tty_keystroke_shortcuts_match_the_old_prompt(monkeypatch):
+    """On a real TTY the old bare prompt answered to a single 'y'/'n' keystroke; the
+    labeled select keeps those shortcuts, so 'n' still records auto_on_open=False
+    (and 'y' True) instead of falling through to the Yes preselect. What mutation
+    this catches: dropping the shortcuts kwarg, which would turn a muscle-memory 'n'
+    into a silent Yes — the loop would then never summon a bot that never auto-posts."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    for key, expect in (("y", True), ("n", False)):
+        monkeypatch.setattr(wizard, "_read_key", lambda k=key: k)
+        assert wizard._ask_auto_on_open(
+            "copilot", single_select=wizard.single_select,
+            pal=wizard._Palette(False), stream=io.StringIO(),
+            input_fn=lambda *a: "") is expect
+
+
+def test_auto_on_open_claude_never_asked(monkeypatch, tmp_path):
+    """Claude stays mention-driven: auto_on_open['claude'] is recorded False and the
+    auto-on-open select never renders for it."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "_set_claude_secret", lambda *a, **k: "present")
+    monkeypatch.setattr(wizard, "_offer_update_managed_file", lambda *a, **k: None)
+    captured = []
+
+    def ss(prompt, options, *, preselect=0, **kw):
+        captured.append(prompt)
+        return 1 if "ready to review PRs" in prompt else preselect
+
+    enabled, aoo, _ = _run_step_reviewers(bots=["claude"], single_select=ss,
+                                          tmp_path=tmp_path)
+    assert enabled == ["claude"]
+    assert aoo == {"claude": False}
+    assert not any("auto-review when a PR is opened" in p for p in captured)
 
 
 # ── F1: launch-into-first-review offer at Done ──────────────────────────────────────
