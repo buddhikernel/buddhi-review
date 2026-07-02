@@ -156,7 +156,7 @@ _ACTIONABLE_PROSE_RE = re.compile(
     r"(?mi)"
     r"(?:^\s*(?:[-*•]|\d+[.)])\s+\S)"          # bullet / numbered list item
     r"|\b(?:"
-    r"consider(?:ing|ed)?|recommend(?:ed|ing|ation)?|suggest(?:ed|ing|ion)?|"
+    r"consider(?:ing|ed)?|recommend(?:s|ed|ing|ations?)?|suggest(?:s|ed|ing|ions?)?|"
     r"please\s+(?:add|fix|change|update|remove|use|rename|refactor|move)|"
     r"(?:you|we)\s+should\s+|"
     r"should\s+(?:be\s+(?!merged|deployed|landed|shipped|fine|okay|ok|good|safe|enough|sufficient|ready)|you\s+|we\s+|probably\s+|also\s+)|"
@@ -228,7 +228,15 @@ QUOTA_RE = re.compile(
     # never fires this branch.
     r"|\b(?:quota|rate[\s-]?limit(?:ed|ing)?|throttl(?:e|ed|ing)|allowance|tokens?|credits?)\b[\s\S]{0,80}?\b(?:wait|come back|try again|retry|check back|resume)\b[\s\S]{0,60}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b"
     r"|\b(?:wait|come back|try again|retry|check back|resume)\b[\s\S]{0,60}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b[\s\S]{0,40}\b(?:quota|rate[\s-]?limit(?:ed|ing)?|throttl(?:e|ed|ing)|allowance|tokens?|credits?)\b"
-    r"|\bunavailable\b[\s\S]{0,40}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b"
+    # "service unavailable for N hours" — standard HTTP-503 / service-down phrasing;
+    # anchored to "service" so engineering findings ("endpoint unavailable for 2 minutes
+    # during deploys") are not mistaken for a quota self-report.
+    r"|\bservice\b[\s\S]{0,20}\bunavailable\b[\s\S]{0,40}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b"
+    # General "unavailable for N time" requires quota vocabulary co-occurring nearby
+    # (either order) so a reviewer's inline finding about deployment downtime never fires
+    # this branch — mirrors the quota-vocabulary guard on the wait/retry branches above.
+    r"|\b(?:quota|rate[\s-]?limit(?:ed|ing)?|throttl(?:e|ed|ing)|allowance|tokens?|credits?)\b[\s\S]{0,80}?\bunavailable\b[\s\S]{0,40}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b"
+    r"|\bunavailable\b[\s\S]{0,40}\b\d+\s*(?:hours?|minutes?|days?|weeks?)\b[\s\S]{0,40}\b(?:quota|rate[\s-]?limit(?:ed|ing)?|throttl(?:e|ed|ing)|allowance|tokens?|credits?)\b"
     # unambiguous self-report phrases
     r"|\btoo many requests\b"
     r"|\bout of (?:credits?|capacity|quota)\b"
