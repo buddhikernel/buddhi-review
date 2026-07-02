@@ -154,12 +154,9 @@ A run is counted when all three rules hold:
 - no reviewer ran out of quota, failed with an error, or refused the PR as too large
   at any point in the run.
 
-88 of 123 merged runs qualify. The 35 excluded runs consist of 2 micro changes, 7
-runs where a reviewer was missing, and 26 runs where a reviewer ran out of quota,
-failed, or refused the PR. Each rule was checked against the PR record itself: the
-diff size comes from the PR, participation comes from posted reviews and comments,
-and quota, error, and refusal notices were detected with the loop's own signal
-patterns.
+Each rule was checked against the PR record itself: the diff size comes from the PR,
+participation comes from posted reviews and comments, and quota, error, and refusal
+notices were detected with the loop's own signal patterns.
 
 </details>
 
@@ -192,8 +189,9 @@ roughly half of the high- or critical-severity bugs. The effect grows with the
 number of bugs in a run: on the 20 runs with 10 or more valid bugs, the
 round-2-or-later share rises to 65.4%.
 
-Built-in review features that stop after one round never inspect the post-fix code,
-so they cannot catch bugs introduced or exposed by those fixes.
+Most PR-review tools stop after a single round of comments. Because they never
+inspect the code after those comments are addressed, they cannot catch bugs that the
+fixes themselves introduce or expose.
 
 <img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%">
 
