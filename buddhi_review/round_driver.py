@@ -64,6 +64,7 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 from buddhi_review import commit_push, detectors, escalation_wait, gh_ingest, merge
 from buddhi_review.actuators import ActionResult, FixDispatch, act_on_result
 from buddhi_review.adapter import ReviewAdapter
+from buddhi_review.classify import DISCARD_LABELS
 from buddhi_review.config import (
     active_reviewers, auto_on_open, has_global_default, label_gated_ci,
     load_config, repo_entry,
@@ -311,7 +312,7 @@ _LABEL_COL: Dict[str, str] = {
 # (header, display width) per column, left to right.
 _TABLE_COLS: Tuple[Tuple[str, int], ...] = (
     ("Bot", 9), ("Posted", 6), ("Subst", 6), ("Cosm", 5), ("PR-d", 5),
-    ("Outd", 5), ("Inval", 6), ("Biz", 4), ("Fail", 5), ("Status", 21),
+    ("Outd", 5), ("Inval", 6), ("Biz", 4), ("Fail", 5), ("Status", 22),
 )
 _TABLE_COUNT_KEYS: Tuple[str, ...] = (
     "posted", "sub", "cosm", "prdesc", "outd", "inval", "biz", "fail",
@@ -336,7 +337,10 @@ _SKIP_LONG: Dict[str, str] = {
     "excluded": "excluded",
 }
 _STATUS_SHORT: Dict[str, str] = {
-    "done": "done",
+    # ONE label for every done-for-the-run reviewer — an explicit clean sentinel
+    # and a summary-only genuine review read identically: the bot reviewed and
+    # had nothing to flag. "active" only ever means "hasn't responded yet".
+    "done": "reviewed — no findings",
     "quota": "quota",
     "pr-too-large": "PR too large",
     "errored": "errored",
@@ -344,6 +348,45 @@ _STATUS_SHORT: Dict[str, str] = {
     "silent": "silent (dropped)",
     "excluded": "excluded",
 }
+
+# The carve-out that is NOT a thumbs-up: an "I wasn't able to review …" body is
+# a placeholder, not a review. The quota / PR-too-large / errored placeholders
+# are filtered upstream (they detect as signals and never become actionable);
+# this guards the SAME family phrased in ways those deliberately-narrow regexes
+# don't match — it gates ONLY the reviewed-no-findings promotion (the safe
+# direction: an over-match merely keeps today's behaviour, the bot stays
+# expected), so a no-review apology is never crowned "reviewed — no findings"
+# and silently dropped from re-summon.
+_NOT_A_REVIEW_RE = re.compile(
+    r"(?i)(?:"
+    # negation → review/request: "wasn't able to review", "could not review",
+    # "can't fulfill your request right now" (real overload copy apologises
+    # about the REQUEST, not the review)
+    r"\b(?:unable to|not able to|can[’']?t|cannot|won[’']?t|failed to|"
+    r"skipped|(?:was|were|is|am|are)n[’']?t|"
+    r"(?:could|did|do|does|will|would|has|have|had)(?:n[’']?t| not))\b"
+    r"[^.!?\n]{0,60}\b(?:review|request)"
+    # review → failure, any verb form: "Review skipped.", "review could not be
+    # completed", "The review was not successful.", "Review generation stopped"
+    r"|\breviews?\b[^.!?\n]{0,40}"
+    r"\b(?:not|skipped|stopped|aborted|cancell?ed|failed)\b"
+    # "No review was generated …"
+    r"|\bno\s+reviews?\b"
+    # zero files reviewed, any word order: "reviewed 0 out of 12 changed
+    # files", "reviewed no files", "0 out of 12 files reviewed", "0 files …"
+    r"|\breviewed\s+(?:0|no)\s"
+    r"|\b0\s+(?:out\s+of\s+\d+\s+)?files?\b"
+    # "your/the request could not be processed" — never an overview's PULL
+    # request (the lookbehind excludes exactly that noun phrase)
+    r"|(?<!pull )\brequests?\b[^.!?\n]{0,40}\b(?:could|can|did|will|would)\s+not\b"
+    # "too complex/long/… to review" (too large/big already signals upstream)
+    r"|\btoo\s+\w+\s+to\s+review\b"
+    # the transient-failure family — overload / timeout / unavailability
+    # apologies that never name the review at all
+    r"|\btimed?\s+out\b|\bunavailable\b|\bhigh\s+(?:volume|demand)\b"
+    r"|\btry\s+again\s+later\b"
+    r")"
+)
 
 
 def _strip_cell_emoji(s: str) -> str:
@@ -957,6 +1000,44 @@ class RoundDriver:
         self.reviewed_ever.add(bot)
         return bot
 
+    def _promote_reviewed_no_findings(self, actionable: Sequence[Comment],
+                                      results: Sequence[CommentResult]) -> None:
+        """A GENUINE review with zero findings is a thumbs-up — the same terminal
+        state as an explicit clean sentinel, in both display and scheduling. A bot
+        qualifies when everything it posted this round is a top-level review body
+        (no inline comment) and every one of those bodies classified into the
+        discard labels (OUTDATED / INVALID) — i.e. the round generated NO work
+        from it: nothing dispatched to the fixer, nothing escalated, nothing
+        failed classification. It is promoted to voluntarily-done, so later
+        rounds neither re-summon it (re-pinging the cleanest response of all,
+        burning reviewer credits) nor render it back to "active" as if it had
+        never responded.
+
+        A placeholder can never qualify: quota / PR-too-large / errored bodies
+        detect as signals upstream in ``_classify_signal`` and return before the
+        actionable add, so they never reach this scan or ``reviewed_ever``; an
+        "I wasn't able to review …" apology phrased past those regexes is caught
+        by :data:`_NOT_A_REVIEW_RE` here — it keeps today's behaviour (expected,
+        re-summoned, never labelled). The placeholder and errored-comeback
+        machinery itself is untouched."""
+        verdict: Dict[str, bool] = {}
+        for c, r in zip(actionable, results):
+            bot = detectors.bot_for_login(c.source)
+            if bot is None:
+                continue
+            no_finding = (not c.path and not c.diff_hunk
+                          and not _NOT_A_REVIEW_RE.search(c.text)
+                          and r.classification.label in DISCARD_LABELS)
+            verdict[bot] = verdict.get(bot, True) and no_finding
+        for bot in _canonical([b for b, ok in verdict.items() if ok]):
+            if bot in self.done or self._bot_state(bot).signal is not None:
+                continue
+            if bot not in self.reviewed_ever:
+                continue  # only a genuine review promotes — never mere chatter
+            self.done.add(bot)
+            print(f"[round] → excluding {bot} from subsequent rounds this run "
+                  f"(reviewed — no findings)")
+
     def _maybe_errored_comeback(self, comment: Comment, result: CommentResult) -> None:
         """An errored-excluded bot comes back ONLY on a SUBSTANTIVE comment
         strictly newer than its recorded error signal. Runs post-classification,
@@ -1107,6 +1188,9 @@ class RoundDriver:
             for a in round_actions:
                 print(f"  [{a.final:16}] comment {a.comment_id} ({a.disposition})"
                       + (f" — {a.detail}" if a.detail else ""))
+            # A summary-only genuine review (zero findings) is done for the run —
+            # decided AFTER classification, BEFORE the table renders its status.
+            self._promote_reviewed_no_findings(actionable, results)
             self._render_round(round_no, actionable, results)  # per-reviewer round summary
 
             if self.adapter.escalation.delivered:

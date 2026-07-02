@@ -50,6 +50,11 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+try:  # PyYAML is a hard dep of the package; guard so import never explodes.
+    import yaml
+except ImportError:  # pragma: no cover
+    yaml = None  # type: ignore[assignment]
+
 from buddhi_review import (config, detectors, managed_files, plan_profile,
                            setup_launcher, shell_env, upsell)
 from buddhi_review.transparency import _colour_enabled
@@ -1045,6 +1050,23 @@ def _probe_ready_for_ci_workflow(repo: Optional[str], run) -> bool:
     return bool(ok and stripped and stripped != "null")
 
 
+def _pyproject_test_extra(pyproject_text: str) -> bool:
+    """Whether ``pyproject_text`` declares a ``test`` extra under
+    ``[project.optional-dependencies]``. A line-oriented text scan, in the same
+    read-only style as the rest of the detector (the stdlib has no TOML parser
+    on every supported Python, and a malformed file must degrade to False, never
+    raise)."""
+    in_section = False
+    for ln in pyproject_text.splitlines():
+        s = ln.strip()
+        if s.startswith("["):
+            in_section = s.replace(" ", "") == "[project.optional-dependencies]"
+            continue
+        if in_section and re.match(r"""^(?:test|"test"|'test')\s*=""", s):
+            return True
+    return False
+
+
 def _detect_ci_command(cwd: Optional[str]) -> Optional[str]:
     """Best-effort detect a repo's CI/test command from its LOCAL checkout, so the
     label gate is auto-wired with a real command instead of a failing placeholder.
@@ -1103,6 +1125,11 @@ def _detect_ci_command(cwd: Optional[str]) -> Optional[str]:
         or "[tool.pytest" in _reads(root / "pyproject.toml")
     )
     if has_manifest and has_tests:
+        # A declared `test` extra means a plain `pip install -e .` gate cannot
+        # even import pytest — the baked command must install the extra or every
+        # gated run dies in seconds on `No module named pytest`.
+        if _pyproject_test_extra(_reads(root / "pyproject.toml")):
+            return "python -m pip install -e '.[test]' && python -m pytest"
         return "python -m pip install -e . && python -m pytest"
     # Go / Rust.
     if (root / "go.mod").is_file():
@@ -1128,6 +1155,160 @@ def _bake_ci_command(content: str, command: str) -> str:
     return "".join(out)
 
 
+# Shell text that cannot be safely collapsed onto one `&&`-joined line: ANY
+# standalone shell control-flow keyword (an `if` block's commands cannot be
+# `&&`-chained without repositioning its `then`/`fi`; a bare `fi`/`done` closer
+# would become the broken `… && fi`), a function-body `{` opener at end of
+# line, or a heredoc. Matching any keyword ANYWHERE in a joined line is
+# deliberately aggressive: a false positive merely falls back to detection,
+# while a miss bakes a gate that syntax-errors (or worse, silently weakens).
+# A SINGLE-line command never joins, so it is exempt (handled by the caller).
+_UNJOINABLE_SHELL_RE = re.compile(
+    r"(?:^|[\s;&|])(?:if|then|elif|else|fi|for|while|until|do|done|case|esac|"
+    r"select)\b"
+    r"|(?:\{$)|<<"
+)
+
+# An unquoted trailing shell comment (`#` at a word start — after whitespace OR
+# an operator, since `;`/`&`/`|` end a word: bash reads `echo x;# note` as a
+# comment too). Joining anything AFTER such a line would land inside the
+# comment — `pip install x  # editable && pytest` silently never runs pytest,
+# turning the gate vacuously green — so any NON-FINAL line carrying one makes
+# the whole chain unextractable. A WORD-glued `#` (e.g. pip's `…#egg=name` URL
+# fragment or `${var#prefix}`) is not a comment and stays fine.
+_TRAILING_COMMENT_RE = re.compile(r"(?:^|[\s;&|()])#")
+
+
+def _ends_in_continuation(s: str) -> bool:
+    """Whether ``s`` ends in a REAL backslash line-continuation: an ODD run of
+    trailing backslashes. An even run is escaped literal backslashes — the line
+    is complete, and whatever follows is a separate command that must be
+    ``&&``-joined, never folded in as arguments (`echo built \\\\` + `false`
+    folded would run `false` as echo arguments — a vacuously green gate)."""
+    return (len(s) - len(s.rstrip("\\"))) % 2 == 1
+
+
+def _join_shell_lines(lines: Sequence[str]) -> Optional[str]:
+    """Collapse the (stripped, non-empty, non-comment) lines of one ``run:``
+    block into a single shell command chain. Consecutive lines are joined with
+    `` && ``; a line already ending in a connector (``&&``/``||``/``|``/``;``/
+    ``&``) or starting with one is joined with a space, and a trailing backslash
+    continuation is folded into its next line — so an already-chained or wrapped
+    command round-trips without doubled operators. Returns ``None`` when a line
+    carries something a one-line `` && `` chain cannot express: control flow, a
+    heredoc, or an unquoted trailing comment on any line that is not the last
+    (everything joined after it would be swallowed by the comment). A SINGLE
+    line needs no joining at all, so it round-trips verbatim — preserving is
+    always safe when nothing is transformed."""
+    if len(lines) == 1:
+        return lines[0]
+    out = ""
+    for i, ln in enumerate(lines):
+        if _UNJOINABLE_SHELL_RE.search(ln):
+            return None
+        if i < len(lines) - 1 and _TRAILING_COMMENT_RE.search(ln):
+            return None
+        if not out:
+            out = ln
+        elif _ends_in_continuation(out):
+            out = out[:-1].rstrip() + " " + ln
+        elif out.endswith(("&&", "||", "|", ";", "&")) or ln.startswith(("&&", "||", "|")):
+            out += " " + ln
+        else:
+            out += " && " + ln
+    return out or None
+
+
+def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
+    """The CI command the INSTALLED label gate actually runs — extracted from
+    the workflow text the version check already fetched — so the UPDATE path can
+    re-bake the user's real command instead of flattening it back to the generic
+    detection. (Live incident, 2026-07-01: a versioned update re-baked the
+    auto-detected ``pip install -e .`` over a hand-wired
+    ``pip install -e '.[test]' …`` gate — every gated run then failed in seconds
+    on ``No module named pytest``, and the gate's extra scan step silently
+    vanished.)
+
+    The gate job's steps are scanned in order and every ``run:`` value is
+    collected (``uses:`` steps such as checkout are skipped). Each step's value
+    is ONE opaque command string, stripped; its internal newlines — and, across
+    steps, the step boundaries — are joined with `` && `` (the baked template
+    has a single command slot). Blank, comment-only, and never-baked
+    ``_CI_COMMAND_MARKER`` lines are dropped. Returns ``None`` when nothing is
+    extractable: unparseable / non-mapping YAML, no ``ci`` (or single) job, no
+    ``run:`` content, or shell control flow that cannot be collapsed onto one
+    line — the caller then falls back to detection (TTY) or skips the update
+    (non-TTY) instead of re-baking blind."""
+    if not installed_text or yaml is None:
+        return None
+    try:
+        doc = yaml.safe_load(installed_text)
+    except Exception:
+        # Not just yaml.YAMLError: pathological nesting raises RecursionError
+        # out of PyYAML's recursive composer, and this best-effort reader of
+        # repo-fetched content must degrade to None, never kill the wizard.
+        return None
+    if not isinstance(doc, dict):
+        return None
+    jobs = doc.get("jobs")
+    if not isinstance(jobs, dict) or not jobs:
+        return None
+    # The bundled template's job id is `ci`; prefer it, tolerate a renamed single
+    # job. Several jobs with no `ci` is ambiguous (jobs run on separate runners —
+    # joining their commands would fabricate a serial chain that never existed).
+    job = jobs.get("ci") if "ci" in jobs else (
+        next(iter(jobs.values())) if len(jobs) == 1 else None)
+    if not isinstance(job, dict):
+        return None
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return None
+    commands: List[str] = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if "run" not in step:
+            continue  # `uses:` steps (checkout) contribute no command
+        run_val = step["run"]
+        if not isinstance(run_val, str):
+            # A non-string `run:` (YAML parsed `run: false` into a boolean; the
+            # Actions runner would still execute it as text). Dropping the step
+            # would silently WEAKEN the chain — unextractable instead.
+            return None
+        lines: List[str] = []
+        for raw_ln in run_val.strip().splitlines():
+            ln = raw_ln.strip()
+            if ln and not ln.startswith("#") and ln != _CI_COMMAND_MARKER:
+                if ln.endswith("\\") and not raw_ln.rstrip("\r\n").endswith("\\"):
+                    # Backslash followed by trailing WHITESPACE: bash escapes
+                    # the whitespace and the line is COMPLETE — but stripping
+                    # just erased the distinction the continuation check keys
+                    # on, so folding here would glue two commands. Unextractable.
+                    return None
+                lines.append(ln)
+            elif lines and _ends_in_continuation(lines[-1]):
+                # A dropped line (blank / comment / marker) right after a
+                # backslash continuation: in real shell the continuation binds
+                # to THIS line, not to whatever kept line follows — folding
+                # across the gap would glue two commands with NO operator
+                # (`echo running gate \` + `# note` + `exit 1` must not become
+                # the always-green `echo running gate exit 1`). Unextractable.
+                return None
+        if not lines:
+            continue
+        joined = _join_shell_lines(lines)
+        if joined is None:
+            return None  # control flow in one step poisons the whole chain
+        commands.append(joined)
+    if not commands:
+        return None
+    # A non-final step ending in a dangling continuation would fold the NEXT
+    # step's command into itself as arguments — unexpressible on one line.
+    if any(_ends_in_continuation(c) for c in commands[:-1]):
+        return None
+    return _join_shell_lines(commands)
+
+
 def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stream,
                                 input_fn=input) -> Optional[str]:
     """After a repo opts INTO label-gated CI, install the generic
@@ -1142,6 +1323,11 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
     (:func:`_detect_ci_command`), confirmed on a TTY with that detection as the
     default, and baked into the single ``run:`` step — so the installed workflow runs
     a REAL command, never a failing ``exit 1`` placeholder the user has to hand-edit.
+    On an UPDATE of an already-installed gate the default flips to the command the
+    installed workflow actually runs (:func:`_installed_ci_command`), falling back to
+    detection only when nothing is extractable — and a non-TTY update either
+    preserves that command verbatim or skips with a warning, NEVER re-bakes the
+    generic detection over a hand-wired gate (the 2026-07-01 incident).
 
     P7 #4 (probe-before-install): if the gate is already on the default branch, it
     says so and opens NO redundant second PR. P7 #2 (merge-me callout): on a
@@ -1154,13 +1340,14 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
     # through to the bake-and-PR flow as an UPDATE (re-wiring the CI command) instead
     # of skipping; a current / unknown installed copy is left untouched.
     is_update = False
+    installed_cmd: Optional[str] = None
     if _probe_ready_for_ci_workflow(repo, run):
         _spec = next((s for s in managed_files.MANAGED_FILES
                       if s["name"] == "tests-ready-for-ci.yml"), None)
         _shipped_v = managed_files.shipped_version(_spec["template"]) if _spec else None
-        _installed_v = managed_files.file_version(
-            _installed_managed_file_text(
-                repo, ".github/workflows/tests-ready-for-ci.yml", run))
+        _installed_text = _installed_managed_file_text(
+            repo, ".github/workflows/tests-ready-for-ci.yml", run)
+        _installed_v = managed_files.file_version(_installed_text)
         if not managed_files.needs_update(_installed_v, _shipped_v):
             _row("ok", "Label-gated CI workflow already on the default branch "
                        "(up to date)", pal, stream)
@@ -1170,6 +1357,10 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
                      f"({_cur}) than the bundled v{_shipped_v} — offering an update.",
              pal, stream)
         is_update = True
+        # An update must PRESERVE the command the installed gate actually runs
+        # (reusing the text the version check just fetched) — re-detecting from
+        # the checkout flattens a hand-wired gate back to the generic guess.
+        installed_cmd = _installed_ci_command(_installed_text)
     template = _ready_for_ci_template_path()
     if not template.exists():
         _row("warn", f"Bundled label-gated CI template not found: {template}", pal, stream)
@@ -1189,17 +1380,32 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
                      "can't auto-wire the CI command. Update the bundled template.", pal, stream)
         return None
     # Resolve the REAL CI command BEFORE opening the PR so the gate never ships a
-    # failing placeholder.
+    # failing placeholder. On an UPDATE the installed gate's own command is the
+    # default; the generic detection is only the fresh-install default and the
+    # fallback when the installed copy yields nothing extractable.
     detected = _detect_ci_command(cwd)
+    default_cmd = (installed_cmd or detected) if is_update else detected
     if not _is_tty():
-        if not detected:
+        if is_update and not installed_cmd:
+            _row("warn", "Skipping the label-gated CI workflow update — the installed "
+                         "gate's CI command couldn't be read, and re-baking an "
+                         "auto-detected command off-TTY could silently drop what your "
+                         "gate really runs. Re-run setup in a terminal to confirm the "
+                         "command.", pal, stream)
+            return None
+        if not default_cmd:
             _row("warn", "Skipping label-gated CI workflow install — no TTY to capture "
                          "a CI command and none auto-detected. Re-run setup in a "
                          "terminal, or copy the bundled tests-ready-for-ci.yml in by "
                          "hand and set its CI command.", pal, stream)
             return None
-        ci_command = detected
-        _row("info", f"No TTY — wiring the auto-detected CI command: {ci_command}", pal, stream)
+        ci_command = default_cmd
+        if is_update:
+            _row("info", f"No TTY — preserving the installed gate's CI command: "
+                         f"{ci_command}", pal, stream)
+        else:
+            _row("info", f"No TTY — wiring the auto-detected CI command: {ci_command}",
+                 pal, stream)
     else:
         if not _ask_yes_no("Install the label-gated CI workflow "
                            "(.github/workflows/tests-ready-for-ci.yml) on the default "
@@ -1208,16 +1414,17 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
                          "workflow on the default branch gates on the `ready-for-ci` "
                          "label.", pal, stream)
             return None
-        # Wire the command FOR the user — a detected default they accept or edit; never
-        # a workflow file they hand-edit afterwards.
-        suffix = (f" [{detected}]" if detected
+        # Wire the command FOR the user — a default they accept or edit (the
+        # installed gate's own command on an update, the detected one on a fresh
+        # install); never a workflow file they hand-edit afterwards.
+        suffix = (f" [{default_cmd}]" if default_cmd
                   else " (e.g. `make ci`, `npm test`, `python -m pytest`)")
         try:
             entered = input_fn(f"  Command this gate runs at merge (your "
                                f"tests/lint/build){suffix}: ").strip()
         except (EOFError, KeyboardInterrupt):
             entered = ""
-        ci_command = entered or detected
+        ci_command = entered or default_cmd
         if not ci_command:
             _row("warn", "No CI command given — not installing a gate that would run "
                          "nothing. Re-run setup and enter your test command.", pal, stream)
