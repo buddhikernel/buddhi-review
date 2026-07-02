@@ -1140,11 +1140,14 @@ def apply_fix(
             # No snapshot: degrade returned trustworthy=True but no actual rollback
             # occurred. We cannot prove the worktree is clean, so escalate rather
             # than letting "skipped" imply a clean state to the round driver.
+            # rollback_failed=True arms the poisoned-worktree gate in round_driver
+            # so it halts before any push — matching the REJECT path (line 1195).
             if snap is None:
                 return FixOutcome(
                     status="transient-failed",
                     detail="SKIP received without snapshot — cannot verify worktree is clean",
                     attempts=attempt,
+                    rollback_failed=True,
                 )
             return FixOutcome(status="skipped", detail=skip_line.strip(), attempts=attempt)
         # Clean success → deterministic pre-commit Unicode cleanup, then tripwire +
