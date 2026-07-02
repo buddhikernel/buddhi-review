@@ -83,9 +83,10 @@ def _confirm(cfg_path, *, repo=REPO, reviewers, ss_answers=None, yn_answers=None
     buf = io.StringIO()
     ms = multi_select or (lambda *a, **k: set(reviewers))
     # Auto-confirm the F1 install gate by default — these tests drive a SUCCESSFUL
-    # confirmation. The gate is a labeled single_select ("… ready to review PRs?"),
-    # so it routes on the single_select channel (option 1 = Yes), entirely separate
-    # from the input_fn per-bot auto-on-open routing. A test wanting a drop overrides
+    # confirmation. The gate is a labeled single_select ("… ready to review PRs?",
+    # option 1 = Yes), and since G3 the per-bot auto-on-open question is a labeled
+    # select on the SAME channel ("Does {Bot} auto-review …", 0 = Yes / 1 = No;
+    # unrouted it takes its Yes preselect). A test wanting a gate drop overrides
     # "ready to review PRs".
     ss = {"ready to review PRs": 1, **(ss_answers or {})}
     rc = wizard.confirm_repo_interactive(
@@ -111,8 +112,8 @@ def test_confirm_writes_per_repo_entry_and_round_trips(tmp_path):
         ss_answers={"GLOBAL default": 1,            # No — only this repo
                     "Auto-merge default for": 1,    # On
                     "Label-gated CI default for": 1,  # On
-                    "Confirm: enable label-gated CI": 1},  # Yes
-        yn_answers={"Copilot": "y"})                # copilot auto-on-open True
+                    "Confirm: enable label-gated CI": 1,  # Yes
+                    "Does Copilot auto-review": 0})  # copilot auto-on-open True
     assert rc == 0
     cfg = _read(cfg_path)
     # The repo is CONFIRMED (the entry exists) and every key round-trips via F1.
@@ -128,8 +129,9 @@ def test_confirm_records_multiselect_and_per_bot_auto_on_open(tmp_path):
     rc, _ = _confirm(
         cfg_path, reviewers={COPILOT, CODEX},
         ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
-                    "Label-gated CI default for": 0},
-        yn_answers={"Copilot": "y", "Codex": "n"})  # per-bot auto_on_open
+                    "Label-gated CI default for": 0,
+                    # per-bot auto_on_open via the G3 labeled select (0=Yes, 1=No)
+                    "Does Copilot auto-review": 0, "Does Codex auto-review": 1})
     assert rc == 0
     cfg = _read(cfg_path)
     assert config.active_reviewers(cfg, REPO) == ("copilot", "codex")
@@ -148,8 +150,7 @@ def test_label_gated_ci_opt_in_requires_the_second_confirm(tmp_path):
         cfg_path, reviewers={COPILOT},
         ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
                     "Label-gated CI default for": 1,        # On …
-                    "Confirm: enable label-gated CI": 0},   # … but No at the confirm
-        yn_answers={"Copilot": "y"})
+                    "Confirm: enable label-gated CI": 0})   # … but No at the confirm
     assert rc == 0
     assert config.label_gated_ci(_read(cfg_path), REPO) is False
 
@@ -161,7 +162,7 @@ def test_label_gated_ci_off_skips_the_confirm(tmp_path):
         cfg_path, reviewers={COPILOT},
         ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
                     "Label-gated CI default for": 0},  # Off
-        yn_answers={"Copilot": "y"}, captured=captured)
+        captured=captured)
     assert rc == 0
     assert config.label_gated_ci(_read(cfg_path), REPO) is False
     # The explicit second confirm is NEVER shown when the answer is Off.
@@ -175,8 +176,7 @@ def test_global_default_promotion_writes_top_level_fleet(tmp_path):
     rc, out = _confirm(
         cfg_path, reviewers={COPILOT, CODEX},
         ss_answers={"GLOBAL default": 0,            # Yes — promote
-                    "Auto-merge default for": 0, "Label-gated CI default for": 0},
-        yn_answers={"Copilot": "y", "Codex": "y"})
+                    "Auto-merge default for": 0, "Label-gated CI default for": 0})
     assert rc == 0
     cfg = _read(cfg_path)
     assert config.has_global_default(cfg) is True
@@ -194,8 +194,10 @@ def test_global_default_question_names_its_subject(tmp_path):
     _confirm(
         cfg_path, reviewers={COPILOT, CODEX},
         ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
-                    "Label-gated CI default for": 0},
-        yn_answers={"Copilot": "y", "Codex": "n"}, captured=captured)
+                    "Label-gated CI default for": 0,
+                    # copilot auto-posts on open, codex does not (G3 labeled select)
+                    "Does Copilot auto-review": 0, "Does Codex auto-review": 1},
+        captured=captured)
     gd = [(p, opts) for p, opts in captured if "GLOBAL default" in p]
     assert gd, "the global-default question must be asked"
     prompt, opts = gd[0]
@@ -211,8 +213,7 @@ def test_no_promotion_leaves_global_default_unset(tmp_path):
     rc, out = _confirm(
         cfg_path, reviewers={COPILOT},
         ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
-                    "Label-gated CI default for": 0},
-        yn_answers={"Copilot": "y"})
+                    "Label-gated CI default for": 0})
     assert rc == 0
     cfg = _read(cfg_path)
     assert config.has_global_default(cfg) is False     # no top-level fleet written
@@ -272,8 +273,7 @@ def test_reviewer_fleet_is_seeded_from_the_global_default(tmp_path):
 
     _confirm(cfg_path, reviewers={COPILOT}, multi_select=capturing_ms,
              ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
-                         "Label-gated CI default for": 0},
-             yn_answers={"Copilot": "y"})
+                         "Label-gated CI default for": 0})
     # The global default ["copilot", "claude"] preselects indices {0, 3}.
     assert seen["preselected"] == {COPILOT, CLAUDE}
 
@@ -304,8 +304,9 @@ def test_confirm_infers_repo_from_git_remote(tmp_path):
         cfg_path=cfg_path, multi_select=lambda *a, **k: {COPILOT},
         single_select=_ss_router({"ready to review PRs": 1, "GLOBAL default": 1,
                                   "Auto-merge default for": 0,
-                                  "Label-gated CI default for": 0}),
-        input_fn=_in_router({"Copilot": "y"}))
+                                  "Label-gated CI default for": 0,
+                                  "Does Copilot auto-review": 0}),
+        input_fn=_in_router({}))
     assert rc == 0
     assert config.repo_entry(_read(cfg_path), "acme/widgets") is not None
 
@@ -323,8 +324,8 @@ def test_confirm_leaves_sibling_repo_and_unknown_keys_intact(tmp_path):
     rc, _ = _confirm(
         cfg_path, reviewers={COPILOT},
         ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
-                    "Label-gated CI default for": 0},
-        yn_answers={"Copilot": "y"})
+                    "Label-gated CI default for": 0,
+                    "Does Copilot auto-review": 0})
     assert rc == 0
     cfg = _read(cfg_path)
     assert config.repo_entry(cfg, "acme/widgets") == {"active_reviewers": ["gemini"]}
@@ -344,8 +345,9 @@ def test_confirm_repo_interactive_full_parity(tmp_path):
         ss_answers={"GLOBAL default": 0,                 # promote to global default
                     "Auto-merge default for": 1,         # auto-merge on
                     "Label-gated CI default for": 1,     # label-gated CI on …
-                    "Confirm: enable label-gated CI": 1},  # … confirmed
-        yn_answers={"Copilot": "y", "Codex": "n"})
+                    "Confirm: enable label-gated CI": 1,  # … confirmed
+                    # per-bot auto_on_open via the G3 labeled select (0=Yes, 1=No)
+                    "Does Copilot auto-review": 0, "Does Codex auto-review": 1})
     assert rc == 0
     cfg = _read(cfg_path)
     # Per-repo persistence (every key via an F1 reader).

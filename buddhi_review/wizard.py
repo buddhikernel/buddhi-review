@@ -1678,6 +1678,30 @@ def _confirm_reviewer_installed(bot: str, repo: Optional[str], *, single_select,
     return idx == 1
 
 
+def _ask_auto_on_open(bot: str, *, single_select, pal, stream, input_fn) -> bool:
+    """Does ``bot`` post a review by itself when a PR is opened? — the one fact the
+    loop cannot deduce from "is the app installed". A labeled select whose options
+    carry the CONSEQUENCE of each answer (the same pattern as the install gate):
+    Yes → the loop leaves the bot alone in round 1 (a summon would duplicate the
+    review it already posts); No → the loop summons it in round 1 so its review
+    still arrives.
+
+    Preselects Yes — the GitHub-App reviewers auto-review on open out of the box —
+    and a non-interactive run (the numbered fallback; a blank or EOF answer)
+    resolves to that same Yes, exactly as the previous bare Yes/No prompt did. The
+    previous prompt's y/n keystroke shortcuts are kept too (y → Yes, n → No), so
+    the muscle-memory answer still records the same value."""
+    idx = single_select(
+        f"  Does {bot.capitalize()} auto-review when a PR is opened?",
+        [("Yes — reviews automatically when a PR is opened",
+          "the loop won't re-summon it in round 1 (avoids a duplicate review)"),
+         ("No — must be triggered/requested to review",
+          "the loop posts its round-1 request so its review still arrives")],
+        preselect=0, pal=pal, stream=stream, input_fn=input_fn,
+        shortcuts={"y": 0, "n": 1})
+    return idx == 0
+
+
 def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, Any], *,
                    run, spawn_command, getpass_fn, pal, stream,
                    multi_select=multi_select, single_select=single_select,
@@ -1790,13 +1814,13 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
         confirmed.append(bot)
 
         # auto_on_open: Claude is mention-driven (never auto-reviews on open); the
-        # GitHub-App bots are asked (default True).
+        # GitHub-App bots are asked via the labeled select (preselect Yes).
         if bot == "claude":
             auto_on_open["claude"] = False
         else:
-            auto_on_open[bot] = _ask_yes_no(
-                f"Does {bot.capitalize()} auto-review when a PR is opened?",
-                default=True, input_fn=input_fn, stream=stream)
+            auto_on_open[bot] = _ask_auto_on_open(bot, single_select=single_select,
+                                                  pal=pal, stream=stream,
+                                                  input_fn=input_fn)
     return confirmed, auto_on_open
 
 
