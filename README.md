@@ -16,14 +16,30 @@ walks you to your first reviewed PR.
 
 ## Seen in real runs, not just in papers
 
-Every merged review loop on the source repository that meets three quality rules is
-counted here. The change must be larger than 50 lines, all four reviewers (Claude,
-Codex, Gemini, Copilot) must have actually reviewed it, and no reviewer may have been
-budget-throttled or errored during the run. That leaves 88 qualifying runs with 681
-verified fixed bugs, measured by the loop's per-bug ledger. They show two effects the
-research predicts (see [Why a panel, and why rounds](#why-a-panel-and-why-rounds)
-below): a model is soft on its own work, and many bugs surface only after earlier
-fixes land.
+The numbers above come from real Buddhi review loops on a large internal repository,
+reviewing changes written with Claude Code. Every merged run that clears a fixed
+quality bar is counted, and nothing is hand-picked: 88 runs, 681 verified fixed bugs,
+measured by the loop's per-bug ledger. Together they show two effects the research
+predicts (see [Why a panel, and why rounds](#why-a-panel-and-why-rounds) below): a
+model is soft on its own work, and many bugs surface only after earlier fixes land.
+
+<details>
+<summary>How runs qualify (the selection rules)</summary>
+
+A run is counted when all three rules hold:
+
+- the change is larger than 50 lines, so trivial micro PRs are excluded;
+- all four reviewers (Claude, Codex, Gemini, Copilot) actually reviewed the PR;
+- no reviewer was budget-throttled, errored, or refused the PR as too large at any
+  point in the run.
+
+88 of 123 merged runs qualify. The 35 exclusions break down as 2 micro changes, 7
+runs missing a reviewer, and 26 runs where a reviewer was throttled or errored. Each
+rule was checked against the PR's own review record: diff size from the PR itself,
+participation from posted reviews and comments, and throttle or error notices
+detected with the loop's own signal patterns.
+
+</details>
 
 ### "Just have Claude review it again" is not adversarial review
 
@@ -33,17 +49,15 @@ high or critical bugs (9.5%), and of the high or critical bugs found in round 2 
 later, 93.5% came from a reviewer other than Claude.
 
 This is the self-preference effect described in
-[[2](https://arxiv.org/abs/2404.13076)], visible in real review runs: a model
-reviewing its own work misses most of what a diverse panel catches.
+[[2 &ndash; LLM Evaluators Recognize and Favor Their Own Generations](https://arxiv.org/abs/2404.13076)],
+visible in real review runs: a model reviewing its own work misses most of what a
+diverse panel catches.
 
 ![Claude's share of the valid bugs, per review run, with the all-runs aggregate line](docs/assets/who-catches-the-bugs.svg)
 
-*Selection rule: a run qualifies when the change is larger than 50 lines, all four
-reviewers participated, and none was throttled, errored, or refused the PR as too
-large. 88 of 123 merged runs qualify; the 35 exclusions are 2 micro changes, 7 runs
-missing a reviewer, and 26 runs where a reviewer was throttled or errored. The bars
-show the 20 qualifying runs with 10 or more valid bugs, a threshold chosen only to
-avoid tiny denominators. The bold line is all 88 runs.*
+*Bars: the 20 qualifying runs with 10 or more valid bugs, a threshold that only
+avoids tiny denominators. Line: all 88 qualifying runs. The selection rules are
+listed under "How runs qualify" above.*
 
 ### One round is not a complete review
 
@@ -59,29 +73,33 @@ that become visible only after earlier findings have been fixed.
 
 ![Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line](docs/assets/when-bugs-surface.svg)
 
-*Selection rule: the same 88-run set as above. The bars are the 20 qualifying runs
-with 10 or more valid bugs; the bold line is all 88 runs. Quote the line, not the
-bars, as the typical case.*
+*Bars and line: the same sets as the chart above. Quote the line, not the bars, as
+the typical case.*
 
 <details>
 <summary><b>The data behind the charts</b></summary>
 
-A closer look at the six largest qualifying runs, reviewer by reviewer:
+A closer look at every qualifying run with 20 or more valid bugs (there are seven),
+reviewer by reviewer:
 
-![Valid bugs caught by each reviewer, in the six largest qualifying runs](docs/assets/six-runs-drilldown.svg)
+![Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs](docs/assets/six-runs-drilldown.svg)
 
 | Run | Valid bugs | Caught by Claude | Claude % | Caught in R2+ | R2+ % | High/critical | High/crit in R2+ |
 |---|---|---|---|---|---|---|---|
-| A | 21 | 0 | 0.0% | 17 | 81.0% | 7 | 5 (71.4%) |
-| B | 47 | 0 | 0.0% | 41 | 87.2% | 14 | 10 (71.4%) |
-| C | 22 | 0 | 0.0% | 15 | 68.2% | 12 | 7 (58.3%) |
+| A | 21 | 0&Dagger; | 0.0% | 17 | 81.0% | 7 | 5 (71.4%) |
+| B | 47 | 0&Dagger; | 0.0% | 41 | 87.2% | 14 | 10 (71.4%) |
+| C | 22 | 0&dagger; | 0.0% | 15 | 68.2% | 12 | 7 (58.3%) |
 | D | 42 | 2 | 4.8% | 34 | 81.0% | 19 | 14 (73.7%) |
 | E | 29 | 1 | 3.4% | 22 | 75.9% | 8 | 8 (100%) |
 | F | 24 | 0&dagger; | 0.0% | 19 | 79.2% | 6 | 5 (83.3%) |
+| G | 20 | 0&dagger; | 0.0% | 4 | 20.0% | 2 | 0 (0.0%) |
 | **All 88 qualifying runs** | **681** | **26** | **3.8%** | **341** | **50.1%** | **189** | **93 (49.2%)** |
 
-&dagger; In Run F, Claude reviewed and posted an explicit all-clear ("No issues
-found.") in round 1. The panel then caught 24 valid bugs, six of them high severity.
+&dagger; On Runs C, F, and G, Claude reviewed and posted an explicit all-clear ("No
+issues found."), and the panel then caught 22, 24, and 20 valid bugs respectively.
+
+&Dagger; On Runs A and B, Claude posted review comments, but none of them produced a
+valid bug.
 
 How to read this honestly:
 
@@ -249,10 +267,10 @@ for the full breakdown.
 
 ## Why a panel, and why rounds
 
-The numbers at the top of this page come from a deliberate design. Buddhi does not
-hand your PR to one reviewer. It fans the review out to a panel of independent models
-from *different* labs and keeps flying rounds until a round comes back clean. Three
-reasons that beats one strong reviewer running once.
+The numbers at the top of this page are the result of a deliberate design: Buddhi
+does not hand your PR to one reviewer; it fans the review out to a panel of
+independent models from *different* labs and keeps flying rounds until a round comes
+back clean. Three reasons that beats one strong reviewer running once.
 
 **Different labs, different blind spots.** You have probably watched one reviewer flag
 a real bug another signed off on. Across many PRs that stops being luck and becomes the
@@ -260,10 +278,12 @@ whole point: models trained by different labs, on different data, fail *differen
 so where one is blind, another tends to see. This is the ensemble-diversity result (a
 panel's misses shrink the less its members' errors overlap), and it has been measured
 on today's models: same-vendor models make *more correlated* errors than cross-vendor
-ones [[1](https://arxiv.org/abs/2506.07962)]. A model is also soft on its own work: it
+ones [[1 &ndash; Correlated Errors in Large Language Models](https://arxiv.org/abs/2506.07962)].
+A model is also soft on its own work: it
 rates its own output more favorably than another model's
-[[2](https://arxiv.org/abs/2404.13076)]. A reviewer from a *different* family is
-therefore not just a second pair of eyes; it is a less self-flattering one.
+[[2 &ndash; LLM Evaluators Recognize and Favor Their Own Generations](https://arxiv.org/abs/2404.13076)],
+so a reviewer from a *different* family is not just a second pair of eyes; it is a
+less self-flattering one.
 
 **A fix is a new change, so it needs a fresh look.** When a fixer resolves a round-1
 comment, it edits the code, and an edit can be wrong or introduce a new bug that exists
@@ -276,7 +296,7 @@ is grading its own homework.
 **It converges on a clean round, not on a fixed count, and not on "zero findings."**
 More rounds are not automatically better: repeated review tends to plateau within a few
 rounds, and pushing past that entrenches noise instead of removing it
-[[3](https://arxiv.org/abs/2305.14325)]. So Buddhi does not loop a set number of times.
+[[3 &ndash; Improving Factuality and Reasoning in Language Models through Multiagent Debate](https://arxiv.org/abs/2305.14325)]. So Buddhi does not loop a set number of times.
 Each round it re-summons the reviewers on the *fixed* code, acts on the findings they
 raise (fixing the substantive and the cosmetic ones alike), and goes again. Convergence
 is the round that comes back with **no new findings to act on**: not the reviewers
@@ -327,8 +347,9 @@ flowchart LR
   votes: Kohli, [*Nine Judges, Two Effective Votes*](https://arxiv.org/abs/2605.29800)),
   whereas a diverse cross-vendor panel beats a single strong judge in LLM *evaluation*
   (Cohere, [*Replacing Judges with Juries* / PoLL](https://arxiv.org/abs/2404.18796)).
-  Finding bugs is a *coverage* problem: keep every reviewer's real catch. It is not a
-  majority vote, so Buddhi takes the union and skips the voting ceiling.
+  Finding bugs is a *coverage* problem, where every reviewer's real catch is kept
+  rather than put to a majority vote, so Buddhi takes the union and skips the voting
+  ceiling.
 
 </details>
 

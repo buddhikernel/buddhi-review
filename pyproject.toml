@@ -23,7 +23,7 @@ description = "Free PR review-and-fix loop for Claude Code: fans out review bots
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-authors = [{ name = "The Buddhi authors" }]
+authors = [{ name = "M. Srivastava" }]
 keywords = [
     "code-review",
     "pull-request",
