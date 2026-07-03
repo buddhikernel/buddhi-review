@@ -140,7 +140,8 @@ CFG3 = {"active_reviewers": ["claude", "copilot", "gemini"],
 def test_summary_only_review_is_done_for_the_run():
     # copilot: top-level review body, zero inline findings → thumbs-up.
     # claude: a real inline finding → fixed, re-summoned next round as today.
-    # gemini: genuinely silent → stays the pending label, re-summoned.
+    # gemini: genuinely silent → never crowned (mainline drops a full-round-
+    # silent reviewer with its own honest label; silence is not approval).
     timeline = [
         (0, Comment(id="ov", text=SUMMARY_ONLY, source="copilot-pull-request-reviewer[bot]",
                     path=None, created_at="2026-07-01T00:00:00Z")),
@@ -165,8 +166,9 @@ def test_summary_only_review_is_done_for_the_run():
     row1 = _table_row(out, "Copilot", 1)
     assert "reviewed — no findings" in row1
     assert "active" not in row1
-    # The silent bot still reads "active" — pending only ever means "no response".
-    assert "active" in _table_row(out, "Gemini", 1)
+    # The silent bot is never crowned — its cell shows the silent-drop (or
+    # pending) label, never the thumbs-up reserved for a genuine review.
+    assert "reviewed — no findings" not in _table_row(out, "Gemini", 1)
     # Later rounds keep the label (never falls back to "active" after it reviewed).
     assert "reviewed — no findings" in _table_row(out, "Copilot", 2)
 
@@ -221,7 +223,9 @@ def test_uncontracted_apologies_never_promote():
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
     assert "copilot" not in d.done
     assert "reviewed — no findings" not in _table_row(out, "Copilot", 1)
-    assert len(gh.copilot_summons()) >= 1  # round 2 still re-summons it
+    # Any drop it gets is the polish-only bucket (soft, --rr-clearable) — never
+    # the voluntarily-done crown.
+    assert "copilot" in d.polishing
 
 
 def test_review_first_apologies_never_promote():
@@ -241,7 +245,7 @@ def test_review_first_apologies_never_promote():
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
     assert "copilot" not in d.done
     assert "reviewed — no findings" not in _table_row(out, "Copilot", 1)
-    assert len(gh.copilot_summons()) >= 1
+    assert "copilot" in d.polishing  # the soft bucket, never the crown
 
 
 def test_transient_failure_apologies_never_promote():
@@ -302,10 +306,11 @@ def test_reviewed_all_files_overview_still_promotes():
     assert gh.copilot_summons() == []
 
 
-def test_unable_to_review_body_is_not_crowned_and_is_resummoned():
+def test_unable_to_review_body_is_never_crowned():
     """An apology body that slips past the deliberately-narrow errored regexes
-    (no 'error'/'failed' wording) must not ride the promotion: no label, not
-    done, and the bot IS re-summoned in the next round."""
+    (no 'error'/'failed' wording) must not ride the promotion: no thumbs-up
+    label, never in ``done`` — the only drop it may get is the soft polish-only
+    bucket (--rr-clearable), never the voluntarily-done crown."""
     assert detectors.detect_signal(UNABLE) is None  # it really does slip past
     cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
     timeline = [(0, Comment(id="na", text=UNABLE,
@@ -315,9 +320,7 @@ def test_unable_to_review_body_is_not_crowned_and_is_resummoned():
     assert "copilot" not in d.done
     assert "excluding copilot" not in out
     assert "reviewed — no findings" not in _table_row(out, "Copilot", 1)
-    # Round 2 re-summons it (auto_on_open bots are only POSTed on rounds ≥2, so
-    # any requested_reviewers call proves the re-summon fired).
-    assert len(gh.copilot_summons()) >= 1
+    assert "copilot" in d.polishing
 
 
 # ---------------------------------------------------------------------------
