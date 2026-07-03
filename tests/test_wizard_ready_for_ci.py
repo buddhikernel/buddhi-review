@@ -164,6 +164,58 @@ def test_bake_multiline_command_keeps_each_line_indented():
     assert wizard._CI_COMMAND_MARKER not in baked
 
 
+# ── _installed_ci_command — workflow-level context guards ───────────────────────────
+
+def _wf(body: str) -> str:
+    """Wrap a YAML body in a minimal workflow skeleton."""
+    return f"name: ci\non: [push]\n{body}"
+
+
+def test_installed_ci_command_basic_extraction():
+    text = _wf("jobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) == "python -m pytest"
+
+
+def test_installed_ci_command_workflow_level_env_returns_none():
+    """A top-level ``env:`` block applies to every step; the stock template cannot
+    carry it, so the command must be treated as unextractable."""
+    text = _wf("env:\n  DB_URL: postgres://localhost/test\n"
+               "jobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_workflow_level_defaults_run_wd_returns_none():
+    """A workflow-level ``defaults.run.working-directory`` silently changes every
+    run step's directory; baking the command without it would run in the wrong dir."""
+    text = _wf("defaults:\n  run:\n    working-directory: src\n"
+               "jobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_workflow_level_defaults_run_shell_returns_none():
+    """A workflow-level ``defaults.run.shell`` changes the shell for every run step."""
+    text = _wf("defaults:\n  run:\n    shell: bash\n"
+               "jobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_job_level_env_still_returns_none():
+    """Job-level env guard must still fire even when workflow-level env is absent."""
+    text = _wf("jobs:\n  ci:\n    runs-on: ubuntu-latest\n"
+               "    env:\n      PYTHONPATH: src\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
 # ── _probe_ready_for_ci_workflow — P7 #4 probe-before-install ───────────────────────
 
 def _probe_router(*, present, content="base64==", rc=None):

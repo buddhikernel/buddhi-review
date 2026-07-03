@@ -1251,6 +1251,21 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
         return None
     if not isinstance(doc, dict):
         return None
+    # Workflow-level execution context that we cannot carry into the stock template:
+    # `env` at the workflow scope injects vars that GitHub applies to every job/step;
+    # `defaults.run.working-directory` / `defaults.run.shell` at the workflow level
+    # silently change the directory or shell for ALL run steps.  Baking the command
+    # without these would produce a gate running in the wrong directory, wrong shell,
+    # or missing env vars — fail closed, same as the job-level guards below.
+    if doc.get("env"):
+        return None
+    _wf_defaults_run = doc.get("defaults") or {}
+    if isinstance(_wf_defaults_run, dict):
+        _wf_defaults_run = _wf_defaults_run.get("run") or {}
+    else:
+        _wf_defaults_run = {}
+    if _wf_defaults_run.get("working-directory") or _wf_defaults_run.get("shell"):
+        return None
     jobs = doc.get("jobs")
     if not isinstance(jobs, dict) or not jobs:
         return None
