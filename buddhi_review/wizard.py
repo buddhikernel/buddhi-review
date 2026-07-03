@@ -1060,7 +1060,8 @@ def _pyproject_test_extra(pyproject_text: str) -> bool:
     for ln in pyproject_text.splitlines():
         s = ln.strip()
         if s.startswith("["):
-            in_section = s.replace(" ", "") == "[project.optional-dependencies]"
+            header = s.split("#")[0].strip().replace(" ", "").replace("\t", "")
+            in_section = header == "[project.optional-dependencies]"
             continue
         if in_section and re.match(r"""^(?:test|"test"|'test')\s*=""", s):
             return True
@@ -1268,7 +1269,13 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
         if not isinstance(step, dict):
             continue
         if "run" not in step:
-            continue  # `uses:` steps (checkout) contribute no command
+            uses_val = step.get("uses", "")
+            # Only the checkout action is safe to skip — any other `uses:` step
+            # (e.g. setup-uv, setup-node) provides environment the run commands
+            # depend on; baking the run commands without it builds a broken gate.
+            if not isinstance(uses_val, str) or not uses_val.startswith("actions/checkout"):
+                return None
+            continue
         run_val = step["run"]
         if not isinstance(run_val, str):
             # A non-string `run:` (YAML parsed `run: false` into a boolean; the
