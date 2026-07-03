@@ -1,5 +1,5 @@
-<svg viewBox="0 0 860 560" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
-<rect width="860" height="560" fill="#fff"/>
+<svg viewBox="0 0 860 480" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<rect width="860" height="480" fill="#fff"/>
 <text x="30" y="36" font-size="19" font-weight="700" fill="#111">Valid bugs caught by each reviewer, per run</text>
 <text x="30" y="57" font-size="12.5" fill="#555">Every qualifying run with 20 or more valid bugs (all 7 of them). Segment length: the number of that run&#8217;s bugs each reviewer caught.</text>
 <text x="98" y="110" font-size="12.5" font-weight="700" fill="#333" text-anchor="end">Run A</text>
@@ -59,6 +59,7 @@
 <text x="303" y="414" font-size="11.5" fill="#444">Gemini</text>
 <rect x="379" y="404" width="11" height="11" rx="2" fill="#8B95A5"/>
 <text x="395" y="414" font-size="11.5" fill="#444">Copilot</text>
-<text x="110" y="432" font-size="10.5" fill="#999">On runs C, F, and G, Claude posted an explicit all-clear (&#8220;No issues found.&#8221;). On runs A and B it did not post an all-clear; it commented, but no comment</text>
-<text x="110" y="446" font-size="10.5" fill="#999">produced a valid bug. Each bug is credited to one catching reviewer. Ledger data, repo anonymized.</text>
+<text x="110" y="432" font-size="10.5" fill="#999">On Runs C, F, and G, Claude posted an explicit all-clear (&#8220;No issues found.&#8221;); the other reviewers subsequently identified 66 valid bugs. On</text>
+<text x="110" y="446" font-size="10.5" fill="#999">Runs A and B, Claude left review comments rather than an all-clear, but none of those comments identified a valid bug. Each bug is credited</text>
+<text x="110" y="460" font-size="10.5" fill="#999">to one catching reviewer. Ledger data, repo anonymized.</text>
 </svg>
