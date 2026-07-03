@@ -1,34 +1,36 @@
 # Getting started
 
-This walks you from a fresh machine to your first PR reviewed by Buddhi. It takes a
-few minutes, most of which is one-time reviewer setup you do once per repo.
+This guide takes you from the required tools and accounts to your first PR reviewed by
+Buddhi. You will install the package, connect at least one reviewer, run the setup
+wizard, and start a review.
 
-> **Buddhi lands your PRs.** A pull request is a flight: it takes off, flies the
-> review rounds, and comes in clean, ready to land (merge). Buddhi reads each
-> reviewer's comments, classifies them, and lets the kernel decide what to do; you
-> answer anything it can't decide right in your terminal.
+> Buddhi sends the PR through repeated review-and-fix rounds. When it needs your
+> judgment, it links you to a local answer file. It never merges unless you opt in.
 
-## Before you start
+## 1. Before you start
 
-You need four things in place:
+You need these four things in place:
 
-- **Claude Code** with the `claude` CLI installed and signed in (the loop drives
-  `claude -p` to classify comments and apply fixes).
-- **The GitHub CLI (`gh`)** installed and authenticated (`gh auth status` is clean).
-  Copilot summoning needs `gh` **≥ 2.87**.
+- **Claude Code** with the `claude` CLI installed and signed in — the loop drives
+  `claude -p` to classify comments and apply fixes.
+- **The GitHub CLI (`gh`)** installed and authenticated, so that `gh auth status`
+  confirms that you are signed in. Copilot summoning needs `gh` **≥ 2.87**.
 - **Python 3.9+**.
-- **A GitHub repository you can open PRs on**, with at least one reviewer bot you can
-  enable (see [Set up your reviewers](#3-set-up-your-reviewers) below).
+- **A GitHub repository in which you can open pull requests** and configure at least
+  one supported reviewer (see [Choose and set up your reviewers](#3-choose-and-set-up-your-reviewers)).
 
-## 1. Install
+Those four are required. Each reviewer you then enable has its own plan, app, workflow,
+or secret requirements, covered in step 3.
+
+## 2. Install
 
 ```bash
 pip install buddhi-review
 ```
 
-This pulls the kernel ([`buddhikernel`](https://github.com/buddhikernel/buddhi)) and
-`PyYAML`, and installs the `buddhi-review` command. Then add the two slash-command
-skills to Claude Code as **skills** (one time; each becomes `~/.claude/skills/<name>/SKILL.md`):
+This installs the `buddhi-review` command, the
+[Buddhi kernel](https://github.com/buddhikernel/buddhi), and the bundled `/review-pr`
+and `/create-pr` skills. Copy the two skills into Claude Code:
 
 ```bash
 SKILLS=$(python3 -c "import buddhi_review, os; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'skills'))" 2>/dev/null)
@@ -42,47 +44,57 @@ else
 fi
 ```
 
-Restart Claude Code afterward so it picks up the new skills directory. (If a
-slash-command of the same name already exists, the skill takes precedence.)
+Restart Claude Code to load the new skills. Each skill is installed under
+`~/.claude/skills/<name>/SKILL.md`. If a slash command with the same name already
+exists, the skill takes precedence.
 
 Sanity-check the install with the offline health check, which runs the kernel-driven
-pipeline on built-in fixtures, with no network and no `claude` call:
+pipeline on built-in fixtures with no network and no `claude` call:
 
 ```bash
 python3 -m buddhi_review self-check
 ```
 
-A clean install ends with `SELF-CHECK OK — the kernel decided every disposition.`
+A successful check ends with `SELF-CHECK OK — the kernel decided every disposition.`
 
-## 2. Run the setup wizard
+## 3. Choose and set up your reviewers
 
-```bash
-/review-pr setup
-```
+Buddhi supports up to four reviewers, but it does not install or enable their vendor
+apps and workflows for you. If the corresponding app or workflow is not installed, the
+reviewer cannot respond — the loop can send a trigger that no installed reviewer will
+receive.
 
-The wizard is an interactive terminal program, so it opens in a **fresh terminal
-window**; complete it there. It walks you through:
+Enable only reviewers that are configured for the repository. Reviewers you leave
+disabled are excluded from triggering, waiting, and run summaries.
 
-- a **tooling doctor** that checks `gh` and `claude` are present and authenticated,
-- your **Claude plan** (drives which model each role uses),
-- the **repository** to bind, and
-- your **reviewer fleet**: which of Copilot / Gemini / Codex / Claude you have, and
-  for each, whether it already reviews a PR automatically when one opens
-  (`auto_on_open`).
+### What a review costs you
 
-It then confirms the **console answer-file** as your notification channel and writes
-everything to `~/.config/review-loop/config.yaml`. If you run without `--repo` (the
-normal case when you're inside the target repo), the loop proceeds without a config
-file. If you pass `--repo OWNER/REPO` explicitly, the repo must be confirmed first.
-An unconfirmed repo exits with a setup banner unless a global default fleet is already
-configured or `BUDDHI_ALLOW_UNCONFIRMED_REPO=1` is set.
+Buddhi is free and MIT-licensed, but each review consumes quota from the provider
+accounts you connect. Buddhi does not bill you or proxy reviews through its own
+accounts. Each reviewer draws on a plan you already hold, and the loop's own classify
+and fix calls run on your machine against your Claude subscription:
 
-## 3. Set up your reviewers
+| Surface | Account or quota used |
+|---|---|
+| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
+| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
+| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
+| **Gemini review** | Your **Gemini Code Assist** entitlement. |
+| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
 
-Buddhi can drive up to four review bots, but **none is automatic for a new user**.
-Each one needs its vendor app or workflow installed on the repo first, or the loop's
-trigger comment fires into a void. Enable only the reviewers you actually have; the
-rest are subtracted everywhere.
+Two forms of usage may appear in your GitHub billing: Copilot AI credits and GitHub
+Actions minutes (the `claude[bot]` workflow). Watch or cap them at
+**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
+The remaining usage is covered by the corresponding vendor accounts or plans (ChatGPT
+for Codex, Gemini Code Assist, and your Claude subscription for the loop itself).
+
+Enable only the reviewers whose plans you hold. `/review-pr setup` disables reviewers
+you do not select, so they are neither triggered nor charged against your quota.
+
+### Reviewer requirements
+
+Buddhi triggers each reviewer differently, and each needs its vendor app or workflow
+installed on the repository first:
 
 | Reviewer | How the loop triggers it | What you must set up first |
 |---|---|---|
@@ -91,7 +103,16 @@ rest are subtracted everywhere.
 | **Codex** | `@codex review` comment | the **OpenAI Codex** GitHub app + a **ChatGPT** plan |
 | **Claude** | `@claude review` comment | the bundled **`claude-code-review.yml`** workflow + a `CLAUDE_CODE_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` repo secret |
 
-### The `claude[bot]` reviewer needs a workflow
+The full per-reviewer how-to (apps, plans, triggers, and the `auto_on_open` setting for
+each) is in
+[`references/reviewer-setup.md`](https://github.com/buddhikernel/buddhi-review/blob/main/buddhi_review/skills/review-pr/references/reviewer-setup.md).
+Config keys and the plan → model mapping are in
+[`references/configuration.md`](https://github.com/buddhikernel/buddhi-review/blob/main/buddhi_review/skills/review-pr/references/configuration.md).
+
+### Claude workflow setup
+
+<details>
+<summary><b>Only if you enable the Claude reviewer</b></summary>
 
 Claude review is workflow-driven, not app-driven. Install the bundled GitHub Actions
 workflow — [`claude-code-review.yml`](https://github.com/buddhikernel/buddhi-review/blob/main/buddhi_review/skills/review-pr/references/claude-code-review.yml)
@@ -103,91 +124,132 @@ or a pay-as-you-go key in `ANTHROPIC_API_KEY` (use whichever you have):
 gh secret set CLAUDE_CODE_OAUTH_TOKEN   # or: gh secret set ANTHROPIC_API_KEY
 ```
 
-Ship the workflow verbatim: its prompt emits a literal `No issues found.` line on a
-clean review, and the loop's clean-review detector is coupled to that exact string.
+Copy the workflow without modification. The workflow must preserve the exact
+`No issues found.` output on a clean review, because the loop uses that string to
+detect an all-clear.
 
-**Re-running `/review-pr setup` keeps this current.** If Claude's reviews go silent,
-its stored token may have expired or been mis-pasted — setup checks the repo's last
-run and offers to re-mint the secret. It also offers to update the bundled workflow
-when a newer version has shipped (your old copy stays in the update PR's history).
+**Re-running `/review-pr setup` keeps this current.** If Claude's reviews go silent, its
+stored token may have expired or been mis-pasted — setup checks the repo's last run and
+offers to generate and store a replacement token. It also offers to update the bundled
+workflow when a newer version has shipped; workflow updates are proposed through a PR,
+so the previous version remains available in Git history.
 
-The full per-reviewer how-to (apps, plans, triggers, and the `auto_on_open` setting
-for each) is in
-[`references/reviewer-setup.md`](https://github.com/buddhikernel/buddhi-review/blob/main/buddhi_review/skills/review-pr/references/reviewer-setup.md).
-Config keys and the plan → model mapping are in
-[`references/configuration.md`](https://github.com/buddhikernel/buddhi-review/blob/main/buddhi_review/skills/review-pr/references/configuration.md).
+</details>
 
-## 4. Review a PR
+## 4. Run the setup wizard
+
+```bash
+/review-pr setup
+```
+
+The wizard is an interactive terminal program, so it opens in a **fresh terminal
+window**; complete it there. It walks you through:
+
+- a **tooling doctor** that checks `gh` and `claude` are present and authenticated;
+- your **Claude plan**, which determines the model used for each role;
+- the **repository** to configure; and
+- your **reviewer fleet**: which of Copilot / Gemini / Codex / Claude you have, and for
+  each, whether it already reviews a PR automatically when one opens (`auto_on_open`).
+
+It then confirms the **local answer-file channel** for questions that require your
+input.
+
+The wizard stores your global settings in `~/.config/review-loop/config.yaml`. When you
+run the loop from inside a repository without `--repo`, it uses the current repository
+automatically. When you pass `--repo OWNER/REPO`, that repository must be confirmed
+unless a global default fleet is configured or `BUDDHI_ALLOW_UNCONFIRMED_REPO=1` is set.
+
+## 5. Review a PR
 
 Two entry points:
 
 ```bash
-# Review a PR that already exists:
+# Review an existing PR:
 /review-pr <pr>
 
 # …or open a PR from your current branch and review it in one step:
 /create-pr
 ```
 
-Both launch the review loop **detached** so it survives the session, and hand control
-back to you. Here is what you see while it flies:
+Both launch the review loop as a detached process, allowing it to continue after the
+Claude Code session ends, and hand control back to you.
 
-- **A launch line and a live-log link.** The launcher prints the log path and a
-  *Telemetry (live log)* hint. Follow the run with `tail -n +1 -f <log>` (on macOS a
-  clickable `file://` "Watch" link opens a window that replays the run from line 1):
+### What you will see during a run
 
-  ```text
-  log: /tmp/buddhi-review-<user>/buddhi-<repo>-PR123.log
-  Cleared for takeoff — buddhi-review launched (PID 4242) on PR #123
-  Telemetry (live log) — follow it with:  tail -n +1 -f "…/buddhi-<repo>-PR123.log"
-  ```
+During a run, you will see:
 
-  The log basename carries the repo name (`<repo>` = the part after `/` in `owner/repo`),
-  so reviewing the same PR number in two different repos never writes to the same file.
+- **the live-log location** — the launcher prints the log path and a `file://` "Watch"
+  link you can follow with `tail -n +1 -f <log>`;
+- **a per-round summary table** — one row per enabled reviewer, with what each posted
+  and its status; if a reviewer stops participating, the summary displays the reason;
+- **clearance requests** when the loop needs a decision from you — it writes the
+  question to an editable answer file and prints a `file://` link; enter a number (or
+  your own text) on the answer line, save, and the loop continues.
 
-- **A per-round summary table**: one row per enabled reviewer, with what each posted
-  and its status (`reviewed`, `active`, `done`, `quota`, `PR too large`, `errored`,
-  `polishing`, `silent (dropped)`, `excluded`, or `not configured (repo)`),
-  so a reviewer that drops out of the expected set never disappears without a reason:
+<details>
+<summary><b>Example run output</b></summary>
 
-  ```text
-  Round 1 of 10 summary
-  ┌───────────┬────────┬─────…
-  │ Bot       │ Posted │  …
-  ```
+The launcher prints a log path and a live-log hint:
 
-- **Clearance requests** when the loop needs a decision from you. It writes the
-  question to an editable answer file and prints a `file://` link; open it, type a
-  number (or your own text) on the answer line, save, and the loop continues:
+```text
+log: /tmp/buddhi-review-<user>/buddhi-<repo>-PR123.log
+Cleared for takeoff — buddhi-review launched (PID 4242) on PR #123
+Telemetry (live log) — follow it with:  tail -n +1 -f "…/buddhi-<repo>-PR123.log"
+```
 
-  ```text
-  [Clearance — a decision the loop needs from you] How should item 'c4' be handled?
-    1. Apply the suggested change
-    2. Skip — the suggestion is not valid here
-    3. Defer — this needs your judgment
-    answer here → file:///…/review-answer-<repo>-PR123-c4.md
-  ```
+The log basename carries the repo name (`<repo>` = the part after `/` in `owner/repo`),
+so reviewing the same PR number in two different repos never writes to the same file.
 
-- **`⚙ [auto]` markers** whenever the loop takes an action on its own (for example a
-  squash-merge on a clean exit, when you opt into auto-merge). Every autonomous action
-  is logged so the trail is greppable.
+Each round prints a summary table, one row per enabled reviewer, with what it posted and
+its status — `reviewed`, `active`, `done`, `quota`, `PR too large`, `errored`,
+`polishing`, `silent (dropped)`, `excluded`, or `not configured (repo)`:
 
-The loop runs review→fix rounds and ends the moment a round produces no substantive
-progress — a round that lands a real fix earns another review round, but a cosmetic-only
-(or nothing-to-fix) round finishes clean. If the round budget runs out with the final
-round clean, that exit is treated like any other clean finish. It **never merges unless
-you opt in** (`--auto-merge`); by default it stops on a clean pass and leaves the merge
-to you.
+```text
+Round 1 of 10 summary
+┌───────────┬────────┬─────…
+│ Bot       │ Posted │  …
+```
 
-### Drive the CLI directly
+Clearance requests look like this:
 
-You can skip the slash commands and drive the loop yourself:
+```text
+[Clearance — a decision the loop needs from you] How should item 'c4' be handled?
+  1. Apply the suggested change
+  2. Skip — the suggestion is not valid here
+  3. Defer — this needs your judgment
+  answer here → file:///…/review-answer-<repo>-PR123-c4.md
+```
+
+`⚙ [auto]` markers appear whenever the loop takes an action on its own (for example a
+squash-merge on a clean exit, when you opt into auto-merge). Every autonomous action is
+logged, so the complete action trail remains searchable in the log.
+
+</details>
+
+The loop runs review→fix rounds. It continues while a round lands a **substantive** fix
+that needs another review, and it stops when:
+
+- a round produces no substantive progress — a clean review, or a round whose only
+  changes are cosmetic or otherwise non-actionable;
+- the round budget is exhausted — it auto-sizes to the diff, with a floor of 2 and a
+  default of 10; or
+- it hits something it cannot resolve on its own — an unanswered escalation, a failed
+  push, or a worktree it could not roll back.
+
+It merges only when you opt into auto-merge (`--auto-merge`, or `auto_merge` in the
+repo's config); by default it stops on a clean pass and leaves the merge to you.
+
+## 6. Advanced: drive the CLI directly
+
+Most first-time users stay with `/review-pr` and `/create-pr`. To skip the slash
+commands and drive the loop yourself:
 
 ```bash
 python3 -m buddhi_review review-pr 123 --repo OWNER/REPO --cwd /path/to/checkout
 ```
 
-or detach it as a background loop and follow its log:
+<details>
+<summary><b>Run it as a detached background loop</b></summary>
 
 ```bash
 LAUNCHER=$(python3 -c "import os, buddhi_review; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'launch-review.sh'))" 2>/dev/null)
@@ -196,32 +258,9 @@ if [ -f "$LAUNCHER" ]; then
 fi
 ```
 
-## What a review costs you
+</details>
 
-Buddhi is free and MIT-licensed, but **the reviews it runs spend your own provider
-quotas.** Buddhi never bills you and never proxies a review through an account of its
-own. Each reviewer draws on a plan you already hold, and the loop's own classify and
-fix calls run on your machine against your Claude subscription:
-
-| Surface | Whose meter it spends |
-|---|---|
-| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
-| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
-| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
-| **Gemini review** | Your **Gemini Code Assist** entitlement. |
-| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
-
-Two of these meters are on your GitHub bill: **GitHub AI credits** (Copilot) and
-**GitHub Actions minutes** (the `claude[bot]` workflow). Watch or cap them at
-**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
-The rest are the vendor plans you already pay for (ChatGPT for Codex, Gemini Code
-Assist, your Claude subscription for the loop itself).
-
-Enable only the reviewers whose plans you hold. `/review-pr setup` subtracts the
-rest, so no trigger fires into a void and nothing is spent on a reviewer you do not
-run.
-
-## Where to go next
+## 7. Where to go next
 
 - [`references/reviewer-setup.md`](https://github.com/buddhikernel/buddhi-review/blob/main/buddhi_review/skills/review-pr/references/reviewer-setup.md)
   — what each reviewer requires (vendor app, plan, trigger, `auto_on_open`).

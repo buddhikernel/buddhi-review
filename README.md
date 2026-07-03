@@ -137,30 +137,16 @@ check still ends with `SELF-CHECK OK`.
 ```
 
 To drive the CLI directly or detach the loop as a background process, see
-[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#4-review-a-pr).
+[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#6-advanced-drive-the-cli-directly).
 
-## What a review costs you
+## Provider usage and cost
 
-Buddhi is free and MIT-licensed, but **each review consumes quota from the provider
-accounts you connect.** Buddhi does not bill you or proxy reviews through its own
-accounts. Each reviewer draws on a plan you already hold:
+Buddhi is free and MIT-licensed, but its reviews consume quota from the provider
+accounts you connect. The loop itself uses your Claude subscription, and each enabled
+reviewer uses its associated plan or account. Buddhi does not bill you or proxy
+reviews through its own accounts.
 
-| Surface | Account or quota used |
-|---|---|
-| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
-| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
-| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
-| **Gemini review** | Your **Gemini Code Assist** entitlement. |
-| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
-
-The minimum viable setup is a Claude subscription, which powers the loop's own
-classify and fix calls, plus at least one reviewer plan you already hold.
-`/review-pr setup` disables the rest, so nothing is spent on a reviewer you do not
-run.
-
-Check or cap your GitHub-side spend at
-**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
-See [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)
+See **[What a review costs you](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)**
 for the full breakdown.
 
 ## What real review runs show
@@ -298,10 +284,11 @@ reviews the current code, acts on every actionable finding, and then reviews the
 updated code again. It converges when a post-fix review returns no new findings that
 require action.
 
-Two guardrails apply. First, every fix is followed by at least one confirmation
-round, so no fix lands unreviewed. Second, the round budget scales with the size of
-the change. Questions that genuinely require human judgment follow the separate
-escalation path described in [When it asks you](#when-it-asks-you).
+Two guardrails apply. First, a substantive fix is always followed by another review
+round, so a behavior-changing fix is never the loop's last, unreviewed action. Second,
+the round budget scales with the size of the change. Questions that genuinely require
+human judgment follow the separate escalation path described in
+[When it asks you](#when-it-asks-you).
 
 A clean round is not proof that the code is correct. It means only that the panel
 found nothing further to act on within the configured review budget.
