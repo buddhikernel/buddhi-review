@@ -6,12 +6,15 @@ sends each PR to a cross-vendor panel of AI reviewers, classifies their findings
 applies fixes, and repeats until the pull request is ready to land. It auto-merges
 only when you opt in.
 
-**LLMs tend to evaluate their own output more favorably, and an AI reviewer usually
-misses most of the bugs in one pass. This is why Buddhi fields a cross-vendor panel
-and re-reviews after every major fix. Across 88 qualifying internal runs on a
-codebase written with Claude Code, four reviewers—Claude, Codex, Gemini, and
-Copilot—found 681 valid bugs, yet Claude grading its own code caught just 3.8%, and
-half of the bugs surfaced only in round 2 or later.**
+**One model reviewing its own work once is not enough.** LLMs tend to evaluate their
+own output more favorably, and a single review pass can leave many bugs undiscovered.
+That is why Buddhi uses a [cross-vendor panel and re-reviews the code after each
+round of fixes](#why-a-panel-and-why-rounds).
+
+Across [88 qualifying internal runs](#what-real-review-runs-show) on a codebase
+written with Claude Code, the four-reviewer panel—Claude, Codex, Gemini, and
+Copilot—found 681 valid bugs. Claude found just 3.8% of them, and half surfaced only
+in round 2 or later.
 
 New here? Run `pip install buddhi-review`, then follow
 **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
@@ -136,6 +139,30 @@ check still ends with `SELF-CHECK OK`.
 To drive the CLI directly or detach the loop as a background process, see
 [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#4-review-a-pr).
 
+## What a review costs you
+
+Buddhi is free and MIT-licensed, but **each review consumes quota from the provider
+accounts you connect.** Buddhi does not bill you or proxy reviews through its own
+accounts. Each reviewer draws on a plan you already hold:
+
+| Surface | Account or quota used |
+|---|---|
+| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
+| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
+| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
+| **Gemini review** | Your **Gemini Code Assist** entitlement. |
+| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
+
+The minimum viable setup is a Claude subscription, which powers the loop's own
+classify and fix calls, plus at least one reviewer plan you already hold.
+`/review-pr setup` disables the rest, so nothing is spent on a reviewer you do not
+run.
+
+Check or cap your GitHub-side spend at
+**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
+See [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)
+for the full breakdown.
+
 ## What real review runs show
 
 These results come from Buddhi review loops on a large private repository, where
@@ -222,12 +249,11 @@ in total, reviewer by reviewer.
 | G | 20 | 0&dagger; | 0.0% | 4 | 20.0% | 2 | 0 (0.0%) |
 | **All 88 qualifying runs** | **681** | **26** | **3.8%** | **341** | **50.1%** | **189** | **93 (49.2%)** |
 
-&dagger; On Runs C, F, and G, Claude reviewed and posted an explicit all-clear ("No
-issues found."), and the panel went on to find 22, 24, and 20 valid bugs
-respectively.
+&dagger; On Runs C, F, and G, Claude posted an explicit all-clear (“No issues
+found.”); the other reviewers subsequently identified 66 valid bugs.
 
-&Dagger; On Runs A and B, Claude did not post an all-clear. It reviewed and left
-comments, but none of them produced a valid bug.
+&Dagger; On Runs A and B, Claude left review comments rather than an all-clear, but
+none of those comments identified a valid bug.
 
 Notes and caveats:
 
@@ -246,30 +272,6 @@ Notes and caveats:
   signal patterns.
 
 </details>
-
-## What a review costs you
-
-Buddhi is free and MIT-licensed, but **each review consumes quota from the provider
-accounts you connect.** Buddhi does not bill you or proxy reviews through its own
-accounts. Each reviewer draws on a plan you already hold:
-
-| Surface | Account or quota used |
-|---|---|
-| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
-| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
-| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
-| **Gemini review** | Your **Gemini Code Assist** entitlement. |
-| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
-
-The minimum viable setup is a Claude subscription, which powers the loop's own
-classify and fix calls, plus at least one reviewer plan you already hold.
-`/review-pr setup` disables the rest, so nothing is spent on a reviewer you do not
-run.
-
-Check or cap your GitHub-side spend at
-**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
-See [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)
-for the full breakdown.
 
 ## Why a panel and why rounds
 
