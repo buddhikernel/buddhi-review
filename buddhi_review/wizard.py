@@ -1272,6 +1272,11 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
     job_env = job.get("env")
     if job_env:
         return None
+    # Job-level service containers (e.g. postgres, redis) are unprovisionable in
+    # the stock template's single-step shell; commands that rely on them would fail
+    # silently, so treat the gate as unextractable.
+    if job.get("services"):
+        return None
     _job_defaults_run = job.get("defaults") or {}
     if isinstance(_job_defaults_run, dict):
         _job_defaults_run = _job_defaults_run.get("run") or {}
@@ -1332,6 +1337,12 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
     # A non-final step ending in a dangling continuation would fold the NEXT
     # step's command into itself as arguments — unexpressible on one line.
     if any(_ends_in_continuation(c) for c in commands[:-1]):
+        return None
+    # Multiple run steps cannot be safely joined: GitHub Actions runs each `run:`
+    # step in its own shell process, so `cd`/`export` side-effects from step N
+    # do NOT persist to step N+1 — joining them on one `&&`-chain would recreate
+    # a different (and wrong) execution environment.
+    if len(commands) > 1:
         return None
     return _join_shell_lines(commands)
 

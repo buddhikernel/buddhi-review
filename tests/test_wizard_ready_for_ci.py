@@ -548,7 +548,10 @@ def test_extract_verbatim_single_run_line():
     assert wizard._installed_ci_command(_CUSTOM_GATE) == _CUSTOM_CMD
 
 
-def test_extract_multi_step_joins_in_step_order():
+def test_extract_multi_step_bails_on_step_isolation():
+    """Multi-step gates cannot be safely joined: each `run:` step in GitHub
+    Actions is a new shell, so `cd`/`export` in step N do NOT persist to
+    step N+1. Joining as `&&` would produce different (wrong) shell state."""
     text = _gate("      - uses: actions/checkout@v4\n"
                  "      - name: Install\n"
                  "        run: pip install -e '.[test]'\n"
@@ -556,9 +559,7 @@ def test_extract_multi_step_joins_in_step_order():
                  "        run: python -m pytest -q\n"
                  "      - name: Gate\n"
                  "        run: python tools/publish_gate.py scan\n")
-    assert wizard._installed_ci_command(text) == (
-        "pip install -e '.[test]' && python -m pytest -q && "
-        "python tools/publish_gate.py scan")
+    assert wizard._installed_ci_command(text) is None
 
 
 def test_extract_multiline_block_joins_lines_and_drops_comments():
