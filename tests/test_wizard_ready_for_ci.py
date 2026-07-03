@@ -268,8 +268,10 @@ def test_installed_ci_command_ubuntu_latest_single_element_list_extracts():
 
 
 def test_installed_ci_command_missing_runs_on_still_extracts():
-    """An absent ``runs-on`` is what the stock template already uses (ubuntu-latest);
-    leave it extractable so the missing-key case is not rejected."""
+    """An absent ``runs-on`` is accepted for robustness; the stock
+    template sets ubuntu-latest but omitting the key is treated as
+    equivalent — leave it extractable so the missing-key case is not
+    rejected."""
     text = _wf("jobs:\n  ci:\n    steps:\n"
                "      - uses: actions/checkout@v4\n"
                "      - run: python -m pytest\n")

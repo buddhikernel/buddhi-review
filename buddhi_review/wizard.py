@@ -1284,9 +1284,10 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
     # `${{ matrix.* }}` expression, or a labels list) carries commands that assume that
     # runner — Xcode, PowerShell, self-hosted tooling — so rebaking them onto
     # ubuntu-latest would run them where those tools do not exist. Fail closed unless
-    # the runner is the stock ubuntu-latest (or absent, which is what the template is).
-    # A single-element list (`[ubuntu-latest]`) is normalized; anything else — another
-    # scalar, a multi-label list, or a matrix expression — is treated as non-stock.
+    # the runner is the stock ubuntu-latest (or absent, accepted for robustness — user
+    # workflows may omit the key). A single-element list (`[ubuntu-latest]`) is
+    # normalized; anything else — another scalar, a multi-label list, or a matrix
+    # expression — is treated as non-stock.
     _runs_on = job.get("runs-on")
     if isinstance(_runs_on, list) and len(_runs_on) == 1:
         _runs_on = _runs_on[0]
