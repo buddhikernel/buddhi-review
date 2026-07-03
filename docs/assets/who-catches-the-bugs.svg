@@ -37,8 +37,7 @@
 <rect x="551.1" y="387.7" width="258.9" height="20" rx="4" fill="#111"/>
 <text x="680.6" y="401.7" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">all 88 qualifying runs: Claude = 3.8%</text>
 <text x="55.0" y="472" font-size="11" fill="#777">Flat stubs are zero. In 14 of these 20 runs Claude reviewed the code and caught nothing.</text>
-<text x="55.0" y="497" font-size="13" font-weight="700" fill="#C2410C">Across all 88 qualifying runs, Claude caught 3.8% of the</text>
-<text x="55.0" y="514" font-size="13" font-weight="700" fill="#C2410C">valid bugs. Reviewers from other vendors caught 96.2%.</text>
-<text x="55.0" y="533" font-size="10.5" fill="#999">Claude caught 18 of the 189 high or critical bugs (9.5%). Of the high or critical</text>
-<text x="55.0" y="547" font-size="10.5" fill="#999">bugs found in round 2 or later, 93.5% came from a non-Claude reviewer.</text>
+<text x="55.0" y="500" font-size="13" font-weight="700" fill="#C2410C">Across all 88 qualifying runs, Claude caught 3.8% of the valid bugs. Reviewers from other vendors caught 96.2%.</text>
+<text x="55.0" y="520" font-size="10.5" fill="#999">Claude caught 18 of the 189 high or critical bugs (9.5%). Of the high or critical bugs found in round 2 or later, 93.5% came from a non-Claude</text>
+<text x="55.0" y="534" font-size="10.5" fill="#999">reviewer.</text>
 </svg>
