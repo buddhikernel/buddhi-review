@@ -370,7 +370,7 @@ def test_set_claude_secret_dual_credential_present(monkeypatch, repo_secrets, ex
 
 def test_set_claude_secret_neither_credential_proceeds(monkeypatch):
     # Neither present → the wizard proceeds to offer minting. Consent Yes reaches the
-    # paste; a blank token there routes to the by-hand instructions ("deferred").
+    # paste; a blank token there routes to the by-hand instructions ("skipped").
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     run, _ = _recorder(_exists_router(owner_type="User", repo_secrets=[]))
     pal, buf = wizard._Palette(False), io.StringIO()
@@ -777,7 +777,7 @@ def test_set_claude_secret_validator_crash_fails_safe(monkeypatch):
 def test_set_claude_secret_present_and_401_enters_remint(monkeypatch):
     # The stored OAuth token is failing live (probe → True) → DON'T skip; enter the
     # re-mint flow. Consent Yes reaches the paste; a blank paste there routes to the
-    # by-hand instructions ("deferred", NOT "present"), and the operator is told the
+    # by-hand instructions ("skipped", NOT "present"), and the operator is told the
     # reviews are failing.
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     run, _ = _recorder(_exists_router(owner_type="User",

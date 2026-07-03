@@ -478,7 +478,7 @@ def _validate_claude_token(token, *, run, which=shutil.which) -> Tuple[str, str]
         try:
             r = run(argv, timeout=25, env=env)
         except Exception as exc:
-            return ("unknown", f"the test couldn't run ({type(exc).__name__}).")
+            return ("unknown", f"The test couldn't run ({type(exc).__name__}).")
         if getattr(r, "returncode", 1) == 0:
             # An apiKeyHelper could have authenticated a BAD token if settings
             # isolation failed, so a pass without it is untrustworthy → "unknown".
