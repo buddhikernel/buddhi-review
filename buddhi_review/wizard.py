@@ -1264,6 +1264,21 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
     steps = job.get("steps")
     if not isinstance(steps, list):
         return None
+    # Job-level execution context that we cannot carry into the stock template:
+    # `defaults.run.working-directory` / `defaults.run.shell` silently change the
+    # directory or shell for every run step; `env` at the job level injects vars the
+    # commands may rely on.  Baking the bare command text without these would produce
+    # a gate that runs from the wrong directory, wrong shell, or missing env vars.
+    job_env = job.get("env")
+    if job_env:
+        return None
+    _job_defaults_run = job.get("defaults") or {}
+    if isinstance(_job_defaults_run, dict):
+        _job_defaults_run = _job_defaults_run.get("run") or {}
+    else:
+        _job_defaults_run = {}
+    if _job_defaults_run.get("working-directory") or _job_defaults_run.get("shell"):
+        return None
     commands: List[str] = []
     for step in steps:
         if not isinstance(step, dict):
@@ -1276,6 +1291,11 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
             if not isinstance(uses_val, str) or not uses_val.startswith("actions/checkout"):
                 return None
             continue
+        # Step-level context fields that we cannot preserve in the template's single
+        # command slot: working-directory, shell, and env all affect how or where the
+        # command runs, and the stock template carries none of them.
+        if step.get("working-directory") or step.get("shell") or step.get("env"):
+            return None
         run_val = step["run"]
         if not isinstance(run_val, str):
             # A non-string `run:` (YAML parsed `run: false` into a boolean; the

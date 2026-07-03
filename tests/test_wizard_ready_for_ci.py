@@ -812,6 +812,73 @@ def test_extract_none_for_unparseable_or_shapeless_yaml():
               "      - name: B\n        run: false\n")) is None
 
 
+def test_extract_none_for_context_dependent_steps():
+    """Steps or jobs with working-directory / shell / env context fields must be
+    rejected — we cannot carry that context into the stock template's single slot."""
+    # Step-level working-directory
+    wd_step = _gate("      - name: CI\n"
+                    "        run: npm test\n"
+                    "        working-directory: frontend\n")
+    assert wizard._installed_ci_command(wd_step) is None
+
+    # Step-level shell override
+    shell_step = _gate("      - name: CI\n"
+                       "        run: make ci\n"
+                       "        shell: bash\n")
+    assert wizard._installed_ci_command(shell_step) is None
+
+    # Step-level env
+    env_step = _gate("      - name: CI\n"
+                     "        run: npm test\n"
+                     "        env:\n"
+                     "          NODE_ENV: test\n")
+    assert wizard._installed_ci_command(env_step) is None
+
+    # Job-level defaults.run.working-directory
+    wd_defaults = (
+        "on: [push]\n"
+        "jobs:\n"
+        "  ci:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    defaults:\n"
+        "      run:\n"
+        "        working-directory: frontend\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: npm test\n"
+    )
+    assert wizard._installed_ci_command(wd_defaults) is None
+
+    # Job-level defaults.run.shell
+    shell_defaults = (
+        "on: [push]\n"
+        "jobs:\n"
+        "  ci:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    defaults:\n"
+        "      run:\n"
+        "        shell: bash\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: make ci\n"
+    )
+    assert wizard._installed_ci_command(shell_defaults) is None
+
+    # Job-level env
+    job_env = (
+        "on: [push]\n"
+        "jobs:\n"
+        "  ci:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    env:\n"
+        "      DB_URL: postgres://localhost/test\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: make test\n"
+    )
+    assert wizard._installed_ci_command(job_env) is None
+
+
 def test_extract_prefers_ci_job_and_tolerates_renamed_single_job():
     renamed = _gate("      - name: CI\n        run: make verify\n", job="tests")
     assert wizard._installed_ci_command(renamed) == "make verify"
