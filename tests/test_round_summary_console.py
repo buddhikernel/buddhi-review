@@ -241,28 +241,68 @@ def test_store_excluded_without_signal_reads_as_excluded_not_unexpected():
 
 def test_bot_status_text_per_cause():
     d = _bare_driver()
-    # done / clean — the one done-for-the-run label, shared by an explicit clean
-    # sentinel and a summary-only genuine review (R2)
+    # clean signal — an EXPLICIT all-clear (sentinel / LGTM) is "Approved 👍"
     d.done.add("claude")
     d._bot_state("claude").signal = detectors.SIGNAL_CLEAN
-    assert d._bot_status_text("claude") == "reviewed — no findings"
+    assert d._bot_status_text("claude") == "Approved 👍"
     # quota / errored
     d._bot_state("copilot").signal = detectors.SIGNAL_QUOTA
     d.store.exclude_quota("copilot")
-    assert d._bot_status_text("copilot") == "quota"
+    assert d._bot_status_text("copilot") == "Quota exhausted ⚠️"
     d._bot_state("codex").signal = detectors.SIGNAL_ERRORED
     d.store.exclude_errored("codex")
-    assert d._bot_status_text("codex") == "errored"
+    assert d._bot_status_text("codex") == "Could not review ❌"
     # store-excluded with no signal → "excluded"
     d.store.exclude_permanent("gemini")
     assert d._bot_status_text("gemini") == "excluded"
 
 
-def test_bot_status_text_active_vs_reviewed():
+def test_bot_status_text_split_approved_vs_no_findings_vs_no_change():
+    # The done-for-the-run labels split three ways on HOW the reviewer got
+    # there: explicit all-clear → Approved; the zero-findings promotion (in
+    # `done` with NO clean signal) → Reviewed — no findings; a dismissed-
+    # substantive demotion → Reviewed — no change.
     d = _bare_driver()
-    assert d._bot_status_text("claude") == "active"          # never seen
+    d._bot_state("claude").signal = detectors.SIGNAL_CLEAN
+    assert d._bot_status_text("claude") == "Approved 👍"
+    d.done.add("copilot")                       # promotion path: no signal
+    assert d._bot_status_text("copilot") == "Reviewed — no findings ✓"
+    d.reviewed_no_change.add("codex")           # dismissed-substantive demotion
+    assert d._bot_status_text("codex") == "Reviewed — no change ✓"
+    d.polishing.add("gemini")                   # cosmetic-only demotion
+    assert d._bot_status_text("gemini") == "Polish-only 🧹"
+
+
+def test_approved_label_is_sticky_across_a_later_hard_signal():
+    # A hard placeholder (quota / errored / PR-too-large) arriving AFTER an
+    # explicit all-clear overwrites the mutable BotState.signal — the sticky
+    # `approved` set must keep the sign-off's label either way round, never
+    # demoting it to the promotion's "Reviewed — no findings ✓".
+    d = _bare_driver()
+    # clean first, quota after (signal overwritten by the placeholder)
+    d.done.add("claude")
+    d.approved.add("claude")
+    d._bot_state("claude").signal = detectors.SIGNAL_QUOTA
+    d.store.exclude_quota("claude")
+    assert d._bot_status_text("claude") == "Approved 👍"
+    # quota first, clean after (signal ends CLEAN) — same label
+    d.done.add("copilot")
+    d.approved.add("copilot")
+    d._bot_state("copilot").signal = detectors.SIGNAL_CLEAN
+    d.store.exclude_quota("copilot")
+    assert d._bot_status_text("copilot") == "Approved 👍"
+
+
+def test_bot_status_text_active_vs_no_review_posted():
+    d = _bare_driver()
+    # Expected yet never seen this round → posted no review (the pre-split
+    # "silent" state, folded into the same label as a silent drop).
+    assert d._bot_status_text("claude") == "No review posted 🔇"
     d._bot_state("claude").last_seen = 12.0                  # contributed this round
-    assert d._bot_status_text("claude") == "reviewed"
+    assert d._bot_status_text("claude") == "Active ✅"
+    # A silent DROP renders the identical label (the old "silent (dropped)").
+    d.silent_dropped.add("gemini")
+    assert d._bot_status_text("gemini") == "No review posted 🔇"
 
 
 def test_round_table_rows_capitalize_unknown_reviewer_label():
