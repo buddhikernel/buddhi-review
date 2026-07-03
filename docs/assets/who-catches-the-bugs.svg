@@ -3,40 +3,42 @@
 <text x="30" y="36" font-size="19" font-weight="700" fill="#111">Claude&#8217;s share of the valid bugs, per review run</text>
 <text x="30" y="57" font-size="12.5" fill="#555">Each bar is one qualifying run with 10 or more valid bugs (all 20 of them). Bar height: the share of that run&#8217;s bugs that Claude caught.</text>
 <text x="30" y="74" font-size="12.5" fill="#555">The bold line is the aggregate over all 88 qualifying runs (681 bugs). Ledger data, repo anonymized.</text>
-<line x1="110" y1="450.0" x2="810" y2="450.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="454.0" font-size="10.5" fill="#888" text-anchor="end">0%</text>
-<line x1="110" y1="365.0" x2="810" y2="365.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="369.0" font-size="10.5" fill="#888" text-anchor="end">10%</text>
-<line x1="110" y1="280.0" x2="810" y2="280.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="284.0" font-size="10.5" fill="#888" text-anchor="end">20%</text>
-<line x1="110" y1="195.0" x2="810" y2="195.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="199.0" font-size="10.5" fill="#888" text-anchor="end">30%</text>
-<line x1="110" y1="110.0" x2="810" y2="110.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="114.0" font-size="10.5" fill="#888" text-anchor="end">40%</text>
-<rect x="110.0" y="140.9" width="27.4" height="309.1" fill="#C2410C" opacity="0.9"/>
-<rect x="145.4" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="180.8" y="280.0" width="27.4" height="170.0" fill="#C2410C" opacity="0.9"/>
-<rect x="216.2" y="396.9" width="27.4" height="53.1" fill="#C2410C" opacity="0.9"/>
-<rect x="251.6" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="287.0" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="322.4" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="357.8" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="393.2" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="428.6" y="409.5" width="27.4" height="40.5" fill="#C2410C" opacity="0.9"/>
-<rect x="464.0" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="499.4" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="534.8" y="420.7" width="27.4" height="29.3" fill="#C2410C" opacity="0.9"/>
-<rect x="570.2" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="605.6" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="641.0" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="676.4" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="711.8" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<rect x="747.2" y="379.2" width="27.4" height="70.8" fill="#C2410C" opacity="0.9"/>
-<rect x="782.6" y="447" width="27.4" height="3" fill="#C2410C" opacity="0.35"/>
-<line x1="110" y1="417.7" x2="810" y2="417.7" stroke="#111" stroke-width="2.5"/>
-<rect x="570" y="387.7" width="240" height="20" rx="4" fill="#111"/>
-<text x="690" y="401.7" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">all 88 qualifying runs: Claude = 3.8%</text>
-<text x="110" y="472" font-size="11" fill="#777">Flat stubs are zero. In 14 of these 20 runs Claude reviewed the code and caught nothing.</text>
-<text x="110" y="500" font-size="13" font-weight="700" fill="#C2410C">Across all 88 qualifying runs, Claude caught 3.8% of the valid bugs. Reviewers from other vendors caught 96.2%.</text>
-<text x="110" y="522" font-size="10.5" fill="#999">Claude caught 18 of the 189 high or critical bugs (9.5%). Of the high or critical bugs found in round 2 or later, 93.5% came from a non-Claude reviewer.</text>
+<line x1="55.0" y1="450.0" x2="810.0" y2="450.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="454.0" font-size="10.5" fill="#888" text-anchor="end">0%</text>
+<line x1="55.0" y1="365.0" x2="810.0" y2="365.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="369.0" font-size="10.5" fill="#888" text-anchor="end">10%</text>
+<line x1="55.0" y1="280.0" x2="810.0" y2="280.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="284.0" font-size="10.5" fill="#888" text-anchor="end">20%</text>
+<line x1="55.0" y1="195.0" x2="810.0" y2="195.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="199.0" font-size="10.5" fill="#888" text-anchor="end">30%</text>
+<line x1="55.0" y1="110.0" x2="810.0" y2="110.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="114.0" font-size="10.5" fill="#888" text-anchor="end">40%</text>
+<rect x="55.0" y="140.9" width="29.6" height="309.1" fill="#C2410C" opacity="0.9"/>
+<rect x="93.2" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="131.4" y="280.0" width="29.6" height="170.0" fill="#C2410C" opacity="0.9"/>
+<rect x="169.5" y="396.9" width="29.6" height="53.1" fill="#C2410C" opacity="0.9"/>
+<rect x="207.7" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="245.9" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="284.1" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="322.3" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="360.5" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="398.6" y="409.5" width="29.6" height="40.5" fill="#C2410C" opacity="0.9"/>
+<rect x="436.8" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="475.0" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="513.2" y="420.7" width="29.6" height="29.3" fill="#C2410C" opacity="0.9"/>
+<rect x="551.4" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="589.5" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="627.7" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="665.9" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="704.1" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<rect x="742.3" y="379.2" width="29.6" height="70.8" fill="#C2410C" opacity="0.9"/>
+<rect x="780.4" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.35"/>
+<line x1="55.0" y1="417.7" x2="810.0" y2="417.7" stroke="#111" stroke-width="2.5"/>
+<rect x="551.1" y="387.7" width="258.9" height="20" rx="4" fill="#111"/>
+<text x="680.6" y="401.7" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">all 88 qualifying runs: Claude = 3.8%</text>
+<text x="55.0" y="472" font-size="11" fill="#777">Flat stubs are zero. In 14 of these 20 runs Claude reviewed the code and caught nothing.</text>
+<text x="55.0" y="497" font-size="13" font-weight="700" fill="#C2410C">Across all 88 qualifying runs, Claude caught 3.8% of the</text>
+<text x="55.0" y="514" font-size="13" font-weight="700" fill="#C2410C">valid bugs. Reviewers from other vendors caught 96.2%.</text>
+<text x="55.0" y="533" font-size="10.5" fill="#999">Claude caught 18 of the 189 high or critical bugs (9.5%). Of the high or critical</text>
+<text x="55.0" y="547" font-size="10.5" fill="#999">bugs found in round 2 or later, 93.5% came from a non-Claude reviewer.</text>
 </svg>

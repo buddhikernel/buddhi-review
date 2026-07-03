@@ -3,13 +3,18 @@
 `buddhi-review` is a **free, MIT-licensed PR review-and-fix loop for Claude Code**,
 built on the public [Buddhi kernel](https://github.com/buddhikernel/buddhi). It
 sends each PR to a cross-vendor panel of AI reviewers, classifies their findings,
-applies fixes, and repeats until the pull request is ready to land. It merges only
-when you opt in.
+applies fixes, and repeats until the pull request is ready to land. It auto-merges
+only when you opt in.
 
-**In internal testing across 88 qualifying runs on a single codebase written with
-Claude Code, four AI reviewers—Claude, Codex, Gemini, and Copilot—identified 681
-valid bugs. Claude found 26 of them, or 3.8%, while half were found only in round 2
-or later.**
+**One model reviewing its own work once is not enough.** LLMs tend to evaluate their
+own output more favorably, and a single review pass can leave many bugs undiscovered.
+That is why Buddhi uses a [cross-vendor panel and re-reviews the code after each
+round of fixes](#why-a-panel-and-why-rounds).
+
+Across [88 qualifying internal runs](#what-real-review-runs-show) on a codebase
+written with Claude Code, the four-reviewer panel—Claude, Codex, Gemini, and
+Copilot—found 681 valid bugs. Claude found just 3.8% of them, and half surfaced only
+in round 2 or later.
 
 New here? Run `pip install buddhi-review`, then follow
 **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
@@ -134,6 +139,30 @@ check still ends with `SELF-CHECK OK`.
 To drive the CLI directly or detach the loop as a background process, see
 [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#4-review-a-pr).
 
+## What a review costs you
+
+Buddhi is free and MIT-licensed, but **each review consumes quota from the provider
+accounts you connect.** Buddhi does not bill you or proxy reviews through its own
+accounts. Each reviewer draws on a plan you already hold:
+
+| Surface | Account or quota used |
+|---|---|
+| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
+| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
+| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
+| **Gemini review** | Your **Gemini Code Assist** entitlement. |
+| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
+
+The minimum viable setup is a Claude subscription, which powers the loop's own
+classify and fix calls, plus at least one reviewer plan you already hold.
+`/review-pr setup` disables the rest, so nothing is spent on a reviewer you do not
+run.
+
+Check or cap your GitHub-side spend at
+**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
+See [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)
+for the full breakdown.
+
 ## What real review runs show
 
 These results come from Buddhi review loops on a large private repository, where
@@ -173,7 +202,7 @@ This pattern is consistent with the self-preference effect
 more favorably. In these runs, Claude missed most of the valid bugs found by the
 cross-vendor panel.
 
-<img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
+<picture><img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%"></picture>
 
 - **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
   such runs. Runs with fewer bugs are left out of the bars, because a percentage
@@ -194,7 +223,7 @@ Most PR-review tools stop after a single round of comments. Because they never
 inspect the code after those comments are addressed, they cannot catch bugs that the
 fixes themselves introduce or expose.
 
-<img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%">
+<picture><img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%"></picture>
 
 - **Bars:** the same 20 runs as the chart above, here showing the share of each
   run's bugs that was found in round 2 or later.
@@ -207,7 +236,7 @@ fixes themselves introduce or expose.
 The chart below breaks down every qualifying run with 20 or more valid bugs, seven
 in total, reviewer by reviewer.
 
-<img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
+<picture><img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%"></picture>
 
 | Run | Valid bugs | Found by Claude | Claude % | Found in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
 |---|---|---|---|---|---|---|---|
@@ -220,12 +249,11 @@ in total, reviewer by reviewer.
 | G | 20 | 0&dagger; | 0.0% | 4 | 20.0% | 2 | 0 (0.0%) |
 | **All 88 qualifying runs** | **681** | **26** | **3.8%** | **341** | **50.1%** | **189** | **93 (49.2%)** |
 
-&dagger; On Runs C, F, and G, Claude reviewed and posted an explicit all-clear ("No
-issues found."), and the panel went on to find 22, 24, and 20 valid bugs
-respectively.
+&dagger; On Runs C, F, and G, Claude posted an explicit all-clear (“No issues
+found.”); the other reviewers subsequently identified 66 valid bugs.
 
-&Dagger; On Runs A and B, Claude did not post an all-clear. It reviewed and left
-comments, but none of them produced a valid bug.
+&Dagger; On Runs A and B, Claude left review comments rather than an all-clear, but
+none of those comments identified a valid bug.
 
 Notes and caveats:
 
@@ -244,30 +272,6 @@ Notes and caveats:
   signal patterns.
 
 </details>
-
-## What a review costs you
-
-Buddhi is free and MIT-licensed, but **each review consumes quota from the provider
-accounts you connect.** Buddhi does not bill you or proxy reviews through its own
-accounts. Each reviewer draws on a plan you already hold:
-
-| Surface | Account or quota used |
-|---|---|
-| **Copilot review** | Your **GitHub AI credits** (a paid GitHub Copilot plan). |
-| **`claude[bot]` review** | Your **GitHub Actions minutes** on a private repo (the bundled `claude-code-review.yml` workflow runs on each summon; public repos on standard runners are free) plus your Claude subscription (`CLAUDE_CODE_OAUTH_TOKEN`) or pay-as-you-go API credit (`ANTHROPIC_API_KEY`) — whichever the repo secret holds. |
-| **Codex review** | Your **ChatGPT plan** (the OpenAI Codex GitHub app). |
-| **Gemini review** | Your **Gemini Code Assist** entitlement. |
-| **The loop's own classify / fix calls** | Your **Claude subscription**: the loop drives the local `claude` CLI to classify each comment and apply fixes. |
-
-The minimum viable setup is a Claude subscription, which powers the loop's own
-classify and fix calls, plus at least one reviewer plan you already hold.
-`/review-pr setup` disables the rest, so nothing is spent on a reviewer you do not
-run.
-
-Check or cap your GitHub-side spend at
-**[github.com/settings/billing/summary](https://github.com/settings/billing/summary)**.
-See [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)
-for the full breakdown.
 
 ## Why a panel and why rounds
 
