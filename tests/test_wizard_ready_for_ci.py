@@ -216,6 +216,68 @@ def test_installed_ci_command_job_level_env_still_returns_none():
     assert wizard._installed_ci_command(text) is None
 
 
+def test_installed_ci_command_macos_runner_returns_none():
+    """A gate on macos-latest carries macOS-only commands (Xcode); the stock template
+    pins ubuntu-latest, so rebaking would run them where they do not exist — fail
+    closed. (Regression: the missing runs-on guard shipped in PR #31.)"""
+    text = _wf("jobs:\n  ci:\n    runs-on: macos-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: xcodebuild test -scheme MyApp\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_windows_runner_returns_none():
+    text = _wf("jobs:\n  ci:\n    runs-on: windows-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: pwsh ./run-tests.ps1\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_self_hosted_runner_returns_none():
+    text = _wf("jobs:\n  ci:\n    runs-on: self-hosted\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: ./gpu-tests.sh\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_self_hosted_labels_list_returns_none():
+    """A multi-label ``runs-on`` list (e.g. [self-hosted, gpu]) targets a specific
+    non-stock runner — unextractable."""
+    text = _wf("jobs:\n  ci:\n    runs-on: [self-hosted, gpu]\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: ./gpu-tests.sh\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_matrix_runner_returns_none():
+    """A ``${{ matrix.* }}`` runner cannot be statically resolved to the stock runner —
+    fail closed rather than assume ubuntu-latest."""
+    text = _wf("jobs:\n  ci:\n    runs-on: ${{ matrix.os }}\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_ubuntu_latest_single_element_list_extracts():
+    """A single-element list [ubuntu-latest] is the stock runner in list form — still
+    extractable."""
+    text = _wf("jobs:\n  ci:\n    runs-on: [ubuntu-latest]\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) == "python -m pytest"
+
+
+def test_installed_ci_command_missing_runs_on_still_extracts():
+    """An absent ``runs-on`` is accepted for robustness; the stock
+    template sets ubuntu-latest but omitting the key is treated as
+    equivalent — leave it extractable so the missing-key case is not
+    rejected."""
+    text = _wf("jobs:\n  ci:\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) == "python -m pytest"
+
+
 # ── _probe_ready_for_ci_workflow — P7 #4 probe-before-install ───────────────────────
 
 def _probe_router(*, present, content="base64==", rc=None):
