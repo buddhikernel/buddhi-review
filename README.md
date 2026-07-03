@@ -280,8 +280,8 @@ Using reviewers from different model families also provides a more independent
 check on the fix: a model re-reading its own fix is grading its own homework.
 
 **Buddhi stops on a clean post-fix round, not after a fixed number of rounds.** Buddhi
-reviews the current code, acts on every actionable finding, and then reviews the
-updated code again. It converges when a post-fix review returns no new findings that
+reviews the current code, acts on every actionable finding, and re-reviews after any
+substantive fix. It converges when a post-fix review returns no new findings that
 require action.
 
 Two guardrails apply. First, a substantive fix is always followed by another review
