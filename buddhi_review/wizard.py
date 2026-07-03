@@ -340,8 +340,15 @@ def _panel(title: str, lines: Sequence[str], pal: _Palette, stream) -> None:
 
 def _row(status: str, text: str, pal: _Palette, stream) -> None:
     glyph = {"ok": f"{pal.GREEN}✓{pal.RESET}", "warn": f"{pal.YELLOW}⚠{pal.RESET}",
-             "bad": f"{pal.RED}✗{pal.RESET}", "info": f"{pal.GREY}·{pal.RESET}"}.get(status, " ")
+             "bad": f"{pal.RED}✗{pal.RESET}", "step": f"{pal.CYAN}▸{pal.RESET}",
+             "info": f"{pal.GREY}·{pal.RESET}"}.get(status, " ")
     print(f"  {glyph} {text}", file=stream)
+
+
+def _note(text: str, pal: _Palette, stream) -> None:
+    """A dim, un-glyphed aside at panel indent (mirrors the MONO wizard's ``note()``).
+    For explanation/context that should recede behind the glyph rows."""
+    print(f"  {pal.GREY}{text}{pal.RESET}", file=stream)
 
 
 def _kv(label: str, value: str, pal: _Palette, stream) -> None:
@@ -405,11 +412,12 @@ _TOKEN_INVALID_RE = re.compile(
 )
 
 
-def _validate_claude_token(token, *, run, which=shutil.which) -> str:
+def _validate_claude_token(token, *, run, which=shutil.which) -> Tuple[str, str]:
     """Tri-state validation of a candidate ``CLAUDE_CODE_OAUTH_TOKEN`` via a headless
     ``claude -p ping --model haiku`` in an ISOLATED subprocess env. Returns
-    ``"valid"`` / ``"invalid"`` / ``"unknown"``. The token is passed ONLY via ``env``
-    — never on argv or in a log line.
+    ``(state, detail)`` with ``state`` in {"valid", "invalid", "unknown"}; ``detail``
+    is a short human message that NEVER contains the token (``""`` when there is none
+    to add). The token is passed ONLY via ``env`` — never on argv or in a log line.
 
     Why this EXACT mechanism (load-bearing — do not re-derive):
       * No ``claude`` on PATH → ``"unknown"``: we cannot test, so never block setup.
@@ -442,7 +450,7 @@ def _validate_claude_token(token, *, run, which=shutil.which) -> str:
     token = "".join((token or "").split())
     claude_bin = which("claude")
     if not claude_bin:
-        return "unknown"
+        return ("unknown", "Claude CLI not found — the token couldn't be tested.")
     env = dict(os.environ)
     env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     for _cred in _HIGHER_PRECEDENCE_CREDS:
@@ -469,16 +477,20 @@ def _validate_claude_token(token, *, run, which=shutil.which) -> str:
             isolated = False  # couldn't isolate settings; env-cred pops still apply
         try:
             r = run(argv, timeout=25, env=env)
-        except Exception:
-            return "unknown"
+        except Exception as exc:
+            return ("unknown", f"The test couldn't run ({type(exc).__name__}).")
         if getattr(r, "returncode", 1) == 0:
             # An apiKeyHelper could have authenticated a BAD token if settings
             # isolation failed, so a pass without it is untrustworthy → "unknown".
-            return "valid" if isolated else "unknown"
+            if not isolated:
+                return ("unknown", "Settings isolation failed — result untrustworthy.")
+            return ("valid", "The token authenticated.")
         blob = (getattr(r, "stdout", "") or "") + "\n" + (getattr(r, "stderr", "") or "")
         if _TOKEN_INVALID_RE.search(blob):
-            return "invalid" if isolated else "unknown"
-        return "unknown"
+            if not isolated:
+                return ("unknown", "Settings isolation failed — result untrustworthy.")
+            return ("invalid", "The token was rejected (authentication failed).")
+        return ("unknown", "The test was inconclusive (no clear authentication error).")
     finally:
         if prev_cwd is not None:
             try:
@@ -1472,10 +1484,10 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
                          "command.", pal, stream)
             return None
         if not default_cmd:
-            _row("warn", "Skipping label-gated CI workflow install — no TTY to capture "
-                         "a CI command and none auto-detected. Re-run setup in a "
-                         "terminal, or copy the bundled tests-ready-for-ci.yml in by "
-                         "hand and set its CI command.", pal, stream)
+            _row("warn", "Skipping label-gated CI workflow install — no TTY to capture a CI "
+                         "command and none auto-detected.", pal, stream)
+            _note("Re-run setup in a terminal, or copy the bundled tests-ready-for-ci.yml in by "
+                  "hand and set its CI command.", pal, stream)
             return None
         ci_command = default_cmd
         if is_update:
@@ -1739,21 +1751,46 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
                 remint = False
         if not remint:
             return "present"
-    if not _is_tty():
-        _row("info", "Set/Re-mint the reviewer token by hand:", pal, stream)
+    def _manual(status="deferred"):
+        _row("step", "Re-mint the reviewer token by hand:" if remint
+                     else "Set the reviewer token by hand:", pal, stream)
         print("    claude setup-token        # prints a long-lived OAuth token", file=stream)
         print(f"    gh secret set {name} --repo {repo}    # paste that token", file=stream)
-        return "deferred"
+        return status
+
     if remint:
+        # The stored token is failing live — say so plainly before the offer.
         _row("warn", f"Claude's reviews are failing on {repo} — its {name} looks "
-                     "invalid or expired. That secret is write-only, so it can't be "
-                     "repaired — only replaced; let's re-mint it.", pal, stream)
-    _row("info", "A terminal opened running `claude setup-token` — finish login there, "
-                 "copy the printed token, then paste it below.", pal, stream)
+                     "invalid or expired.", pal, stream)
+        _note("That secret is write-only, so it can't be repaired — only replaced; "
+              "let's re-mint it.", pal, stream)
+
+    if not _is_tty():
+        return _manual()
+    # CONSENT GATE: the mint spawns a terminal + expects a paste — never launch it
+    # without an explicit yes. Declining routes to the by-hand instructions.
+    if remint:
+        _q = f"Re-mint {name} for {repo} now via `claude setup-token`?"
+    else:
+        _q = f"{name} is not set on {repo}. Set it now via `claude setup-token`?"
+    if not _ask_yes_no(_q, default=False, input_fn=input_fn, stream=stream,
+                       pal=pal, single_select_fn=single_select):
+        return _manual("skipped")
+
+    # Open `claude setup-token` in a fresh window so its OAuth flow gets a real TTY
+    # (it cannot run headlessly), then key the note off whether the spawn succeeded.
     try:
-        spawn_command("claude setup-token", label="claude-setup-token", stream=stream)
+        res = spawn_command("claude setup-token", label="claude-setup-token", stream=stream)
+        if isinstance(res, dict) and res.get("spawned"):
+            _note("A terminal opened running `claude setup-token` — finish login there, "
+                  "copy the printed token, then paste it below.", pal, stream)
+        else:
+            _note("Run `claude setup-token` in another terminal, then paste the printed "
+                  "token below.", pal, stream)
     except Exception:
-        pass
+        _note("Run `claude setup-token` in another terminal, then paste the printed "
+              "token below.", pal, stream)
+
     # Part A — paste → verify-before-store, with bounded re-prompts on a rejected
     # token. The token is stored ONLY once it authenticates ("valid") or its status
     # is genuinely "unknown" (no claude binary / inconclusive); an "invalid" token
@@ -1772,36 +1809,41 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
         except (EOFError, KeyboardInterrupt):
             token = ""
         if not token:
-            return "skipped"
+            return _manual("skipped")
         _row("step", "Testing the token…", pal, stream)
         try:
-            state = validate(token, run=run)
+            state, detail = validate(token, run=run)
         except Exception as exc:
             # A validator that RAISES (vs. the default, which catches its own errors
             # and returns "unknown") is a contract violation / bug, not a transient
             # blip — fail SAFE: never store on it.
             _row("warn", f"The token check crashed ({type(exc).__name__}) — not saving "
                          f"{name} on GitHub.", pal, stream)
-            return "failed"
+            return _manual("failed")
         if state == "valid":
             break
         if state == "unknown":
             # Couldn't prove it good OR bad — warn loudly, then store it anyway so a
             # transient / offline check never blocks setup.
-            _row("warn", f"Couldn't verify the token — storing {name} unverified. If "
-                         f"Claude's reviews 401 on this repo later, re-run setup to "
-                         f"re-mint it.", pal, stream)
+            _row("warn", f"Couldn't verify the token — storing {name} unverified.",
+                 pal, stream)
+            if detail:
+                _note(str(detail), pal, stream)
+            _note("If Claude's reviews 401 on this repo later, re-run setup to re-mint it.",
+                  pal, stream)
             break
         # "invalid": the token didn't authenticate.
         _row("warn", "That token didn't authenticate — it may be mis-pasted, expired, "
                      "or for the wrong account.", pal, stream)
+        if detail:
+            _note(str(detail), pal, stream)
         if attempt < max_attempts:
-            _row("info", "Copy the token again from the `claude setup-token` window, "
-                         "then paste it below.", pal, stream)
+            _note("Copy the token again from the `claude setup-token` window, "
+                  "then paste it below.", pal, stream)
             continue
         _row("warn", f"Still not authenticating after {max_attempts} tries — not "
                      f"saving {name} on GitHub.", pal, stream)
-        return "failed"
+        return _manual("failed")
     # Scope SAFELY: repo-only by default. On an org-owned repo, offer the explicit
     # org-wide opt-in (still visible to this repo alone); _set_secret_scoped checks
     # org-admin and falls back to repo scope on any denial.
