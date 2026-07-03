@@ -3,42 +3,42 @@
 <text x="30" y="36" font-size="19" font-weight="700" fill="#111">Share of bugs caught in round 2 or later, per review run</text>
 <text x="30" y="57" font-size="12.5" fill="#555">Each bar is one qualifying run with 10 or more valid bugs (all 20 of them). Bar height: the share of that run&#8217;s bugs found after round 1.</text>
 <text x="30" y="74" font-size="12.5" fill="#555">The bold line is the aggregate over all 88 qualifying runs (681 bugs). Ledger data, repo anonymized.</text>
-<line x1="110" y1="450.0" x2="810" y2="450.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="454.0" font-size="10.5" fill="#888" text-anchor="end">0%</text>
-<line x1="110" y1="365.0" x2="810" y2="365.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="369.0" font-size="10.5" fill="#888" text-anchor="end">25%</text>
-<line x1="110" y1="280.0" x2="810" y2="280.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="284.0" font-size="10.5" fill="#888" text-anchor="end">50%</text>
-<line x1="110" y1="195.0" x2="810" y2="195.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="199.0" font-size="10.5" fill="#888" text-anchor="end">75%</text>
-<line x1="110" y1="110.0" x2="810" y2="110.0" stroke="#eee" stroke-width="1"/>
-<text x="102" y="114.0" font-size="10.5" fill="#888" text-anchor="end">100%</text>
-<rect x="110.0" y="264.5" width="27.4" height="185.5" fill="#E5484D" opacity="0.85"/>
-<rect x="145.4" y="174.8" width="27.4" height="275.2" fill="#E5484D" opacity="0.85"/>
-<rect x="180.8" y="280.0" width="27.4" height="170.0" fill="#E5484D" opacity="0.85"/>
-<rect x="216.2" y="280.0" width="27.4" height="170.0" fill="#E5484D" opacity="0.85"/>
-<rect x="251.6" y="214.6" width="27.4" height="235.4" fill="#E5484D" opacity="0.85"/>
-<rect x="287.0" y="280.0" width="27.4" height="170.0" fill="#E5484D" opacity="0.85"/>
-<rect x="322.4" y="153.4" width="27.4" height="296.6" fill="#E5484D" opacity="0.85"/>
-<rect x="357.8" y="204.4" width="27.4" height="245.6" fill="#E5484D" opacity="0.85"/>
-<rect x="393.2" y="218.2" width="27.4" height="231.8" fill="#E5484D" opacity="0.85"/>
-<rect x="428.6" y="174.8" width="27.4" height="275.2" fill="#E5484D" opacity="0.85"/>
-<rect x="464.0" y="204.4" width="27.4" height="245.6" fill="#E5484D" opacity="0.85"/>
-<rect x="499.4" y="246.0" width="27.4" height="204.0" fill="#E5484D" opacity="0.85"/>
-<rect x="534.8" y="192.1" width="27.4" height="257.9" fill="#E5484D" opacity="0.85"/>
-<rect x="570.2" y="280.0" width="27.4" height="170.0" fill="#E5484D" opacity="0.85"/>
-<rect x="605.6" y="336.7" width="27.4" height="113.3" fill="#E5484D" opacity="0.85"/>
-<rect x="641.0" y="348.0" width="27.4" height="102.0" fill="#E5484D" opacity="0.85"/>
-<rect x="676.4" y="293.1" width="27.4" height="156.9" fill="#E5484D" opacity="0.85"/>
-<rect x="711.8" y="180.8" width="27.4" height="269.2" fill="#E5484D" opacity="0.85"/>
-<rect x="747.2" y="280.0" width="27.4" height="170.0" fill="#E5484D" opacity="0.85"/>
-<rect x="782.6" y="382.0" width="27.4" height="68.0" fill="#E5484D" opacity="0.85"/>
-<line x1="110" y1="279.7" x2="810" y2="279.7" stroke="#111" stroke-width="2.5"/>
-<rect x="560" y="249.7" width="250" height="20" rx="4" fill="#111"/>
-<text x="685" y="263.7" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">all 88 qualifying runs: 50.1% in round 2+</text>
-<text x="110" y="472" font-size="11" fill="#777">Runs with more bugs tend to earn more review rounds, so most of these bars sit above the all-runs line.</text>
-<text x="110" y="497" font-size="13" font-weight="700" fill="#B01722">Across all 88 qualifying runs, 50.1% of valid bugs, and 49.2%</text>
-<text x="110" y="514" font-size="13" font-weight="700" fill="#B01722">of the 189 high or critical ones, were caught only in round 2+.</text>
-<text x="110" y="533" font-size="10.5" fill="#999">On the 20 runs shown as bars, the round 2+ share is 65.4%. A reviewer that</text>
-<text x="110" y="547" font-size="10.5" fill="#999">stops after one round would have shipped every bug counted in these bars.</text>
+<line x1="55.0" y1="450.0" x2="810.0" y2="450.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="454.0" font-size="10.5" fill="#888" text-anchor="end">0%</text>
+<line x1="55.0" y1="365.0" x2="810.0" y2="365.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="369.0" font-size="10.5" fill="#888" text-anchor="end">25%</text>
+<line x1="55.0" y1="280.0" x2="810.0" y2="280.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="284.0" font-size="10.5" fill="#888" text-anchor="end">50%</text>
+<line x1="55.0" y1="195.0" x2="810.0" y2="195.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="199.0" font-size="10.5" fill="#888" text-anchor="end">75%</text>
+<line x1="55.0" y1="110.0" x2="810.0" y2="110.0" stroke="#eee" stroke-width="1"/>
+<text x="46.4" y="114.0" font-size="10.5" fill="#888" text-anchor="end">100%</text>
+<rect x="55.0" y="264.5" width="29.6" height="185.5" fill="#E5484D" opacity="0.85"/>
+<rect x="93.2" y="174.8" width="29.6" height="275.2" fill="#E5484D" opacity="0.85"/>
+<rect x="131.4" y="280.0" width="29.6" height="170.0" fill="#E5484D" opacity="0.85"/>
+<rect x="169.5" y="280.0" width="29.6" height="170.0" fill="#E5484D" opacity="0.85"/>
+<rect x="207.7" y="214.6" width="29.6" height="235.4" fill="#E5484D" opacity="0.85"/>
+<rect x="245.9" y="280.0" width="29.6" height="170.0" fill="#E5484D" opacity="0.85"/>
+<rect x="284.1" y="153.4" width="29.6" height="296.6" fill="#E5484D" opacity="0.85"/>
+<rect x="322.3" y="204.4" width="29.6" height="245.6" fill="#E5484D" opacity="0.85"/>
+<rect x="360.5" y="218.2" width="29.6" height="231.8" fill="#E5484D" opacity="0.85"/>
+<rect x="398.6" y="174.8" width="29.6" height="275.2" fill="#E5484D" opacity="0.85"/>
+<rect x="436.8" y="204.4" width="29.6" height="245.6" fill="#E5484D" opacity="0.85"/>
+<rect x="475.0" y="246.0" width="29.6" height="204.0" fill="#E5484D" opacity="0.85"/>
+<rect x="513.2" y="192.1" width="29.6" height="257.9" fill="#E5484D" opacity="0.85"/>
+<rect x="551.4" y="280.0" width="29.6" height="170.0" fill="#E5484D" opacity="0.85"/>
+<rect x="589.5" y="336.7" width="29.6" height="113.3" fill="#E5484D" opacity="0.85"/>
+<rect x="627.7" y="348.0" width="29.6" height="102.0" fill="#E5484D" opacity="0.85"/>
+<rect x="665.9" y="293.1" width="29.6" height="156.9" fill="#E5484D" opacity="0.85"/>
+<rect x="704.1" y="180.8" width="29.6" height="269.2" fill="#E5484D" opacity="0.85"/>
+<rect x="742.3" y="280.0" width="29.6" height="170.0" fill="#E5484D" opacity="0.85"/>
+<rect x="780.4" y="382.0" width="29.6" height="68.0" fill="#E5484D" opacity="0.85"/>
+<line x1="55.0" y1="279.7" x2="810.0" y2="279.7" stroke="#111" stroke-width="2.5"/>
+<rect x="540.4" y="249.7" width="269.6" height="20" rx="4" fill="#111"/>
+<text x="675.2" y="263.7" font-size="11.5" font-weight="700" fill="#fff" text-anchor="middle">all 88 qualifying runs: 50.1% in round 2+</text>
+<text x="55.0" y="472" font-size="11" fill="#777">Runs with more bugs tend to earn more review rounds, so most of these bars sit above the all-runs line.</text>
+<text x="55.0" y="497" font-size="13" font-weight="700" fill="#B01722">Across all 88 qualifying runs, 50.1% of valid bugs, and 49.2%</text>
+<text x="55.0" y="514" font-size="13" font-weight="700" fill="#B01722">of the 189 high or critical ones, were caught only in round 2+.</text>
+<text x="55.0" y="533" font-size="10.5" fill="#999">On the 20 runs shown as bars, the round 2+ share is 65.4%. A reviewer that</text>
+<text x="55.0" y="547" font-size="10.5" fill="#999">stops after one round would have shipped every bug counted in these bars.</text>
 </svg>
