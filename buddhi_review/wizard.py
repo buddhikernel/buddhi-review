@@ -1277,6 +1277,11 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
     # silently, so treat the gate as unextractable.
     if job.get("services"):
         return None
+    # A container-baked job runs inside a custom image with tools/libraries that the
+    # stock ubuntu-latest template does not provide; dropping the container key would
+    # cause the preserved command to fail or behave differently.
+    if job.get("container"):
+        return None
     _job_defaults_run = job.get("defaults") or {}
     if isinstance(_job_defaults_run, dict):
         _job_defaults_run = _job_defaults_run.get("run") or {}
@@ -1294,6 +1299,12 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
             # (e.g. setup-uv, setup-node) provides environment the run commands
             # depend on; baking the run commands without it builds a broken gate.
             if not isinstance(uses_val, str) or not uses_val.startswith("actions/checkout"):
+                return None
+            # A checkout step with `with:` inputs (submodules, lfs, fetch-depth, path,
+            # etc.) configures the tree in ways the stock template's plain checkout
+            # cannot reproduce; the preserved command would then run against a different
+            # or incomplete tree.
+            if step.get("with"):
                 return None
             continue
         # Step-level context fields that we cannot preserve in the template's single
