@@ -3,13 +3,15 @@
 `buddhi-review` is a **free, MIT-licensed PR review-and-fix loop for Claude Code**,
 built on the public [Buddhi kernel](https://github.com/buddhikernel/buddhi). It
 sends each PR to a cross-vendor panel of AI reviewers, classifies their findings,
-applies fixes, and repeats until the pull request is ready to land. It merges only
-when you opt in.
+applies fixes, and repeats until the pull request is ready to land. It auto-merges
+only when you opt in.
 
-**In internal testing across 88 qualifying runs on a single codebase written with
-Claude Code, four AI reviewers—Claude, Codex, Gemini, and Copilot—identified 681
-valid bugs. Claude found 26 of them, or 3.8%, while half were found only in round 2
-or later.**
+**LLMs tend to evaluate their own output more favorably, and an AI reviewer usually
+misses most of the bugs in one pass. This is why Buddhi fields a cross-vendor panel
+and re-reviews after every major fix. Across 88 qualifying internal runs on a
+codebase written with Claude Code, four reviewers—Claude, Codex, Gemini, and
+Copilot—found 681 valid bugs, yet Claude grading its own code caught just 3.8%, and
+half of the bugs surfaced only in round 2 or later.**
 
 New here? Run `pip install buddhi-review`, then follow
 **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
@@ -173,7 +175,7 @@ This pattern is consistent with the self-preference effect
 more favorably. In these runs, Claude missed most of the valid bugs found by the
 cross-vendor panel.
 
-<img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
+<picture><img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%"></picture>
 
 - **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
   such runs. Runs with fewer bugs are left out of the bars, because a percentage
@@ -194,7 +196,7 @@ Most PR-review tools stop after a single round of comments. Because they never
 inspect the code after those comments are addressed, they cannot catch bugs that the
 fixes themselves introduce or expose.
 
-<img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%">
+<picture><img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%"></picture>
 
 - **Bars:** the same 20 runs as the chart above, here showing the share of each
   run's bugs that was found in round 2 or later.
@@ -207,7 +209,7 @@ fixes themselves introduce or expose.
 The chart below breaks down every qualifying run with 20 or more valid bugs, seven
 in total, reviewer by reviewer.
 
-<img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
+<picture><img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%"></picture>
 
 | Run | Valid bugs | Found by Claude | Claude % | Found in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
 |---|---|---|---|---|---|---|---|
