@@ -125,7 +125,11 @@ def _public_repo_files():
 @pytest.mark.parametrize("path", _public_repo_files(),
                          ids=lambda p: str(p.relative_to(_REPO)))
 def test_no_paid_or_private_surface_in_tests_and_docs(path):
-    hits = g.scan_paid_and_publish(path.read_text(encoding="utf-8"))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        pytest.fail(f"{path.relative_to(_REPO)}: not valid UTF-8")
+    hits = g.scan_paid_and_publish(text)
     assert hits == [], f"{path.relative_to(_REPO)}: {hits}"
 
 
