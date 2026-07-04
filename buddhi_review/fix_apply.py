@@ -26,7 +26,12 @@ guided fix (agentic ``claude -p`` with its built-in Read/Edit/Bash tools):
 * **Dangerous-change tripwire:** a pure predicate over the applied diff
   that FORCES the pre-commit verify pass (``BUDDHI_FIX_TRIPWIRE_OUTSIDE_LINES``
   default 40). When it fires it announces its firing reasons on **stdout** (the
-  alarm belongs in the run output, not a strippable diagnostics layer).
+  alarm belongs in the run output, not a strippable diagnostics layer). It scans
+  the (near-)FULL attempt diff — the 60KB budget caps only the verify-prompt
+  artifact, trip-aware so flagged hunks always reach the verify model — and a
+  post-image marker-span index catches an element edit deep inside a wide
+  ``*_FLAGS``/``ISOLATION`` construct whose declaration never rides the hunk.
+  A clipped scan (sanity ceilings) itself forces the verify pass.
 * **Pre-commit verify (``--verify-fixes {off,auto,on}`` default ``auto``):**
   a cheap verify model gets the claim + applied diff → CONFIRM/REJECT; REJECT
   rolls back + skips; an unreachable/unparseable verify **fails OPEN**. The
@@ -291,10 +296,11 @@ def build_fix_prompt(
 Snapshot = Tuple[str, Dict[str, tuple]]
 
 
-def _git(cwd: str, *args: str, text: bool = True) -> "subprocess.CompletedProcess":
+def _git(cwd: str, *args: str, text: bool = True,
+         errors: Optional[str] = None) -> "subprocess.CompletedProcess":
     return subprocess.run(
         ["git", *args], cwd=cwd, capture_output=True, text=text,
-        timeout=_GIT_TIMEOUT, stdin=subprocess.DEVNULL,
+        errors=errors, timeout=_GIT_TIMEOUT, stdin=subprocess.DEVNULL,
     )
 
 
@@ -444,7 +450,14 @@ def _restore_or_degrade(cwd: str, snapshot: Optional[Snapshot], when: str) -> bo
 # The dangerous-change tripwire (pure predicate over the applied diff)
 # ---------------------------------------------------------------------------
 
-_FLAGS_RE = re.compile(r"\b[A-Z0-9_]*_FLAGS\b|\bISOLATION\b")
+# Any *_FLAGS mention — a definition, an annotation, or a use/splice like
+# ``argv += list(BASE_FLAGS)``. A use-site edit is the same danger class as a
+# definition edit, so there is deliberately no ``[:=]`` definition anchor.
+_FLAGS_RE = re.compile(r"\b[A-Za-z0-9_]*_FLAGS\b")
+# Substring (not \b-fenced): catches both the constant definition and any splice
+# like ``*CLAUDE_MCP_ISOLATION_FLAGS`` — underscores are word chars, so
+# ``\bISOLATION\b`` would never match inside MCP_ISOLATION_FLAGS.
+_ISOLATION_RE = re.compile(r"ISOLATION")
 # A bare ``assert`` statement on the sign-stripped content of a ``-`` line, and a
 # removed test function (``def test…`` / ``async def test…``). Both are matched
 # against the CONTENT (sign already stripped), so a deleted ``self.assert…``
@@ -463,6 +476,7 @@ def diff_tripwire(
     commented_line: Optional[int] = None,
     outside_limit: Optional[int] = None,
     region_window: int = TRIPWIRE_REGION_WINDOW,
+    marker_spans: Optional[Dict[str, tuple]] = None,
 ) -> Optional[str]:
     """Return the tripping reason(s), or None for a clean diff. Trips on edits
     that touch ``*_FLAGS``/``ISOLATION`` constants, delete an assertion, remove a
@@ -478,7 +492,45 @@ def diff_tripwire(
     sits inside a hunk that also carries a ``+``/``-`` change (the marker often
     lives on the surrounding CONTEXT line or the ``@@`` construct header, not the
     changed line itself), never merely because the token appears somewhere in a
-    touched file."""
+    touched file. ``marker_spans`` — the post-image span index built by
+    :func:`_tripwire_spans_for_diff` — feeds the same per-hunk signal for the
+    wide-construct case where the declaration line never rides the hunk at all:
+    a ``+``/``-`` line whose new-file position falls INSIDE a construct's span
+    trips even with no marker text anywhere in the hunk. Omitting it reproduces
+    the bare per-hunk behavior exactly (the predicate stays pure — the span
+    index is plain data; the impure file reads live in the collector)."""
+    tripped = _tripwire_walk(
+        diff, commented_files, commented_line, outside_limit, region_window,
+        marker_spans, collect_hunks=False)[0]
+    return tripped
+
+
+def _tripwire_flagged_hunks(
+    diff: Optional[str],
+    marker_spans: Optional[Dict[str, tuple]] = None,
+) -> list:
+    """Pure: the raw text (file headers + ``@@`` header + body) of every hunk
+    that arms a per-hunk tripwire signal — a flags/ISOLATION marker or span hit
+    alongside a ``+``/``-`` change, a deleted assertion, a removed test def, or
+    any hunk of a deleted test file. :func:`_compose_verify_diff` puts these
+    FIRST in the verify-prompt budget when the full diff overflows it, so the
+    verify model always sees the exact hunks that tripped the wire."""
+    return _tripwire_walk(diff, (), None, None, TRIPWIRE_REGION_WINDOW,
+                          marker_spans, collect_hunks=True)[1]
+
+
+def _tripwire_walk(
+    diff: Optional[str],
+    commented_files: Sequence[str],
+    commented_line: Optional[int],
+    outside_limit: Optional[int],
+    region_window: int,
+    marker_spans: Optional[Dict[str, tuple]],
+    collect_hunks: bool,
+) -> tuple:
+    """The one shared diff walk behind :func:`diff_tripwire` (the predicate)
+    and :func:`_tripwire_flagged_hunks` (the extractor). Pure. Returns
+    (reason-string-or-None, flagged_hunks)."""
     limit = outside_limit if outside_limit is not None else TRIPWIRE_OUTSIDE_LINES
     try:
         cline = int(commented_line) if commented_line is not None else None
@@ -493,13 +545,33 @@ def diff_tripwire(
     # Per-hunk accumulators, reset on each new file (``diff --git``) and each
     # ``@@`` header: a marker anywhere in the hunk sets ``hunk_marker``; any
     # ``+``/``-`` content line sets ``hunk_change``; a hunk with BOTH edits a
-    # flags/isolation construct.
-    hunk_marker = hunk_change = False
+    # flags/isolation construct. ``hunk_span`` is the same signal sourced from
+    # the post-image span index instead: a ``+``/``-`` line whose new-file
+    # position sits INSIDE a marker construct, for the wide-construct case
+    # where no marker line rides the hunk.
+    hunk_marker = hunk_change = hunk_span = hunk_dangerous = False
+    in_hunk = False   # True from ``@@`` until the next ``diff --git`` — an
+                      # ADDED body line starting ``++ `` yields a raw
+                      # ``+++ …`` line that must NOT be misread as a file
+                      # header (it would wipe cur_spans/current_file for the
+                      # rest of the file and desync new_lineno)
+    cur_spans: tuple = ()
+    cur_file_flagged = False   # a deleted test file flags every hunk in it
+    flagged: list = []
+    header_lines: list = []    # the current file's ``diff --git``/``---``/``+++`` lines
+    hunk_lines: list = []      # the current hunk's ``@@`` + body lines
+
+    def _marker(text: str) -> bool:
+        return bool(_FLAGS_RE.search(text) or _ISOLATION_RE.search(text))
 
     def _close_hunk() -> None:
         nonlocal flags_touched
-        if hunk_marker and hunk_change:
+        if (hunk_marker or hunk_span) and hunk_change:
             flags_touched = True
+        if (collect_hunks and hunk_lines and hunk_change
+                and (hunk_marker or hunk_span or hunk_dangerous
+                     or cur_file_flagged)):
+            flagged.append("".join(header_lines + hunk_lines))
 
     # An empty / None / "(diff unavailable)" string has no +/- content lines, so
     # it can never trip — but guard None explicitly so a caller that can't produce
@@ -507,49 +579,79 @@ def diff_tripwire(
     for line in (diff or "").splitlines():
         if line.startswith("diff --git "):
             _close_hunk()
-            hunk_marker = hunk_change = False
+            hunk_marker = hunk_change = hunk_span = hunk_dangerous = False
+            in_hunk = False
+            hunk_lines = []
+            header_lines = [line + "\n"]
             current_file = old_file = ""
+            cur_spans = ()
+            cur_file_flagged = False
             new_lineno = 0
             continue
-        if line.startswith("--- "):
+        if not in_hunk and line.startswith("--- "):
             p = line[4:].strip()
             old_file = "" if p == "/dev/null" else (p[2:] if p.startswith(("a/", "b/")) else p)
+            header_lines.append(line + "\n")
             continue
-        if line.startswith("+++ "):
+        if not in_hunk and line.startswith("+++ "):
             p = line[4:].strip()
             if line.startswith("+++ b/"):
-                current_file = line[6:]
+                # _clean_diff_path drops the trailing TAB git appends for a
+                # space-containing path, so the span-index key matches the
+                # collector's and ``commented_files`` matching works.
+                current_file = _clean_diff_path(line[6:])
             elif p == "/dev/null":
                 current_file = old_file
                 # A whole test file being deleted (``+++ /dev/null``) removes a test.
                 if _is_test_path(old_file):
                     test_removed = True
+                    cur_file_flagged = True
             else:
                 current_file = p
+            cur_spans = tuple((marker_spans or {}).get(current_file, ()))
+            header_lines.append(line + "\n")
             continue
         if line.startswith("@@"):
             _close_hunk()
-            hunk_marker = hunk_change = False
+            hunk_marker = hunk_change = hunk_span = hunk_dangerous = False
+            in_hunk = True
+            hunk_lines = [line + "\n"]
             m = _HUNK_NEWSTART_RE.search(line)
             new_lineno = int(m.group(1)) if m else 0
             # git appends the enclosing construct after the second ``@@`` — a
             # ``*_FLAGS = (`` there is the marker for a tuple-element edit below.
-            if _FLAGS_RE.search(line):
+            if _marker(line):
                 hunk_marker = True
             continue
-        if not line or line[0] not in "+- ":
+        if not line:
+            # An empty body line is an EMPTY CONTEXT line (diff.suppressBlankEmpty
+            # emits `` instead of a single space): it consumes a new-file line, so
+            # it must advance the counter or every span/region check below it in
+            # the hunk drifts by one.
+            if hunk_lines:
+                new_lineno += 1
+                if collect_hunks:
+                    hunk_lines.append("\n")
             continue
+        if line[0] not in "+- ":
+            continue
+        if collect_hunks and hunk_lines:
+            hunk_lines.append(line + "\n")
         sign, content = line[0], line[1:]
-        if _FLAGS_RE.search(content):
+        if _marker(content):
             hunk_marker = True
         in_region = (current_file in commented_files) and (
             cline is None or abs(new_lineno - cline) <= region_window)
         if sign in "+-":
             hunk_change = True
+            if cur_spans and any(s <= new_lineno <= e for s, e in cur_spans):
+                hunk_span = True
             if sign == "-" and _ASSERT_RE.search(content):
                 assert_deleted = True
+                hunk_dangerous = True
             if sign == "-" and _TEST_DEF_RE.search(content):
                 test_removed = True
+                hunk_dangerous = True
             if commented_files and not in_region:
                 outside += 1
         if sign in "+ ":
@@ -558,14 +660,162 @@ def diff_tripwire(
 
     reasons = []
     if flags_touched:
-        reasons.append("edits a *_FLAGS/ISOLATION constant")
+        reasons.append("edits a *_FLAGS / ISOLATION constant")
     if assert_deleted:
         reasons.append("deletes an assertion")
     if test_removed:
         reasons.append("removes a test")
     if outside > limit:
         reasons.append(f">{limit} changed lines outside the commented region")
-    return "; ".join(reasons) if reasons else None
+    return ("; ".join(reasons) if reasons else None), flagged
+
+
+# ---------------------------------------------------------------------------
+# The post-image marker-span index (the wide-construct closer)
+# ---------------------------------------------------------------------------
+# The per-hunk scan above can only see a marker that RIDES the hunk (a context
+# line or the ``@@`` construct header). An element edit deep inside a very wide
+# construct — ``X_FLAGS = (`` … 200 lines … ``)`` — produces a hunk with no
+# marker anywhere in it. The span index closes that hole:
+# ``_tripwire_spans_for_diff`` reads each post-image file the diff touches and
+# records the line span of every assignment-shaped marker construct; the walker
+# then trips on any ``+``/``-`` line whose new-file position falls INSIDE a
+# span. Assignment shape is required so a prose/comment ISOLATION mention never
+# opens a span; the multi-line bracket extension runs only for Python files
+# (the lexer's grammar) — other files gain nothing from a single-line span
+# because a change ON the marker line already trips the per-hunk scan directly.
+_SPAN_ASSIGN_RE = re.compile(r"^\s*[A-Za-z_][A-Za-z0-9_]*\s*[:=]")
+_SPAN_LEXED_SUFFIXES = (".py", ".pyi")
+_SPAN_MAX_FILE_BYTES = 5_000_000   # bigger than any plausible source file
+
+
+def _tripwire_marker_spans(text: str) -> list:
+    """Pure: 1-based inclusive (start, end) line spans of assignment-shaped
+    ``*_FLAGS`` / ``ISOLATION`` constructs in a Python file's text. A span
+    covers the declaration line through its balanced-bracket close; a
+    lightweight lexer skips string literals (including triple-quoted blocks)
+    and ``#`` comments, and a backslash continuation extends the search. An
+    UNTERMINATED construct spans to EOF — miscounts err LONG, and a longer
+    span only forces a cheap verify pass. Known residual: PEP-701 same-quote
+    nested f-strings can close a span early; the per-hunk scan floor still
+    applies there (see the pinning test in tests/test_safety_floor_ports.py)."""
+    spans = []
+    lines = text.split("\n")
+    i, n = 0, len(lines)
+    while i < n:
+        line = lines[i]
+        if (_SPAN_ASSIGN_RE.match(line)
+                and (_FLAGS_RE.search(line) or _ISOLATION_RE.search(line))):
+            end = _span_construct_end(lines, i)
+            spans.append((i + 1, end + 1))
+            i = end + 1
+        else:
+            i += 1
+    return spans
+
+
+def _span_construct_end(lines: Sequence[str], start: int) -> int:
+    """0-based index of the line where the bracket construct opened at
+    ``lines[start]`` closes (net depth back to 0 at a line end), the
+    statement's last line for a bracket-less (single-line or backslash-
+    continued) construct, or the last file line for an unterminated one (fail
+    long). Depth is judged at LINE ends only, so an annotation's own balanced
+    brackets (``X_FLAGS: Tuple[str, ...] = (``) never end the span before the
+    value's bracket opens. A backslash escapes the next character inside ANY
+    string form — ``\\\"\"\"`` inside a triple-quoted element must not read as
+    a terminator, or the span would close early and fail SHORT."""
+    depth = 0
+    opened = False
+    in_str = None          # None | "'" | '"' | "'''" | '\"""'
+    i, n = start, len(lines)
+    while i < n:
+        line = lines[i]
+        j, length = 0, len(line)
+        while j < length:
+            ch = line[j]
+            if in_str:
+                if ch == "\\":
+                    j += 2
+                    continue
+                if line.startswith(in_str, j):
+                    j += len(in_str)
+                    in_str = None
+                    continue
+                j += 1
+                continue
+            if ch in "\"'":
+                trip = ch * 3
+                if line.startswith(trip, j):
+                    in_str = trip
+                    j += 3
+                else:
+                    in_str = ch
+                    j += 1
+                continue
+            if ch == "#":
+                break
+            if ch in "([{":
+                depth += 1
+                opened = True
+            elif ch in ")]}":
+                depth -= 1
+            j += 1
+        if in_str and len(in_str) == 1 and not line.endswith("\\"):
+            # A single-quote string survives the newline only under an
+            # explicit backslash continuation; when in doubt we stay "in
+            # string", which can only LENGTHEN the span (fail long).
+            in_str = None
+        if opened and depth <= 0:
+            return i
+        if not opened and not line.rstrip().endswith("\\"):
+            # No bracket: the statement ends HERE — ``i`` is past ``start``
+            # when this line was reached via backslash continuations, so the
+            # span covers the whole continued statement.
+            return i
+        i += 1
+    return n - 1            # unterminated construct: fail long, span to EOF
+
+
+def _tripwire_spans_for_diff(diff: Optional[str], cwd: Optional[str]) -> Dict[str, tuple]:
+    """Impure companion to :func:`diff_tripwire`: build the post-image marker-
+    span index for every Python file the diff touches. Returns {repo-relative
+    path: ((start, end), …)} with keys normalized exactly like the walker's
+    ``current_file`` (the ``+++ b/`` remainder; the producer pins quotepath/
+    noprefix/mnemonicPrefix so the headers are canonical). Best-effort by
+    design: a deleted, unreadable, quotepath-escaped, traversal-escaping,
+    non-Python, or over-large target simply contributes no spans — the
+    per-hunk scan still covers it (a whole-construct or whole-file deletion
+    puts the declaration line itself in the hunk)."""
+    spans: Dict[str, tuple] = {}
+    if not diff or not cwd:
+        return spans
+    for line in diff.splitlines():
+        if not line.startswith("+++ b/"):
+            continue
+        # Same normalization as the walker's ``current_file`` (TAB-strip for
+        # space-containing paths) so the span-index keys always match.
+        p = _clean_diff_path(line[6:])
+        if not p or p.startswith('"'):
+            continue
+        if not p.endswith(_SPAN_LEXED_SUFFIXES) or p in spans:
+            continue
+        full = _safe_repo_path(cwd, p)
+        if not full or not os.path.isfile(full):
+            continue
+        try:
+            if os.path.getsize(full) > _SPAN_MAX_FILE_BYTES:
+                continue
+            # newline="" + split("\n") keeps line numbering byte-exact with
+            # git's (universal-newline reads would split lone \r differently).
+            with open(full, "r", encoding="utf-8", errors="replace",
+                      newline="") as f:
+                text = f.read()
+        except OSError:
+            continue
+        s = _tripwire_marker_spans(text)
+        if s:
+            spans[p] = tuple(s)
+    return spans
 
 
 # ---------------------------------------------------------------------------
@@ -1151,8 +1401,10 @@ def apply_fix(
                 )
             return FixOutcome(status="skipped", detail=skip_line.strip(), attempts=attempt)
         # Clean success → deterministic pre-commit Unicode cleanup, then tripwire +
-        # verify over this attempt's diff.
-        diff = _attempt_diff(cwd, ref)
+        # verify over this attempt's diff (the FULL scan text — the 60KB cap is
+        # applied only to the verify-prompt artifact by _compose_verify_diff).
+        snap_untracked = snap[1] if snap is not None else None
+        diff, scan_truncated = _attempt_diff(cwd, ref, snap_untracked)
         if _unicode_cleanup_enabled():
             files_n, chars_n = deterministic_unicode_cleanup(
                 cwd, added_lines_by_file(diff))
@@ -1163,8 +1415,16 @@ def apply_fix(
                     f"({chars_n} char(s)) before commit",
                     colour=_DIM,
                 )
-                diff = _attempt_diff(cwd, ref)  # recompute so tripwire/verify see the cleaned diff
-        trip = diff_tripwire(diff, commented_files=commented_files, commented_line=commented_line)
+                diff, scan_truncated = _attempt_diff(cwd, ref, snap_untracked)  # recompute so tripwire/verify see the cleaned diff
+        marker_spans = _tripwire_spans_for_diff(diff, cwd)
+        trip = diff_tripwire(diff, commented_files=commented_files,
+                             commented_line=commented_line,
+                             marker_spans=marker_spans)
+        if scan_truncated:
+            # A clipped scan means dangerous content may sit in the UNSCANNED
+            # tail — fail closed: force the verify pass.
+            trip = (((trip + "; ") if trip else "")
+                    + "attempt diff exceeded the scan budget")
         run_verify = verify_runner is not None and should_verify(
             verify_mode, diff, tripwired=bool(trip), label=label)
         if trip:  # tripwire alarm — the firing reason belongs on stdout, not a strip layer
@@ -1174,12 +1434,16 @@ def apply_fix(
                 + (" — forcing verify" if run_verify else ""),
                 colour=_YELLOW,
             )
+        # The ≤60KB artifact for the verify prompt + FixOutcome.diff. Trip-aware:
+        # over budget, the tripwire-flagged hunks ride FIRST so the verify model
+        # always sees the exact hunks that tripped the wire.
+        prompt_diff = _compose_verify_diff(diff, bool(trip), marker_spans)
         if run_verify:
             # Best-effort, memoized per worktree: gives the verify pass the PR's
             # own stated intent so it can ALSO reject a fix that undoes deliberate
             # work. Empty intent leaves the prompt byte-for-byte the no-intent one.
             seed_pr_intent(cwd)
-            verdict = verify_fix(comment_text, diff, runner=verify_runner)
+            verdict = verify_fix(comment_text, prompt_diff, runner=verify_runner)
             if verdict["verdict"] == "REJECT":
                 reason = str(verdict.get("reason") or "fix-verify rejected the change")
                 _status_line("✗", f"fix-verify REJECT — rolling back: {reason}", colour=_YELLOW)
@@ -1203,7 +1467,7 @@ def apply_fix(
                     + ("" if not rollback_failed
                        else (" — no snapshot; rejected edits may remain" if snap is None
                              else " — rollback FAILED, stray edits may ride the next push")),
-                    diff=diff,
+                    diff=prompt_diff,
                     attempts=attempt,
                     rollback_failed=rollback_failed,
                 )
@@ -1216,7 +1480,8 @@ def apply_fix(
                 )
             else:
                 _status_line("✓", "fix verified (CONFIRM)", colour=_DIM)
-        return FixOutcome(status="applied", detail=trip or "", diff=diff, attempts=attempt)
+        return FixOutcome(status="applied", detail=trip or "",
+                          diff=prompt_diff, attempts=attempt)
 
     # The give-up tail runs exactly once per comment — reached when any transient
     # failure (timeout or non-zero exit) exhausts the bounded retry budget.
@@ -1235,46 +1500,186 @@ def apply_fix(
 
 
 # Force the canonical, stable diff header form regardless of the user's git config,
-# so `added_lines_by_file`'s `+++ b/<path>` parsing always works: `core.quotepath=false`
-# keeps a non-ASCII path LITERAL (the default octal-quotes + wraps it), and
+# so `added_lines_by_file`'s and the span collector's `+++ b/<path>` parsing and the
+# tripwire walker's line accounting always work: `core.quotepath=false` keeps a
+# non-ASCII path LITERAL (the default octal-quotes + wraps it),
 # `diff.noprefix=false` / `diff.mnemonicPrefix=false` keep the `a/`-`b/` prefixes
-# (those configs emit no prefix or a `w/` prefix, which the parser can't map back).
+# (those configs emit no prefix or a `w/` prefix, which the parser can't map back),
+# and `diff.suppressBlankEmpty=false` keeps blank context lines as `" "` lines.
 _DIFF_HEADER_FLAGS = ("-c", "core.quotepath=false",
                       "-c", "diff.noprefix=false",
-                      "-c", "diff.mnemonicPrefix=false")
+                      "-c", "diff.mnemonicPrefix=false",
+                      "-c", "diff.suppressBlankEmpty=false")
 
-# Cap the attempt diff fed to the tripwire scan and the A4 verify prompt: an
-# unbounded diff (a huge fix, a giant untracked file) would blow the verify
-# prompt and slow the scan. Once the accumulated diff reaches the budget, stop
-# appending untracked-file chunks and truncate the whole string with a sentinel.
-_ATTEMPT_DIFF_MAX_BYTES = 60000
+# The attempt diff is produced ONCE, scan-first: the tripwire + the
+# should-verify decision read the (near-)FULL text, and only the verify-prompt
+# artifact is capped afterwards by `_compose_verify_diff` — capping BEFORE the
+# scan let a dangerous edit past the cap escape unseen. The scan itself is
+# bounded only by sanity ceilings; crossing ANY of them returns
+# scan_truncated=True, which the call site turns into a FORCED-verify trip
+# reason ("attempt diff exceeded the scan budget") — unscannable content never
+# degrades silently.
+_ATTEMPT_DIFF_MAX_BYTES = 60000       # the verify-prompt artifact cap
+_SCAN_DIFF_MAX_BYTES = 5_000_000      # total scan ceiling
+_SCAN_CHUNK_MAX_BYTES = 1_000_000     # per-untracked-file ceiling
+_SCAN_UNTRACKED_MAX_FILES = 200       # untracked-file count ceiling
 _DIFF_TRUNCATED_SENTINEL = "\n... [diff truncated]\n"
+_VERIFY_DIFF_NOTE = ("# NOTE: this diff exceeded the inline budget; the "
+                     "tripwire-flagged hunks are shown first, followed by the "
+                     "truncated remainder.\n")
 
 
-def _attempt_diff(cwd: str, tracked_ref: str) -> str:
+def _attempt_diff(cwd: str, tracked_ref: str,
+                  snap_untracked: Optional[Dict[str, tuple]] = None) -> Tuple[str, bool]:
+    """The (near-)FULL diff of the attempt vs the snapshot's tracked ref, plus
+    a chunk per untracked file the ATTEMPT touched. Files already untracked at
+    snapshot time whose bytes are provably unchanged are filtered out
+    (`_drop_unchanged_untracked`) so pre-existing worktree junk neither rides
+    the scan text nor trips the ceilings on every fix. Returns
+    (diff_text, scan_truncated): `scan_truncated` is True when a scan ceiling
+    clipped or dropped content OR the untracked files could not be enumerated —
+    the caller must then treat the diff as incompletely scannable and FORCE
+    the verify pass. ("", False) when the tracked diff itself is wholly
+    unavailable — that fail-open contract is unchanged. `--no-ext-diff` keeps
+    an external diff driver from replacing the hunk text the tripwire scans;
+    errors="replace" keeps one non-UTF-8 file from blanking the whole scan."""
     try:
-        d = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", tracked_ref)
+        d = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", "--no-ext-diff", tracked_ref,
+                 errors="replace")
         tracked = d.stdout if d.returncode == 0 else ""
-        parts = [tracked]
+        truncated = False
         total = len(tracked.encode('utf-8'))
-        # Only pull untracked-file chunks while under the budget; stop once the
-        # accumulated diff reaches it (an over-budget tracked diff skips them all).
-        if total < _ATTEMPT_DIFF_MAX_BYTES:
-            u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard")
-            if u.returncode == 0:
-                for rel in (p for p in u.stdout.split("\0") if p):
-                    if total >= _ATTEMPT_DIFF_MAX_BYTES:
-                        break
+        if total > _SCAN_DIFF_MAX_BYTES:
+            tracked = (tracked.encode('utf-8')[:_SCAN_DIFF_MAX_BYTES]
+                       .decode('utf-8', errors='ignore'))
+            total = _SCAN_DIFF_MAX_BYTES
+            truncated = True
+        parts = [tracked]
+        try:
+            u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard",
+                     errors="replace")
+            if u.returncode != 0:
+                # Can't enumerate untracked files: a fixer-created dangerous
+                # new file could be sitting unscanned — fail closed like a
+                # dropped chunk, not silently open.
+                return "".join(parts), True
+            names = [p for p in u.stdout.split("\0") if p]
+            names = _drop_unchanged_untracked(names, snap_untracked or {}, cwd)
+            if len(names) > _SCAN_UNTRACKED_MAX_FILES:
+                names = names[:_SCAN_UNTRACKED_MAX_FILES]
+                truncated = True
+            for rel in names:
+                if total >= _SCAN_DIFF_MAX_BYTES:
+                    truncated = True
+                    break
+                try:
                     # git diff --no-index exits 1 when files differ (normal); capture stdout regardless
-                    nd = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", "--no-index",
-                              "--", "/dev/null", rel)
-                    if nd.stdout:
-                        parts.append(nd.stdout)
-                        total += len(nd.stdout.encode('utf-8'))
-        joined = "".join(parts)
-        encoded = joined.encode('utf-8')
-        if len(encoded) > _ATTEMPT_DIFF_MAX_BYTES:
-            joined = encoded[:_ATTEMPT_DIFF_MAX_BYTES].decode('utf-8', errors='ignore') + _DIFF_TRUNCATED_SENTINEL
-        return joined
-    except (subprocess.TimeoutExpired, OSError):
-        return ""
+                    nd = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", "--no-ext-diff",
+                              "--no-index", "--", "/dev/null", rel,
+                              errors="replace")
+                    chunk = nd.stdout or ""
+                    cb = chunk.encode('utf-8')
+                    cap = min(_SCAN_CHUNK_MAX_BYTES,
+                              _SCAN_DIFF_MAX_BYTES - total)
+                    if len(cb) > cap:
+                        chunk = cb[:cap].decode('utf-8', errors='ignore')
+                        truncated = True
+                    if chunk:
+                        parts.append(chunk)
+                        total += len(chunk.encode('utf-8'))
+                except (subprocess.TimeoutExpired, OSError, ValueError):
+                    truncated = True   # an unscanned chunk exists — fail closed
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            truncated = True   # the untracked appendix was cut short — fail closed
+        return "".join(parts), truncated
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return "", False
+
+
+def _drop_unchanged_untracked(names: list, snap_untracked: Dict[str, tuple],
+                              cwd: str) -> list:
+    """Filter the current untracked files down to the ones this attempt
+    plausibly touched: keep every file NOT in the snapshot's untracked map,
+    every symlink whose target changed, and every regular file whose blob
+    hash differs from the snapshot's; drop only what is PROVABLY byte-
+    identical to its snapshot state. Any error keeps the file (fail toward
+    inclusion). One batched `git hash-object --stdin-paths` call covers all
+    regular-file candidates. Pure list-in/list-out apart from that one git
+    call, preserving ls-files order."""
+    if not snap_untracked:
+        return names
+    keep, candidates = set(), []
+    for n in names:
+        entry = snap_untracked.get(n)
+        full = os.path.join(cwd or ".", n)
+        if entry is None:
+            keep.add(n)                          # new since the snapshot
+        elif (isinstance(entry, (tuple, list)) and len(entry) >= 2
+              and entry[0] == "link"):
+            try:
+                same = (os.path.islink(full)
+                        and os.readlink(full) == entry[1])
+            except OSError:
+                same = False
+            if not same:
+                keep.add(n)
+        elif (isinstance(entry, (tuple, list)) and len(entry) >= 2
+              and entry[0] == "blob" and entry[1]
+              and os.path.isfile(full) and not os.path.islink(full)):
+            candidates.append((n, entry[1]))     # hash-compare below
+        else:
+            keep.add(n)                          # unknown shape — include
+    if candidates:
+        try:
+            hashed = subprocess.run(
+                ["git", "hash-object", "--stdin-paths"],
+                cwd=cwd, capture_output=True, text=True, timeout=30,
+                input="\n".join(n for n, _ in candidates) + "\n")
+            shas = (hashed.stdout.splitlines()
+                    if hashed.returncode == 0 else [])
+            if len(shas) == len(candidates):
+                for (n, snap_sha), cur in zip(candidates, shas):
+                    if cur.strip() != snap_sha:
+                        keep.add(n)
+            else:
+                keep.update(n for n, _ in candidates)
+        except Exception:
+            keep.update(n for n, _ in candidates)
+    return [n for n in names if n in keep]
+
+
+def _cap_utf8_diff(s: str, max_bytes: int) -> str:
+    """Truncate `s` to at most `max_bytes` UTF-8 bytes + the sentinel."""
+    b = s.encode('utf-8')
+    if len(b) <= max_bytes:
+        return s
+    return (b[:max_bytes].decode('utf-8', errors='ignore')
+            + _DIFF_TRUNCATED_SENTINEL)
+
+
+def _compose_verify_diff(diff: Optional[str], tripped: bool,
+                         marker_spans: Optional[Dict[str, tuple]] = None) -> str:
+    """The ≤ _ATTEMPT_DIFF_MAX_BYTES(+sentinel/note) diff artifact for the
+    verify prompt (and the stored FixOutcome.diff). Scan-first companion to
+    `_attempt_diff`:
+      * fits the budget → verbatim;
+      * over budget, not tripped → head + sentinel (the old behavior);
+      * over budget AND tripped → the tripwire-flagged hunks ride FIRST (with
+        their file headers), then the truncated head of the full diff — the
+        verify model always sees the exact hunks that tripped the wire, never
+        a benign-looking prefix standing in for a dangerous tail.
+    Pure; safe on any diff text. A trip with no extractable hunk (the
+    outside-region count, a scan-budget force) falls back to the plain cap."""
+    raw = diff or ""
+    if len(raw.encode('utf-8')) <= _ATTEMPT_DIFF_MAX_BYTES:
+        return raw
+    if not tripped:
+        return _cap_utf8_diff(raw, _ATTEMPT_DIFF_MAX_BYTES)
+    flagged = _tripwire_flagged_hunks(raw, marker_spans)
+    if not flagged:
+        return _cap_utf8_diff(raw, _ATTEMPT_DIFF_MAX_BYTES)
+    head = _VERIFY_DIFF_NOTE + "".join(flagged)
+    head_bytes = len(head.encode('utf-8'))
+    if head_bytes >= _ATTEMPT_DIFF_MAX_BYTES:
+        return _cap_utf8_diff(head, _ATTEMPT_DIFF_MAX_BYTES)
+    return head + _cap_utf8_diff(raw, _ATTEMPT_DIFF_MAX_BYTES - head_bytes)
