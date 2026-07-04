@@ -23,6 +23,7 @@ from test_round_driver import make_driver, CLAUDE_ONLY
 UTC = timezone.utc
 RESET = datetime(2026, 7, 4, 13, 0, 0, tzinfo=UTC)
 RESET_EPOCH = int(RESET.timestamp())
+BEFORE_RESET = datetime(2026, 7, 4, 12, 0, tzinfo=UTC)
 _MIN = datetime.min.replace(tzinfo=UTC)
 
 RATE_LIMITED_BODY = (
@@ -47,7 +48,8 @@ def test_rate_limited_claude_does_not_satisfy_the_merge_gate():
     genuinely reviewed, so the never-merge-unreviewed gate must block the merge.
     Mutation this catches: routing the release through reviewed_ever."""
     driver, clock, gh = make_driver([(0, _marker())], cfg=CLAUDE_ONLY,
-                                    auto_merge=True)
+                                    auto_merge=True,
+                                    wall_clock=lambda: BEFORE_RESET)
     outcome = driver.run()
     assert outcome.merged is False, "must not merge — claude never reviewed"
     assert "claude" not in driver.reviewed_ever
@@ -64,7 +66,7 @@ def _fresh_driver(**kw):
 
 
 def test_rate_limited_marker_records_reset_and_releases_and_excludes():
-    driver = _fresh_driver()
+    driver = _fresh_driver(wall_clock=lambda: BEFORE_RESET)
     driver._scan_unavailable_markers([_marker()])
     assert driver._rate_limited_until["claude"] == RESET
     # released from the wait (signal set → _quiesced short-circuits)...
@@ -126,10 +128,39 @@ def test_unknown_reset_comes_back_on_first_boundary():
     assert driver._rate_limited_until == {}
 
 
+# ── Stale marker (resets_at already in the past) ────────────────────────────
+
+def test_stale_marker_is_ignored():
+    """A marker whose resets_at epoch is already past must NOT quiesce the
+    round — it should be skipped so a real in-flight review isn't cut short."""
+    after_reset = datetime(2026, 7, 4, 14, 0, tzinfo=UTC)  # 1 hour after RESET
+    driver = _fresh_driver(wall_clock=lambda: after_reset)
+    driver._scan_unavailable_markers([_marker()])
+    assert driver._rate_limited_until == {}
+    assert driver._bot_state("claude").signal is None
+
+
+def test_comeback_clears_silent_dropped():
+    """After a rate-limited round, claude ends up in silent_dropped.
+    The comeback must clear it so expected_bots re-admits claude."""
+    before = datetime(2026, 7, 4, 12, 0, tzinfo=UTC)
+    after = datetime(2026, 7, 4, 13, 0, 1, tzinfo=UTC)
+    driver = _fresh_driver(wall_clock=lambda: before)
+    driver._rate_limited_until["claude"] = RESET
+    driver._bot_state("claude").signal = detectors.SIGNAL_RATE_LIMITED
+    driver.silent_dropped.add("claude")   # populated by _record_round_attendance
+    driver.silent_rounds["claude"] = 1
+    driver.wall_clock = lambda: after
+    driver._apply_rate_limit_comeback()
+    assert "claude" not in driver.silent_dropped
+    assert driver.silent_rounds.get("claude", 0) == 0
+    assert "claude" in driver.expected_bots()
+
+
 # ── Label ────────────────────────────────────────────────────────────────────
 
 def test_rate_limited_label():
-    driver = _fresh_driver()
+    driver = _fresh_driver(wall_clock=lambda: BEFORE_RESET)
     driver._scan_unavailable_markers([_marker()])
     assert driver._bot_status_text("claude") == "Rate-limited ⏳"
     assert driver._skip_key("claude") == "rate-limited"

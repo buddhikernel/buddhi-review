@@ -1094,6 +1094,14 @@ class RoundDriver:
         if until is not None:
             when = until.isoformat()
             comeback = f"re-summons claude in the first round after {when}"
+            # Stale marker: the reset window already elapsed before this loop
+            # saw it. Quiescing the round on a past epoch would prematurely
+            # close a round that may still have a real review in-flight.
+            if until <= self.wall_clock():
+                self.notice("claude-rate-limited",
+                            f"stale rate-limit marker (resets_at {when} already "
+                            f"elapsed) — ignoring", status="skip")
+                return
         else:
             until = datetime.min.replace(tzinfo=timezone.utc)
             when = "an unknown time"
@@ -1115,6 +1123,11 @@ class RoundDriver:
             st = self._bot_state(bot)
             if st.signal == detectors.SIGNAL_RATE_LIMITED:
                 st.signal = None
+            # The rate-limit round quiesces without a real review from the bot,
+            # so _record_round_attendance adds it to silent_dropped. Clear that
+            # here so expected_bots() re-admits the bot after the reset.
+            self.silent_dropped.discard(bot)
+            self.silent_rounds[bot] = 0
             self.notice("rate-limited-comeback",
                         f"{bot} usage window has reset — re-requesting", status="done")
 
