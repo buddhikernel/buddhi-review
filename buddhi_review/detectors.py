@@ -584,7 +584,7 @@ PR_ERRORED_VOCAB_RE = re.compile(
     r"|(?:review(?:er)?s?|bots?)\b[\s\S]{0,12}\berror(?:s|ed)?"
     r"|(?:review(?:er)?s?|bots?)[\s\S]{0,25}(?:internal|unexpected|transient)[\s-]+error"
     r"|(?:internal|unexpected|transient)[\s-]+error[\s\S]{0,25}(?:review(?:er)?s?|bots?)"
-    r"|something[\s-]+went[\s-]+wrong[\s\S]{0,40}(?:review(?:er)?s?|bots?|generat)"
+    r"|something[\s-]+went[\s-]+wrong[\s\S]{0,40}(?:review(?:er)?s?|bots?|generat(?:e[sd]?|ing|ion)?)"
     r")\b"
 )
 _PR_CAUSE_VOCAB: Dict[str, "re.Pattern[str]"] = {
