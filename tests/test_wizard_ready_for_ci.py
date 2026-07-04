@@ -80,7 +80,7 @@ def test_template_uses_standard_runner_only():
 
 
 def test_template_is_publish_clean():
-    """Adversarial claim #1: the shipped template leaks no paid/private/MONO surface
+    """Adversarial claim #1: the shipped template leaks no paid or private surface
     (it is scanned by the publish gate as installed product)."""
     text = _template_path().read_text(encoding="utf-8")
     assert g.scan_paid_and_publish(text) == []

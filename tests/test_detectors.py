@@ -794,7 +794,7 @@ def test_probe_uses_workflow_basename_and_repo_flag():
 
 
 def test_probe_skips_skipped_runs_to_the_executed_run():
-    """REGRESSION (the buddhi-review silent self-heal bug): the NEWEST Claude run is
+    """REGRESSION (the buddhi-review silent skipped-run bug): the NEWEST Claude run is
     frequently a `skipped` no-op (a non-`@claude` comment trips the workflow's `if:`
     guard) with an EMPTY log. The probe must look PAST it to the most recent EXECUTED
     run and detect THAT run's 401 — not stop at the skipped run and false-negative."""

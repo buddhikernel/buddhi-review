@@ -73,19 +73,25 @@ _FINAL_TO_PARITY = {
     "escalated": "escalated",
 }
 
-# Publish-gate strings that must never ride a shipped fixture. The whole-tree
-# OSS-purity guard (tests/test_oss_purity.py) scans ONLY buddhi_review/ and never
-# sees these JSON fixtures, so this list MUST mirror its terms (paid-product names
-# + publish-gate strings) AND add the fixture-specific company/token shapes. The
-# drift-guard test below fails if test_oss_purity ever grows a term this misses.
+# Publish-gate strings that must never ride a shipped fixture. The source-surface
+# OSS-purity guard (tests/test_oss_purity.py) scans buddhi_review/, tests/*.py and
+# the root/docs markdown but never these JSON fixtures, so this list MUST mirror
+# its terms (paid-product names + publish-gate strings) AND add the
+# fixture-specific company/token shapes. The drift-guard test below fails if
+# test_oss_purity ever grows a term this misses. (Matching here is SUBSTRING —
+# deliberately stricter than the word-boundary scanner, so e.g. "mono" also
+# rejects a fixture that says "monolith"; a fixture edit that trips gets a
+# human look rather than a silent pass.)
 _FORBIDDEN = (
     # test_oss_purity._FORBIDDEN — paid/internal product + limitation surface.
     "telegram", "autopilot", "cockpit", "self-heal",
     "auto-rebase", "--implementer-session", "keep this session open",
     "buddhi board", "work dashboard", "buddhi-board", "work-dashboard",
-    # FREE-3 widened paid module / reserved-cell identifiers (mirror publish_gate).
+    # FREE-3 widened paid module / reserved-cell identifiers (mirror publish_gate)
+    # + the private reference tree's internal label ("mono").
     "dashboard_server", "telegram_status_bot", "bot_quota", "oob_resolution",
-    "review_loop", "dashboard_refresh", "app1", "app2", "oob", "stage0", "stage-0",
+    "review_loop", "dashboard_refresh", "app1", "app2", "oob", "mono",
+    "stage0", "stage-0",
     # FREE-3 paid-monolith module + namespace surface (mirror _PAID_MODULE_NAMES).
     "buddhi_pro", "buddhi-pro", "buddhikernel_pro", "buddhikernel-pro",
     "buddhi_review_pro", "buddhi-review-pro",

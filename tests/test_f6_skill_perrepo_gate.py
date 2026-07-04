@@ -8,9 +8,8 @@ to global defaults. It must NEVER walk the user through reviewer/auto-on-open/
 label-CI selection inline in the session (the standing "no deterministic setup in
 the Claude Code session" rule). A CONFIRMED repo must draw no prompt at all.
 
-This is the FREE-skill twin of the monolith skills' Step 1.1 (P5). The two files
-have no automated drift-guard apart from this test, so it asserts the gate is
-present, single-ask, and consistent across both.
+The two files have no automated drift-guard apart from this test, so it asserts
+the gate is present, single-ask, and consistent across both.
 """
 from pathlib import Path
 

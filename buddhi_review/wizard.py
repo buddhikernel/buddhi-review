@@ -346,7 +346,7 @@ def _row(status: str, text: str, pal: _Palette, stream) -> None:
 
 
 def _note(text: str, pal: _Palette, stream) -> None:
-    """A dim, un-glyphed aside at panel indent (mirrors the MONO wizard's ``note()``).
+    """A dim, un-glyphed aside at panel indent.
     For explanation/context that should recede behind the glyph rows."""
     print(f"  {pal.GREY}{text}{pal.RESET}", file=stream)
 

@@ -80,6 +80,6 @@ it never reaches the classifier.
 ## Sanitization contract (publish-clean)
 
 Nothing in any fixture may contain an author path (`/Users/...`), the owner
-handle, `project-registry`, a real private repo name, or a token. The parity
-suite enforces this with a grep guard over every fixture file. Use neutral
-placeholders: `example-org/widget`, `app/uploader.py`, generic PR numbers.
+handle, a private registry or repo name, or a token. The parity suite enforces
+this with a grep guard over every fixture file. Use neutral placeholders:
+`example-org/widget`, `app/uploader.py`, generic PR numbers.
