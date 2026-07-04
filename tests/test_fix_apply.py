@@ -365,22 +365,48 @@ def test_tripwire_removed_bare_assert_not_self_assert():
     assert diff_tripwire("-    self.assertEqual(x, 1)") is None
 
 
-def test_attempt_diff_caps_at_max_bytes(repo):
-    # #39: a huge tracked change is capped to the byte budget with the sentinel.
+def test_attempt_diff_scans_full_and_composer_caps(repo):
+    # #39, re-pointed: the byte budget guards the VERIFY-PROMPT artifact, not
+    # the scan — `_attempt_diff` returns the full text (so the tripwire sees
+    # everything) and `_compose_verify_diff` is where the cap + sentinel live.
     big = "y = 1\n" + "\n".join(f"line{i} = {i}" for i in range(20000)) + "\n"
     (repo / "tracked.py").write_text(big)
-    diff = fix_apply._attempt_diff(str(repo), "HEAD")
-    assert len(diff) <= fix_apply._ATTEMPT_DIFF_MAX_BYTES + len(fix_apply._DIFF_TRUNCATED_SENTINEL)
-    assert "[diff truncated]" in diff
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD")
+    assert not truncated
+    assert len(diff.encode()) > fix_apply._ATTEMPT_DIFF_MAX_BYTES
+    assert "line19999" in diff              # the tail is scannable
+    capped = fix_apply._compose_verify_diff(diff, False)
+    assert (len(capped.encode())
+            <= fix_apply._ATTEMPT_DIFF_MAX_BYTES
+            + len(fix_apply._DIFF_TRUNCATED_SENTINEL.encode()))
+    assert "[diff truncated]" in capped
 
 
-def test_attempt_diff_stops_appending_untracked_over_budget(repo):
-    # #39: once the tracked diff already exceeds the budget, untracked chunks are
-    # not appended at all.
+def test_attempt_diff_scans_untracked_past_the_prompt_budget(repo):
+    # #39, re-pointed (inverse of the old stop-appending assertion): an
+    # untracked chunk beyond the old 60KB budget is now IN the scan text —
+    # a dangerous line there can no longer hide from the tripwire — while the
+    # composed verify artifact stays capped.
     (repo / "tracked.py").write_text("z = 1\n" + "q" * 70000 + "\n")
-    (repo / "untracked_marker.py").write_text("SHOULD_NOT_APPEAR = 1\n")
-    diff = fix_apply._attempt_diff(str(repo), "HEAD")
-    assert "SHOULD_NOT_APPEAR" not in diff
+    (repo / "untracked_marker.py").write_text("NOW_SCANNED_FLAGS = ('--x',)\n")
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD")
+    assert not truncated
+    assert "NOW_SCANNED_FLAGS" in diff
+    assert diff_tripwire(diff) is not None
+    capped = fix_apply._compose_verify_diff(diff, True)
+    assert (len(capped.encode())
+            <= fix_apply._ATTEMPT_DIFF_MAX_BYTES
+            + len(fix_apply._DIFF_TRUNCATED_SENTINEL.encode()))
+
+
+def test_attempt_diff_scan_ceiling_reports_truncated(repo, monkeypatch):
+    # Crossing a scan ceiling must surface as truncated=True (the caller turns
+    # that into a forced verify) — never a silent shorter scan.
+    (repo / "tracked.py").write_text("z = 1\n" + "q" * 5000 + "\n")
+    monkeypatch.setattr(fix_apply, "_SCAN_DIFF_MAX_BYTES", 1000)
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD")
+    assert truncated
+    assert len(diff.encode()) <= 1000
 
 
 def test_apply_fix_forwards_phase1_stamps(repo):
@@ -393,3 +419,28 @@ def test_apply_fix_forwards_phase1_stamps(repo):
     prompts.clear()
     apply_fix("claim", cwd=str(repo), runner=fixer)
     assert "CLASSIFIER NOTES" not in prompts[0]
+
+
+def test_apply_fix_scan_truncation_forces_verify(repo, monkeypatch):
+    # off-mode + a benign diff would skip the pass entirely — a clipped scan
+    # must force it anyway: unscannable never degrades silently.
+    verify_calls = []
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "tracked.py").write_text("benign\n")
+        return 0, "done"
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    monkeypatch.setattr(
+        fix_apply, "_attempt_diff",
+        lambda cwd, ref, snap_untracked=None: (
+            "diff --git a/f b/f\n--- a/f\n+++ b/f\n"
+            "@@ -1 +1 @@\n-a\n+b\n", True))
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, label="COSMETIC",
+                    verify_runner=verify, verify_mode="off", retries=0)
+    assert out.status == "applied"
+    assert len(verify_calls) == 1
+    assert "attempt diff exceeded the scan budget" in out.detail
