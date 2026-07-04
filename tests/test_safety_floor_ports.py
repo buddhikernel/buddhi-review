@@ -12,6 +12,7 @@ is covered, and adds the harness-hygiene guard.
 """
 from __future__ import annotations
 
+import subprocess
 import tempfile
 from pathlib import Path
 
@@ -416,14 +417,11 @@ def test_attempt_diff_ls_files_failure_fails_closed(repo_sf, monkeypatch):
     assert "X2 = 1" in diff   # the tracked diff is preserved
 
 
-import subprocess
-
-
 @pytest.fixture
 def repo_sf(tmp_path):
     def git(*args):
         subprocess.run(["git", *args], cwd=tmp_path, check=True,
-                            capture_output=True)
+                       capture_output=True)
     git("init", "-q")
     git("config", "user.email", "t@example.com")
     git("config", "user.name", "t")
