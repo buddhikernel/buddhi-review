@@ -62,7 +62,7 @@ def test_no_paid_or_private_surface(path):
 
 def test_at_least_the_new_modules_are_scanned():
     names = {p.name for p in _shipped_files()}
-    for expected in ("wizard.py", "create_pr.py", "shell_env.py", "setup_launcher.py",
+    for expected in ("wizard.py", "open_pr.py", "shell_env.py", "setup_launcher.py",
                      "backends.py", "git_guardrail_hook.py", "plan_profile.py"):
         assert expected in names
 
@@ -92,7 +92,7 @@ _VOCAB_SCAFFOLDING = frozenset({
     "tests/test_publish_gate.py",            # scanner unit fixtures spell the vocabulary
     "tests/test_verdict_parity.py",          # fixture guard mirrors the tables (superset)
     "tests/test_claude_workflow_parity.py",  # asserts author/handle absent from the workflow
-    "tests/test_create_pr.py",               # asserts the paid rebase notice never prints
+    "tests/test_open_pr.py",                 # asserts the paid rebase notice never prints
     "tests/test_escalation_triggers.py",     # asserts no autonomy-dial vocabulary leaks in
     "tests/test_notifier_transparency.py",   # asserts a paid channel value coerces to console
     "tests/test_shell_env.py",               # asserts paid env keys never reach the env

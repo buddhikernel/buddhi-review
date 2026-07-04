@@ -34,8 +34,8 @@ skills to Claude Code as **skills** (one time; each becomes `~/.claude/skills/<n
 SKILLS=$(python3 -c "import buddhi_review, os; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'skills'))" 2>/dev/null)
 if [ -d "$SKILLS" ]; then
   mkdir -p ~/.claude/skills/
-  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/create-pr
-  cp -R "$SKILLS"/review-pr "$SKILLS"/create-pr ~/.claude/skills/
+  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/open-pr ~/.claude/skills/create-pr
+  cp -R "$SKILLS"/review-pr "$SKILLS"/open-pr ~/.claude/skills/
   echo "✓ Skills installed to ~/.claude/skills/ — restart Claude Code to load them"
 else
   echo "✗ Error: Could not locate buddhi_review skills. Ensure buddhi-review is installed in the active Python environment."
@@ -126,7 +126,7 @@ Two entry points:
 /review-pr <pr>
 
 # …or open a PR from your current branch and review it in one step:
-/create-pr
+/open-pr
 ```
 
 Both launch the review loop **detached** so it survives the session, and hand control

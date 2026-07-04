@@ -609,13 +609,13 @@ def refuse_primary_checkout(pr, repo, cwd, *, run=None,
         f"pointed at the PRIMARY checkout ({cwd}), which is sitting "
         f"on the PR head branch {head}. Running fixers there risks leaking an "
         f"uncommitted fix edit onto the default branch after the PR merges. "
-        f"Launch from a dedicated per-PR worktree (the create-pr / review-pr "
+        f"Launch from a dedicated per-PR worktree (the open-pr / review-pr "
         f"flow builds one), or set BUDDHI_ALLOW_PRIMARY_CHECKOUT=1 to override.")
     _print_refusal_banner(f"PREFLIGHT — PRIMARY CHECKOUT — {repo or 'this repo'} on {head}", reason)
     notice("primary-checkout gate",
            f"{REFUSED_TO_LAUNCH_MARKER} in the primary checkout on {head} — fixers "
            f"need a dedicated worktree", status="stop",
-           hint="run via create-pr / review-pr; bypass: BUDDHI_ALLOW_PRIMARY_CHECKOUT=1")
+           hint="run via open-pr / review-pr; bypass: BUDDHI_ALLOW_PRIMARY_CHECKOUT=1")
     return reason
 
 

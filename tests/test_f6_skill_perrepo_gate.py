@@ -1,6 +1,6 @@
 """F6 — the SKILL.md per-repo unconfigured-repo gate (both shipped skills).
 
-Both ``create-pr`` and ``review-pr`` must carry the SAME per-repo reviewer
+Both ``open-pr`` and ``review-pr`` must carry the SAME per-repo reviewer
 confirmation gate: after the repo is resolved, shell out to F1's status reader
 (``python -m buddhi_review status --repo <repo>``), and on an UNCONFIRMED repo
 ask the user ONCE — either launch the terminal wizard for that repo or fall back
@@ -17,13 +17,13 @@ import pytest
 import yaml
 
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "buddhi_review" / "skills"
-_SKILLS = ("create-pr", "review-pr")
+_SKILLS = ("open-pr", "review-pr")
 
 # The header the gate ships under in both files, and the next section header that
 # bounds it (so a marker matched elsewhere in the file can never pass the scan).
 _GATE_HEADER = "### 1.1 Per-repo reviewer confirmation gate"
 _NEXT_SECTION = {
-    "create-pr": "### 2. Pre-launch rebase gate",
+    "open-pr": "### 2. Pre-launch rebase gate",
     "review-pr": "### 2. Select which PR to review",
 }
 

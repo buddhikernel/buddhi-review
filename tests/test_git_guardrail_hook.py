@@ -20,7 +20,7 @@ from buddhi_review import git_guardrail_hook as g
 
 _PUBLIC = Path(__file__).resolve().parent.parent
 _SKILLS_DIR = _PUBLIC / "buddhi_review" / "skills"
-_SKILLS = ("review-pr", "create-pr")
+_SKILLS = ("review-pr", "open-pr")
 
 
 # ── decide(): commands that MUST be blocked ──────────────────────────────────
@@ -110,7 +110,7 @@ ALLOW = [
     "git worktree add .claude/worktrees/x -b b origin/main",
     "git revert abc123",                        # new commit, not a rewrite
     "git stash",
-    "python3 -m buddhi_review create-pr --title t --body b",
+    "python3 -m buddhi_review open-pr --title t --body b",
     "bash launch-review.sh 42 --repo o/r",
     "echo git rebase main",                     # 'git' is an arg to echo, not a command
     "grep -r 'git merge' .",

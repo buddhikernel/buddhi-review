@@ -1,4 +1,4 @@
-"""create_pr.py — the create-pr actuator (git decision tree + create + launch).
+"""open_pr.py — the open-pr actuator (git decision tree + create + launch).
 
 The git half runs against a real temp repo; ``gh`` and the detached launcher are
 injected seams so the suite is network-free and opens no real PR.
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from buddhi_review import create_pr
+from buddhi_review import open_pr
 
 
 # ── git temp-repo helpers ──────────────────────────────────────────────────────────
@@ -65,40 +65,40 @@ def _seam(*, pr_url="https://github.com/acme/widgets/pull/7", already_exists=Fal
 
 def _run_actuate(work, run, launch, **kw):
     out, err = io.StringIO(), io.StringIO()
-    rc = create_pr.actuate(repo="acme/widgets", cwd=str(work), base="main",
-                           title="Add a thing", body="why", run=run, launch=launch,
-                           out=out, err=err, **kw)
+    rc = open_pr.actuate(repo="acme/widgets", cwd=str(work), base="main",
+                         title="Add a thing", body="why", run=run, launch=launch,
+                         out=out, err=err, **kw)
     return rc, out.getvalue(), err.getvalue()
 
 
 # ── decide_path (pure) ─────────────────────────────────────────────────────────────
 
 def test_decide_path():
-    S = create_pr.GitState
-    assert create_pr.decide_path(S("main", "feat/x", True, True, False, True)) == "A"
-    assert create_pr.decide_path(S("main", "feat/x", True, True, True, False)) == "B"
-    assert create_pr.decide_path(S("main", "main", False, True, True, False)) == "C"
-    assert create_pr.decide_path(S("main", "main", False, True, False, False)) == "C_or_D"
-    assert create_pr.decide_path(S("main", "", False, False, False, False)) == "D"
+    S = open_pr.GitState
+    assert open_pr.decide_path(S("main", "feat/x", True, True, False, True)) == "A"
+    assert open_pr.decide_path(S("main", "feat/x", True, True, True, False)) == "B"
+    assert open_pr.decide_path(S("main", "main", False, True, True, False)) == "C"
+    assert open_pr.decide_path(S("main", "main", False, True, False, False)) == "C_or_D"
+    assert open_pr.decide_path(S("main", "", False, False, False, False)) == "D"
 
 
 # ── resolve_repo ───────────────────────────────────────────────────────────────────
 
 def test_resolve_repo_explicit_wins():
-    assert create_pr.resolve_repo("/x", "acme/widgets", run=None) == "acme/widgets"
+    assert open_pr.resolve_repo("/x", "acme/widgets", run=None) == "acme/widgets"
 
 
 def test_resolve_repo_infers_from_gh():
     def run(argv, cwd=None, timeout=60, input=None):
         return types.SimpleNamespace(returncode=0, stdout="acme/widgets\n")
-    assert create_pr.resolve_repo("/x", None, run) == "acme/widgets"
+    assert open_pr.resolve_repo("/x", None, run) == "acme/widgets"
 
 
 def test_resolve_repo_raises_without_remote():
     def run(argv, cwd=None, timeout=60, input=None):
         return types.SimpleNamespace(returncode=1, stdout="")
-    with pytest.raises(create_pr.CreatePrError):
-        create_pr.resolve_repo("/x", None, run)
+    with pytest.raises(open_pr.OpenPrError):
+        open_pr.resolve_repo("/x", None, run)
 
 
 # ── Full flows ─────────────────────────────────────────────────────────────────────
@@ -218,7 +218,7 @@ def test_no_implementer_session_or_keep_open_notice(tmp_path):
 
 
 def test_source_has_no_paid_consult_markers():
-    text = Path(create_pr.__file__).read_text(encoding="utf-8")
+    text = Path(open_pr.__file__).read_text(encoding="utf-8")
     assert "--implementer-session" not in text
     assert "keep this session open" not in text.lower()
 

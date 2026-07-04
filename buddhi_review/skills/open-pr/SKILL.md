@@ -1,5 +1,5 @@
 ---
-name: create-pr
+name: open-pr
 description: >
   Create a PR from your local changes, then run the automated review loop on it.
   Branches, commits, pushes, opens the PR with `gh pr create`, and launches the
@@ -23,7 +23,7 @@ hooks:
           command: python3 -m buddhi_review.git_guardrail_hook
 ---
 
-# /create-pr — create a PR, then review it
+# /open-pr — create a PR, then review it
 
 **Buddhi lands your PRs.** This skill gets a PR airborne — branch, commit, push,
 open — then flies the automated review rounds; once review is clean it is ready
@@ -42,7 +42,7 @@ terminal.
   confirmation** prompt (Step 1.1, only when this repo's reviewers are
   unconfirmed), and the **rebase gate** (Step 2, only when the branch is behind
   base). Run everything else back-to-back.
-- **The actuator does the git mechanics.** `python3 -m buddhi_review create-pr`
+- **The actuator does the git mechanics.** `python3 -m buddhi_review open-pr`
   detects the git state, commits/branches/pushes as needed, opens the PR, and
   launches the review loop. You author the title/body and pick the branch; you do
   NOT run the branch/commit/push git commands yourself.
@@ -132,7 +132,7 @@ and act on `repo_confirmed`:
 
        On a headless host the launcher prints the one-liner to run by hand
        instead. After it returns, reply exactly: ``Setup opened in a new window —
-       finish it there, then re-run /create-pr.`` and **EXIT**.
+       finish it there, then re-run /open-pr.`` and **EXIT**.
     2. **Use global defaults** *(offer only when `has_global_default` is `true`)* —
        continue to Step 2 without writing a per-repo entry; the loop runs with
        your global default fleet. When `has_global_default` is `false`, omit this
@@ -177,7 +177,7 @@ uncommitted / on-base), commits/branches/pushes as needed, ensures remote infra,
 opens the PR, and launches the review loop detached:
 
 ```bash
-python3 -m buddhi_review create-pr \
+python3 -m buddhi_review open-pr \
   --title "<title>" --body "<body>" \
   [--repo "<owner/repo>"] [--cwd "$CWD"] \
   [--branch-prefix feat|fix|refactor] [--branch "<explicit-branch-name>"]
