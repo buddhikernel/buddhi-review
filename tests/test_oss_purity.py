@@ -2,12 +2,16 @@
 
 The free skill's source AND its shipped docs must describe ONLY free behavior.
 This scans the package source tree (``buddhi_review/**`` — every ``*.py``,
-``skills/**/*.{md,yml}`` and ``*.sh``) for:
+``skills/**/*.{md,yml}`` and ``*.sh``) — PLUS the public-repo-only surface the
+artifact gate never sees (``tests/**/*.py``, ``tests/**/*.md``, the root-level
+``*.md``, ``docs/**/*.md``, the hand-authored README chart ``docs/**/*.svg``,
+and the public CI workflows ``.github/workflows/*.{yml,yaml}``) — for:
 
   * paid PRODUCT / INTERNAL names and paid IDENTIFIER names that have no
     legitimate free use (Telegram, Autopilot, Cockpit, self-heal, the paid
-    auto-rebase mechanism framed as a free limitation, and the paid module /
-    reserved-cell identifiers ``review_loop`` / ``dashboard_server`` /
+    auto-rebase mechanism framed as a free limitation, the private reference
+    tree's internal label ``mono``, and the paid module / reserved-cell
+    identifiers ``review_loop`` / ``dashboard_server`` /
     ``telegram_status_bot`` / ``bot_quota`` / ``oob_resolution`` / ``App1`` /
     ``App2`` / ``Stage-0`` / ``stage0``);
   * publish-gate strings (author path, owner handle, internal registry);
@@ -61,6 +65,131 @@ def test_at_least_the_new_modules_are_scanned():
     for expected in ("wizard.py", "create_pr.py", "shell_env.py", "setup_launcher.py",
                      "backends.py", "git_guardrail_hook.py", "plan_profile.py"):
         assert expected in names
+
+
+# ── Public-repo-only surface: tests/, root & docs markdown, README-chart SVGs,
+#    and the public CI workflow YAML ──────────────────────────────────────────────
+# These files ship in the PUBLIC repo (never the wheel), so the artifact gate
+# never scans them — historically a blind spot: a private-tree reference in a
+# test comment, a root doc, a hand-drawn SVG's ``<text>``/``<!-- comment -->``,
+# or a workflow ``name:``/``run:`` line sailed through. Scanned with the same
+# paid/publish scanner. The entitlement scan stays package-code-only by design:
+# tests and docs legitimately say "MIT License".
+_REPO = _PKG.parent
+_TESTS = Path(__file__).resolve().parent
+
+# Files that enumerate the forbidden vocabulary BY DESIGN — scanner fixtures and
+# negative assertions (``assert "manasvi" not in text``). This is the same
+# scaffolding carve-out the artifact gate applies to tests/ + tools/ wholesale,
+# but per-file, so every OTHER file stays scanned and a NEW file is scanned by
+# default. Entries are REPO-RELATIVE POSIX paths (not bare basenames), so the
+# exemption pins to the exact fixture: a future same-named file at a different
+# path (e.g. ``tests/subdir/test_wizard.py``) is still scanned. Every entry must
+# actually trip the scanner (honesty guard below): a scan-clean or renamed entry
+# must be removed, so the allowlist can never quietly exempt an ordinary file.
+_VOCAB_SCAFFOLDING = frozenset({
+    "tests/test_oss_purity.py",              # this guard: docstring + re-exported tables
+    "tests/test_publish_gate.py",            # scanner unit fixtures spell the vocabulary
+    "tests/test_verdict_parity.py",          # fixture guard mirrors the tables (superset)
+    "tests/test_claude_workflow_parity.py",  # asserts author/handle absent from the workflow
+    "tests/test_create_pr.py",               # asserts the paid rebase notice never prints
+    "tests/test_escalation_triggers.py",     # asserts no autonomy-dial vocabulary leaks in
+    "tests/test_notifier_transparency.py",   # asserts a paid channel value coerces to console
+    "tests/test_shell_env.py",               # asserts paid env keys never reach the env
+    "tests/test_wizard.py",                  # asserts wizard output ships no paid name
+})
+
+
+def _collect_public_repo_files(repo_root: Path, tests_dir: Path):
+    """Enumerate the public-repo-only scan surface under ``repo_root`` (parametrized
+    so the self-tests can point it at a synthetic tree). Excludes the exact
+    repo-relative paths in _VOCAB_SCAFFOLDING; a glob over a missing dir is empty,
+    never an error."""
+    candidates = list(tests_dir.rglob("*.py"))
+    candidates += tests_dir.rglob("*.md")
+    candidates += repo_root.glob("*.md")
+    candidates += (repo_root / "docs").rglob("*.md")
+    candidates += (repo_root / "docs").rglob("*.svg")
+    candidates += (repo_root / ".github" / "workflows").glob("*.yml")
+    candidates += (repo_root / ".github" / "workflows").glob("*.yaml")
+    return sorted(
+        p for p in candidates
+        if p.relative_to(repo_root).as_posix() not in _VOCAB_SCAFFOLDING
+    )
+
+
+def _public_repo_files():
+    return _collect_public_repo_files(_REPO, _TESTS)
+
+
+@pytest.mark.parametrize("path", _public_repo_files(),
+                         ids=lambda p: str(p.relative_to(_REPO)))
+def test_no_paid_or_private_surface_in_tests_and_docs(path):
+    hits = g.scan_paid_and_publish(path.read_text(encoding="utf-8"))
+    assert hits == [], f"{path.relative_to(_REPO)}: {hits}"
+
+
+def test_public_repo_surface_is_actually_covered():
+    """The globs must keep picking the surface up — an empty/mis-rooted glob
+    would silently skip the whole widened scan."""
+    files = _public_repo_files()
+    names = {p.name for p in files}
+    for expected in ("conftest.py", "test_wizard_ready_for_ci.py",
+                     "README.md", "GETTING_STARTED.md", "ARCHITECTURE.md"):
+        assert expected in names
+    # The two hardening surfaces (defense-in-depth) must be picked up too.
+    assert any(p.suffix == ".svg" for p in files), "docs SVG surface not scanned"
+    assert any(p.parent.name == "workflows" and p.suffix in (".yml", ".yaml")
+               for p in files), "public workflow YAML surface not scanned"
+
+
+@pytest.mark.parametrize("rel", sorted(_VOCAB_SCAFFOLDING))
+def test_vocab_scaffolding_allowlist_is_honest(rel):
+    path = _REPO / rel
+    assert path.exists(), (
+        f"stale _VOCAB_SCAFFOLDING entry '{rel}' — the file is gone or renamed; "
+        f"remove (or update) the entry")
+    hits = g.scan_paid_and_publish(path.read_text(encoding="utf-8"))
+    assert hits != [], (
+        f"'{rel}' is scan-clean — it no longer earns its exemption; remove it "
+        f"from _VOCAB_SCAFFOLDING so it is scanned like every other file")
+
+
+# ── Self-tests for the widened enumeration + relative-path exemption ─────────────
+def _write(path: Path, text: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+def test_svg_and_workflow_surfaces_are_scanned(tmp_path):
+    """A planted forbidden word in a docs SVG and a public workflow YAML is picked
+    up by the enumeration and caught by the scanner — these ship in the public
+    repo but never in the wheel, so only this guard covers them."""
+    svg = _write(tmp_path / "docs" / "assets" / "x.svg",
+                 '<svg xmlns="http://www.w3.org/2000/svg">'
+                 '<!-- Autopilot --><text>chart</text></svg>')
+    wf = _write(tmp_path / ".github" / "workflows" / "leak.yml",
+                "name: ci\njobs:\n  t:\n    steps:\n      - run: echo bot_quota\n")
+    collected = _collect_public_repo_files(tmp_path, tmp_path / "tests")
+    rels = {p.relative_to(tmp_path).as_posix() for p in collected}
+    assert "docs/assets/x.svg" in rels, "docs SVG not enumerated"
+    assert ".github/workflows/leak.yml" in rels, "workflow YAML not enumerated"
+    assert g.scan_paid_and_publish(svg.read_text(encoding="utf-8")), "SVG leak not caught"
+    assert g.scan_paid_and_publish(wf.read_text(encoding="utf-8")), "workflow leak not caught"
+
+
+def test_allowlist_pins_to_relative_path_not_basename(tmp_path):
+    """The fixture exemption pins to the exact repo-relative path: a file sharing
+    an allowlisted BASENAME at a different path is NOT exempted (it is scanned)."""
+    tests = tmp_path / "tests"
+    _write(tests / "test_wizard.py", "x = 1\n")             # allowlisted exact path
+    _write(tests / "subdir" / "test_wizard.py", "x = 1\n")  # same basename, other path
+    rels = {p.relative_to(tmp_path).as_posix()
+            for p in _collect_public_repo_files(tmp_path, tests)}
+    assert "tests/test_wizard.py" not in rels, "exact-path fixture must stay exempted"
+    assert "tests/subdir/test_wizard.py" in rels, (
+        "a same-basename file at a different path must be scanned, not exempted")
 
 
 # ── No entitlement / licence-check logic anywhere in the free code ─────────────────

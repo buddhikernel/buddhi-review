@@ -1,4 +1,4 @@
-"""The in-run contextual upgrade nudge (PRO-7 / execution-plan §D4 + §E.9).
+"""The in-run contextual upgrade nudge.
 
 Proves the whole gate: shown ONLY when the free skill runs without an active paid
 backend, contextual to what the run did, frequency-capped, dismissible, suppressible
