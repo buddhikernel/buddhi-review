@@ -339,6 +339,7 @@ _SKIP_LONG: Dict[str, str] = {
     "polish": "polishing only — no substantive findings left",
     "silent": "silent for a full round — dropped from re-request",
     "excluded": "excluded",
+    "not-requested": "not requested (not in the enabled reviewer fleet)",
 }
 _STATUS_SHORT: Dict[str, str] = {
     # The canonical round-summary label set. Done-for-the-run reviewers split
@@ -357,6 +358,11 @@ _STATUS_SHORT: Dict[str, str] = {
     "polish": "Polish-only 🧹",
     "silent": "No review posted 🔇",
     "excluded": "excluded",
+    # A roster reviewer outside the enabled fleet this run — never summoned, so
+    # its row is a quiet "for completeness" entry, distinct from the repo-gate
+    # "Not configured (repo) 🔧" (cannot run here) and from "No review posted 🔇"
+    # (was expected, stayed silent).
+    "not-requested": "Not requested ·",
 }
 # Render-time statuses for reviewers with NO skip key (still expected).
 # "Active ✅" only ever means "engaged this round"; an expected reviewer that
@@ -832,6 +838,12 @@ class RoundDriver:
             return "silent"
         if self.store.is_excluded(bot):
             return "excluded"
+        if bot not in active_reviewers(self.cfg, self.repo):
+            # Outside the enabled fleet — never summoned this run. Deliberately
+            # the LOWEST-priority reason: any real state above (a sign-off, a
+            # posted placeholder, a round-end demotion) outranks it, so a bot
+            # that engaged anyway is never masked as merely not-requested.
+            return "not-requested"
         return None
 
     def _log_skipped(self, expected: Sequence[str]) -> None:
@@ -858,12 +870,21 @@ class RoundDriver:
             # "No review posted 🔇" as a silent drop.
             return (_STATUS_NOT_CONFIGURED if self._repo_unconfigured
                     else _STATUS_SHORT["silent"])
+        if key == "not-requested" and self._bot_state(bot).last_seen is not None:
+            # A not-summoned reviewer that posted anyway THIS round is engaged,
+            # not absent — activity earns the same "Active ✅" an expected
+            # reviewer gets, never the not-requested fallback.
+            return _STATUS_ACTIVE
         return _STATUS_SHORT.get(key, key)
 
     def _round_table_rows(self, actionable: Sequence[Comment],
                           results: Sequence[CommentResult]) -> List[dict]:
-        """One summary row per enabled reviewer (canonical order) from this round's
-        classified comments + each reviewer's terminal status."""
+        """One summary row per reviewer (canonical order) from this round's
+        classified comments + each reviewer's terminal status. The table is the
+        COMPLETE view: every built-in reviewer gets a row every round — one
+        outside the enabled fleet renders "Not requested ·" — plus a row for any
+        reviewer that actually posted. Display only: summoning, polling, and
+        expectation stay on the enabled fleet."""
         counts: Dict[str, Dict[str, int]] = {}
         for c, r in zip(actionable, results):
             bot = detectors.bot_for_login(c.source)
@@ -875,7 +896,10 @@ class RoundDriver:
             if col:
                 d[col] = d.get(col, 0) + 1
         rows: List[dict] = []
-        for bot in _canonical(active_reviewers(self.cfg, self.repo)):
+        roster = _canonical(list(REVIEWER_ORDER)
+                            + list(active_reviewers(self.cfg, self.repo))
+                            + list(counts))
+        for bot in roster:
             d = counts.get(bot, {})
             row = {"bot_key": bot, "label": _REVIEWER_LABEL.get(bot, bot.capitalize()),
                    "status": self._bot_status_text(bot)}
@@ -1111,8 +1135,13 @@ class RoundDriver:
         # last_seen stamp left over from a prior round. Without this every round
         # ≥2 would close on its first poll and could auto-merge un-reviewed
         # (the signal/done/excluded short-circuits in `_quiesced` are unaffected).
+        # EVERY tracked reviewer resets, not just the expected set: the round
+        # summary reads the stamp as "posted THIS round", so a not-summoned
+        # bot's stale stamp must never render "Active ✅" in a round it sat out.
         for bot in expected:
             self._bot_state(bot).last_seen = None
+        for st in self.bots.values():
+            st.last_seen = None
         actionable: List[Comment] = []
         last_activity = round_start
         while True:

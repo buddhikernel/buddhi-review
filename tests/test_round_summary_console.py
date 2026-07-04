@@ -308,8 +308,65 @@ def test_bot_status_text_active_vs_no_review_posted():
 def test_round_table_rows_capitalize_unknown_reviewer_label():
     d = _bare_driver(cfg={"active_reviewers": ["mystery"], "auto_on_open": {"mystery": True}})
     rows = d._round_table_rows([], [])
-    assert rows[0]["bot_key"] == "mystery"
-    assert rows[0]["label"] == "Mystery"  # _REVIEWER_LABEL fallback to capitalize()
+    # full-roster view: the built-in four render first (canonical order), then
+    # the enabled unknown reviewer keeps its row after them
+    assert [r["bot_key"] for r in rows] == \
+        ["claude", "copilot", "codex", "gemini", "mystery"]
+    assert rows[-1]["label"] == "Mystery"  # _REVIEWER_LABEL fallback to capitalize()
+
+
+def test_round_table_rows_cover_full_roster_with_not_requested():
+    # A configured-but-inactive built-in reviewer still gets a row — labelled
+    # "Not requested ·" — while the enabled-but-quiet reviewers keep their
+    # existing "No review posted 🔇" label, and the order stays canonical.
+    d = _bare_driver(cfg={"active_reviewers": ["claude", "codex"],
+                          "auto_on_open": {"claude": False, "codex": True}})
+    rows = d._round_table_rows([], [])
+    assert [r["bot_key"] for r in rows] == ["claude", "copilot", "codex", "gemini"]
+    by = {r["bot_key"]: r for r in rows}
+    assert by["copilot"]["status"] == "Not requested ·"
+    assert by["gemini"]["status"] == "Not requested ·"
+    assert by["copilot"]["posted"] == 0 and by["gemini"]["posted"] == 0
+    assert by["claude"]["status"] == "No review posted 🔇"
+    assert by["codex"]["status"] == "No review posted 🔇"
+
+
+def test_skip_key_and_long_form_for_not_requested_bot():
+    d = _bare_driver(cfg={"active_reviewers": ["claude"],
+                          "auto_on_open": {"claude": False}})
+    assert d._skip_key("gemini") == "not-requested"
+    assert d._bot_status_text("gemini") == "Not requested ·"
+    # every skip key carries an honest long form
+    assert "not requested" in round_driver._SKIP_LONG["not-requested"]
+    # distinct from the repo-gate label — an unconfirmed-repo idle EXPECTED
+    # reviewer still reads "Not configured (repo) 🔧", never "Not requested ·"
+    assert d._bot_status_text("gemini") != round_driver._STATUS_NOT_CONFIGURED
+
+
+def test_not_requested_is_lowest_priority_real_state_wins():
+    # A not-summoned reviewer that engaged anyway is never masked as
+    # not-requested: an explicit all-clear renders "Approved 👍", and mere
+    # activity this round renders the same "Active ✅" an expected bot earns.
+    d = _bare_driver(cfg={"active_reviewers": ["claude"],
+                          "auto_on_open": {"claude": False}})
+    d.done.add("gemini")
+    d.approved.add("gemini")
+    d._bot_state("gemini").signal = detectors.SIGNAL_CLEAN
+    assert d._bot_status_text("gemini") == "Approved 👍"
+    d._bot_state("codex").last_seen = 12.0
+    assert d._bot_status_text("codex") == "Active ✅"
+
+
+def test_round_start_reset_clears_stale_stamp_for_not_requested_bot():
+    # A not-summoned bot that posted in an EARLIER round must fall back to
+    # "Not requested ·" in a later round it sat out — the round-start reset
+    # covers every tracked reviewer, not just the expected set.
+    d = _bare_driver(cfg={"active_reviewers": ["claude"],
+                          "auto_on_open": {"claude": False}})
+    d.fetch = lambda pr, repo=None, cwd=None: []
+    d._bot_state("gemini").last_seen = 5.0          # engaged in a prior round
+    d._wait_for_quiescence([], 0.0)                 # a round it sits out
+    assert d._bot_status_text("gemini") == "Not requested ·"
 
 
 # ------------------------------------------------- driver: end-to-end console
@@ -355,11 +412,12 @@ def _run_capture(timeline, cfg, **kw):
         return [c for t, c in timeline if t <= clock.t]
 
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=_Notifier()))
+    kw.setdefault("gh_run", _Gh())
     d = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg, adapter=adapter,
         classify_runner=lambda p: json.dumps({"label": "SUBSTANTIVE", "reason": "t"}),
         fix_dispatch=lambda c, r: FixOutcome(status="applied"),
-        fetch=fetch, gh_run=_Gh(), clock=clock, sleep=clock.sleep,
+        fetch=fetch, clock=clock, sleep=clock.sleep,
         notice=lambda *a, **k: "",
         # register_delay=0 keeps these console-render tests on the tight timing
         # they were written for (the post-summon register delay is exercised in
@@ -394,6 +452,43 @@ def test_expecting_line_is_canonical_and_table_renders_each_round():
     assert "summary" in out and "┌" in out and "TOTAL" in out
     # honest skip-reason logging fired once codex was excluded
     assert "skipping codex: quota exhausted" in out
+
+
+def test_full_roster_table_summons_only_the_active_set():
+    # With a two-bot fleet the console table still renders all four built-in
+    # reviewers — the inactive two as "Not requested ·" — while the expecting
+    # line, the summons, and the polling stay on the active set only.
+    calls = []
+
+    class _RecGh(_Gh):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            calls.append(list(argv))
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+    timeline = [
+        (0, Comment(id="a", text="No issues found.", source="claude[bot]")),
+        (0, Comment(id="b", text="No issues found.", source="codex[bot]")),
+    ]
+    cfg = {"active_reviewers": ["claude", "codex"],
+           "auto_on_open": {"claude": False, "codex": True}}
+    outcome, out, _ = _run_capture(timeline, cfg, max_rounds=3, gh_run=_RecGh())
+    assert outcome.status == "clean"
+    r1 = [ln for ln in out.splitlines() if "Round 1 of" in ln and "expecting" in ln][0]
+    assert "expecting: claude, codex" in r1
+    assert "copilot" not in r1 and "gemini" not in r1
+    # all four built-ins have a table row; the two outside the fleet read
+    # "Not requested ·"
+    for label in ("Claude", "Copilot", "Codex", "Gemini"):
+        assert any(ln.startswith("│") and label in ln for ln in out.splitlines())
+    assert out.count("Not requested ·") == 2
+    # no summon ever targeted a not-requested bot: neither gemini's trigger
+    # comment nor copilot's review-request API call was posted. The positive
+    # control first — claude's round-1 summon MUST be visible through the same
+    # recorded seam, or the negative assertions below prove nothing.
+    bodies = [" ".join(argv) for argv in calls]
+    assert any(round_driver.TRIGGER_COMMENTS["claude"] in b for b in bodies)
+    assert not any(round_driver.TRIGGER_COMMENTS["gemini"] in b for b in bodies)
+    assert not any("requested_reviewers" in b for b in bodies)
 
 
 def test_max_rounds_auto_size_seam_via_diff_lines():
