@@ -285,9 +285,25 @@ def test_errored_comeback_only_on_substantive_strictly_newer():
     assert not driver.store.is_excluded("claude")  # came back
 
 
-def test_errored_no_comeback_on_non_substantive_newer_comment():
-    # A newer COSMETIC/OUTDATED/INVALID comment is NOT proof of recovery.
-    for label in ("COSMETIC", "INVALID", "OUTDATED"):
+def test_errored_comeback_on_cosmetic_newer_comment():
+    # A newer COSMETIC comment IS proof of recovery — a cosmetic finding proves
+    # the bot produced review output, exactly as a substantive one does.
+    timeline = [
+        (0, Comment(id="a", text="I encountered an internal error while reviewing.",
+                    source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
+        (30, Comment(id="b", text="nit: trailing whitespace here",
+                     source="claude[bot]", created_at="2026-06-10T00:05:00Z")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=TWO_BOTS,
+                                    classify=label_runner("COSMETIC"))
+    driver.run()
+    assert not driver.store.is_excluded("claude")  # came back
+
+
+def test_errored_no_comeback_on_non_review_output_newer_comment():
+    # A newer OUTDATED/INVALID comment is NOT proof of recovery — only review
+    # output (SUBSTANTIVE / COSMETIC) retracts.
+    for label in ("INVALID", "OUTDATED"):
         timeline = [
             (0, Comment(id="a", text="I encountered an internal error while reviewing.",
                         source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
@@ -300,9 +316,27 @@ def test_errored_no_comeback_on_non_substantive_newer_comment():
         assert driver.store.is_excluded("claude"), f"label={label}"
 
 
-def test_errored_no_comeback_on_equal_missing_or_unparseable_timestamp():
-    # Equal / missing / unparseable → stay excluded, conservatively.
-    for second_stamp in ("2026-06-10T00:00:00Z", None, "N/A", "yesterday"):
+def test_errored_comeback_on_equal_stamp_same_review():
+    # An EQUAL stamp retracts: a review submission stamps its body and inline
+    # comments with the same created_at, so equal-stamp review output from the
+    # same bot is same-review evidence — the review that carried the false
+    # error signal also carried real output.
+    timeline = [
+        (0, Comment(id="a", text="I encountered an internal error while reviewing.",
+                    source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
+        (30, Comment(id="b", text="this null check is missing",
+                     source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=TWO_BOTS,
+                                    classify=label_runner("SUBSTANTIVE"))
+    driver.run()
+    assert not driver.store.is_excluded("claude")  # equal stamp → came back
+
+
+def test_errored_no_comeback_on_older_missing_or_unparseable_timestamp():
+    # Strictly-older / missing / unparseable → stay excluded, conservatively
+    # (an old comment posted BEFORE the error proves nothing about recovery).
+    for second_stamp in ("2026-06-09T23:59:59Z", None, "N/A", "yesterday"):
         timeline = [
             (0, Comment(id="a", text="I encountered an internal error while reviewing.",
                         source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
@@ -315,6 +349,119 @@ def test_errored_no_comeback_on_equal_missing_or_unparseable_timestamp():
         assert driver.store.is_excluded("claude"), f"stamp={second_stamp!r}"
 
 
+# --- record-time completed-review check: a body that IS review output must
+# never be recorded as an errored placeholder in the first place ------------
+# These call _classify_signal directly (not via run()) so the assertions pin
+# the RECORD-TIME decision itself — an end-to-end run would let the errored
+# comeback retract a wrongly-recorded signal and mask a record-time bug.
+
+
+def test_inline_finding_never_records_errored():
+    # An INLINE comment (path set) whose text trips the errored regex is a
+    # finding about the reviewed code, not a placeholder — it must flow to the
+    # kernel as actionable, and the bot must stay un-excluded.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    c = Comment(id="a",
+                text="The review process encountered an error here when the "
+                     "token is stale — handle that case.",
+                source="claude[bot]", created_at="2026-06-10T00:00:00Z",
+                path="src/auth.py")
+    assert driver._classify_signal(c, 0.0) == "claude"   # actionable
+    assert not driver.store.is_excluded("claude")
+    assert driver._bot_state("claude").error_created_at is None
+
+
+def test_review_body_with_same_submission_findings_never_records_errored():
+    # A review body that trips the errored regex but lands in the SAME fetch
+    # batch as a SAME-INSTANT inline finding from the same bot is a completed
+    # review's summary — the submission demonstrably produced output, so no
+    # errored signal is recorded.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    body = Comment(id="a", text="Failed to generate a review? No — see the "
+                                "inline notes.",
+                   source="claude[bot]", created_at="2026-06-10T00:00:00Z")
+    stamps = {"claude": ["2026-06-10T00:00:00Z"]}
+    assert driver._classify_signal(body, 0.0, batch_finding_stamps=stamps) == "claude"
+    assert not driver.store.is_excluded("claude")
+
+
+def test_stale_batch_findings_never_shield_a_new_placeholder():
+    # Round 1's first poll ingests the PR's WHOLE history, so a days-old
+    # inline finding rides the same batch as a genuinely new placeholder —
+    # it proves nothing about the new failure and must not shield it.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    ph = Comment(id="a", text="I encountered an internal error while reviewing.",
+                 source="claude[bot]", created_at="2026-06-10T00:00:00Z")
+    stamps = {"claude": ["2026-06-08T00:00:00Z"]}  # two days older
+    assert driver._classify_signal(ph, 0.0, batch_finding_stamps=stamps) is None
+    assert driver.store.is_excluded("claude")
+
+
+def test_other_bots_findings_never_shield_a_placeholder():
+    # The shield is per-bot: bot A's inline finding says nothing about bot B.
+    driver, clock, gh = make_driver([], cfg=TWO_BOTS)
+    ph = Comment(id="a", text="I encountered an internal error while reviewing.",
+                 source="claude[bot]", created_at="2026-06-10T00:00:00Z")
+    stamps = {"copilot": ["2026-06-10T00:00:00Z"]}
+    assert driver._classify_signal(ph, 0.0, batch_finding_stamps=stamps) is None
+    assert driver.store.is_excluded("claude")
+
+
+def test_shielded_errored_body_with_clean_phrasing_not_approved():
+    # A review body that trips the errored regex AND contains "no issues found"
+    # phrasing, shielded by a same-instant inline finding, must NOT be promoted
+    # to clean-approved. The bot errored; its inline findings are the actual
+    # review output. Crowning it "Approved" would satisfy the merge gate even
+    # though nobody truly reviewed the PR.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    body = Comment(
+        id="a",
+        text="I encountered an internal error while reviewing some files. "
+             "No issues found in the rest.",
+        source="claude[bot]",
+        created_at="2026-06-10T00:00:00Z",
+    )
+    stamps = {"claude": ["2026-06-10T00:00:00Z"]}
+    result = driver._classify_signal(body, 0.0, batch_finding_stamps=stamps)
+    assert result == "claude"           # shielded → actionable, not suppressed
+    assert not driver.store.is_excluded("claude")  # not recorded as errored
+    assert "claude" not in driver.done      # NOT promoted to done
+    assert "claude" not in driver.approved  # NOT clean-approved
+
+
+def test_failure_placeholder_with_zero_output_phrasing_records_errored():
+    # "The review run failed; no comments were posted." — the zero-output
+    # sentence is the FAILURE's own consequence, not an all-clear. Clean-review
+    # phrasing inside an errored-matching body must NOT shield the signal: a
+    # failed reviewer crowned "Approved" would satisfy the never-merge-
+    # unreviewed gate and auto-merge a PR nobody reviewed.
+    for text in (
+        "The review run failed; no comments were posted.",
+        "Review run failed — no comments were generated.",
+    ):
+        timeline = [(0, Comment(id="a", text=text, source="claude[bot]",
+                                created_at="2026-06-10T00:00:00Z"))]
+        driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY)
+        driver.run()
+        assert driver.store.is_excluded("claude"), text
+        assert "claude" not in driver.done, text
+        assert "claude" not in driver.approved, text
+        assert "claude" not in driver.reviewed_ever, text
+
+
+def test_real_error_placeholder_still_records_errored():
+    # A genuine placeholder (no findings, no inline path) still records the
+    # errored exclusion — the record-time check narrows what COUNTS as
+    # errored, it does not disable the detector.
+    timeline = [
+        (0, Comment(id="a", text="I encountered an internal error while reviewing.",
+                    source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY)
+    driver.run()
+    assert driver.store.is_excluded("claude")
+
+
 def test_strictly_newer_helper():
     from buddhi_review.round_driver import _strictly_newer
     assert _strictly_newer("2026-06-10T00:05:00Z", "2026-06-10T00:00:00Z")
@@ -323,6 +470,18 @@ def test_strictly_newer_helper():
     assert not _strictly_newer("N/A", "2026-06-10T00:00:00Z")                   # unparseable
     # mixed offsets must compare by instant, not lexicographically
     assert not _strictly_newer("2026-06-10T00:00:00+00:00", "2026-06-10T00:00:00Z")
+
+
+def test_same_instant_helper():
+    from buddhi_review.round_driver import _same_instant
+    assert _same_instant("2026-06-10T00:00:00Z", "2026-06-10T00:00:00Z")
+    # mixed offsets compare by instant, not lexicographically
+    assert _same_instant("2026-06-10T00:00:00+00:00", "2026-06-10T00:00:00Z")
+    assert not _same_instant("2026-06-10T00:05:00Z", "2026-06-10T00:00:00Z")
+    assert not _same_instant(None, "2026-06-10T00:00:00Z")   # missing
+    assert not _same_instant("N/A", "2026-06-10T00:00:00Z")  # unparseable
+    # a naive stamp never equals an aware one (conservative: stays excluded)
+    assert not _same_instant("2026-06-10T00:00:00", "2026-06-10T00:00:00Z")
 
 
 def test_human_comments_never_drive_bot_state():
