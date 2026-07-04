@@ -32,13 +32,15 @@ no-issues (empty bodies are dropped at ingest).
 **Exclusion.** Three independent cause-buckets ride ``ReviewStore``: quota and
 PR-too-large are permanent; errored is transient and retractable — a bot whose
 comment is **strictly newer** than its recorded error signal comes back (an
-unparseable/equal/missing timestamp keeps it excluded, conservatively). Two soft,
-run-scoped driver sets ride alongside: a reviewer whose round posted only
-non-substantive comments is dropped as **polish-only**, and a reviewer expected
-yet silent for a full round is **dropped from re-request** (silence is not
-approval). Every summon / poll / merge gate subtracts the derived union.
+unparseable/equal/missing timestamp keeps it excluded, conservatively). Three
+soft, run-scoped driver sets ride alongside: a reviewer whose round posted only
+non-substantive comments is dropped as **polish-only**, one whose real findings
+were ALL dismissed on reassessment (no change applied) is dropped as
+**reviewed — no change**, and a reviewer expected yet silent for a full round
+is **dropped from re-request** (silence is not approval). Every summon / poll /
+merge gate subtracts the derived union.
 ``--rr`` re-pings everyone: it clears the soft buckets (voluntarily-done +
-polish) at run start; the hard buckets are never cleared. ``--rr`` /
+polish + reviewed-no-change) at run start; the hard buckets are never cleared. ``--rr`` /
 ``--rr-active`` also widen the round-1 summon set (``--rr``) or exit clean when
 nothing is active (``--rr-active``).
 
@@ -328,26 +330,39 @@ _REAL_FINDING_LABELS = frozenset({
 # Why a reviewer is not in a round's expected set, keyed by a stable reason code.
 # The long form is the honest skip-log line; the short form is the table cell.
 _SKIP_LONG: Dict[str, str] = {
-    "done": "voluntarily done (LGTM)",
+    "approved": "voluntarily done (LGTM)",
+    "done": "voluntarily done (reviewed — no findings)",
     "quota": "quota exhausted",
     "pr-too-large": "PR too large",
     "errored": "errored (retractable on a newer comment)",
+    "no-change": "every finding dismissed on reassessment — no change applied",
     "polish": "polishing only — no substantive findings left",
     "silent": "silent for a full round — dropped from re-request",
     "excluded": "excluded",
 }
 _STATUS_SHORT: Dict[str, str] = {
-    # ONE label for every done-for-the-run reviewer — an explicit clean sentinel
-    # and a summary-only genuine review read identically: the bot reviewed and
-    # had nothing to flag. "active" only ever means "hasn't responded yet".
-    "done": "reviewed — no findings",
-    "quota": "quota",
-    "pr-too-large": "PR too large",
-    "errored": "errored",
-    "polish": "polishing",
-    "silent": "silent (dropped)",
+    # The canonical round-summary label set. Done-for-the-run reviewers split
+    # three ways: an EXPLICIT all-clear (the "No issues found." sentinel / the
+    # clean-review detector — a sign-off) is "Approved 👍"; a genuine review
+    # with zero actionable findings but NO explicit sign-off is "Reviewed — no
+    # findings ✓"; a reviewer whose substantive findings were ALL dismissed on
+    # reassessment (fixer skip — no change applied) is "Reviewed — no change ✓"
+    # (the same ✓ — functionally "reviewed, nothing to do").
+    "approved": "Approved 👍",
+    "done": "Reviewed — no findings ✓",
+    "no-change": "Reviewed — no change ✓",
+    "quota": "Quota exhausted ⚠️",
+    "pr-too-large": "PR too large to review",
+    "errored": "Could not review ❌",
+    "polish": "Polish-only 🧹",
+    "silent": "No review posted 🔇",
     "excluded": "excluded",
 }
+# Render-time statuses for reviewers with NO skip key (still expected).
+# "Active ✅" only ever means "engaged this round"; an expected reviewer that
+# posted nothing renders the same "No review posted 🔇" as a silent drop.
+_STATUS_ACTIVE = "Active ✅"
+_STATUS_NOT_CONFIGURED = "Not configured (repo) 🔧"
 
 # The carve-out that is NOT a thumbs-up: an "I wasn't able to review …" body is
 # a placeholder, not a review. The quota / PR-too-large / errored placeholders
@@ -715,13 +730,26 @@ class RoundDriver:
         self.answer_waiter = answer_waiter or escalation_wait.wait_for_delivered
 
         self.store = self.adapter.store
-        self.done: Set[str] = set()           # voluntarily-done (clean review)
+        self.done: Set[str] = set()           # voluntarily-done (clean review OR round-end promotion)
+        # The explicit all-clear subset of `done` — reviewers whose clean
+        # review the detector caught. Tracked as a set of its own (not just
+        # BotState.signal) because a LATER hard signal (quota / errored /
+        # PR-too-large placeholder) overwrites the mutable signal; the
+        # sign-off already happened, so its "Approved 👍" label must not be
+        # demoted to "Reviewed — no findings ✓" by a placeholder's arrival.
+        self.approved: Set[str] = set()
         # Soft, run-scoped exclusion sets kept on the driver (NOT the ReviewStore
         # hard buckets), so they never touch the SAFETY / hard-cause reporting.
         # Cleared by --rr (re-requests everyone):
         #   polishing     — a reviewer whose round posted only non-substantive
         #                   comments (nothing left to fix); dropped from re-request.
         self.polishing: Set[str] = set()
+        #   reviewed_no_change — a reviewer whose substantive comment(s) this
+        #                   round were ALL dismissed on reassessment (fixer
+        #                   skip — no change applied); dropped from re-request
+        #                   so the run never loops re-asking a reviewer whose
+        #                   findings it has already judged not worth changing.
+        self.reviewed_no_change: Set[str] = set()
         # NOT cleared by --rr — a silent drop persists for the run; re-inclusion
         # fires in _classify_signal() when the bot posts a new comment mid-run:
         #   silent_dropped — a reviewer expected yet silent for a full round;
@@ -763,12 +791,13 @@ class RoundDriver:
 
     def expected_bots(self) -> List[str]:
         """The expected-bot gate: enabled reviewers minus voluntarily-done, minus
-        the soft driver drops (polish-only + silent), minus the derived union of
+        the soft driver drops (polish-only + silent + reviewed-no-change), minus the derived union of
         the three hard exclusion buckets."""
         return [
             b for b in active_reviewers(self.cfg, self.repo)
             if b not in self.done
             and b not in self.polishing
+            and b not in self.reviewed_no_change
             and b not in self.silent_dropped
             and not self.store.is_excluded(b)
         ]
@@ -780,10 +809,17 @@ class RoundDriver:
 
     def _skip_key(self, bot: str) -> Optional[str]:
         """Why ``bot`` is not in this round's expected set → a stable reason code,
-        or None when it is still expected (active)."""
+        or None when it is still expected (active). Done-for-the-run splits on
+        HOW the reviewer got there: an explicit all-clear (the clean-review
+        signal — sentinel / LGTM) is "approved"; the round-end promotion (a
+        genuine review with zero findings and no sign-off) is "done"."""
         st = self._bot_state(bot)
-        if bot in self.done or st.signal == detectors.SIGNAL_CLEAN:
+        if bot in self.approved or st.signal == detectors.SIGNAL_CLEAN:
+            return "approved"
+        if bot in self.done:
             return "done"
+        if bot in self.reviewed_no_change:
+            return "no-change"
         if st.signal == detectors.SIGNAL_QUOTA:
             return "quota"
         if st.signal == detectors.SIGNAL_PR_TOO_LARGE:
@@ -814,10 +850,14 @@ class RoundDriver:
         key = self._skip_key(bot)
         if key is None:
             if self._bot_state(bot).last_seen is not None:
-                return "reviewed"
+                return _STATUS_ACTIVE  # engaged this round
             # Idle on a repo running with no confirmed fleet and no global
-            # default → say so honestly instead of a neutral "active".
-            return "not configured (repo)" if self._repo_unconfigured else "active"
+            # default → say so honestly. Otherwise the reviewer was expected
+            # yet posted nothing (an unsummonable reviewer is never
+            # silent-dropped, but it still posted no review) — the same
+            # "No review posted 🔇" as a silent drop.
+            return (_STATUS_NOT_CONFIGURED if self._repo_unconfigured
+                    else _STATUS_SHORT["silent"])
         return _STATUS_SHORT.get(key, key)
 
     def _round_table_rows(self, actionable: Sequence[Comment],
@@ -980,7 +1020,8 @@ class RoundDriver:
             return None
         if detectors.detect_clean_review(comment.text, llm_json=self.clean_llm):
             self.done.add(bot)
-            st.signal = detectors.SIGNAL_CLEAN
+            self.approved.add(bot)  # sticky: a later hard signal must not
+            st.signal = detectors.SIGNAL_CLEAN  # demote the sign-off's label
             # A clean approval / "No issues found." sentinel IS a genuine review —
             # it feeds the SAFETY gate's reviewed-set (a fleet that approves clean
             # with zero comments still merges; the critical no-false-positive case).
@@ -1002,8 +1043,10 @@ class RoundDriver:
 
     def _promote_reviewed_no_findings(self, actionable: Sequence[Comment],
                                       results: Sequence[CommentResult]) -> None:
-        """A GENUINE review with zero findings is a thumbs-up — the same terminal
-        state as an explicit clean sentinel, in both display and scheduling. A bot
+        """A GENUINE review with zero findings is done for the run — the same
+        scheduling as an explicit clean sentinel, but a distinct label: with no
+        explicit sign-off it renders "Reviewed — no findings ✓", never the
+        sentinel's "Approved 👍". A bot
         qualifies when everything it posted this round is a top-level review body
         (no inline comment) and every one of those bodies classified into the
         discard labels (OUTDATED / INVALID) — i.e. the round generated NO work
@@ -1098,26 +1141,56 @@ class RoundDriver:
             self.sleep(self.times.poll_interval)
 
     def _update_polishing(self, actionable: Sequence[Comment],
-                          results: Sequence[CommentResult]) -> None:
-        """Round-end: a reviewer whose comments this round were ALL non-substantive
-        (none SUBSTANTIVE / BUSINESS_QUESTION / CLASSIFICATION_FAILED) has nothing
-        left to fix — drop it from re-request for the rest of the run (soft,
-        --rr-clearable). A reviewer that posted a real finding this round, one that
-        went voluntarily-done, or one hard-excluded (quota / PR-too-large /
-        errored) is never demoted to polish."""
+                          results: Sequence[CommentResult],
+                          actions: Sequence[ActionResult] = ()) -> None:
+        """Round-end demotions (both soft, --rr-clearable):
+
+        * **polish** — a reviewer whose comments this round were ALL
+          non-substantive (none SUBSTANTIVE / BUSINESS_QUESTION /
+          CLASSIFICATION_FAILED) has nothing left to fix; dropped from
+          re-request for the rest of the run.
+        * **reviewed — no change** — a reviewer whose real findings this round
+          all ended dismissed with NO change applied (``final ==
+          "skipped-invalid"``): the fixer judged the comment invalid /
+          already-fixed / not applicable, or a fix-verify REJECT rolled the
+          attempted change back. A substantive comment the loop decided not
+          to act on is not cosmetic — it gets its own label — and re-asking
+          that reviewer would loop it against the same verdict, so it too is
+          dropped from re-request.
+
+        A finding that was FIXED, escalated, or deferred keeps its reviewer in
+        the re-request gate (a fix earns a re-review; an escalation is still
+        pending); CLASSIFICATION_FAILED counts as a real finding
+        unconditionally (it rides the escalation exit). A reviewer that went
+        voluntarily-done or is hard-excluded (quota / PR-too-large / errored)
+        is never demoted here."""
         commented: Set[str] = set()
-        real_finding: Set[str] = set()
+        surviving: Set[str] = set()   # ≥1 real finding still standing
+        dismissed: Set[str] = set()   # ≥1 real finding reassessed away
+        finals = {a.comment_id: a.final for a in actions}
         for c, r in zip(actionable, results):
             bot = detectors.bot_for_login(c.source)
             if bot is None:
                 continue
             commented.add(bot)
-            if r.classification.label in _REAL_FINDING_LABELS:
-                real_finding.add(bot)
-        for bot in commented - real_finding:
+            label = r.classification.label
+            if label not in _REAL_FINDING_LABELS:
+                continue
+            if (label != "CLASSIFICATION_FAILED"
+                    and finals.get(c.id) == "skipped-invalid"):
+                dismissed.add(bot)
+            else:
+                surviving.add(bot)
+        for bot in commented - surviving:
             if bot in self.done or self.store.is_excluded(bot):
                 continue  # a clean / hard-cause reason already owns this reviewer
-            self.polishing.add(bot)
+            if bot in dismissed:
+                self.reviewed_no_change.add(bot)
+                print(f"[round] → excluding {bot} from subsequent rounds this "
+                      f"run (reviewed — no change: every finding dismissed on "
+                      f"reassessment)")
+            else:
+                self.polishing.add(bot)
 
     def _worktree_has_changes(self) -> bool:
         """True when ``git status --porcelain`` reports any change in the loop's
@@ -1140,10 +1213,13 @@ class RoundDriver:
         silent-reviewer warning at run end (every exit path, via ``finally``)."""
         if self.rr:
             # --rr re-pings everyone: clear the SOFT exclusions (voluntarily-done
-            # + polish-only) so a previously-satisfied reviewer is summoned again.
-            # The hard buckets (quota / PR-too-large / errored) are never cleared.
+            # + polish-only + reviewed-no-change) so a previously-satisfied
+            # reviewer is summoned again. The hard buckets (quota / PR-too-large
+            # / errored) are never cleared.
             self.done.clear()
+            self.approved.clear()
             self.polishing.clear()
+            self.reviewed_no_change.clear()
         self._run_start_fleet = set(self.expected_bots())
         try:
             outcome = self._run_loop()
@@ -1191,6 +1267,13 @@ class RoundDriver:
             # A summary-only genuine review (zero findings) is done for the run —
             # decided AFTER classification, BEFORE the table renders its status.
             self._promote_reviewed_no_findings(actionable, results)
+            # Round-end demotions BEFORE the table renders, so a reviewer about
+            # to be dropped shows its actual next-round disposition (Polish-only
+            # / Reviewed — no change) instead of a stale "Active": a reviewer
+            # whose whole round was non-substantive has nothing left to fix, and
+            # one whose real findings were ALL dismissed on reassessment must
+            # not be re-asked (it would loop against the same verdict).
+            self._update_polishing(actionable, results, round_actions)
             self._render_round(round_no, actionable, results)  # per-reviewer round summary
 
             if self.adapter.escalation.delivered:
@@ -1218,12 +1301,6 @@ class RoundDriver:
                 # Bucket C: a poisoned worktree must never be rebased/force-pushed.
                 return RunOutcome("needs-human", round_no, False, self.actions,
                                   rebase_skip=True)
-
-            # A reviewer whose whole round was non-substantive (cosmetic / PR-desc
-            # / outdated / invalid — nothing SUBSTANTIVE / BUSINESS_QUESTION /
-            # CLASSIFICATION_FAILED) has nothing left to fix: drop it from
-            # re-request for the rest of the run.
-            self._update_polishing(actionable, results)
 
             committed_changes = False
             if any(a.final == "fixed" for a in round_actions) and self.push:

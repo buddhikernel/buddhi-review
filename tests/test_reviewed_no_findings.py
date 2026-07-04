@@ -1,21 +1,21 @@
-"""R2 — a GENUINE review with zero findings is a thumbs-up, in display AND
+"""R2 — a GENUINE review with zero findings is done for the run, in display AND
 scheduling.
 
 Live case: a reviewer responded with a top-level "overview" review body that
 carried no inline findings and no clean sentinel. The round card left its status
 at the pending label (implying it had never responded) and later rounds
 re-summoned it — re-pinging the cleanest response of all and burning reviewer
-credits. Decided semantics (operator, 2026-07-02):
+credits. Decided semantics (operator, 2026-07-02; labels split 2026-07-04):
 
-* Display — an explicit clean sentinel and a summary-only genuine review show
-  the SAME status cell: "reviewed — no findings". "active" only ever means
-  "hasn't responded yet".
-* Scheduling — a genuine zero-findings responder is done for the run: excluded
-  from re-summon in later rounds exactly like a clean-sentinel bot, and it
-  counts as reviewed for the no-reviewer-reviewed merge gate.
+* Display — an explicit all-clear (the clean sentinel / LGTM detector) shows
+  "Approved 👍"; a summary-only genuine review with zero findings and NO
+  explicit sign-off shows "Reviewed — no findings ✓". "Active ✅" only ever
+  means "engaged this round".
+* Scheduling — both are done for the run: excluded from re-summon in later
+  rounds, and both count as reviewed for the no-reviewer-reviewed merge gate.
 * The carve-out — a placeholder ("wasn't able to review", quota, errored) is a
-  response, not a review: it never gets the label, never rides the promotion,
-  and the placeholder + errored-comeback machinery is untouched.
+  response, not a review: it never gets either label, never rides the
+  promotion, and the placeholder + errored-comeback machinery is untouched.
 """
 import io
 import json
@@ -155,25 +155,32 @@ def test_summary_only_review_is_done_for_the_run():
     assert "copilot" in d.done
     assert ("[round] → excluding copilot from subsequent rounds this run "
             "(reviewed — no findings)") in out
-    assert "skipping copilot: voluntarily done (LGTM)" in out  # round-2 skip log
+    # round-2 skip log — the promotion's long form, not the explicit-LGTM one
+    assert "skipping copilot: voluntarily done (reviewed — no findings)" in out
     # It genuinely reviewed — the no-reviewer-reviewed merge gate is fed.
     assert "copilot" in d.reviewed_ever
     # copilot is auto_on_open and done after round 1 → NEVER (re-)summoned.
     assert gh.copilot_summons() == []
     # claude (findings bot) is re-requested in round 2 exactly as today.
     assert len(gh.claude_summons()) >= 2
-    # Display: the round-1 card shows the thumbs-up label, not a pending one.
+    # Display: the round-1 card shows the no-findings label, not a pending one —
+    # and NOT "Approved" (no explicit sign-off was given).
     row1 = _table_row(out, "Copilot", 1)
-    assert "reviewed — no findings" in row1
-    assert "active" not in row1
-    # The silent bot is never crowned — its cell shows the silent-drop (or
-    # pending) label, never the thumbs-up reserved for a genuine review.
-    assert "reviewed — no findings" not in _table_row(out, "Gemini", 1)
-    # Later rounds keep the label (never falls back to "active" after it reviewed).
-    assert "reviewed — no findings" in _table_row(out, "Copilot", 2)
+    assert "Reviewed — no findings" in row1
+    assert "Active" not in row1
+    assert "Approved" not in row1
+    # The silent bot is never crowned — its cell shows the silent-drop label
+    # ("No review posted"), never a label reserved for a genuine review.
+    assert "Reviewed — no findings" not in _table_row(out, "Gemini", 1)
+    assert "No review posted" in _table_row(out, "Gemini", 1)
+    # Later rounds keep the label (never falls back to "Active" after it reviewed).
+    assert "Reviewed — no findings" in _table_row(out, "Copilot", 2)
 
 
-def test_clean_sentinel_shares_the_same_label_and_scheduling():
+def test_clean_sentinel_is_approved_with_the_same_scheduling():
+    # The split: an EXPLICIT all-clear (the "No issues found." sentinel) renders
+    # "Approved 👍" — never the promotion's "Reviewed — no findings ✓" — while
+    # the scheduling (done for the run, feeds the merge gate) is identical.
     cfg = {"active_reviewers": ["claude"], "auto_on_open": {"claude": False}}
     timeline = [(0, Comment(id="ok", text="No issues found.", source="claude[bot]"))]
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
@@ -181,8 +188,9 @@ def test_clean_sentinel_shares_the_same_label_and_scheduling():
     assert "claude" in d.done and "claude" in d.reviewed_ever
     # The clean-sentinel path is untouched (its own log line still fires)…
     assert "[clean-review] claude: nothing to flag — voluntarily done" in out
-    # …and its status cell is the SAME label as a summary-only genuine review.
-    assert "reviewed — no findings" in _table_row(out, "Claude", 1)
+    # …and its status cell is the explicit-sign-off label, not the promotion's.
+    assert "Approved" in _table_row(out, "Claude", 1)
+    assert "Reviewed — no findings" not in _table_row(out, "Claude", 1)
     assert len(gh.claude_summons()) == 1  # the round-1 summon; never re-pinged
 
 
@@ -203,8 +211,8 @@ def test_quota_placeholder_keeps_its_own_label_and_never_promotes():
     assert "copilot" not in d.done
     assert "copilot" not in d.reviewed_ever  # must NOT satisfy the merge gate
     assert "excluding copilot" not in out
-    assert "quota" in _table_row(out, "Copilot", 1)
-    assert "reviewed — no findings" not in _table_row(out, "Copilot", 1)
+    assert "Quota exhausted" in _table_row(out, "Copilot", 1)
+    assert "Reviewed — no findings" not in _table_row(out, "Copilot", 1)
 
 
 def test_uncontracted_apologies_never_promote():
@@ -222,7 +230,7 @@ def test_uncontracted_apologies_never_promote():
                             source="copilot-pull-request-reviewer[bot]"))]
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
     assert "copilot" not in d.done
-    assert "reviewed — no findings" not in _table_row(out, "Copilot", 1)
+    assert "Reviewed — no findings" not in _table_row(out, "Copilot", 1)
     # Any drop it gets is the polish-only bucket (soft, --rr-clearable) — never
     # the voluntarily-done crown.
     assert "copilot" in d.polishing
@@ -244,7 +252,7 @@ def test_review_first_apologies_never_promote():
         text="Copilot reviewed 0 out of 12 changed files in this pull request."))]
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
     assert "copilot" not in d.done
-    assert "reviewed — no findings" not in _table_row(out, "Copilot", 1)
+    assert "Reviewed — no findings" not in _table_row(out, "Copilot", 1)
     assert "copilot" in d.polishing  # the soft bucket, never the crown
 
 
@@ -265,7 +273,7 @@ def test_transient_failure_apologies_never_promote():
                             source="gemini-code-assist[bot]"))]
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
     assert "gemini" not in d.done
-    assert "reviewed — no findings" not in _table_row(out, "Gemini", 1)
+    assert "Reviewed — no findings" not in _table_row(out, "Gemini", 1)
 
 
 def test_reversed_and_uncontracted_apology_variants_never_promote():
@@ -285,13 +293,16 @@ def test_reversed_and_uncontracted_apology_variants_never_promote():
                             source="copilot-pull-request-reviewer[bot]"))]
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
     assert "copilot" not in d.done
-    assert "reviewed — no findings" not in _table_row(out, "Copilot", 1)
+    assert "Reviewed — no findings" not in _table_row(out, "Copilot", 1)
 
 
 def test_reviewed_all_files_overview_still_promotes():
     """The positive control for the carve-out guard: a REAL zero-findings
     overview — 'reviewed 12 out of 12 changed files' — must not trip any
-    apology pattern; it promotes exactly like the live motivating case."""
+    apology pattern; it is crowned done exactly like the live motivating case.
+    Its "generated no new remarks" line is caught by the broadened clean-review
+    DETECTOR (an explicit all-clear signal), so under the label split it lands
+    on the sign-off branch: "Approved 👍"."""
     body = ("## Pull request overview\n"
             "Copilot reviewed 12 out of 12 changed files in this pull request "
             "and generated no new remarks.")
@@ -302,7 +313,7 @@ def test_reviewed_all_files_overview_still_promotes():
                             source="copilot-pull-request-reviewer[bot]"))]
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
     assert "copilot" in d.done
-    assert "reviewed — no findings" in _table_row(out, "Copilot", 1)
+    assert "Approved" in _table_row(out, "Copilot", 1)
     assert gh.copilot_summons() == []
 
 
@@ -319,7 +330,7 @@ def test_unable_to_review_body_is_never_crowned():
     outcome, out, d, gh = _drive(timeline, cfg, max_rounds=3)
     assert "copilot" not in d.done
     assert "excluding copilot" not in out
-    assert "reviewed — no findings" not in _table_row(out, "Copilot", 1)
+    assert "Reviewed — no findings" not in _table_row(out, "Copilot", 1)
     assert "copilot" in d.polishing
 
 
