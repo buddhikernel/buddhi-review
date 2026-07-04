@@ -102,7 +102,7 @@ class TestSurfaceStepBehavior:
             "  if [ \"$1\" = \"--body\" ]; then shift; body=\"$1\"; fi\n"
             "  shift\n"
             "done\n"
-            f"printf '%s' \"$body\" > {capture}\n"
+            f"printf '%s' \"$body\" > '{capture}'\n"
             "exit 0\n", encoding="utf-8")
         gh.chmod(gh.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         sp = tmp_path / "surface.sh"
