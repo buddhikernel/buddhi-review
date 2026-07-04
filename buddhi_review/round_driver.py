@@ -60,7 +60,7 @@ import textwrap
 import time
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from buddhi_review import commit_push, detectors, escalation_wait, gh_ingest, merge
@@ -200,6 +200,30 @@ def _same_instant(new: Optional[str], old: Optional[str]) -> bool:
     if n is None or o is None:
         return False
     return n == o
+
+
+def _utcnow() -> datetime:
+    """Wall-clock now (UTC). The driver's ``clock`` seam is ``time.monotonic``
+    for poll timing; the rate-limit comeback instead compares a wall-clock reset
+    epoch, so it needs a distinct, separately-injectable wall-clock seam."""
+    return datetime.now(timezone.utc)
+
+
+# The claude-code-review.yml workflow (managed-version 2) surfaces a Claude
+# usage-limit silence as a machine-readable PR marker comment authored by
+# github-actions[bot] (deliberately NOT claude[bot] — bot_for_login never maps
+# it, so it can never read as a posted review or a clean sentinel):
+#   <!-- claude-review-unavailable-v1 type=rate_limited resets_at=<epoch> -->
+#   <!-- claude-review-unavailable-v1 type=credits_exhausted -->
+# The free loop acts on type=rate_limited ONLY: it releases claude from the wait
+# and re-summons it once the reset instant passes. type=credits_exhausted is a
+# paid-tier concept (the workflow still emits it, but the free loop has no
+# billing-mode split, so it is logged and ignored — the reviewer falls through
+# to the ordinary silent handling).
+CLAUDE_UNAVAILABLE_MARKER_RE = re.compile(
+    r"claude-review-unavailable-v1\s+type=(?P<type>rate_limited|credits_exhausted)"
+    r"(?:\s+resets_at=(?P<resets_at>\d+))?")
+CLAUDE_UNAVAILABLE_MARKER_AUTHOR = "github-actions[bot]"
 
 
 @dataclass
@@ -349,6 +373,7 @@ _SKIP_LONG: Dict[str, str] = {
     "quota": "quota exhausted",
     "pr-too-large": "PR too large",
     "errored": "errored (retractable on a newer comment)",
+    "rate-limited": "rate-limited (usage window exhausted — re-requested after it resets)",
     "no-change": "every finding dismissed on reassessment — no change applied",
     "polish": "polishing only — no substantive findings left",
     "silent": "silent for a full round — dropped from re-request",
@@ -369,6 +394,7 @@ _STATUS_SHORT: Dict[str, str] = {
     "quota": "Quota exhausted ⚠️",
     "pr-too-large": "PR too large to review",
     "errored": "Could not review ❌",
+    "rate-limited": "Rate-limited ⏳",
     "polish": "Polish-only 🧹",
     "silent": "No review posted 🔇",
     "excluded": "excluded",
@@ -696,6 +722,7 @@ class RoundDriver:
         fetch: Optional[Callable[..., List[Comment]]] = None,
         gh_run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], datetime] = _utcnow,
         sleep: Callable[[float], None] = time.sleep,
         notice: Callable[..., str] = automation_notice,
         times: Optional[RoundTimes] = None,
@@ -736,6 +763,7 @@ class RoundDriver:
         # fake covers every gh/git/test spawn the driver makes.
         self.gh_run = gh_run or commit_push._default_run
         self.clock = clock
+        self.wall_clock = wall_clock
         self.sleep = sleep
         self.notice = notice
         self.times = times or RoundTimes()
@@ -777,6 +805,12 @@ class RoundDriver:
         self.silent_dropped: Set[str] = set()
         self.bots: Dict[str, BotState] = {}
         self.processed_ids: Set[str] = set()
+        # _rate_limited_until: bot → the UTC datetime its provider usage
+        #   window resets (from a workflow rate_limited marker). While an
+        #   entry is present the bot is excluded from re-request; the timed
+        #   comeback pops it once the reset instant passes. datetime.min
+        #   marks an unknown reset → the plain next-round retry.
+        self._rate_limited_until: Dict[str, datetime] = {}
         self.actions: List[ActionResult] = []
 
         # ── F5 run-cumulative review tracking (the SAFETY gate + silent-reviewer
@@ -819,6 +853,7 @@ class RoundDriver:
             and b not in self.polishing
             and b not in self.reviewed_no_change
             and b not in self.silent_dropped
+            and b not in self._rate_limited_until
             and not self.store.is_excluded(b)
         ]
 
@@ -846,6 +881,8 @@ class RoundDriver:
             return "pr-too-large"
         if st.signal == detectors.SIGNAL_ERRORED:
             return "errored"
+        if st.signal == detectors.SIGNAL_RATE_LIMITED:
+            return "rate-limited"
         if bot in self.polishing:
             return "polish"
         if bot in self.silent_dropped:
@@ -1007,6 +1044,92 @@ class RoundDriver:
         for c in fresh:
             self.processed_ids.add(c.id)
         return fresh
+
+    def _scan_unavailable_markers(self, fresh: Sequence[Comment]) -> None:
+        """Act on a workflow-posted Claude usage-limit marker in this batch.
+
+        The claude-code-review.yml workflow (managed-version 2) posts ONE marker
+        PR comment when its Claude run died on a usage limit — a state that
+        otherwise reads as plain reviewer silence and burns the full poll window.
+        Only a comment authored EXACTLY by github-actions[bot] is trusted (a PR
+        participant pasting the marker text cannot gate the reviewer). The free
+        loop acts on ``type=rate_limited`` ONLY: it records the reset instant and
+        releases claude from the wait so the window is not burned; the timed
+        comeback re-summons it once the reset passes. ``type=credits_exhausted``
+        is a paid-tier concept (no billing-mode split here) — logged and ignored,
+        so claude falls through to the ordinary silent handling."""
+        newest = None  # (parsed_datetime_or_None, match)
+        for c in fresh:
+            if c.source != CLAUDE_UNAVAILABLE_MARKER_AUTHOR:
+                continue
+            m = CLAUDE_UNAVAILABLE_MARKER_RE.search(c.text or "")
+            if not m:
+                continue
+            key = _parse_iso(c.created_at)
+            if newest is None or (key is not None and (newest[0] is None or key > newest[0])):
+                newest = (key, m)
+        if newest is None:
+            return
+        m = newest[1]
+        mtype = m.group("type")
+        if mtype != "rate_limited":
+            self.notice("claude-review-unavailable",
+                        f"marker type={mtype} ignored (the free loop handles "
+                        f"rate_limited only)", status="skip")
+            return
+        if "claude" in self.done:
+            return  # already concluded this run — nothing to release
+        epoch = int(m.group("resets_at") or 0)
+        until = None
+        # Guard the conversion: an implausibly large epoch (a future ms-scale
+        # resetsAt from an SDK format change would pass the workflow's
+        # digits-only sanitizer) makes datetime.fromtimestamp raise; this runs in
+        # the poll hot path, so degrade a bad epoch to the unknown-reset
+        # next-round-retry path rather than crash the run.
+        if 0 < epoch <= 4102444800:  # <= year 2100 in seconds
+            try:
+                until = datetime.fromtimestamp(epoch, timezone.utc)
+            except (ValueError, OverflowError, OSError):
+                until = None
+        if until is not None:
+            when = until.isoformat()
+            comeback = f"re-summons claude in the first round after {when}"
+            # Stale marker: the reset window already elapsed before this loop
+            # saw it. Quiescing the round on a past epoch would prematurely
+            # close a round that may still have a real review in-flight.
+            if until <= self.wall_clock():
+                self.notice("claude-rate-limited",
+                            f"stale rate-limit marker (resets_at {when} already "
+                            f"elapsed) — ignoring", status="skip")
+                return
+        else:
+            until = datetime.min.replace(tzinfo=timezone.utc)
+            when = "an unknown time"
+            comeback = "retries claude next round (no reset time in the marker)"
+        self._rate_limited_until["claude"] = until
+        self._bot_state("claude").signal = detectors.SIGNAL_RATE_LIMITED
+        self.notice("claude-rate-limited",
+                    f"subscription usage window exhausted (workflow marker) — "
+                    f"released from this round's wait; resets {when}",
+                    status="fallback", hint=comeback)
+
+    def _apply_rate_limit_comeback(self) -> None:
+        """Round-boundary comeback: pop every rate-limited bot whose reset instant
+        has passed (datetime.min pops on the FIRST boundary → the plain next-round
+        retry) and clear its released signal so it re-enters ``expected_bots``."""
+        now = self.wall_clock()
+        for bot in sorted(b for b, until in self._rate_limited_until.items() if until <= now):
+            self._rate_limited_until.pop(bot, None)
+            st = self._bot_state(bot)
+            if st.signal == detectors.SIGNAL_RATE_LIMITED:
+                st.signal = None
+            # The rate-limit round quiesces without a real review from the bot,
+            # so _record_round_attendance adds it to silent_dropped. Clear that
+            # here so expected_bots() re-admits the bot after the reset.
+            self.silent_dropped.discard(bot)
+            self.silent_rounds[bot] = 0
+            self.notice("rate-limited-comeback",
+                        f"{bot} usage window has reset — re-requesting", status="done")
 
     def _classify_signal(self, comment: Comment, now: float,
                          batch_finding_stamps: Optional[Dict[str, List[Optional[str]]]] = None,
@@ -1206,6 +1329,12 @@ class RoundDriver:
         while True:
             now = self.clock()
             fresh = self._ingest_new()
+            # Workflow-surfaced Claude usage-limit marker (managed-version 2).
+            # Scanned on the fresh batch (author-pinned to github-actions[bot],
+            # which bot_for_login never maps, so the classify loop below can
+            # never see it); _ingest_new's processed_ids de-dup makes it fire
+            # exactly once, so no time-window freshness gate is needed.
+            self._scan_unavailable_markers(fresh)
             # Inline-finding stamps per bot in this batch: a review submission
             # lands its body and inline comments together with the SAME
             # created_at, so the body of a findings-bearing review must not be
@@ -1333,6 +1462,7 @@ class RoundDriver:
 
     def _run_loop(self) -> RunOutcome:
         for round_no in range(1, self.max_rounds + 1):
+            self._apply_rate_limit_comeback()
             expected = _canonical(self.expected_bots())
             if not expected:
                 if self.rr_active and round_no == 1:
@@ -1746,6 +1876,8 @@ class RoundDriver:
         silent banner). Never raises."""
         if bot != "claude" or not self.repo:
             return False
+        if bot in self._rate_limited_until:
+            return False
         try:
             run_id = self._claude_review_run_id(self._pr_checks_rows())
             if run_id is None:
@@ -1810,6 +1942,8 @@ class RoundDriver:
                 continue  # responded at least once → not wastefully silent
             if self.store.is_excluded(bot):
                 continue  # quota / PR-too-large / errored — a known reason, not silence
+            if bot in self._rate_limited_until:
+                continue  # rate-limited by a workflow marker — not a setup failure
             if not self._was_review_expected(bot):
                 continue  # never actually summonable → don't penalize
             rounds = self.silent_rounds.get(bot, 0)

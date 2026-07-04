@@ -343,6 +343,9 @@ SIGNAL_CLEAN = "clean"
 SIGNAL_QUOTA = "quota"
 SIGNAL_PR_TOO_LARGE = "pr-too-large"
 SIGNAL_ERRORED = "errored"
+# A state code (NOT a detect_signal output): set by the round driver when the
+# claude-code-review.yml workflow posts a rate_limited usage-limit marker.
+SIGNAL_RATE_LIMITED = "rate-limited"
 
 # Reviewer-bot login → the loop's bot name. Substring match — vendor logins
 # carry suffixes like "[bot]" and product prefixes.
