@@ -188,6 +188,20 @@ def _strictly_newer(new: Optional[str], old: Optional[str]) -> bool:
         return False
 
 
+def _same_instant(new: Optional[str], old: Optional[str]) -> bool:
+    """True ONLY when both stamps parse AND denote the SAME instant. Missing /
+    unparseable → False (conservative). The errored comeback pairs this with
+    :func:`_strictly_newer`: a review submission stamps its body and its inline
+    comments with the SAME created_at, so equal stamps from the same bot are
+    same-review evidence (the review that carried the false error signal also
+    carried real output) — while a strictly-older comment still never retracts
+    a newer error. Naive-vs-aware stamps compare unequal (excluded stays)."""
+    n, o = _parse_iso(new), _parse_iso(old)
+    if n is None or o is None:
+        return False
+    return n == o
+
+
 @dataclass
 class RoundTimes:
     """Round wait bounds — these defaults are the authoritative ones."""
@@ -970,9 +984,17 @@ class RoundDriver:
             self.processed_ids.add(c.id)
         return fresh
 
-    def _classify_signal(self, comment: Comment, now: float) -> Optional[str]:
+    def _classify_signal(self, comment: Comment, now: float,
+                         batch_finding_stamps: Optional[Dict[str, List[Optional[str]]]] = None,
+                         ) -> Optional[str]:
         """Fold one fresh comment into the per-bot state. Returns the bot name
-        when the comment is ACTIONABLE (must flow to the kernel), else None."""
+        when the comment is ACTIONABLE (must flow to the kernel), else None.
+        ``batch_finding_stamps`` — per-bot ``created_at`` stamps of the inline
+        findings in the SAME fetch batch (computed by the poll loop) — feeds
+        the errored record-time check: a review that arrives WITH same-instant
+        findings is a completed review, never an error placeholder. Stamps
+        (not a bare bot set), so a STALE finding swept up by round 1's
+        full-history first poll can never shield a genuinely NEW placeholder."""
         bot = detectors.bot_for_login(comment.source)
         if bot is None:
             return None  # humans and unknown logins don't drive bot state or rounds
@@ -986,13 +1008,14 @@ class RoundDriver:
             self.notice("silent-reinclusion", f"{bot} posted a new comment — re-included",
                         status="done")
 
-        # The errored comeback is NOT decided here: a bot is retracted only
-        # on a SUBSTANTIVE comment strictly newer than the error signal, and the
-        # SUBSTANTIVE label is not known until the kernel classifies the comment.
-        # An errored bot's fresh comment still flows downstream as actionable
-        # (below) → classified → `_maybe_errored_comeback` retracts iff it is
-        # SUBSTANTIVE + strictly newer. A cosmetic / OUTDATED / INVALID /
-        # question comment is NOT proof of recovery, so it never brings the bot back.
+        # The errored comeback is NOT decided here: a bot is retracted only on a
+        # comment carrying REVIEW OUTPUT (classified SUBSTANTIVE or COSMETIC —
+        # either proves the bot produced a review) that is not older than the
+        # error signal, and that label is not known until the kernel classifies
+        # the comment. An errored bot's fresh comment still flows downstream as
+        # actionable (below) → classified → `_maybe_errored_comeback` retracts.
+        # An OUTDATED / INVALID / question comment is NOT proof of recovery, so
+        # it never brings the bot back.
         if self.quota_llm is not None:
             pr_title, pr_body = self._fetch_pr_title_body()
         else:
@@ -1001,6 +1024,26 @@ class RoundDriver:
             comment.text, quota_llm=self.quota_llm,
             pr_title=pr_title, pr_body=pr_body,
         )
+        if signal == detectors.SIGNAL_ERRORED:
+            # Record-time completed-review check: a body that IS an inline
+            # finding, or that arrives alongside SAME-INSTANT findings from the
+            # same bot (a review submission stamps its body and inline comments
+            # alike), is REVIEW OUTPUT — the bot demonstrably reviewed, so no
+            # errored signal is recorded and the comment flows on to the normal
+            # handling below. Deliberately NOT accepted as evidence here:
+            #   * clean-review phrasing in the SAME body — a real failure
+            #     placeholder states its own zero output ("review run failed;
+            #     no comments were posted"), and reading that as an all-clear
+            #     would crown the failed bot "Approved", satisfy the merge
+            #     gate, and auto-merge a PR nobody reviewed;
+            #   * a same-batch finding with a DIFFERENT stamp — round 1's
+            #     first poll ingests the PR's whole history, and a stale
+            #     finding proves nothing about a new placeholder.
+            same_submission_finding = any(
+                _same_instant(stamp, comment.created_at)
+                for stamp in (batch_finding_stamps or {}).get(bot, ()))
+            if comment.path or comment.diff_hunk or same_submission_finding:
+                signal = None
         if signal == detectors.SIGNAL_QUOTA:
             self.store.exclude_quota(bot)
             st.signal = signal
@@ -1082,28 +1125,36 @@ class RoundDriver:
                   f"(reviewed — no findings)")
 
     def _maybe_errored_comeback(self, comment: Comment, result: CommentResult) -> None:
-        """An errored-excluded bot comes back ONLY on a SUBSTANTIVE comment
-        strictly newer than its recorded error signal. Runs post-classification,
-        when the label is known. Equal / missing / unparseable stamps keep it
-        excluded (``_strictly_newer`` is conservative)."""
+        """An errored-excluded bot comes back ONLY on a comment carrying REVIEW
+        OUTPUT — classified SUBSTANTIVE or COSMETIC (a cosmetic finding proves
+        the bot produced a review just as a substantive one does) — that is not
+        older than its recorded error signal: strictly newer, or the SAME
+        instant (a review submission stamps its body and inline comments alike,
+        so an equal stamp from the same bot is same-review evidence; see
+        :func:`_same_instant`). Runs post-classification, when the label is
+        known. Older / missing / unparseable stamps keep it excluded
+        (conservative); OUTDATED / INVALID / question output never retracts."""
         bot = detectors.bot_for_login(comment.source)
         if bot is None:
             return
         st = self._bot_state(bot)
         if st.error_created_at is None:
             return
-        if result.classification.label != "SUBSTANTIVE":
+        if result.classification.label not in ("SUBSTANTIVE", "COSMETIC"):
             return
-        # An EDITED substantive comment can prove recovery by its edit time, so the
-        # candidate stamp is updated_at-then-created_at; the recorded error stamp
-        # stays created_at. The strictly-newer rule is unchanged (conservative).
+        # An EDITED comment can prove recovery by its edit time, so the
+        # candidate stamp is updated_at-then-created_at; the recorded error
+        # stamp stays created_at. The recency gate is unchanged (conservative):
+        # a strictly-older comment never retracts a newer error.
         candidate = comment.updated_at or comment.created_at
-        if _strictly_newer(candidate, st.error_created_at):
+        if (_strictly_newer(candidate, st.error_created_at)
+                or _same_instant(candidate, st.error_created_at)):
             self.store.errored_comeback(bot)
             st.signal = None
             st.error_created_at = None
-            self.notice("errored-comeback", f"{bot} posted a newer substantive "
-                        "comment — back in the re-request gate", status="done")
+            self.notice("errored-comeback", f"{bot} posted review output at or "
+                        "after its error signal — back in the re-request gate",
+                        status="done")
 
     def _wait_for_quiescence(self, expected: Sequence[str], round_start: float) -> List[Comment]:
         # Round-scope the silence timer: a re-requested bot is "not seen yet THIS
@@ -1118,8 +1169,19 @@ class RoundDriver:
         while True:
             now = self.clock()
             fresh = self._ingest_new()
+            # Inline-finding stamps per bot in this batch: a review submission
+            # lands its body and inline comments together with the SAME
+            # created_at, so the body of a findings-bearing review must not be
+            # recorded as an error placeholder even when its text trips the
+            # errored regex. Stamps, not a bot set — see _classify_signal.
+            finding_stamps: Dict[str, List[Optional[str]]] = {}
             for c in fresh:
-                bot = self._classify_signal(c, now)
+                if c.path or c.diff_hunk:
+                    b = detectors.bot_for_login(c.source)
+                    if b is not None:
+                        finding_stamps.setdefault(b, []).append(c.created_at)
+            for c in fresh:
+                bot = self._classify_signal(c, now, batch_finding_stamps=finding_stamps)
                 if bot is not None:
                     actionable.append(c)
             if fresh:
@@ -1257,7 +1319,7 @@ class RoundDriver:
             )
             round_actions = []
             for c, r in zip(actionable, results):
-                self._maybe_errored_comeback(c, r)  # SUBSTANTIVE-only retract
+                self._maybe_errored_comeback(c, r)  # review-output retract (subst/cosmetic)
                 round_actions.append(
                     act_on_result(c, r, adapter=self.adapter, fix_dispatch=self.fix_dispatch))
             self.actions.extend(round_actions)
