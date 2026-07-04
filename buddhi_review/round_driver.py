@@ -1138,8 +1138,6 @@ class RoundDriver:
         # EVERY tracked reviewer resets, not just the expected set: the round
         # summary reads the stamp as "posted THIS round", so a not-summoned
         # bot's stale stamp must never render "Active ✅" in a round it sat out.
-        for bot in expected:
-            self._bot_state(bot).last_seen = None
         for st in self.bots.values():
             st.last_seen = None
         actionable: List[Comment] = []
