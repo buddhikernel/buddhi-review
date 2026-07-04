@@ -1,6 +1,6 @@
-"""The ``create-pr`` actuator — create a PR from local work, then launch the loop.
+"""The ``open-pr`` actuator — create a PR from local work, then launch the loop.
 
-This is the silent core of the ``/create-pr`` flow (the interactive first-run and
+This is the silent core of the ``/open-pr`` flow (the interactive first-run and
 rebase gates live in the skill's ``SKILL.md``). It ports the reference create-pr
 git decision tree directly:
 
@@ -36,8 +36,8 @@ from typing import Callable, Optional, Sequence
 from buddhi_review.transparency import automation_notice
 
 
-class CreatePrError(RuntimeError):
-    """A create-pr step failed in a way the actuator cannot recover from."""
+class OpenPrError(RuntimeError):
+    """An open-pr step failed in a way the actuator cannot recover from."""
 
 
 @dataclass
@@ -74,7 +74,7 @@ def _git(run, cwd, *args, timeout: int = 60):
 
 def resolve_repo(cwd: str, repo: Optional[str], run) -> str:
     """Resolve ``owner/repo``: an explicit ``repo`` arg wins; else infer from the
-    cwd's GitHub ``origin`` via ``gh repo view``. Raises :class:`CreatePrError`
+    cwd's GitHub ``origin`` via ``gh repo view``. Raises :class:`OpenPrError`
     when neither resolves."""
     if repo:
         return repo
@@ -86,7 +86,7 @@ def resolve_repo(cwd: str, repo: Optional[str], run) -> str:
     resolved = _out(r) if r is not None else ""
     if resolved:
         return resolved
-    raise CreatePrError(
+    raise OpenPrError(
         f"could not infer the repo from {cwd}. Pass --repo <owner/repo>, or run from "
         f"a directory with a configured GitHub remote.")
 
@@ -122,7 +122,7 @@ def detect_state(cwd: str, base: str, run) -> GitState:
             # ref so a clean feature branch is not mis-classified as "nothing to do".
             r = _git(run, cwd, "log", f"origin/{base}..HEAD", "--oneline", timeout=15)
             if not _ok(r):
-                raise CreatePrError(
+                raise OpenPrError(
                     f"Could not resolve base branch '{base}' or 'origin/{base}'. "
                     f"Please verify that the base branch exists locally or on the remote.")
         ahead = _ok(r) and bool(_out(r))
@@ -171,7 +171,7 @@ def _push(run, cwd, _err) -> None:
     r = _git(run, cwd, "push", "-u", "origin", "HEAD", timeout=120)
     if not _ok(r):
         detail = _out(r) or (getattr(r, "stderr", "") or "").strip() or "see git output"
-        raise CreatePrError(f"git push failed: {detail}")
+        raise OpenPrError(f"git push failed: {detail}")
 
 
 def prepare_branch(cwd: str, repo: str, state: GitState, path: str, *, title: str, body: str,
@@ -188,7 +188,7 @@ def prepare_branch(cwd: str, repo: str, state: GitState, path: str, *, title: st
         _git(run, cwd, "add", "-A", timeout=60)
         cr = _git(run, cwd, "commit", "-m", title, "-m", body, timeout=60)
         if not _ok(cr):
-            raise CreatePrError(f"git commit failed: {_out(cr) or (getattr(cr, 'stderr', '') or '').strip() or 'see git output'}")
+            raise OpenPrError(f"git commit failed: {_out(cr) or (getattr(cr, 'stderr', '') or '').strip() or 'see git output'}")
         _push(run, cwd, err)
         return state.current
 
@@ -221,7 +221,7 @@ def _prepare_on_base(cwd: str, repo: str, state: GitState, *, title: str, body: 
         cr = run(["gh", "repo", "create", repo, "--private", "--source=.", "--remote", "origin"],
                  cwd=cwd, timeout=60)
         if not _ok(cr):
-            raise CreatePrError(f"gh repo create failed: {_out(cr) or (getattr(cr, 'stderr', '') or '').strip() or 'see gh output'}")
+            raise OpenPrError(f"gh repo create failed: {_out(cr) or (getattr(cr, 'stderr', '') or '').strip() or 'see gh output'}")
 
     # 3b. Fetch.
     _git(run, cwd, "fetch", "origin", timeout=120)
@@ -235,10 +235,10 @@ def _prepare_on_base(cwd: str, repo: str, state: GitState, *, title: str, body: 
         if not state.has_commits:
             bc = _git(run, cwd, "commit", "--allow-empty", "-m", "chore: initialize repository", timeout=30)
             if not _ok(bc):
-                raise CreatePrError(f"bootstrap commit failed: {_out(bc) or 'see git output (check user.name/email)'}")
+                raise OpenPrError(f"bootstrap commit failed: {_out(bc) or 'see git output (check user.name/email)'}")
         r = _git(run, cwd, "push", "-u", "origin", base, timeout=120)
         if not _ok(r):
-            raise CreatePrError(f"could not push the base branch: {_out(r) or 'see git output'}")
+            raise OpenPrError(f"could not push the base branch: {_out(r) or 'see git output'}")
         return _branch_commit_push(cwd, base, head, title=title, body=body, run=run, err=err)
 
     if not state.has_commits:
@@ -246,7 +246,7 @@ def _prepare_on_base(cwd: str, repo: str, state: GitState, *, title: str, body: 
         _git(run, cwd, "add", "-A", timeout=60)
         wc = _git(run, cwd, "commit", "-m", "wip: save local work", timeout=60)
         if not _ok(wc):
-            raise CreatePrError(f"wip commit failed: {_out(wc) or 'see git output (check user.name/email)'}")
+            raise OpenPrError(f"wip commit failed: {_out(wc) or 'see git output (check user.name/email)'}")
         return _graft_onto_base(cwd, base, head, run=run, err=err)
 
     # Local has commits. Shared or unrelated history?
@@ -265,13 +265,13 @@ def _prepare_on_base(cwd: str, repo: str, state: GitState, *, title: str, body: 
             _git(run, cwd, "rebase", "--abort", timeout=30)
             if stashed:
                 _git(run, cwd, "stash", "pop", timeout=30)
-            raise CreatePrError(
+            raise OpenPrError(
                 f"rebasing local work onto origin/{base} conflicted — resolve the "
                 f"divergent history by hand, then re-run.")
         if stashed:
             sp = _git(run, cwd, "stash", "pop", timeout=30)
             if not _ok(sp):
-                raise CreatePrError(
+                raise OpenPrError(
                     f"stash pop failed after rebase — the working tree may have conflicts: "
                     f"{_out(sp) or (getattr(sp, 'stderr', '') or '').strip() or 'see git output'}")
         return _branch_commit_push(cwd, base, head, title=title, body=body, run=run, err=err)
@@ -287,13 +287,13 @@ def _branch_commit_push(cwd: str, _base: str, head: str, *, title: str, body: st
         # The branch may already exist; switch to it.
         co = _git(run, cwd, "checkout", head, timeout=30)
         if not _ok(co):
-            raise CreatePrError(f"git checkout failed: {_out(co)}")
+            raise OpenPrError(f"git checkout failed: {_out(co)}")
     _git(run, cwd, "add", "-A", timeout=60)
     # Commit only if there is something staged (a clean tree makes commit fail).
     if _out(_git(run, cwd, "status", "--porcelain", timeout=15)):
         ci = _git(run, cwd, "commit", "-m", title, "-m", body, timeout=60)
         if not _ok(ci):
-            raise CreatePrError(f"git commit failed: {_out(ci) or (getattr(ci, 'stderr', '') or '').strip() or 'see git output'}")
+            raise OpenPrError(f"git commit failed: {_out(ci) or (getattr(ci, 'stderr', '') or '').strip() or 'see git output'}")
     _push(run, cwd, err)
     return head
 
@@ -309,7 +309,7 @@ def _graft_onto_base(cwd: str, base: str, head: str, *, run, err) -> str:
         _git(run, cwd, "add", "-A", timeout=60)
         ci = _git(run, cwd, "commit", "-m", "wip: save local work", timeout=60)
         if not _ok(ci):
-            raise CreatePrError(f"git commit failed: {_out(ci) or (getattr(ci, 'stderr', '') or '').strip() or 'see git output'}")
+            raise OpenPrError(f"git commit failed: {_out(ci) or (getattr(ci, 'stderr', '') or '').strip() or 'see git output'}")
         committed_wip = True
     shas = _out(_git(run, cwd, "rev-list", "--reverse", f"origin/{base}..HEAD", timeout=30)).split()
     cr = _git(run, cwd, "checkout", "-B", "_buddhi_temp_pr", f"origin/{base}", timeout=30)
@@ -317,7 +317,7 @@ def _graft_onto_base(cwd: str, base: str, head: str, *, run, err) -> str:
         if committed_wip:
             _git(run, cwd, "checkout", base, timeout=30)
             _git(run, cwd, "reset", "--soft", "HEAD~1", timeout=30)
-        raise CreatePrError(f"could not branch off origin/{base}: {_out(cr) or 'see git output'}")
+        raise OpenPrError(f"could not branch off origin/{base}: {_out(cr) or 'see git output'}")
     for sha in shas:
         pr = _git(run, cwd, "cherry-pick", sha, timeout=60)
         if not _ok(pr):
@@ -326,7 +326,7 @@ def _graft_onto_base(cwd: str, base: str, head: str, *, run, err) -> str:
             if committed_wip:
                 _git(run, cwd, "reset", "--soft", "HEAD~1", timeout=30)
             _git(run, cwd, "branch", "-D", "_buddhi_temp_pr", timeout=30)
-            raise CreatePrError(
+            raise OpenPrError(
                 f"cherry-pick of {sha[:8]} onto origin/{base} conflicted — resolve the "
                 f"divergent history by hand, then re-run.")
     # Guard: -M force-overwrites an existing local branch; refuse rather than silently lose history.
@@ -335,7 +335,7 @@ def _graft_onto_base(cwd: str, base: str, head: str, *, run, err) -> str:
         if committed_wip:
             _git(run, cwd, "reset", "--soft", "HEAD~1", timeout=30)
         _git(run, cwd, "branch", "-D", "_buddhi_temp_pr", timeout=30)
-        raise CreatePrError(
+        raise OpenPrError(
             f"local branch '{head}' already exists — delete or rename it, then re-run "
             f"(or pass a different --branch name).")
     br = _git(run, cwd, "branch", "-M", "_buddhi_temp_pr", head, timeout=30)
@@ -343,7 +343,7 @@ def _graft_onto_base(cwd: str, base: str, head: str, *, run, err) -> str:
         _git(run, cwd, "checkout", base, timeout=30)
         if committed_wip:
             _git(run, cwd, "reset", "--soft", "HEAD~1", timeout=30)
-        raise CreatePrError(f"git branch rename failed: {_out(br)}")
+        raise OpenPrError(f"git branch rename failed: {_out(br)}")
     _push(run, cwd, err)
     return head
 
@@ -389,13 +389,13 @@ def create_and_launch(repo: str, cwd: str, base: str, head: str, *, title: str, 
             url = _extract_url(getattr(vr, "stdout", "")) if _ok(vr) else ""
             print("• PR already exists for this branch — reusing it.", file=err)
         else:
-            raise CreatePrError(f"gh pr create failed: {_out(cr) or (getattr(cr, 'stderr', '') or '').strip() or 'see gh output'}")
+            raise OpenPrError(f"gh pr create failed: {_out(cr) or (getattr(cr, 'stderr', '') or '').strip() or 'see gh output'}")
     if not url:
-        raise CreatePrError("could not determine the PR URL after gh pr create.")
+        raise OpenPrError("could not determine the PR URL after gh pr create.")
 
     m = re.search(r"/(\d+)/?$", url)
     if not m:
-        raise CreatePrError(f"could not extract a PR number from URL '{url}'.")
+        raise OpenPrError(f"could not extract a PR number from URL '{url}'.")
     pr_number = m.group(1)
     print(f"✓ PR #{pr_number} ready — {url}", file=err)
 
@@ -414,8 +414,8 @@ def create_and_launch(repo: str, cwd: str, base: str, head: str, *, title: str, 
 def _dispatch_launch(pr_number: str, repo: str, cwd: str, err) -> None:
     """Default launch callable: route the loop launch through the front-door
     dispatcher so a separately-installed, active backend can take over the same
-    ``/create-pr`` — with none installed it runs the free loop, unchanged. Imported
-    locally to keep ``create_pr``'s git decision tree free of a load-time
+    ``/open-pr`` — with none installed it runs the free loop, unchanged. Imported
+    locally to keep ``open_pr``'s git decision tree free of a load-time
     dependency on the launch layer."""
     from buddhi_review.backends import launch_review_loop
     # The chosen backend's launcher prints its own "where to watch" line (free → a
@@ -433,7 +433,7 @@ def actuate(*, repo: Optional[str], cwd: Optional[str], base: Optional[str], tit
             body: str, branch: Optional[str] = None, branch_prefix: str = "feat",
             no_loop: bool = False, run: Optional[Callable] = None,
             launch: Optional[Callable] = None, out=None, err=None) -> int:
-    """Run the full silent create-pr flow. Returns an exit code (0 on success).
+    """Run the full silent open-pr flow. Returns an exit code (0 on success).
     Decoration → ``err`` (stderr); the PR URL is the last line on ``out`` (stdout)."""
     run = run or _default_run
     launch = launch or _dispatch_launch
@@ -441,7 +441,7 @@ def actuate(*, repo: Optional[str], cwd: Optional[str], base: Optional[str], tit
     err = err or sys.stderr
     cwd = cwd or os.getcwd()
     if not os.path.isdir(cwd):
-        print(f"create-pr: --cwd '{cwd}' is not a directory.", file=err)
+        print(f"open-pr: --cwd '{cwd}' is not a directory.", file=err)
         return 2
 
     try:
@@ -472,6 +472,6 @@ def actuate(*, repo: Optional[str], cwd: Optional[str], base: Optional[str], tit
         create_and_launch(repo, cwd, base, head, title=title, body=body, run=run,
                           launch=launch, out=out, err=err, no_loop=no_loop)
         return 0
-    except CreatePrError as exc:
-        print(f"create-pr: {exc}", file=err)
+    except OpenPrError as exc:
+        print(f"open-pr: {exc}", file=err)
         return 1

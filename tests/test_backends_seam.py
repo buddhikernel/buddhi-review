@@ -1,7 +1,7 @@
 """The front-door seam: backend discovery, selection, and the launch dispatcher.
 
 Proves the delegation path with a TEST DOUBLE — a fake backend whose ``is_active()``
-is True — and asserts both ``/review-pr`` and ``/create-pr`` route to it, and fall
+is True — and asserts both ``/review-pr`` and ``/open-pr`` route to it, and fall
 back to the free engine when no active backend is registered. No real loop spawns:
 the launcher subprocess is replaced with a recording stub.
 """
@@ -14,7 +14,7 @@ from pathlib import Path
 import pytest
 
 import buddhi_review
-from buddhi_review import backends, cli, create_pr
+from buddhi_review import backends, cli, open_pr
 
 _LAUNCHER = Path(buddhi_review.__file__).parent / "launch-review.sh"
 
@@ -249,7 +249,7 @@ def test_review_pr_falls_back_to_free(monkeypatch):
     assert "--rr" in rec[0]  # the front door's flags reached the engine launch
 
 
-# ── /create-pr routes through the dispatcher ───────────────────────────────────────
+# ── /open-pr routes through the dispatcher ───────────────────────────────────────
 
 def _gh_run(argv, cwd=None, timeout=60, input=None):
     if argv[:3] == ["gh", "pr", "create"]:
@@ -258,38 +258,38 @@ def _gh_run(argv, cwd=None, timeout=60, input=None):
     return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
 
-def test_create_pr_default_launch_routes_to_active_backend(monkeypatch):
+def test_open_pr_default_launch_routes_to_active_backend(monkeypatch):
     rec = []
     monkeypatch.setattr(backends, "discover_backends",
                         lambda **k: [FakeBackend(active=True, priority=9, rec=rec)])
     out, err = io.StringIO(), io.StringIO()
-    url = create_pr.create_and_launch(
+    url = open_pr.create_and_launch(
         "acme/widgets", "/work", "main", "feat/x", title="t", body="b",
-        run=_gh_run, launch=create_pr._dispatch_launch, out=out, err=err)
+        run=_gh_run, launch=open_pr._dispatch_launch, out=out, err=err)
     assert url == "https://github.com/acme/widgets/pull/7"
     assert rec == [("7", "acme/widgets", "/work")]  # routed through the dispatcher
     assert out.getvalue().strip().splitlines()[-1] == url  # PR URL still last on stdout
 
 
-def test_create_pr_default_launch_falls_back_to_free(monkeypatch):
+def test_open_pr_default_launch_falls_back_to_free(monkeypatch):
     rec = []
     monkeypatch.setattr(backends, "discover_backends",
                         lambda **k: [backends.FreeBackend()])
     monkeypatch.setattr(backends, "_detached_run", lambda cmd, *a, **kw: rec.append(cmd))
     out, err = io.StringIO(), io.StringIO()
-    url = create_pr.create_and_launch(
+    url = open_pr.create_and_launch(
         "acme/widgets", "/work", "main", "feat/x", title="t", body="b",
-        run=_gh_run, launch=create_pr._dispatch_launch, out=out, err=err)
+        run=_gh_run, launch=open_pr._dispatch_launch, out=out, err=err)
     assert url == "https://github.com/acme/widgets/pull/7"
     assert rec and rec[0][:3] == ["bash", str(_LAUNCHER), "7"]  # free engine launched
 
 
-def test_create_pr_no_loop_never_launches(monkeypatch):
+def test_open_pr_no_loop_never_launches(monkeypatch):
     called = []
     monkeypatch.setattr(backends, "discover_backends",
                         lambda **k: [FakeBackend(active=True, rec=called)])
     out, err = io.StringIO(), io.StringIO()
-    create_pr.create_and_launch(
+    open_pr.create_and_launch(
         "acme/widgets", "/work", "main", "feat/x", title="t", body="b",
-        run=_gh_run, launch=create_pr._dispatch_launch, out=out, err=err, no_loop=True)
+        run=_gh_run, launch=open_pr._dispatch_launch, out=out, err=err, no_loop=True)
     assert called == []  # --no-loop skips the dispatcher entirely

@@ -2279,7 +2279,7 @@ def step_done(path: Path, *, pal, stream) -> None:
         f"Config written : {path}",
         "Re-run setup   : /review-pr setup",
         "Review a PR    : /review-pr <pr-number>   (omit to auto-select)",
-        "Create a PR    : /create-pr",
+        "Create a PR    : /open-pr",
     ], pal, stream)
     _teaser(_PRO_SOON_TEASER, pal, stream)
 

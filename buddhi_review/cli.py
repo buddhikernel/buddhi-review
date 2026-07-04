@@ -9,7 +9,7 @@ Subcommands:
                    the safety floor, console escalation + answer poll, opt-in
                    squash-merge), driven by the multi-round quiescence loop with
                    clean-review detection and per-round re-request handling.
-  ``create-pr``  — create a PR from local work, then launch the loop: resolve repo →
+  ``open-pr``    — create a PR from local work, then launch the loop: resolve repo →
                    git decision tree (commit/branch/push) → gh pr create → launch the
                    review adapter detached (PR URL is the last stdout line).
   ``setup``      — the interactive onboarding wizard (plan, repo, reviewer fleet).
@@ -198,12 +198,12 @@ def _run_loop(args: argparse.Namespace) -> int:
     return 0 if outcome.status == "clean" else 1
 
 
-def _create_pr(args: argparse.Namespace) -> int:
-    from buddhi_review import create_pr
+def _open_pr(args: argparse.Namespace) -> int:
+    from buddhi_review import open_pr
     if not args.title:
-        print("create-pr: --title is required.", file=sys.stderr)
+        print("open-pr: --title is required.", file=sys.stderr)
         return 2
-    return create_pr.actuate(
+    return open_pr.actuate(
         repo=args.repo,
         cwd=args.cwd,
         base=args.base,
@@ -290,7 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
                              "(invoked by launch-review.sh; users call review-pr)")
     _add_loop_args(rl)
 
-    cp = sub.add_parser("create-pr", help="create a PR then run the loop")
+    cp = sub.add_parser("open-pr", help="create a PR then run the loop")
     cp.add_argument("--repo")
     cp.add_argument("--cwd")
     # base defaults to None → the actuator detects origin/HEAD, then a local
@@ -321,8 +321,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _review_pr(args)
     if args.command == "run-loop":
         return _run_loop(args)
-    if args.command == "create-pr":
-        return _create_pr(args)
+    if args.command == "open-pr":
+        return _open_pr(args)
     if args.command == "setup":
         return _setup(args)
     if args.command == "status":

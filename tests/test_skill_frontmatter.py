@@ -10,7 +10,7 @@ import pytest
 import yaml
 
 _SKILLS_DIR = Path(__file__).resolve().parent.parent / "buddhi_review" / "skills"
-_SKILLS = ("review-pr", "create-pr")
+_SKILLS = ("review-pr", "open-pr")
 
 
 def _frontmatter(skill_name):
@@ -46,6 +46,6 @@ def test_review_pr_positional_args():
     assert fm["arguments"] == ["$pr", "$repo"]
 
 
-def test_create_pr_positional_args():
-    fm = _frontmatter("create-pr")
+def test_open_pr_positional_args():
+    fm = _frontmatter("open-pr")
     assert fm["arguments"] == ["$repo"]
