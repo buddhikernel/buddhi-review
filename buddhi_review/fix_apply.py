@@ -1438,6 +1438,10 @@ def apply_fix(
         # over budget, the tripwire-flagged hunks ride FIRST so the verify model
         # always sees the exact hunks that tripped the wire.
         prompt_diff = _compose_verify_diff(diff, bool(trip), marker_spans)
+        if scan_truncated:
+            prompt_diff = ("⚠ NOTE: diff is incomplete — scan ceiling or untracked "
+                           "enumeration failure; treat any CONFIRM conservatively.\n"
+                           + prompt_diff)
         if run_verify:
             # Best-effort, memoized per worktree: gives the verify pass the PR's
             # own stated intent so it can ALSO reject a fix that undoes deliberate
@@ -1546,7 +1550,9 @@ def _attempt_diff(cwd: str, tracked_ref: str,
     try:
         d = _git(cwd, *_DIFF_HEADER_FLAGS, "diff", "--no-ext-diff", tracked_ref,
                  errors="replace")
-        tracked = d.stdout if d.returncode == 0 else ""
+        if d.returncode != 0:
+            return "", False
+        tracked = d.stdout
         truncated = False
         total = len(tracked.encode('utf-8'))
         if total > _SCAN_DIFF_MAX_BYTES:
