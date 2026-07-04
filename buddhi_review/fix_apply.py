@@ -728,9 +728,14 @@ def _span_construct_end(lines: Sequence[str], start: int) -> int:
     opened = False
     in_str = None          # None | "'" | '"' | "'''" | '\"""'
     i, n = start, len(lines)
+    # On the start line, skip past '=' so annotation brackets (e.g.
+    # Tuple[str, ...]) don't set opened=True before the value's bracket
+    # opens on a later line via backslash continuation.
+    _eq = lines[start].find("=") if start < n else -1
+    _start_j = _eq + 1 if _eq >= 0 else 0
     while i < n:
         line = lines[i]
-        j, length = 0, len(line)
+        j, length = (_start_j if i == start else 0), len(line)
         while j < length:
             ch = line[j]
             if in_str:
@@ -1442,6 +1447,7 @@ def apply_fix(
             prompt_diff = ("⚠ NOTE: diff is incomplete — scan ceiling or untracked "
                            "enumeration failure; treat any CONFIRM conservatively.\n"
                            + prompt_diff)
+            prompt_diff = _cap_utf8_diff(prompt_diff, _ATTEMPT_DIFF_MAX_BYTES)
         if run_verify:
             # Best-effort, memoized per worktree: gives the verify pass the PR's
             # own stated intent so it can ALSO reject a fix that undoes deliberate

@@ -152,6 +152,12 @@ def test_span_backslash_continuation_extends():
     assert _spans("X_FLAGS = \\\n    (\n    'a',\n)\nB = 1\n") == [(1, 4)]
 
 
+def test_span_annotated_backslash_continuation_extends():
+    # Annotation brackets (Tuple[str, ...]) must not end the span early when
+    # the value opens on the next line via backslash continuation.
+    assert _spans("X_FLAGS: Tuple[str, ...] = \\\n    (\n    'a',\n)\nB = 1\n") == [(1, 4)]
+
+
 def test_span_unterminated_construct_spans_to_eof():
     text = "X_FLAGS = (\n    'a',\n    'b',\n"
     s = _spans(text)
