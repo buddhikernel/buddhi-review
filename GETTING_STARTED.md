@@ -145,11 +145,13 @@ back to you. Here is what you see while it flies:
   The log basename carries the repo name (`<repo>` = the part after `/` in `owner/repo`),
   so reviewing the same PR number in two different repos never writes to the same file.
 
-- **A per-round summary table**: one row per enabled reviewer, with what each posted
+- **A per-round summary table**: one row per reviewer — every built-in reviewer
+  plus any other that posted, shown for completeness — with what each posted
   and its status (`Active`, `Approved`, `Reviewed — no findings`,
   `Reviewed — no change`, `Polish-only`, `Quota exhausted`,
   `PR too large to review`, `Could not review`, `No review posted`,
-  `Not configured (repo)`, or the internal fallback `excluded`), so a
+  `Not configured (repo)`, `Not requested ·` for a reviewer outside the
+  enabled fleet, or the internal fallback `excluded`), so a
   reviewer that drops out of the expected set never disappears without a
   reason:
 
