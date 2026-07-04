@@ -760,7 +760,7 @@ def _span_construct_end(lines: Sequence[str], start: int) -> int:
             elif ch in ")]}":
                 depth -= 1
             j += 1
-        if in_str and len(in_str) == 1 and not line.endswith("\\"):
+        if in_str and len(in_str) == 1 and not line.rstrip("\r").endswith("\\"):
             # A single-quote string survives the newline only under an
             # explicit backslash continuation; when in doubt we stay "in
             # string", which can only LENGTHEN the span (fail long).
