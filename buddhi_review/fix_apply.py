@@ -1107,9 +1107,9 @@ _DIFF_NEWFILE_RE = re.compile(r'^\+\+\+ "?b/(.+)$')
 _DIFF_HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 
 
-def _clean_diff_path(p: str) -> str:
+def _clean_diff_path(p: str, *, quoted: bool = False) -> str:
     p = p.split("\t", 1)[0]      # drop git's space-path TAB delimiter
-    if p.endswith('"'):
+    if quoted and p.endswith('"'):
         p = p[:-1]               # the regex's optional `"?` already consumed the leading quote
     return p
 
@@ -1135,7 +1135,7 @@ def added_lines_by_file(diff: str) -> Dict[str, set]:
         if new_lineno == 0:
             m = _DIFF_NEWFILE_RE.match(line)
             if m:
-                current = _clean_diff_path(m.group(1))
+                current = _clean_diff_path(m.group(1), quoted=line.startswith('+++ "b/'))
                 out.setdefault(current, set())
             elif line.startswith("+++ /dev/null"):
                 current = None
