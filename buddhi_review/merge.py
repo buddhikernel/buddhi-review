@@ -195,7 +195,7 @@ def squash_merge(
     repo: Optional[str] = None,
     enabled: bool = False,
     cwd: Optional[str] = None,
-    run: Callable[[Sequence[str], Optional[str]], "subprocess.CompletedProcess[str]"] = _default_run,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
     notice: Callable[..., str] = automation_notice,
 ) -> bool:
     """Squash-merge ``pr`` + delete its branch, iff opted in. Returns True only

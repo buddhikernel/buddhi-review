@@ -89,7 +89,7 @@ def fetch_comments(
     *,
     repo: Optional[str] = None,
     cwd: Optional[str] = None,
-    run: Callable[[Sequence[str], Optional[str]], "subprocess.CompletedProcess[str]"] = _default_run,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
 ) -> List[Comment]:
     """Fetch the PR's reviewer comments + review bodies as ``Comment`` objects.
 
@@ -142,7 +142,7 @@ def fetch_pr_diff_lines(
     *,
     repo: Optional[str] = None,
     cwd: Optional[str] = None,
-    run: Callable[[Sequence[str], Optional[str]], "subprocess.CompletedProcess[str]"] = _default_run,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
 ) -> Optional[int]:
     """Best-effort PR diff size (additions + deletions) via ``gh pr view``, used to
     auto-size the review→fix round budget. Returns ``None`` on ANY failure —
@@ -197,7 +197,7 @@ def ingest_source(
     *,
     repo: Optional[str] = None,
     cwd: Optional[str] = None,
-    run: Callable[[Sequence[str], Optional[str]], "subprocess.CompletedProcess[str]"] = _default_run,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
 ) -> Callable[[], Iterable[RawItem]]:
     """An ``ingest_source`` for ``ReviewAdapter`` — the pre-classification raw
     stream for the kernel's ``ingest`` verb (classification enriches later)."""
