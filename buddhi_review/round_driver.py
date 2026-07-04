@@ -730,7 +730,7 @@ class RoundDriver:
         self.answer_waiter = answer_waiter or escalation_wait.wait_for_delivered
 
         self.store = self.adapter.store
-        self.done: Set[str] = set()           # voluntarily-done (clean review)
+        self.done: Set[str] = set()           # voluntarily-done (clean review OR round-end promotion)
         # The explicit all-clear subset of `done` — reviewers whose clean
         # review the detector caught. Tracked as a set of its own (not just
         # BotState.signal) because a LATER hard signal (quota / errored /
@@ -791,7 +791,7 @@ class RoundDriver:
 
     def expected_bots(self) -> List[str]:
         """The expected-bot gate: enabled reviewers minus voluntarily-done, minus
-        the soft driver drops (polish-only + silent), minus the derived union of
+        the soft driver drops (polish-only + silent + reviewed-no-change), minus the derived union of
         the three hard exclusion buckets."""
         return [
             b for b in active_reviewers(self.cfg, self.repo)
@@ -818,14 +818,14 @@ class RoundDriver:
             return "approved"
         if bot in self.done:
             return "done"
+        if bot in self.reviewed_no_change:
+            return "no-change"
         if st.signal == detectors.SIGNAL_QUOTA:
             return "quota"
         if st.signal == detectors.SIGNAL_PR_TOO_LARGE:
             return "pr-too-large"
         if st.signal == detectors.SIGNAL_ERRORED:
             return "errored"
-        if bot in self.reviewed_no_change:
-            return "no-change"
         if bot in self.polishing:
             return "polish"
         if bot in self.silent_dropped:

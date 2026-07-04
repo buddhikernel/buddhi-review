@@ -122,9 +122,10 @@ you cannot enable it). In that case set `auto_on_open` to match reality:
 ## When a reviewer posts nothing
 
 An **enabled** reviewer that produces no comments stays in the round table marked
-`Active` — it is still expected, and the loop keeps polling for it each round
-(reviewers disabled in config are absent from the table entirely; reviewers
-excluded mid-run show `Reviewed — no findings`/`Quota exhausted`/`PR too large to review`/`Could not review`). If a reviewer
+`No review posted 🔇` — it is still expected, and the loop keeps polling for it
+each round. `Active ✅` only appears once the reviewer has engaged in the current
+round (reviewers disabled in config are absent from the table entirely; reviewers
+excluded mid-run show `Approved`/`Reviewed — no findings`/`Reviewed — no change`/`Quota exhausted`/`PR too large to review`/`Could not review`/`Polish-only`). If a reviewer
 *never* posts across the whole run, that is the
 signal your prerequisite setup is incomplete — check, for that bot:
 
