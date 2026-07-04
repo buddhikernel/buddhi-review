@@ -1058,15 +1058,15 @@ class RoundDriver:
         comeback re-summons it once the reset passes. ``type=credits_exhausted``
         is a paid-tier concept (no billing-mode split here) — logged and ignored,
         so claude falls through to the ordinary silent handling."""
-        newest = None  # (created_at_or_"", match)
+        newest = None  # (parsed_datetime_or_None, match)
         for c in fresh:
             if c.source != CLAUDE_UNAVAILABLE_MARKER_AUTHOR:
                 continue
             m = CLAUDE_UNAVAILABLE_MARKER_RE.search(c.text or "")
             if not m:
                 continue
-            key = c.created_at or ""
-            if newest is None or key > newest[0]:
+            key = _parse_iso(c.created_at)
+            if newest is None or (key is not None and (newest[0] is None or key > newest[0])):
                 newest = (key, m)
         if newest is None:
             return
@@ -1876,6 +1876,8 @@ class RoundDriver:
         silent banner). Never raises."""
         if bot != "claude" or not self.repo:
             return False
+        if bot in self._rate_limited_until:
+            return False
         try:
             run_id = self._claude_review_run_id(self._pr_checks_rows())
             if run_id is None:
@@ -1940,6 +1942,8 @@ class RoundDriver:
                 continue  # responded at least once → not wastefully silent
             if self.store.is_excluded(bot):
                 continue  # quota / PR-too-large / errored — a known reason, not silence
+            if bot in self._rate_limited_until:
+                continue  # rate-limited by a workflow marker — not a setup failure
             if not self._was_review_expected(bot):
                 continue  # never actually summonable → don't penalize
             rounds = self.silent_rounds.get(bot, 0)
