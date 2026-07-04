@@ -1043,7 +1043,17 @@ class RoundDriver:
                 _same_instant(stamp, comment.created_at)
                 for stamp in (batch_finding_stamps or {}).get(bot, ()))
             if comment.path or comment.diff_hunk or same_submission_finding:
+                # Body is shielded — the bot demonstrably reviewed — but keep a
+                # flag so detect_clean_review is skipped below. An errored body
+                # that also contains "no issues found" phrasing must NOT be read
+                # as an approval: the bot errored, and its inline findings are
+                # the actual review output.
                 signal = None
+                shielded_errored_body = True
+            else:
+                shielded_errored_body = False
+        else:
+            shielded_errored_body = False
         if signal == detectors.SIGNAL_QUOTA:
             self.store.exclude_quota(bot)
             st.signal = signal
@@ -1061,7 +1071,7 @@ class RoundDriver:
             self.notice("exclusion", f"{bot} excluded (errored — retractable on a newer comment)",
                         status="skip")
             return None
-        if detectors.detect_clean_review(comment.text, llm_json=self.clean_llm):
+        if not shielded_errored_body and detectors.detect_clean_review(comment.text, llm_json=self.clean_llm):
             self.done.add(bot)
             self.approved.add(bot)  # sticky: a later hard signal must not
             st.signal = detectors.SIGNAL_CLEAN  # demote the sign-off's label

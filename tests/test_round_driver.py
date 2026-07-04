@@ -407,6 +407,28 @@ def test_other_bots_findings_never_shield_a_placeholder():
     assert driver.store.is_excluded("claude")
 
 
+def test_shielded_errored_body_with_clean_phrasing_not_approved():
+    # A review body that trips the errored regex AND contains "no issues found"
+    # phrasing, shielded by a same-instant inline finding, must NOT be promoted
+    # to clean-approved. The bot errored; its inline findings are the actual
+    # review output. Crowning it "Approved" would satisfy the merge gate even
+    # though nobody truly reviewed the PR.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    body = Comment(
+        id="a",
+        text="I encountered an internal error while reviewing some files. "
+             "No issues found in the rest.",
+        source="claude[bot]",
+        created_at="2026-06-10T00:00:00Z",
+    )
+    stamps = {"claude": ["2026-06-10T00:00:00Z"]}
+    result = driver._classify_signal(body, 0.0, batch_finding_stamps=stamps)
+    assert result == "claude"           # shielded → actionable, not suppressed
+    assert not driver.store.is_excluded("claude")  # not recorded as errored
+    assert "claude" not in driver.done      # NOT promoted to done
+    assert "claude" not in driver.approved  # NOT clean-approved
+
+
 def test_failure_placeholder_with_zero_output_phrasing_records_errored():
     # "The review run failed; no comments were posted." — the zero-output
     # sentence is the FAILURE's own consequence, not an all-clear. Clean-review

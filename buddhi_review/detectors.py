@@ -565,7 +565,8 @@ PR_QUOTA_VOCAB_RE = re.compile(
 # form (PR_QUOTA_VOCAB_RE's ``rate[\s-]?limit`` set the precedent).
 PR_TOO_LARGE_VOCAB_RE = re.compile(
     r"(?i)\b(?:"
-    r"too[\s-]+(?:large|big)"                   # "PR too large to review" label
+    r"too-(?:large|big)"                         # hyphenated slug "too-large" / "too-big"
+    r"|too[\s-]+(?:large|big)[\s-]+(?:for|to)[\s-]+review"  # "too large to review"
     r"|pr[\s-]?too[\s-]?large"                  # the signal name / slug form
     r"|(?:size|diff|file)[\s-]+limits?"
     r"|oversized?[\s-]+(?:pr|pull[\s-]+request|diff)"
@@ -581,9 +582,9 @@ PR_ERRORED_VOCAB_RE = re.compile(
     r"|error(?:ed)?[\s-]+(?:review(?:er)?s?|bots?|placeholders?|signals?|"
     r"labels?|statuse?s?|regex(?:es)?|patterns?|detect(?:ors?|ion))"
     r"|(?:review(?:er)?s?|bots?)\b[\s\S]{0,12}\berror(?:s|ed)?"
-    r"|(?:internal|unexpected|transient)[\s-]+error"
-    r"|something[\s-]+went[\s-]+wrong"
-    r"|errored"
+    r"|(?:review(?:er)?s?|bots?)[\s\S]{0,25}(?:internal|unexpected|transient)[\s-]+error"
+    r"|(?:internal|unexpected|transient)[\s-]+error[\s\S]{0,25}(?:review(?:er)?s?|bots?)"
+    r"|something[\s-]+went[\s-]+wrong[\s\S]{0,40}(?:review(?:er)?s?|bots?|generat)"
     r")\b"
 )
 _PR_CAUSE_VOCAB: Dict[str, "re.Pattern[str]"] = {
