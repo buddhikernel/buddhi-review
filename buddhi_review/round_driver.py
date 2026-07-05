@@ -938,11 +938,12 @@ class RoundDriver:
         #   manual-landing rebase reports the honest state ("CI is red — merge at
         #   your discretion") instead of "ready to merge".
         self._premerge_ci_red: bool = False
-        # _threads_unresolved: set when the pre-merge thread gate blocked a clean
-        #   exit because GitHub still reported an unresolved review thread the loop
-        #   did not (and must not) auto-resolve — used so the manual-landing
-        #   hand-back reports the honest reason instead of "ready to merge".
-        self._threads_unresolved: bool = False
+        # _thread_gate_block_reason: set when the pre-merge thread gate blocked a
+        #   clean exit — the string captures WHY it blocked ("a review thread is
+        #   still unresolved", "could not check review threads (no owner/repo
+        #   configured)", …). None when the gate never fired or the PR is merge-
+        #   ready. Used so the manual-landing hand-back reports the honest reason.
+        self._thread_gate_block_reason: Optional[str] = None
         # _handled_inline_ids: ids of the INLINE review comments the run genuinely
         #   finished (a resolving disposition). A review thread's ROOT is always an
         #   inline comment (a PullRequestReviewComment), a DISTINCT GitHub id
@@ -2120,7 +2121,6 @@ class RoundDriver:
             # re-confirms; a thread the loop did not touch (a human's open thread)
             # or could not finish (a rejected fix) keeps the PR un-merge-ready.
             if not self._thread_gate_ok():
-                self._threads_unresolved = True
                 return RunOutcome("clean", rounds, False, self.actions)
             if label_gated_ci(self.cfg, self.repo):
                 ci_ok = merge.wait_for_ci_green(
@@ -2191,18 +2191,20 @@ class RoundDriver:
             print(f"[thread-gate] could not read PR #{self.pr} review threads — "
                   f"proceeding (a transient read error is not an unresolved thread)")
             return True
-        except RuntimeError as _exc:
-            if "requires an explicit owner/repo" in str(_exc):
-                # A missing or malformed repo string is a non-transient configuration
-                # error — gh_ingest.fetch_review_threads needs owner/repo for GraphQL
-                # variables and cannot degrade gracefully. Block rather than silently
-                # skip the thread check and allow an auto-merge with open threads.
-                self.notice("thread-gate",
-                            f"PR #{self.pr}: cannot check review threads — "
-                            f"no owner/repo configured for GraphQL thread reader",
-                            status="stop",
-                            hint="re-run with --repo owner/name to enable the thread gate")
-                return False
+        except gh_ingest.RepoNotConfiguredError:
+            # A missing or malformed repo string is a non-transient configuration
+            # error — gh_ingest.fetch_review_threads needs owner/repo for GraphQL
+            # variables and cannot degrade gracefully. Block rather than silently
+            # skip the thread check and allow an auto-merge with open threads.
+            self._thread_gate_block_reason = (
+                "could not check review threads (no owner/repo configured)")
+            self.notice("thread-gate",
+                        f"PR #{self.pr}: cannot check review threads — "
+                        f"no owner/repo configured for GraphQL thread reader",
+                        status="stop",
+                        hint="re-run with --repo owner/name to enable the thread gate")
+            return False
+        except RuntimeError:
             # Other RuntimeErrors (GraphQL blips, gh network failures) are transient.
             print(f"[thread-gate] could not read PR #{self.pr} review threads — "
                   f"proceeding (a transient read error is not an unresolved thread)")
@@ -2237,6 +2239,7 @@ class RoundDriver:
             # An unresolved thread the loop never handled → definitely not merge-
             # ready, decided on the first (good) read; no re-query, so a transient
             # error at re-query time can never launder it into a merge.
+            self._thread_gate_block_reason = "a review thread is still unresolved"
             self.notice("thread-gate",
                         f"PR #{self.pr}: {len(foreign)} review thread(s) still "
                         f"unresolved that the loop did not address — not merging; "
@@ -2258,6 +2261,7 @@ class RoundDriver:
             # A resolve mutation reported failure AND the confirming re-read errored:
             # the thread's true state is genuinely unconfirmed. Do NOT fail-open into
             # a merge on unconfirmed state — block and hand back instead.
+            self._thread_gate_block_reason = "a review thread is still unresolved"
             self.notice("thread-gate",
                         f"PR #{self.pr}: could not confirm this run's review-thread "
                         f"resolution (a resolve call failed and the confirming re-read "
@@ -2266,6 +2270,7 @@ class RoundDriver:
             return False
         remaining = [t for t in threads2 if not t.is_resolved]
         if remaining:
+            self._thread_gate_block_reason = "a review thread is still unresolved"
             self.notice("thread-gate",
                         f"PR #{self.pr}: {len(remaining)} review thread(s) still "
                         f"unresolved after resolving this run's own — not merging; "
@@ -2442,8 +2447,8 @@ class RoundDriver:
         # pre-merge CI (when gated) was not red.
         if self._premerge_ci_red:
             return "the pre-merge CI is red"
-        if self._threads_unresolved:
-            return "a review thread is still unresolved"
+        if self._thread_gate_block_reason is not None:
+            return self._thread_gate_block_reason
         if self.rr_none:
             # --rr-none asked for no review by design, so an empty fleet here is
             # not "unconfigured" — the comments were fixed and the PR is ready.

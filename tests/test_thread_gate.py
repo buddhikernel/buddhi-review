@@ -246,18 +246,21 @@ def test_gate_fails_soft_on_reader_error():
 
 
 def test_gate_blocks_on_missing_repo_config_error():
-    # A missing/invalid repo raises RuntimeError("…requires an explicit owner/repo")
-    # from gh_ingest.fetch_review_threads — that is a non-transient config error, NOT
+    # A missing/invalid repo raises RepoNotConfiguredError from
+    # gh_ingest.fetch_review_threads — that is a non-transient config error, NOT
     # a transient gh blip, so the gate must block (return False) rather than fail-soft.
     class MissingRepoFetch:
         resolved = []
         def fetch(self, pr, repo=None, cwd=None):
-            raise RuntimeError("fetch_review_threads requires an explicit owner/repo")
+            raise gh_ingest.RepoNotConfiguredError(
+                "fetch_review_threads requires an explicit owner/repo")
         def resolve(self, thread_id, cwd=None):
             return True
 
     driver = _driver_with_gate([], MissingRepoFetch())
     assert driver._thread_gate_ok() is False
+    assert driver._thread_gate_block_reason == (
+        "could not check review threads (no owner/repo configured)")
 
 
 def test_gate_fails_soft_on_requery_error():
@@ -338,7 +341,7 @@ def test_e2e_unresolved_human_thread_blocks_and_hands_back(capsys):
     assert outcome.merged is False
     assert gh.matching("gh", "merge", "--squash") == []   # never merged
     assert ft.resolved == []                              # human thread untouched
-    assert driver._threads_unresolved is True
+    assert driver._thread_gate_block_reason == "a review thread is still unresolved"
     # the honest hand-back reason surfaces this, not "ready to merge"
     assert driver._handback_caution_reason(outcome) == "a review thread is still unresolved"
 

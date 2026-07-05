@@ -39,6 +39,13 @@ THREADS_JSON_ENV = "BUDDHI_REVIEW_THREADS_JSON"
 _GH_TIMEOUT = 60
 
 
+class RepoNotConfiguredError(RuntimeError):
+    """Raised by ``fetch_review_threads`` when no explicit ``owner/repo`` is
+    supplied. GraphQL variables require it; gh does not substitute the REST
+    placeholder. Callers catch this specifically to distinguish a non-transient
+    configuration error from a transient network / gh failure."""
+
+
 @dataclass(frozen=True)
 class Reaction:
     """One reaction on the PR body (issues/<pr>/reactions). ``content`` is the
@@ -353,7 +360,7 @@ def fetch_review_threads(
     if not repo or "/" not in repo:
         # GraphQL needs explicit owner/name variables — gh does not substitute the
         # REST ``{owner}/{repo}`` placeholder into GraphQL args. Signal the caller.
-        raise RuntimeError("fetch_review_threads requires an explicit owner/repo")
+        raise RepoNotConfiguredError("fetch_review_threads requires an explicit owner/repo")
     owner, name = repo.split("/", 1)
 
     threads: List[ReviewThread] = []
