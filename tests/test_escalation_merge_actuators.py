@@ -144,14 +144,43 @@ def test_fix_disposition_applied_maps_to_fixed():
     assert a.final == "fixed"
 
 
-def test_fix_disposition_skip_and_reject_map_to_skipped_invalid():
+def test_fix_disposition_skip_splits_invalid_vs_already_fixed():
+    # A genuine SKIP renders the honest sub-label the fixer stated in its reason:
+    # an already-fixed marker → skipped-already-fixed, else skipped-invalid.
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier({})))
-    for status in ("skipped", "rejected"):
-        a = act_on_result(
-            Comment(id="c1", text="t"), _result("fix"), adapter=adapter,
-            fix_dispatch=lambda c, r, s=status: FixOutcome(status=s),
-        )
-        assert a.final == "skipped-invalid"
+    invalid = act_on_result(
+        Comment(id="c1", text="t"), _result("fix"), adapter=adapter,
+        fix_dispatch=lambda c, r: FixOutcome(status="skipped",
+                                             detail="SKIP: the cited flag is wrong"),
+    )
+    assert invalid.final == "skipped-invalid"
+    already = act_on_result(
+        Comment(id="c1", text="t"), _result("fix"), adapter=adapter,
+        fix_dispatch=lambda c, r: FixOutcome(status="skipped",
+                                             detail="SKIP: already handled upstream"),
+    )
+    assert already.final == "skipped-already-fixed"
+    # An empty/unclassifiable reason defaults to the invalid bucket.
+    bare = act_on_result(
+        Comment(id="c1", text="t"), _result("fix"), adapter=adapter,
+        fix_dispatch=lambda c, r: FixOutcome(status="skipped"),
+    )
+    assert bare.final == "skipped-invalid"
+
+
+def test_fix_disposition_reject_is_its_own_label_and_escalates():
+    # A verify-REJECT keeps its own honest 'rejected' label (NOT laundered as
+    # skipped-invalid) AND surfaces for a human on the fix- rail so it is never
+    # silently counted as clean progress toward auto-merge.
+    notifier = FakeNotifier({})
+    adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=notifier))
+    a = act_on_result(
+        Comment(id="c1", text="t"), _result("fix"), adapter=adapter,
+        fix_dispatch=lambda c, r: FixOutcome(status="rejected", detail="verify REJECT"),
+    )
+    assert a.final == "rejected"
+    assert notifier.sent and notifier.sent[0].id == "fix-c1"        # the human gets the ask
+    assert adapter.escalation.delivered and adapter.escalation.delivered[0].id == "fix-c1"
 
 
 def test_fix_transient_failure_escalates_not_ladders():
@@ -170,7 +199,7 @@ def test_fix_disposition_threads_rollback_failed_flag():
     # fix disposition (so the round driver's poisoned-worktree gate can see it);
     # a clean fix (and the non-fix paths) default to False.
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier({})))
-    for status, final in (("applied", "fixed"), ("rejected", "skipped-invalid"),
+    for status, final in (("applied", "fixed"), ("rejected", "rejected"),
                           ("transient-failed", "escalated")):
         a = act_on_result(
             Comment(id="c1", text="t"), _result("fix"), adapter=adapter,

@@ -64,12 +64,15 @@ _ROUND_SPACING = 90
 
 # ActionResult.final -> the §5 per-comment vocabulary. A kernel "skip" (an
 # OUTDATED / INVALID comment the loop correctly declined to act on) and a fixer
-# "skipped-invalid" (a fix the resolver self-skipped or the verify pass rejected)
-# both mean "not acted on, invalid here" in the §5 3-way.
+# "skipped-invalid" / "skipped-already-fixed" (a genuine validity-judgment SKIP)
+# all mean "not acted on, nothing to do" in the §5 3-way. A fixer "rejected" (a
+# fix-verify REJECT) escalates for a human, so it collapses to "escalated".
 _FINAL_TO_PARITY = {
     "fixed": "fixed",
     "skipped-invalid": "skipped-invalid",
+    "skipped-already-fixed": "skipped-invalid",
     "skipped": "skipped-invalid",
+    "rejected": "escalated",
     "escalated": "escalated",
 }
 
