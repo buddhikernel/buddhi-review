@@ -393,7 +393,11 @@ def _is_refusal_skip(reason: str) -> bool:
 # rather than the "invalid / would break" case. Used only to render an honest
 # final label — both are genuine validity judgments and both dismiss the finding.
 _ALREADY_FIXED_MARKERS = (
-    "already",
+    "already handled",
+    "already addressed",
+    "already fixed",
+    "already applied",
+    "already resolved",
     "no longer",
     "does not exist",
     "doesn't exist",
@@ -405,7 +409,7 @@ _ALREADY_FIXED_MARKERS = (
 )
 
 
-def _skip_kind(reason: str) -> str:
+def skip_kind(reason: str) -> str:
     """Classify a genuine SKIP reason as ``"already fixed"`` (already-addressed /
     referenced code gone) or ``"invalid"`` (the comment is invalid / the
     suggested fix would break something). The fixer states which in its one-line

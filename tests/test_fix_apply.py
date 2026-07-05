@@ -380,13 +380,16 @@ def test_is_refusal_skip_markers_and_word_boundary():
 
 
 def test_skip_kind_splits_already_fixed_from_invalid():
-    assert fix_apply._skip_kind("SKIP: already handled upstream") == "already fixed"
-    assert fix_apply._skip_kind("SKIP: the referenced code no longer exists") == "already fixed"
-    assert fix_apply._skip_kind("SKIP: addressed in a prior commit") == "already fixed"
+    assert fix_apply.skip_kind("SKIP: already handled upstream") == "already fixed"
+    assert fix_apply.skip_kind("SKIP: the referenced code no longer exists") == "already fixed"
+    assert fix_apply.skip_kind("SKIP: addressed in a prior commit") == "already fixed"
     # invalid = a validity judgment with no already-fixed marker
-    assert fix_apply._skip_kind("SKIP: the cited flag is wrong — it never triggers") == "invalid"
-    assert fix_apply._skip_kind("SKIP: applying this would break the retry loop") == "invalid"
-    assert fix_apply._skip_kind("") == "invalid"
+    assert fix_apply.skip_kind("SKIP: the cited flag is wrong — it never triggers") == "invalid"
+    assert fix_apply.skip_kind("SKIP: applying this would break the retry loop") == "invalid"
+    assert fix_apply.skip_kind("") == "invalid"
+    # bare 'already' must NOT fire on unrelated uses like 'already triggers'
+    assert fix_apply.skip_kind("SKIP: this already triggers a retry") == "invalid"
+    assert fix_apply.skip_kind("SKIP: already retries on timeout") == "invalid"
 
 
 def test_apply_fix_verify_reject_rolls_back(repo):

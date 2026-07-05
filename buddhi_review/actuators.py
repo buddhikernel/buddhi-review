@@ -30,7 +30,7 @@ from typing import Callable, Optional
 from buddhi_review import plan_profile
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.classify import REWRITE_LABELS
-from buddhi_review.fix_apply import FixOutcome, apply_fix, _skip_kind
+from buddhi_review.fix_apply import FixOutcome, apply_fix, skip_kind
 from buddhi_review.loop import Comment, CommentResult
 from buddhi_review.notifier import Ask
 
@@ -311,7 +311,7 @@ def act_on_result(
             # applied. Render the honest sub-label it stated in its reason
             # (already-fixed vs invalid); both dismiss the finding downstream.
             final = ("skipped-already-fixed"
-                     if _skip_kind(outcome.detail) == "already fixed"
+                     if skip_kind(outcome.detail) == "already fixed"
                      else "skipped-invalid")
             return ActionResult(comment.id, d, final, outcome.detail, rollback_failed=rb)
         if outcome.status == "rejected":
