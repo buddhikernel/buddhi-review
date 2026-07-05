@@ -1411,6 +1411,7 @@ class RoundDriver:
                 # when the bot is already excluded for another comment this batch.
                 self.reviewed_ever.discard(bot)
                 self.done.discard(bot)           # quota hard-cause evicts any prior clean fold
+                self.approved.discard(bot)       # quota hard-cause wins over any prior +1 fold
                 self._reaction_done.discard(bot)  # keep in sync with done
                 self.notice("exclusion",
                             f"{bot} excluded for the run: quota exhausted "
