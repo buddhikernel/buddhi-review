@@ -203,3 +203,80 @@ def test_fetch_pr_diff_lines_returns_none_on_failure():
     def boom(argv, *, cwd=None):
         raise OSError("gh missing")
     assert gh_ingest.fetch_pr_diff_lines("7", run=boom) is None
+
+
+# ------------------------------------------------------------------- reactions
+
+
+def test_reactions_env_seam_short_circuits_gh(monkeypatch):
+    monkeypatch.setenv(
+        gh_ingest.REACTIONS_JSON_ENV,
+        json.dumps([
+            {"id": 1, "content": "+1", "user": {"login": "chatgpt-codex-connector[bot]",
+                                                 "type": "User"}},
+            {"id": 2, "content": "eyes", "user": {"login": "copilot[bot]", "type": "Bot"}},
+        ]),
+    )
+
+    def explode(argv, **kw):  # gh must never be invoked when the seam is set
+        raise AssertionError("gh was called")
+
+    reactions = gh_ingest.fetch_reactions("5", run=explode)
+    assert [(r.id, r.content, r.source) for r in reactions] == [
+        ("1", "+1", "chatgpt-codex-connector[bot]"),
+        ("2", "eyes", "copilot[bot]"),
+    ]
+
+
+def test_reactions_drop_non_bot_authors(monkeypatch):
+    # A human's +1 must never reach the fold — only a "[bot]" login OR type=="Bot"
+    # is trusted. A login that merely CONTAINS a bot alias (john-copilot) is a
+    # human and is dropped.
+    monkeypatch.setenv(
+        gh_ingest.REACTIONS_JSON_ENV,
+        json.dumps([
+            {"id": 1, "content": "+1", "user": {"login": "octocat", "type": "User"}},
+            {"id": 2, "content": "+1", "user": {"login": "john-copilot", "type": "User"}},
+            {"id": 3, "content": "+1", "user": {"login": "claude[bot]", "type": "Bot"}},
+        ]),
+    )
+    reactions = gh_ingest.fetch_reactions("5")
+    assert [r.source for r in reactions] == ["claude[bot]"]
+
+
+def test_reactions_gh_endpoint_and_dedup(monkeypatch):
+    monkeypatch.delenv(gh_ingest.REACTIONS_JSON_ENV, raising=False)
+    calls = []
+
+    def fake_run(argv, *, cwd=None):
+        calls.append(argv)
+        # concatenated pages with a duplicate id across pages
+        return _proc(
+            json.dumps([{"id": 9, "content": "+1", "user": {"login": "codex[bot]"}}])
+            + json.dumps([{"id": 9, "content": "+1", "user": {"login": "codex[bot]"}}]))
+
+    reactions = gh_ingest.fetch_reactions("7", repo="o/r", run=fake_run)
+    assert calls[0][:3] == ["gh", "api", "--paginate"]
+    assert calls[0][-1] == "repos/o/r/issues/7/reactions"
+    assert [r.id for r in reactions] == ["9"]  # deduped across pages
+
+
+def test_reactions_malformed_dropped(monkeypatch):
+    monkeypatch.setenv(
+        gh_ingest.REACTIONS_JSON_ENV,
+        json.dumps([
+            {"content": "+1", "user": {"login": "codex[bot]"}},   # no id
+            {"id": 2, "user": {"login": "codex[bot]"}},           # no content
+            {"id": 3, "content": "+1"},                            # no user
+            {"id": 4, "content": "+1", "user": {"login": "codex[bot]"}},  # ok
+        ]),
+    )
+    reactions = gh_ingest.fetch_reactions("5")
+    assert [r.id for r in reactions] == ["4"]
+
+
+def test_reactions_gh_failure_raises(monkeypatch):
+    monkeypatch.delenv(gh_ingest.REACTIONS_JSON_ENV, raising=False)
+    with pytest.raises(RuntimeError):
+        gh_ingest.fetch_reactions("7", repo="o/r",
+                                  run=lambda argv, **kw: _proc(rc=1, stderr="boom"))

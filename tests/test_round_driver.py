@@ -1,14 +1,17 @@
 """Quiescence round-loop + exclusion wiring — fake clock, no network."""
 import json
 import subprocess
+from datetime import datetime, timezone
 
-from buddhi_review import round_driver
+from buddhi_review import detectors, gh_ingest, round_driver
 from buddhi_review.actuators import FixDispatch
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.fix_apply import FixOutcome
 from buddhi_review.loop import Comment
 from buddhi_review.round_driver import RoundDriver, RoundTimes
 from buddhi_review.seams import ConsoleEscalation
+
+UTC = timezone.utc
 
 
 class FakeClock:
@@ -51,18 +54,27 @@ def label_runner(label):
 
 
 def make_driver(timeline, *, cfg, clock=None, gh=None, times=None, classify=None,
-                fix=None, answer_waiter=None, **kw):
-    """timeline = [(t_visible, Comment), ...] — comments appear at clock time."""
+                fix=None, answer_waiter=None, reactions=None, **kw):
+    """timeline = [(t_visible, Comment), ...] — comments appear at clock time.
+    reactions = [(t_visible, gh_ingest.Reaction), ...] — same clock semantics."""
     clock = clock or FakeClock()
     gh = gh or GhRecorder()
     def fetch(pr, repo=None, cwd=None):
         return [c for t, c in timeline if t <= clock.t]
+    def fetch_reactions(pr, repo=None, cwd=None):
+        return [r for t, r in (reactions or []) if t <= clock.t]
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier()))
+    # make_driver models a FRESH launch — the timeline's comments arrive DURING
+    # the round (after a summon), so preflight (the pre-round-1 snapshot of a PR's
+    # pre-existing reviews) is off by default here; the dedicated preflight tests
+    # pass preflight=True and seed comments/reactions already on the PR.
+    kw.setdefault("preflight", False)
     driver = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg, adapter=adapter,
         classify_runner=classify or label_runner("INVALID"),
         fix_dispatch=fix,
-        fetch=fetch, gh_run=gh, clock=clock, sleep=clock.sleep,
+        fetch=fetch, reactions_fetch=fetch_reactions, gh_run=gh,
+        clock=clock, sleep=clock.sleep,
         notice=lambda *a, **k: "",
         # register_delay=0 by default so the existing timing tests isolate the
         # quiescence / gating behaviour from the post-summon register delay; the
@@ -1391,3 +1403,329 @@ def test_errored_comeback_updated_at_takes_precedence_over_created_at():
                                     classify=label_runner("SUBSTANTIVE"))
     driver.run()
     assert driver.store.is_excluded("claude")   # updated_at (older) → no comeback
+
+
+# ===========================================================================
+# PR-state snapshot machinery: preflight · reactions · round baselines
+# (make_driver defaults preflight=False; these tests opt in with preflight=True
+# and/or a reactions timeline, so a comment/reaction already on the PR is folded
+# BEFORE round 1.)
+# ===========================================================================
+
+# --------------------------------------------------------------- preflight (#10)
+
+def test_preflight_processes_pre_existing_comment_in_round1_without_waiting():
+    # A finding already on the PR at launch is folded at preflight and fixed in
+    # round 1 with NO poll wait — the finding-poster already gave its verdict, so
+    # round 1 neither re-summons nor waits on it.
+    fixed = []
+
+    def fix(c, r):
+        fixed.append(c.id)
+        return FixOutcome(status="applied")
+
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        auto_merge=True, answer_waiter=lambda esc, **k: {}, preflight=True)
+    outcome = driver.run()
+    assert outcome.status == "clean" and outcome.rounds == 1
+    assert fixed == ["a"]                          # the pre-existing comment was fixed
+    assert clock.t < driver.times.min_bot_wait      # NO min-bot wait was burned
+    assert gh.matching("@claude review") == []      # finding-poster not re-summoned round 1
+    assert outcome.merged is True                   # a genuine review happened → merge
+
+
+def test_preflight_all_clean_skips_the_poll_entirely():
+    # Every reviewer already approved before launch → the fleet is empty at round 1
+    # and the existing "no expected bots → clean exit" branch fires: the poll window
+    # is never opened, so an already-reviewed PR does not burn the min-bot wait.
+    timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]"))]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY, auto_merge=True,
+                                    preflight=True)
+    outcome = driver.run()
+    assert outcome.status == "clean"
+    assert "claude" in driver.approved and "claude" in driver.reviewed_ever
+    assert clock.t == 0                              # poll never opened → no wait
+    assert gh.matching("@claude review") == []      # nobody re-summoned
+    assert outcome.merged is True                   # the clean review still merges
+    assert outcome.rounds == 0                       # exited before any polling round
+
+
+def test_preflight_partial_clean_still_summons_the_unreviewed_bot():
+    # copilot already approved (preflight-done); claude has NOT reviewed. Round 1
+    # skips copilot (already responded) but still summons + waits on claude.
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
+    timeline = [
+        (0, Comment(id="c", text="No issues found.", source="copilot[bot]")),
+        (30, Comment(id="a", text="No issues found.", source="claude[bot]")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=cfg, auto_merge=True, preflight=True)
+    outcome = driver.run()
+    assert "copilot" in driver.done                  # folded clean at preflight
+    assert gh.matching("requested_reviewers") == []  # copilot NOT re-summoned
+    assert gh.matching("@claude review")             # claude WAS summoned (unreviewed)
+    assert "claude" in driver.done
+    assert outcome.merged is True
+
+
+def test_preflight_honors_pre_existing_rate_limit_marker_and_scans_once():
+    # A rate-limit marker already on the PR is honored at preflight (claude released
+    # before round 1), and the marker is scanned exactly once across preflight +
+    # poll (processed_ids de-dup). A second bot keeps the poll running so the two
+    # scan paths are both exercised.
+    reset = datetime(2026, 7, 4, 13, 0, tzinfo=UTC)
+    before = datetime(2026, 7, 4, 12, 0, tzinfo=UTC)
+    marker = Comment(
+        id="m", from_issue_channel=True, source="github-actions[bot]",
+        created_at="2026-07-04T10:00:00Z",
+        text=("<!-- claude-review-unavailable-v1 type=rate_limited "
+              f"resets_at={int(reset.timestamp())} -->"))
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
+    timeline = [(0, marker),
+                (30, Comment(id="c", text="No issues found.", source="copilot[bot]"))]
+    driver, clock, gh = make_driver(timeline, cfg=cfg, wall_clock=lambda: before,
+                                    auto_merge=True, preflight=True)
+    scans = []
+    _orig = driver._scan_unavailable_markers
+    driver._scan_unavailable_markers = (
+        lambda fresh: scans.append([c.id for c in fresh]) or _orig(fresh))
+    outcome = driver.run()
+    assert driver._rate_limited_until.get("claude") == reset   # released at preflight
+    assert driver._bot_state("claude").signal == detectors.SIGNAL_RATE_LIMITED
+    assert sum(batch.count("m") for batch in scans) == 1        # scanned exactly once
+    assert len(scans) >= 2                                      # preflight + poll ran
+    assert "copilot" in driver.done                            # the poll still ran
+
+
+def test_preflight_de_dups_a_folded_comment_from_the_poll():
+    # A pre-existing finding folded at preflight is NEVER re-ingested by the poll —
+    # processed_ids guarantees it is dispatched to the fixer exactly once.
+    fixed = []
+
+    def fix(c, r):
+        fixed.append(c.id)
+        return FixOutcome(status="applied")
+
+    # fetch always returns the finding (as if it stays on the PR); only preflight
+    # consumes it, the poll must not re-see it.
+    driver, clock, gh = make_driver(
+        [(0, Comment(id="a", text="rename tmp", source="claude[bot]"))],
+        cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        answer_waiter=lambda esc, **k: {}, preflight=True)
+    driver.run()
+    assert fixed == ["a"]                 # dispatched once, not twice
+    assert "a" in driver.processed_ids
+
+
+def test_preflight_chatter_only_bot_is_still_polled_for_its_real_review():
+    # A bot that posts only issue-channel chatter before launch (no verdict) is
+    # NOT a preflight responder — round 1 still summons + waits for it, and its
+    # real review (arriving during the round) is caught. Guards against skipping a
+    # reviewer that only said "reviewing…" but had not actually reviewed.
+    chatter = Comment(id="ch", from_issue_channel=True, source="claude[bot]",
+                      text="I'm reviewing this PR now.")
+    timeline = [(0, chatter),
+                (30, Comment(id="ok", text="No issues found.", source="claude[bot]"))]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY, auto_merge=True,
+                                    preflight=True)
+    outcome = driver.run()
+    assert "claude" not in driver._preflight_responders   # chatter is not a verdict
+    assert gh.matching("@claude review")                  # claude WAS summoned round 1
+    assert "claude" in driver.done                        # its real review was caught
+    assert clock.t < driver.times.min_bot_wait            # seen at preflight → no long hold
+    assert outcome.merged is True
+
+
+# --------------------------------------------------------------- reactions (#g13a)
+
+def _reaction(rid, content="+1", source="chatgpt-codex-connector[bot]"):
+    return gh_ingest.Reaction(id=rid, content=content, source=source)
+
+
+def test_fresh_plus_one_reaction_marks_bot_done():
+    # codex posts NO comment — only a +1 reaction that lands after the summon (a
+    # fresh id, not in the stale baseline). It routes through the same clean outcome
+    # the sentinel uses: Approved / reviewed / done.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    driver, clock, gh = make_driver(
+        [], cfg=cfg, reactions=[(30, _reaction("rx1"))], auto_merge=True)
+    outcome = driver.run()
+    assert "codex" in driver.done and "codex" in driver.approved
+    assert "codex" in driver.reviewed_ever        # a +1 IS a genuine clean review
+    assert outcome.merged is True
+    assert clock.t < driver.times.min_bot_wait     # the +1 quiesced the round
+
+
+def test_stale_plus_one_reaction_does_not_mark_done():
+    # A +1 already present at round start (id in the baseline) is stale — from an
+    # earlier commit — and never marks the bot done; codex stays expected and,
+    # silent all round, is dropped.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": True}}
+    driver, clock, gh = make_driver(
+        [], cfg=cfg, reactions=[(0, _reaction("rx-old", source="codex[bot]"))])
+    driver.run()
+    assert "codex" not in driver.done               # stale +1 is not a fresh sign-off
+    assert "codex" in driver.silent_dropped         # silent a full round → dropped
+
+
+def test_reaction_capture_failure_does_not_fold_a_stale_plus_one():
+    # If the baseline CAPTURE fetch fails transiently (no baseline is ever
+    # established), a stale +1 present before the run must NOT be folded — the
+    # None-baseline sentinel keeps the fold fail-closed, so a phantom empty
+    # baseline can never let a stale +1 masquerade as fresh and auto-merge.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": True}}
+    driver, clock, gh = make_driver([], cfg=cfg, auto_merge=True, preflight=True)
+    calls = {"n": 0}
+    stale = [gh_ingest.Reaction(id="rx-old", content="+1", source="codex[bot]")]
+
+    def flaky(pr, repo=None, cwd=None):
+        calls["n"] += 1
+        if calls["n"] <= 2:            # the preflight + round-1 baseline captures fail
+            raise RuntimeError("gh transient")
+        return stale                    # a later fetch would surface the stale +1
+
+    driver.fetch_reactions = flaky
+    outcome = driver.run()
+    assert "codex" not in driver.done       # stale +1 never folded (fail closed)
+    assert "codex" not in driver.approved
+    assert outcome.merged is False          # SAFETY gate blocks the unreviewed merge
+
+
+def test_plus_one_never_overrides_a_quota_exclusion():
+    # codex hits quota (via a comment), and a fresh +1 lands the same round — the
+    # +1 must NOT flip it to done; the hard exclusion stands.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    timeline = [(1, Comment(id="q", text="Rate limit exceeded for this model.",
+                            source="codex[bot]"))]
+    driver, clock, gh = make_driver(timeline, cfg=cfg, reactions=[(1, _reaction("rx2"))],
+                                    auto_merge=True)
+    outcome = driver.run()
+    assert driver.store.is_excluded("codex")        # quota exclusion holds
+    assert "codex" not in driver.done               # the +1 did not override it
+    assert "codex" not in driver.approved
+    assert outcome.merged is False                  # never reviewed → no merge
+
+
+def test_plus_one_never_overrides_an_errored_exclusion():
+    # Same rule for the errored bucket: a fresh +1 must not retract an errored
+    # exclusion (only genuine review output does, via _maybe_errored_comeback).
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    timeline = [(1, Comment(id="e", text="I encountered an internal error while "
+                            "generating the review.", source="codex[bot]"))]
+    driver, clock, gh = make_driver(timeline, cfg=cfg, reactions=[(1, _reaction("rx3"))])
+    driver.run()
+    assert driver.store.is_excluded("codex")        # errored exclusion holds
+    assert "codex" not in driver.done               # the +1 did not override it
+
+
+# --------------------------------------------------------------- baselines (#g13c)
+
+def test_late_comment_attributes_to_the_next_round_exactly_once():
+    # A comment that is not present during round 1's poll is picked up by round 2's
+    # poll exactly once (processed_ids), fixed there — never lost, never doubled.
+    seen = []
+
+    def classify(prompt):
+        label = "COSMETIC" if "finding two" in prompt else "SUBSTANTIVE"
+        return json.dumps({"label": label, "reason": "t"})
+
+    def fix(c, r):
+        seen.append(c.id)
+        return FixOutcome(status="applied")
+
+    timeline = [
+        (1, Comment(id="a", text="finding one", source="claude[bot]")),
+        (200, Comment(id="b", text="finding two", source="claude[bot]")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY, classify=classify,
+                                    fix=fix, max_rounds=5,
+                                    answer_waiter=lambda esc, **k: {})
+    driver.run()
+    assert seen == ["a", "b"]                         # a in round 1, b in round 2
+    assert seen.count("b") == 1                       # never double-processed
+    assert "b" in driver._round_baseline.get("claude", set())  # recorded in the baseline
+
+
+def test_between_round_quota_recheck_excludes_on_novel_wording():
+    # A quota message whose wording BOTH the regex and the keyword gate miss is
+    # classified as an ordinary finding in-round; the between-rounds re-check runs
+    # the LLM quota tier (ungated) over the new-since-baseline item and excludes the
+    # bot, retracting its mis-recorded review from the merge gate.
+    novel = "My allotment for the cycle is spent; I will resume next period."
+    assert detectors.detect_signal(novel, quota_llm=lambda p: {"quota": True}) is None
+
+    def quota_llm(prompt):
+        return {"quota": novel in prompt}
+
+    timeline = [(1, Comment(id="q", text=novel, source="claude[bot]"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), max_rounds=3,
+        quota_llm=quota_llm, answer_waiter=lambda esc, **k: {})
+    driver.run()
+    assert driver.store.is_excluded("claude")                 # excluded by the re-check
+    assert driver._bot_state("claude").signal == detectors.SIGNAL_QUOTA
+    assert "claude" not in driver.reviewed_ever               # a quota msg is not a review
+
+
+def test_preflight_novel_quota_is_re_checked_and_never_merges():
+    # A novel-wording quota message ALREADY on the PR (folded at preflight) is run
+    # through the same LLM quota re-check the poll path uses — so a reviewer that
+    # only ever said "I'm out of quota" is excluded and never counts as a genuine
+    # review, and the never-merge-unreviewed gate blocks the auto-merge.
+    novel = "My allotment for the cycle is spent; I will resume next period."
+
+    def quota_llm(prompt):
+        return {"quota": novel in prompt}
+
+    timeline = [(0, Comment(id="q", text=novel, source="claude[bot]"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), max_rounds=3,
+        quota_llm=quota_llm, auto_merge=True, answer_waiter=lambda esc, **k: {},
+        preflight=True)
+    outcome = driver.run()
+    assert driver.store.is_excluded("claude")     # excluded by the preflight re-check
+    assert "claude" not in driver.reviewed_ever   # a quota msg is not a review
+    assert outcome.merged is False                # never-merge-unreviewed gate holds
+
+
+def test_double_quota_message_does_not_leave_a_polluted_review():
+    # A reviewer posting BOTH a novel-wording quota body (mis-recorded as a review)
+    # AND a regex-caught quota in the SAME batch: the regex one hard-excludes it,
+    # and the re-check must STILL purge the mis-recorded review from the novel one —
+    # otherwise the never-merge gate would count a reviewer that never reviewed.
+    novel = "My allotment for the cycle is spent; I will resume next period."
+
+    def quota_llm(prompt):
+        return {"quota": novel in prompt}
+
+    timeline = [
+        (1, Comment(id="nov", text=novel, source="claude[bot]")),
+        (1, Comment(id="reg", text="Rate limit exceeded for this model.",
+                    source="claude[bot]")),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), max_rounds=2,
+        quota_llm=quota_llm, auto_merge=True, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert driver.store.is_excluded("claude")
+    assert "claude" not in driver.reviewed_ever   # the mis-recorded review is purged
+    assert outcome.merged is False                # never-merge-unreviewed gate holds
+
+
+def test_between_round_recheck_is_noop_without_the_quota_seam():
+    # With no quota_llm wired the re-check never fires — a plain finding stays a
+    # finding and the bot is not excluded.
+    novel = "My allotment for the cycle is spent; I will resume next period."
+    timeline = [(1, Comment(id="q", text=novel, source="claude[bot]"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), max_rounds=1,
+        answer_waiter=lambda esc, **k: {})
+    driver.run()
+    assert not driver.store.is_excluded("claude")

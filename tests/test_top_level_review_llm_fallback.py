@@ -102,7 +102,7 @@ def test_round_driver_consults_llm_seam_on_a_review_body():
     driver = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=CLAUDE_ONLY, adapter=adapter,
         classify_runner=lambda prompt: json.dumps({"label": "INVALID", "reason": "t"}),
-        clean_llm=clean_llm,
+        clean_llm=clean_llm, preflight=False,  # review arrives during the round
         fetch=lambda pr, repo=None, cwd=None: [review],
         gh_run=_gh, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
         # register_delay=0 isolates the definitive-signal timing from the
