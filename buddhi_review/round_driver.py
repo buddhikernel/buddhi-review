@@ -863,6 +863,13 @@ class RoundDriver:
         #   failed capture can never let a stale +1 masquerade as fresh (fail
         #   closed, never fail open with no baseline).
         self._reaction_baseline: Optional[Set[str]] = None
+        # _reaction_done: subset of `done` added via a +1 reaction fold (not a
+        #   text-based clean review). Used by the between-rounds quota re-check to
+        #   apply the ungated LLM pass even to reaction-done bots — their comment
+        #   texts were NOT checked for quota in-round, so a novel-wording quota
+        #   message the keyword gate missed must still be catchable here. Cleared
+        #   by --rr alongside done / approved.
+        self._reaction_done: Set[str] = set()
         # _round_baseline: per-bot comment/review ids known through the end of the
         #   last completed round (preflight seeds round 1's). An item whose id is
         #   NOT in its bot's baseline is new-since-the-last-re-request — the only
@@ -1341,6 +1348,7 @@ class RoundDriver:
                 continue
             st.last_seen = now
             self.done.add(bot)
+            self._reaction_done.add(bot)    # mark as reaction-done for quota re-check
             self.approved.add(bot)          # sticky "Approved 👍" (a later hard
             st.signal = detectors.SIGNAL_CLEAN  #   signal must not demote it)
             self.reviewed_ever.add(bot)     # a +1 IS a genuine clean review
@@ -1383,8 +1391,8 @@ class RoundDriver:
                 continue
             if c.id in self._round_baseline.get(bot, set()):
                 continue  # known before this round's re-request — already handled
-            if bot in self.done:
-                continue  # a genuine clean sign-off stands — never re-cast to quota
+            if bot in self.done and bot not in self._reaction_done:
+                continue  # text-based clean sign-off already passed quota check in-round
             st = self._bot_state(bot)
             already_excluded = self.store.is_excluded(bot)
             # Fast skip only when there is nothing left to do: already hard-excluded
@@ -1402,6 +1410,8 @@ class RoundDriver:
                 # mis-recorded so it can never satisfy the never-merge gate, even
                 # when the bot is already excluded for another comment this batch.
                 self.reviewed_ever.discard(bot)
+                self.done.discard(bot)           # quota hard-cause evicts any prior clean fold
+                self._reaction_done.discard(bot)  # keep in sync with done
                 self.notice("exclusion",
                             f"{bot} excluded for the run: quota exhausted "
                             f"(detected on a between-rounds re-check)", status="skip")
@@ -1811,6 +1821,7 @@ class RoundDriver:
             # reviewer is summoned again. The hard buckets (quota / PR-too-large
             # / errored) are never cleared.
             self.done.clear()
+            self._reaction_done.clear()
             self.approved.clear()
             self.polishing.clear()
             self.reviewed_no_change.clear()

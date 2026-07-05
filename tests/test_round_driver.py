@@ -1729,3 +1729,52 @@ def test_between_round_recheck_is_noop_without_the_quota_seam():
         answer_waiter=lambda esc, **k: {})
     driver.run()
     assert not driver.store.is_excluded("claude")
+
+
+def test_reaction_done_bot_still_gets_quota_recheck():
+    # A bot folded via +1 reaction (reaction_done) must NOT skip the between-rounds
+    # quota re-check. If the bot ALSO posted a novel-wording quota message that the
+    # keyword gate missed in-round (and was mis-recorded as a review), the re-check
+    # must catch it and exclude the bot — the hard cause wins over the +1 fold.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    novel = "My allotment for the cycle is spent; I will resume next period."
+    assert detectors.detect_signal(novel, quota_llm=lambda p: {"quota": True}) is None
+
+    def quota_llm(prompt):
+        return {"quota": novel in prompt}
+
+    # The novel quota comment lands at t=1; the +1 reaction also lands at t=1
+    # (after the summon at t=0). _fold_reactions folds the +1 first; without the
+    # fix the done-guard would skip the quota re-check on the comment.
+    timeline = [(1, Comment(id="q", text=novel, source="codex[bot]"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, reactions=[(1, _reaction("rx-q", source="codex[bot]"))],
+        classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), max_rounds=3,
+        quota_llm=quota_llm, auto_merge=True, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert driver.store.is_excluded("codex")              # quota re-check caught it
+    assert "codex" not in driver.reviewed_ever            # mis-recorded review purged
+    assert outcome.merged is False                        # SAFETY gate blocks merge
+
+
+def test_quota_recheck_evicts_reaction_done_bot_from_done():
+    # After the between-rounds quota re-check detects quota on a reaction-done bot,
+    # the bot must be removed from done (fix #2) so the quota hard-cause is the
+    # unambiguous recorded outcome and no stale clean-state entry remains.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    novel = "My allotment for the cycle is spent; I will resume next period."
+
+    def quota_llm(prompt):
+        return {"quota": novel in prompt}
+
+    timeline = [(1, Comment(id="q", text=novel, source="codex[bot]"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, reactions=[(1, _reaction("rx-q2", source="codex[bot]"))],
+        classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), max_rounds=3,
+        quota_llm=quota_llm, answer_waiter=lambda esc, **k: {})
+    driver.run()
+    assert driver.store.is_excluded("codex")
+    assert "codex" not in driver.done           # evicted from done by quota detection
+    assert "codex" not in driver._reaction_done  # in sync with done
