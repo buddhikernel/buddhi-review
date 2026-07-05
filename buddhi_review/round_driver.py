@@ -1876,6 +1876,10 @@ class RoundDriver:
         if self._repo_gate_probed:
             return
         self._repo_gate_probed = True
+        # Skip the gh probe entirely when Claude is not in the enabled fleet —
+        # _bot_status_text's "not-requested" path never reads _repo_gate_excluded.
+        if "claude" not in active_reviewers(self.cfg, self.repo):
+            return
         if not detectors.detect_claude_workflow_present(
                 self.repo, cwd=self.cwd, run=self.gh_run):
             self._repo_gate_excluded.add("claude")

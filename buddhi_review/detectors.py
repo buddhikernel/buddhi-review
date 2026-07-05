@@ -1055,11 +1055,11 @@ def detect_claude_workflow_present(
     (no git remote) therefore reads absent, which is the honest fail-closed
     outcome (presence unconfirmable).
 
-    ``BUDDHI_CLAUDE_WORKFLOW_YML``, when set, supplies the workflow YAML directly
-    (network-free tests) and is treated as a present workflow — ``gh`` is never
-    invoked."""
-    if os.environ.get(CLAUDE_WORKFLOW_YML_ENV, "").strip():
-        return True
+    ``BUDDHI_CLAUDE_WORKFLOW_YML``, when set, short-circuits the ``gh`` call
+    (network-free tests): a non-empty value ⇒ present (``True``), an
+    empty/whitespace value ⇒ absent (``False``) — ``gh`` is never invoked."""
+    if CLAUDE_WORKFLOW_YML_ENV in os.environ:
+        return bool(os.environ[CLAUDE_WORKFLOW_YML_ENV].strip())
     try:
         proc = run(
             ["gh", "api",
