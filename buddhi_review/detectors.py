@@ -1058,7 +1058,7 @@ def detect_claude_workflow_present(
     ``BUDDHI_CLAUDE_WORKFLOW_YML``, when set, supplies the workflow YAML directly
     (network-free tests) and is treated as a present workflow — ``gh`` is never
     invoked."""
-    if os.environ.get(CLAUDE_WORKFLOW_YML_ENV) is not None:
+    if os.environ.get(CLAUDE_WORKFLOW_YML_ENV, "").strip():
         return True
     try:
         proc = run(
