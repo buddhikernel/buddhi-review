@@ -17,6 +17,7 @@ import pytest
 import yaml
 
 from buddhi_review import git_guardrail_hook as g
+from buddhi_review import session_worktrees as sw
 
 _PUBLIC = Path(__file__).resolve().parent.parent
 _SKILLS_DIR = _PUBLIC / "buddhi_review" / "skills"
@@ -330,3 +331,176 @@ def test_lazy_public_reexports_still_resolve():
     assert callable(buddhi_review.automation_notice)
     with pytest.raises(AttributeError):
         buddhi_review.does_not_exist
+
+
+# ── session → worktree capture (the open-pr / review-pr auto-target fix) ───────
+@pytest.fixture
+def _isolate_registry(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUDDHI_SESSION_WORKTREES_PATH",
+                       str(tmp_path / "session-worktrees.json"))
+    return tmp_path
+
+
+def _feed(monkeypatch, command, *, session_id="sess-x", cwd="/spawn/dir"):
+    return _run_main(monkeypatch, {
+        "session_id": session_id, "cwd": cwd,
+        "tool_name": "Bash", "tool_input": {"command": command},
+    })
+
+
+def test_capture_on_worktree_add_with_dash_c_and_branch(monkeypatch, _isolate_registry):
+    # The standing flow: git -C <repo> worktree add .claude/worktrees/<slug> -b <branch> <base>
+    _feed(monkeypatch, "git -C /Users/me/repo worktree add "
+          ".claude/worktrees/nifty -b fix/x origin/main", session_id="sA")
+    assert sw.lookup("sA") == "/Users/me/repo/.claude/worktrees/nifty"
+
+
+def test_capture_relative_add_resolves_against_shell_cwd(monkeypatch, _isolate_registry):
+    _feed(monkeypatch, "git worktree add .claude/worktrees/zoo",
+          session_id="sB", cwd="/Users/me/repo2")
+    assert sw.lookup("sB") == "/Users/me/repo2/.claude/worktrees/zoo"
+
+
+def test_capture_leading_cd_resolves_worktree_add_against_the_cd_target(
+        monkeypatch, _isolate_registry):
+    # cd-resolution: a leading `cd X && git worktree add <rel>` in ONE command
+    # resolves <rel> against X — the dir the git actually runs in — not the fixed
+    # payload cwd. Without this the recorded path is a phantom under the spawn
+    # checkout and the resolver falls back to $PWD. (A CREATION target is not
+    # disk-checked, so the correct path is recorded even before it exists.)
+    _feed(monkeypatch,
+          "cd /Users/me/other-repo && git worktree add .claude/worktrees/cdw -b b main",
+          session_id="sCd", cwd="/spawn/dir")
+    assert sw.lookup("sCd") == "/Users/me/other-repo/.claude/worktrees/cdw"
+
+
+def test_capture_subshell_cd_isolates_directory_change(monkeypatch, _isolate_registry):
+    # Subshell isolation: a cd inside a subshell (X) must not affect a command
+    # that runs outside the subshell.
+    _feed(monkeypatch,
+          "(cd /Users/me/other-repo && git worktree add .claude/worktrees/sub -b b main)"
+          " && git worktree add .claude/worktrees/outer -b b main",
+          session_id="sSub", cwd="/spawn/dir")
+    assert sw.lookup("sSub") == "/spawn/dir/.claude/worktrees/outer"
+
+
+def test_capture_separate_call_add_keeps_payload_cwd(monkeypatch, _isolate_registry):
+    # Honest bound: cd-resolution is single-command-scoped. A bare `git worktree
+    # add <rel>` in a SEPARATE call (no `cd` in its string) still resolves against
+    # the payload cwd; the resolver's live-worktree filter is the safety net for
+    # the phantom that a cross-repo prior `cd` in an earlier call can produce.
+    _feed(monkeypatch, "git worktree add .claude/worktrees/sep -b b main",
+          session_id="sSep", cwd="/spawn/dir")
+    assert sw.lookup("sSep") == "/spawn/dir/.claude/worktrees/sep"
+
+
+def test_capture_on_git_dash_c_into_existing_worktree(
+        monkeypatch, _isolate_registry, tmp_path):
+    # Operating on a worktree created in a prior session is still captured — but a
+    # `-C` OPERATION targets a LIVE checkout, so the worktree must actually exist on
+    # disk. (A non-existent -C path is a phantom mis-resolution and is dropped; see
+    # the phantom-guard tests below.)
+    wt = tmp_path / "repo" / ".claude" / "worktrees" / "bar"
+    wt.mkdir(parents=True)
+    _feed(monkeypatch, f"git -C {wt} status", session_id="sC")
+    assert sw.lookup("sC") == str(wt)
+
+
+def test_no_capture_for_primary_checkout_dash_c(monkeypatch, _isolate_registry):
+    # A -C into the PRIMARY checkout (not under .claude/worktrees) is NOT a
+    # task-scoped worktree → no registration.
+    _feed(monkeypatch, "git -C /Users/me/repo status", session_id="sD")
+    assert sw.lookup("sD") is None
+
+
+def test_no_capture_without_session_id(monkeypatch, _isolate_registry):
+    _run_main(monkeypatch, {
+        "cwd": "/Users/me/repo", "tool_name": "Bash",
+        "tool_input": {"command": "git worktree add .claude/worktrees/x"},
+    })
+    # Nothing to key on → nothing recorded (and no crash).
+    assert sw.lookup("") is None
+
+
+def test_no_capture_for_unrelated_command(monkeypatch, _isolate_registry):
+    _feed(monkeypatch, "git status && ls -la", session_id="sE")
+    assert sw.lookup("sE") is None
+
+
+def test_no_capture_for_off_tree_worktree_add(monkeypatch, _isolate_registry):
+    # Defense-in-depth: a `worktree add` whose target is NOT under
+    # .claude/worktrees (off-convention) is not recorded.
+    _feed(monkeypatch, "git -C /Users/me/repo worktree add /tmp/sibling -b b main",
+          session_id="sOff")
+    assert sw.lookup("sOff") is None
+
+
+def test_capture_picks_worktree_add_in_a_chain(monkeypatch, _isolate_registry):
+    # `git fetch && git worktree add …` — the add target is captured, not fetch.
+    _feed(monkeypatch, "git -C /r fetch origin && git -C /r worktree add "
+          ".claude/worktrees/chained -b b main", session_id="sF")
+    assert sw.lookup("sF") == "/r/.claude/worktrees/chained"
+
+
+def test_capture_never_changes_the_deny_decision(
+        monkeypatch, _isolate_registry, tmp_path):
+    # A blocked command that ALSO names a (live) worktree path still denies (capture
+    # is a pure side-effect that runs after the decision).
+    wt = tmp_path / "repo" / ".claude" / "worktrees" / "wt"
+    wt.mkdir(parents=True)
+    rc, out = _feed(monkeypatch, f"git -C {wt} reset --hard HEAD~1", session_id="sG")
+    assert rc == 0
+    assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+    # …and the (existing) worktree was still captured.
+    assert sw.lookup("sG") == str(wt)
+
+
+def test_capture_failure_never_breaks_the_hook(monkeypatch, _isolate_registry):
+    # If the registry write blows up, the hook still returns cleanly (fail-open).
+    monkeypatch.setattr(sw, "register",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    rc, out = _feed(monkeypatch, "git worktree add .claude/worktrees/x",
+                    session_id="sH")
+    assert rc == 0 and out == ""   # allowed, no crash
+
+
+# ── phantom-worktree guard (cross-repo mis-registration) ──────────────────────
+def test_no_capture_for_dash_c_relative_phantom(monkeypatch, _isolate_registry):
+    # The failure this guards: after the agent `cd`s into another repo, a RELATIVE
+    # `git -C .claude/worktrees/X` is resolved against the fixed session cwd (the
+    # repo it cd'd AWAY from), yielding a directory that does not exist. A `-C`
+    # OPERATION targets a live checkout, so a non-existent candidate is dropped —
+    # never recorded as a phantom the resolver would later mis-target.
+    _feed(monkeypatch, "git -C .claude/worktrees/ghost status",
+          session_id="sPh", cwd="/no/such/spawn/repo")
+    assert sw.lookup("sPh") is None
+
+
+def test_no_capture_for_dash_c_absolute_removed_worktree(
+        monkeypatch, _isolate_registry, tmp_path):
+    # An absolute -C into a worktree that no longer exists on disk (removed) is
+    # likewise a phantom for the resolver → dropped, not recorded.
+    gone = tmp_path / "repo" / ".claude" / "worktrees" / "removed"  # never created
+    _feed(monkeypatch, f"git -C {gone} status", session_id="sGone")
+    assert sw.lookup("sGone") is None
+
+
+def test_worktree_add_target_recorded_before_it_exists(monkeypatch, _isolate_registry):
+    # Timing exception: a `worktree add` TARGET is about to be created and does NOT
+    # exist yet at PreToolUse time, so the disk-existence phantom guard (which
+    # applies ONLY to `-C` OPERATIONS) must NOT drop it — creation is still
+    # recorded. A phantom CREATION is dropped later by the resolver's live-worktree
+    # filter, not here.
+    _feed(monkeypatch, "git -C /Users/me/repo worktree add "
+          ".claude/worktrees/fresh -b b main", session_id="sFresh")
+    assert sw.lookup("sFresh") == "/Users/me/repo/.claude/worktrees/fresh"
+
+
+def test_capture_malformed_payload_never_raises(monkeypatch, _isolate_registry):
+    # A payload whose tool_input is not a dict must neither raise nor record.
+    rc, out = _run_main(monkeypatch, {
+        "session_id": "sBad", "cwd": "/spawn/dir",
+        "tool_name": "Bash", "tool_input": "not a dict",
+    })
+    assert rc == 0 and out == ""
+    assert sw.lookup("sBad") is None

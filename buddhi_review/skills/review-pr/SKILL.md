@@ -118,6 +118,25 @@ Resolve `OWNER/REPO` and `CWD`:
 2. **Else accept an explicit `owner/repo` argument** and set `CWD` to the cwd (or
    a path argument if given).
 
+3. **Auto-target the worktree this session worked in.** When the work was done in
+   a NEW worktree off `main` (the standing rule), the session's `$PWD` can still
+   point at the spawn checkout while the real work sits in a `git -C <worktree>`
+   elsewhere. Consult the resolver — it returns the session's recorded worktree
+   only when that worktree is a live checkout of `OWNER_REPO` and differs from
+   `$CWD`, else it echoes `$CWD` unchanged:
+
+   ```bash
+   RESOLVED=$(python3 -m buddhi_review.worktree_target resolve \
+     --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD" 2>/dev/null)
+   if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CWD" ]; then
+     CWD="$RESOLVED"
+     echo "Auto-selected this session's worktree: $CWD"
+   fi
+   ```
+
+   This is silent (no ask) — it only prefers the session's own worktree over a
+   stale `$PWD`; every other step (PR selection, launch) runs unchanged.
+
 ### 1.1 Per-repo reviewer confirmation gate
 
 Reviewer availability is **per-repo** — Copilot/Gemini/Codex are vendor GitHub

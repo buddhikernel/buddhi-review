@@ -29,9 +29,15 @@ malformed input or internal error — it is a productivity guard, never a
 session-breaker. Pure stdlib; tested by ``tests/test_git_guardrail_hook.py``.
 """
 import json
-import sys
+import os
 import re
 import shlex
+import sys
+
+try:
+    from buddhi_review import session_worktrees
+except Exception:  # pragma: no cover - hook must import even if the module is absent
+    session_worktrees = None
 
 OVERRIDE_TOKEN = "BUDDHI_ALLOW_MANUAL_GIT=1"
 
@@ -204,6 +210,206 @@ def decide(command):
     return (False, "")
 
 
+# ── session → worktree capture (side-effect, NEVER affects the block decision) ──
+# The standing "do your work in a NEW worktree" rule means the agent creates and
+# operates on a worktree (B) while its shell $PWD stays at the spawn checkout (A).
+# The /open-pr + /review-pr skills then can't tell which worktree the session is on
+# and open the PR from the wrong place. We close that here: this hook already sees
+# every git command + the session id, so on `git worktree add B` (creation) OR
+# `git -C B …` on a worktree under .claude/worktrees (operation) we record
+# session_id → B. The skills' worktree resolver reads it to auto-open the loop on B
+# with no prompt. Strictly best-effort: every step is exception-swallowed and runs
+# AFTER the deny decision, so a capture bug can neither block a command nor allow a
+# blocked one.
+_WORKTREE_SEGMENT = "/.claude/worktrees/"
+# `git worktree add` options that consume the FOLLOWING token (so the bare
+# positional that is the new worktree PATH is found after skipping them).
+_ADD_VALUE_OPTS = {"-b", "-B", "--reason"}
+
+
+def _git_invocations(command, base_cwd=None):
+    """The ``(effective_cwd, arg-list)`` of every git command in COMMAND position
+    — mirrors decide()'s walk so a ``git`` that is an argument to another command
+    (echo, a commit message) is ignored. A leading ``cd <dir>`` / ``pushd <dir>``
+    on the same line is tracked so a ``cd X && git worktree add <rel>`` resolves
+    the worktree under X, not the shell's starting cwd (the recorded path was
+    otherwise a phantom under the spawn checkout). ``base_cwd`` is the session/
+    payload cwd (``data['cwd']``) — a fixed snapshot of the spawn checkout, NOT
+    the live persistent shell cwd (which the hook payload does not report); when
+    None the cwd component of each pair is None."""
+    toks = _tokenize(command)
+    n = len(toks)
+    i = 0
+    at_cmd_start = True
+    cwd = os.path.abspath(os.path.expanduser(base_cwd)) if base_cwd else None
+    cwd_stack = []
+    out = []
+    while i < n:
+        tok = toks[i]
+        if tok == "(" and cwd is not None:
+            cwd_stack.append(cwd)
+            at_cmd_start = True
+            i += 1
+            continue
+        if tok == ")" and cwd_stack:
+            cwd = cwd_stack.pop()
+            at_cmd_start = True
+            i += 1
+            continue
+        if _is_sep(tok) or tok in _CMD_STARTERS:
+            at_cmd_start = True
+            i += 1
+            continue
+        if at_cmd_start and tok in _CMD_PREFIXES:
+            _pfx_vals = _PREFIX_VALUE_FLAGS.get(tok, set())
+            i += 1
+            while i < n and toks[i].startswith("-"):
+                if toks[i] in _pfx_vals:
+                    i += 2
+                else:
+                    i += 1
+            continue
+        if at_cmd_start and _ENV_ASSIGN.match(tok):
+            i += 1
+            continue
+        if at_cmd_start and cwd is not None and tok in ("cd", "pushd"):
+            # Track a directory change so a following `git worktree add <rel>`
+            # resolves against the cd target. The first bare (non-flag) argument is
+            # the directory; an arg-less / flag-only `cd` (→ $HOME) or `cd -` leaves
+            # the tracked cwd unchanged (unresolvable here — conservative).
+            j = i + 1
+            newdir = None
+            while j < n and not _is_sep(toks[j]):
+                if not toks[j].startswith("-") and toks[j] != "-":
+                    # Skip pushd stack-index refs like +N — not a directory name.
+                    if tok == "pushd" and re.match(r'^\+\d+$', toks[j]):
+                        j += 1
+                        continue
+                    newdir = toks[j]
+                    break
+                j += 1
+            if newdir is not None:
+                cwd = os.path.abspath(os.path.join(cwd, os.path.expanduser(newdir)))
+            while i < n and not _is_sep(toks[i]):  # consume the whole cd segment
+                i += 1
+            continue
+        if at_cmd_start and _is_git(tok):
+            j = i + 1
+            args = []
+            while j < n and not _is_sep(toks[j]):
+                args.append(toks[j])
+                j += 1
+            out.append((cwd, args))
+            i = j
+            continue
+        at_cmd_start = False
+        i += 1
+    return out
+
+
+def _under_worktrees(path):
+    """True iff ``path`` lives under a ``.claude/worktrees`` directory."""
+    norm = path.replace(os.sep, "/")
+    return _WORKTREE_SEGMENT in (norm + "/")
+
+
+def _add_target(rest):
+    """The new-worktree PATH positional from the tokens after ``worktree add``
+    (skipping value-taking options like ``-b <branch>``), or None."""
+    k = 0
+    while k < len(rest):
+        t = rest[k]
+        if t in _ADD_VALUE_OPTS:
+            k += 2
+            continue
+        if t.startswith("-"):
+            k += 1
+            continue
+        return t  # first bare positional is the worktree path
+    return None
+
+
+def _worktree_from_args(args, base_cwd):
+    """The absolute worktree path a single git invocation targets, or None:
+    the ``worktree add`` PATH (resolved against the git process cwd, incl. -C),
+    or a ``-C <dir>`` that itself sits under .claude/worktrees. The result is
+    gated on living under ``.claude/worktrees`` (the standing convention) so an
+    off-tree ``worktree add /tmp/x`` never lands in the registry — belt-and-
+    suspenders, since the resolver already ignores a recorded path that is not an
+    actual candidate.
+
+    PHANTOM GUARD: this hook resolves a RELATIVE path against ``base_cwd`` — the
+    FIXED Claude Code session/project dir — but the git command actually runs in
+    the persistent shell's cwd, which the hook payload does NOT report. So after
+    the agent ``cd``s into another repo, a relative ``git -C .claude/worktrees/X``
+    resolves against the WRONG base and yields a directory that does not exist. For
+    an OPERATION on an existing worktree (``-C <wt>``, i.e. NOT a ``worktree add``)
+    that directory MUST already be on disk, so a non-existent candidate is a
+    cross-repo mis-resolution — drop it rather than record a path the resolver
+    would later mis-target. A ``worktree add`` TARGET is about to be created and
+    does NOT exist yet at PreToolUse time, so it cannot be disk-checked here; the
+    resolver's live-worktree filter drops a phantom creation at selection time
+    instead."""
+    dash_c = None
+    k = 0
+    while k < len(args) and args[k].startswith("-"):
+        if args[k] in _VALUE_OPTS:
+            if args[k] == "-C" and k + 1 < len(args):
+                dash_c = args[k + 1]
+            k += 2
+        else:
+            k += 1
+    sub = args[k] if k < len(args) else None
+    rest = args[k + 1:] if k < len(args) else []
+    git_cwd = base_cwd
+    if dash_c:
+        git_cwd = os.path.abspath(os.path.join(base_cwd, os.path.expanduser(dash_c)))
+    candidate = None
+    is_add = sub == "worktree" and rest and rest[0] == "add"
+    if is_add:
+        target = _add_target(rest[1:])
+        if target:
+            candidate = os.path.abspath(os.path.join(git_cwd, os.path.expanduser(target)))
+    elif dash_c:
+        candidate = git_cwd
+    if not candidate or not _under_worktrees(candidate):
+        return None
+    # Phantom guard (see the docstring): a ``-C`` OPERATION targets a worktree
+    # that must already exist; if the resolved path is not a real directory the
+    # relative path was mis-resolved against the session cwd — drop it. A
+    # ``worktree add`` creation target does not exist yet at PreToolUse time and
+    # so is left for the resolver's live-worktree filter.
+    if not is_add and not os.path.isdir(candidate):
+        return None
+    return candidate
+
+
+def _maybe_register_worktree(data):
+    """Record session_id → the worktree this command creates/operates on. Pure
+    side-effect; swallows everything."""
+    try:
+        if session_worktrees is None:
+            return
+        session_id = data.get("session_id")
+        if not session_id:
+            return
+        tool_input = data.get("tool_input")
+        command = (tool_input.get("command", "") or "") if isinstance(tool_input, dict) else ""
+        # Cheap gate: only the two command shapes that name a worktree.
+        if "worktree" not in command and ".claude/worktrees" not in command:
+            return
+        base_cwd = data.get("cwd") or os.getcwd()
+        found = None
+        for cwd, args in _git_invocations(command, base_cwd):
+            wt = _worktree_from_args(args, cwd or base_cwd)
+            if wt:
+                found = wt  # last one in the command wins
+        if found:
+            session_worktrees.register(session_id, found)
+    except Exception:
+        return
+
+
 def main():
     try:
         data = json.load(sys.stdin)
@@ -219,14 +425,17 @@ def main():
             return 0
         command = tool_input.get("command", "") or ""
         blocked, reason = decide(command)
-        if blocked:
-            sys.stdout.write(json.dumps({"hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": reason,
-            }}))
     except Exception:
         return 0  # fail OPEN
+    # Best-effort session→worktree capture — AFTER the deny decision so it can
+    # never change whether a command is blocked (its own helper also fails open).
+    _maybe_register_worktree(data)
+    if blocked:
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": reason,
+        }}))
     return 0
 
 
