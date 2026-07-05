@@ -33,6 +33,9 @@ COMMENTS_JSON_ENV = "BUDDHI_REVIEW_COMMENTS_JSON"
 # Reactions seam — a JSON list of raw reaction dicts (same shape gh returns)
 # short-circuits the gh call, mirroring COMMENTS_JSON_ENV.
 REACTIONS_JSON_ENV = "BUDDHI_REVIEW_REACTIONS_JSON"
+# Review-threads seam — a JSON list of raw ``reviewThreads`` node dicts (same
+# shape GitHub's GraphQL returns) short-circuits the gh call, like the two above.
+THREADS_JSON_ENV = "BUDDHI_REVIEW_THREADS_JSON"
 _GH_TIMEOUT = 60
 
 
@@ -269,6 +272,149 @@ def _decode_concatenated(text: str) -> Iterable[dict]:
                     yield item
         elif isinstance(obj, dict):
             yield obj
+
+
+@dataclass(frozen=True)
+class ReviewThread:
+    """One GitHub review thread on the PR. ``id`` is the GraphQL node id needed
+    to resolve it; ``is_resolved`` is GitHub's own resolved flag; and
+    ``root_comment_id`` is the databaseId (stringified) of the thread's FIRST
+    comment — the key that ties a thread back to a :class:`Comment` the loop
+    ingested and handled (a :class:`Comment` built from ``pulls/<pr>/comments``
+    carries the same stringified databaseId as ``id``). ``root_comment_id`` is
+    None when the thread carries no comments (never expected in practice —
+    tolerated so a malformed node can never crash the read)."""
+    id: str
+    is_resolved: bool
+    root_comment_id: Optional[str]
+
+
+def _review_thread_from_raw(raw: dict) -> Optional[ReviewThread]:
+    """Map one raw ``reviewThreads`` node → :class:`ReviewThread`, or None when
+    it has no usable GraphQL node id."""
+    tid = raw.get("id")
+    if not isinstance(tid, str) or not tid:
+        return None
+    comments = raw.get("comments")
+    nodes = comments.get("nodes") if isinstance(comments, dict) else None
+    root: Optional[str] = None
+    if nodes:
+        first = nodes[0]
+        if isinstance(first, dict) and first.get("databaseId") is not None:
+            root = str(first["databaseId"])
+    return ReviewThread(id=tid, is_resolved=bool(raw.get("isResolved")),
+                        root_comment_id=root)
+
+
+_REVIEW_THREADS_QUERY = """query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $pr) {
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          isResolved
+          comments(first: 1) { nodes { databaseId } }
+        }
+      }
+    }
+  }
+}"""
+
+_RESOLVE_REVIEW_THREAD_MUTATION = """mutation($threadId: ID!) {
+  resolveReviewThread(input: {threadId: $threadId}) {
+    thread { isResolved }
+  }
+}"""
+
+
+def fetch_review_threads(
+    pr: str,
+    *,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> List[ReviewThread]:
+    """Fetch every review thread on the PR via ``gh api graphql``, paginating past
+    GitHub's 100-node page limit. Returns one :class:`ReviewThread` per thread so
+    a caller can tell which are still unresolved and match each back to the
+    comment that opened it. Same two seams as :func:`fetch_reactions`:
+    ``BUDDHI_REVIEW_THREADS_JSON`` (a JSON list of raw thread nodes) short-circuits
+    the network, and ``run`` is injectable. A ``gh`` / GraphQL / parse failure
+    RAISES ``RuntimeError`` — the caller decides how to degrade (the pre-merge
+    thread gate fails soft on it, never wedging a mergeable PR). ``reviewThreads``
+    are the inline-comment threads only; the general PR conversation is not a
+    thread and never appears here."""
+    seeded = os.environ.get(THREADS_JSON_ENV)
+    if seeded is not None:
+        raws = _parse_payload(seeded)
+        return [t for t in map(_review_thread_from_raw, raws) if t is not None]
+
+    if not repo or "/" not in repo:
+        # GraphQL needs explicit owner/name variables — gh does not substitute the
+        # REST ``{owner}/{repo}`` placeholder into GraphQL args. Signal the caller.
+        raise RuntimeError("fetch_review_threads requires an explicit owner/repo")
+    owner, name = repo.split("/", 1)
+
+    threads: List[ReviewThread] = []
+    cursor: Optional[str] = None
+    while True:
+        argv = ["gh", "api", "graphql",
+                "-f", f"query={_REVIEW_THREADS_QUERY}",
+                "-f", f"owner={owner}", "-f", f"name={name}",
+                "-F", f"pr={pr}"]
+        if cursor:
+            argv += ["-f", f"cursor={cursor}"]
+        try:
+            proc = run(argv, cwd=cwd)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(f"failed to execute 'gh' CLI: {exc}") from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip()[:300]
+            raise RuntimeError(
+                f"gh api graphql reviewThreads failed (rc={proc.returncode}): {detail}")
+        try:
+            data = json.loads(proc.stdout)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise RuntimeError(
+                f"failed to parse gh api graphql reviewThreads response: {exc}") from exc
+        rt = ((((data or {}).get("data") or {}).get("repository") or {})
+              .get("pullRequest") or {}).get("reviewThreads") or {}
+        for node in (rt.get("nodes") or []):
+            if isinstance(node, dict):
+                t = _review_thread_from_raw(node)
+                if t is not None:
+                    threads.append(t)
+        page_info = rt.get("pageInfo") or {}
+        if page_info.get("hasNextPage") and page_info.get("endCursor"):
+            cursor = page_info["endCursor"]
+        else:
+            break
+    return threads
+
+
+def resolve_review_thread(
+    thread_id: str,
+    *,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> bool:
+    """Mark ONE review thread resolved via the ``resolveReviewThread`` GraphQL
+    mutation. Returns True on success, False on any ``gh`` error — best-effort by
+    design: the pre-merge gate RE-QUERIES thread state afterwards and treats that
+    re-query, not this return value, as the source of truth. Under the
+    ``BUDDHI_REVIEW_THREADS_JSON`` seam there is no live GitHub to mutate, so the
+    seeded reader payload stays authoritative and this is a no-op success."""
+    if os.environ.get(THREADS_JSON_ENV) is not None:
+        return True
+    argv = ["gh", "api", "graphql",
+            "-f", f"query={_RESOLVE_REVIEW_THREAD_MUTATION}",
+            "-f", f"threadId={thread_id}"]
+    try:
+        proc = run(argv, cwd=cwd)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0
 
 
 def ingest_source(

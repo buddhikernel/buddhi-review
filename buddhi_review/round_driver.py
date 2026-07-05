@@ -108,6 +108,20 @@ def _env_trigger(name: str, default: str) -> str:
 MAX_ROUNDS_FALLBACK = 10
 _MAX_ROUNDS_BACKSTOP = 100
 
+# ``ActionResult.final`` values that mean the loop genuinely FINISHED with a
+# comment this run — a fix that landed, or a finding the loop dismissed as
+# outdated / invalid / already-fixed / already-converged. Only a review thread
+# whose root comment reached one of these is auto-resolved by the pre-merge
+# thread gate. Deliberately EXCLUDED: ``rejected`` (a fix the verify pass
+# refused — the finding still stands), ``escalated`` and ``deferred`` (handed to
+# a human / postponed). A thread tied to one of THOSE, or to no comment the loop
+# touched at all (a human's open thread), is never resolved and keeps the PR
+# un-merge-ready — the point of the gate.
+_RESOLVED_FINALS = frozenset({
+    "fixed", "skipped", "skipped-invalid", "skipped-already-fixed",
+    "already-resolved",
+})
+
 
 def pick_max_rounds(lines) -> int:
     """Diff size (added + deleted lines) → the review→fix round budget.
@@ -733,6 +747,8 @@ class RoundDriver:
         quota_llm: Optional[Callable[[str], Optional[dict]]] = None,
         fetch: Optional[Callable[..., List[Comment]]] = None,
         reactions_fetch: Optional[Callable[..., List["gh_ingest.Reaction"]]] = None,
+        threads_fetch: Optional[Callable[..., List["gh_ingest.ReviewThread"]]] = None,
+        resolve_thread: Optional[Callable[..., bool]] = None,
         gh_run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = _utcnow,
@@ -778,6 +794,12 @@ class RoundDriver:
         # ``fetch``): a bare +1 from a reviewer is a voluntarily-done signal that
         # never arrives as a comment, so it is read here instead.
         self.fetch_reactions = reactions_fetch or gh_ingest.fetch_reactions
+        # The review-thread reader + resolver (same injectable/env-seamed shape as
+        # ``fetch``): the pre-merge thread gate reads GitHub's per-thread resolved
+        # state through ``fetch_threads`` and marks the run's own handled threads
+        # resolved through ``resolve_thread``.
+        self.fetch_threads = threads_fetch or gh_ingest.fetch_review_threads
+        self.resolve_thread = resolve_thread or gh_ingest.resolve_review_thread
         # commit_push's runner accepts both cwd= and timeout=, so one injected
         # fake covers every gh/git/test spawn the driver makes.
         self.gh_run = gh_run or commit_push._default_run
@@ -916,6 +938,18 @@ class RoundDriver:
         #   manual-landing rebase reports the honest state ("CI is red — merge at
         #   your discretion") instead of "ready to merge".
         self._premerge_ci_red: bool = False
+        # _threads_unresolved: set when the pre-merge thread gate blocked a clean
+        #   exit because GitHub still reported an unresolved review thread the loop
+        #   did not (and must not) auto-resolve — used so the manual-landing
+        #   hand-back reports the honest reason instead of "ready to merge".
+        self._threads_unresolved: bool = False
+        # _handled_inline_ids: ids of the INLINE review comments the run genuinely
+        #   finished (a resolving disposition). A review thread's ROOT is always an
+        #   inline comment (a PullRequestReviewComment), a DISTINCT GitHub id
+        #   namespace from review-body / conversation comments — so the thread gate
+        #   matches thread roots against ONLY these ids, never a review-body id that
+        #   could numerically collide with (and wrongly resolve) a human's thread.
+        self._handled_inline_ids: Set[str] = set()
         # _claude_trigger_failed: True once an "@claude review" summon failed to
         #   post and was never later re-posted successfully. Drives the additive
         #   #g9a NOTIFICATION (never a block): a clean exit where the loop's
@@ -1935,6 +1969,13 @@ class RoundDriver:
                 round_actions.append(
                     act_on_result(c, r, adapter=self.adapter, fix_dispatch=self.fix_dispatch))
             self.actions.extend(round_actions)
+            # Record which INLINE comments (path-anchored — the only comments that
+            # are review-thread ROOTS) the run genuinely finished, so the pre-merge
+            # thread gate resolves ONLY the run's own inline threads and can never
+            # match a review-body / conversation id against a thread root.
+            for c, a in zip(actionable, round_actions):
+                if c.path and a.final in _RESOLVED_FINALS:
+                    self._handled_inline_ids.add(a.comment_id)
             for a in round_actions:
                 print(f"  [{a.final:16}] comment {a.comment_id} ({a.disposition})"
                       + (f" — {a.detail}" if a.detail else ""))
@@ -2070,6 +2111,17 @@ class RoundDriver:
                 return RunOutcome("clean", rounds, False, self.actions)
             # (c) >=1 expected reviewer genuinely reviewed (incl. a clean approval)
             #     → the merge may proceed, subject to the pre-merge gates.
+            # ── Thread-resolution gate ───────────────────────────────────────────
+            # GitHub must confirm zero unresolved review threads before this PR is
+            # merge-ready. Runs AFTER the SAFETY gate above (so an unreviewed PR is
+            # already blocked and never reaches here) and BEFORE the label /
+            # non-label pre-merge fork below, so ONE gate guards both pre-merge
+            # paths. It first resolves the threads THIS run genuinely handled, then
+            # re-confirms; a thread the loop did not touch (a human's open thread)
+            # or could not finish (a rejected fix) keeps the PR un-merge-ready.
+            if not self._thread_gate_ok():
+                self._threads_unresolved = True
+                return RunOutcome("clean", rounds, False, self.actions)
             if label_gated_ci(self.cfg, self.repo):
                 ci_ok = merge.wait_for_ci_green(
                     self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run,
@@ -2106,6 +2158,82 @@ class RoundDriver:
             run=self.gh_run, notice=self.notice,
         )
         return RunOutcome("clean", rounds, merged, self.actions)
+
+    def _thread_gate_ok(self) -> bool:
+        """Pre-merge review-thread gate. Returns True iff the merge may proceed on
+        thread state. Resolves the review threads THIS run genuinely handled (their
+        root is an INLINE comment the loop brought to a ``_RESOLVED_FINALS``
+        disposition — tracked in ``_handled_inline_ids``), then confirms GitHub
+        reports zero unresolved threads.
+
+        Never auto-resolves a thread the loop did not handle: a human's still-open
+        thread, or a comment whose fix the verify pass rejected, is left untouched
+        and BLOCKS the merge (the whole point of the gate). The blocking decision
+        for such a thread rides the FIRST (successful) read — no re-query is needed
+        for a thread we never touched — so a later transient error can never let it
+        slip through. Fail-soft everywhere else: a ``gh`` / GraphQL read error (the
+        reader raises) is NOT an unresolved thread, so it logs and proceeds,
+        mirroring ``check_pr_mergeable``'s fail-open contract — a transient blip
+        never wedges a mergeable PR."""
+        try:
+            threads = self.fetch_threads(self.pr, repo=self.repo, cwd=self.cwd)
+        except (subprocess.SubprocessError, OSError, RuntimeError):
+            # Fail-soft: a transient read error is NOT an unresolved thread, so it
+            # must never wedge a mergeable PR. A plain console warning (not an
+            # auto-action notice) — the gate simply could not run, it took no
+            # merge decision, mirroring the silent degrade of the reaction fold.
+            print(f"[thread-gate] could not read PR #{self.pr} review threads — "
+                  f"proceeding (a transient read error is not an unresolved thread)")
+            return True
+        unresolved = [t for t in threads if not t.is_resolved]
+        if not unresolved:
+            return True
+        # The run's OWN threads: an unresolved thread whose root comment the loop
+        # brought to a genuine done verdict this run. ``_handled_inline_ids`` is
+        # scoped to INLINE comment ids (the only comments that are thread roots),
+        # so a review-body / conversation id can never match a thread root here.
+        # Everything else unresolved is "foreign" — a human's open thread or a
+        # rejected fix — never touched.
+        handled = self._handled_inline_ids
+        own = [t for t in unresolved
+               if t.root_comment_id is not None and t.root_comment_id in handled]
+        foreign = [t for t in unresolved if t not in own]
+        for t in own:
+            try:
+                self.resolve_thread(t.id, cwd=self.cwd)
+            except (subprocess.SubprocessError, OSError, RuntimeError):
+                # Best-effort — the re-query below is the source of truth. A resolve
+                # that silently failed simply leaves the thread unresolved there.
+                pass
+        if foreign:
+            # An unresolved thread the loop never handled → definitely not merge-
+            # ready, decided on the first (good) read; no re-query, so a transient
+            # error at re-query time can never launder it into a merge.
+            self.notice("thread-gate",
+                        f"PR #{self.pr}: {len(foreign)} review thread(s) still "
+                        f"unresolved that the loop did not address — not merging; "
+                        f"handing back", status="stop",
+                        hint="resolve the open thread(s) on GitHub, then re-run")
+            return False
+        # Only the run's own threads were unresolved — re-query to confirm the
+        # resolve mutations actually landed on GitHub.
+        try:
+            threads2 = self.fetch_threads(self.pr, repo=self.repo, cwd=self.cwd)
+        except (subprocess.SubprocessError, OSError, RuntimeError):
+            # Fail-soft on the confirming re-query too (own threads were already
+            # resolved above; a blip must not wedge the now-clean PR).
+            print(f"[thread-gate] could not re-read PR #{self.pr} review threads "
+                  f"after resolving — proceeding")
+            return True
+        remaining = [t for t in threads2 if not t.is_resolved]
+        if remaining:
+            self.notice("thread-gate",
+                        f"PR #{self.pr}: {len(remaining)} review thread(s) still "
+                        f"unresolved after resolving this run's own — not merging; "
+                        f"handing back", status="stop",
+                        hint="resolve the open thread(s) on GitHub, then re-run")
+            return False
+        return True
 
     def _premerge_gate_ok(self) -> bool:
         """#43/#44 non-label pre-merge gate. Returns True iff the merge may proceed.
@@ -2275,6 +2403,8 @@ class RoundDriver:
         # pre-merge CI (when gated) was not red.
         if self._premerge_ci_red:
             return "the pre-merge CI is red"
+        if self._threads_unresolved:
+            return "a review thread is still unresolved"
         if self.rr_none:
             # --rr-none asked for no review by design, so an empty fleet here is
             # not "unconfigured" — the comments were fixed and the PR is ready.

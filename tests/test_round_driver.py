@@ -1,6 +1,7 @@
 """Quiescence round-loop + exclusion wiring — fake clock, no network."""
 import json
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timezone
 
 from buddhi_review import detectors, gh_ingest, round_driver
@@ -53,6 +54,42 @@ def label_runner(label):
     return lambda prompt: json.dumps({"label": label, "reason": "t"})
 
 
+class FakeThreads:
+    """A stateful stand-in for GitHub's review-thread API used by the pre-merge
+    thread gate. ``fetch`` returns the current threads (fresh copies); ``resolve``
+    flips one to resolved so a subsequent ``fetch`` sees it, exactly like the real
+    ``resolveReviewThread`` mutation. Set ``fail=True`` to make the reader raise a
+    transient gh / GraphQL error; ``resolve_fail=True`` to make resolve() a no-op
+    (the mutation silently failed)."""
+
+    def __init__(self, threads=()):
+        self._threads = {t.id: t for t in threads}
+        self.fail = False
+        self.resolve_fail = False
+        self.resolved = []          # thread ids passed to resolve(), in order
+        self.fetches = 0            # number of fetch() calls (re-query counting)
+
+    def thread(self, id, root_comment_id, is_resolved=False):
+        self._threads[id] = gh_ingest.ReviewThread(
+            id=id, is_resolved=is_resolved, root_comment_id=root_comment_id)
+        return self
+
+    def fetch(self, pr, repo=None, cwd=None):
+        self.fetches += 1
+        if self.fail:
+            raise RuntimeError("gh graphql boom")
+        return [replace(t) for t in self._threads.values()]
+
+    def resolve(self, thread_id, cwd=None):
+        self.resolved.append(thread_id)
+        if self.resolve_fail:
+            return False
+        t = self._threads.get(thread_id)
+        if t is not None:
+            self._threads[thread_id] = replace(t, is_resolved=True)
+        return True
+
+
 def make_driver(timeline, *, cfg, clock=None, gh=None, times=None, classify=None,
                 fix=None, answer_waiter=None, reactions=None, **kw):
     """timeline = [(t_visible, Comment), ...] — comments appear at clock time.
@@ -69,6 +106,11 @@ def make_driver(timeline, *, cfg, clock=None, gh=None, times=None, classify=None
     # pre-existing reviews) is off by default here; the dedicated preflight tests
     # pass preflight=True and seed comments/reactions already on the PR.
     kw.setdefault("preflight", False)
+    # Network-free thread-gate seams by default (no threads → the gate is a no-op
+    # and merge tests behave exactly as before). A test exercising the gate passes
+    # its own threads_fetch / resolve_thread (e.g. a FakeThreads) via **kw.
+    kw.setdefault("threads_fetch", lambda pr, repo=None, cwd=None: [])
+    kw.setdefault("resolve_thread", lambda thread_id, cwd=None: True)
     driver = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg, adapter=adapter,
         classify_runner=classify or label_runner("INVALID"),

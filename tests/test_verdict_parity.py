@@ -262,6 +262,11 @@ def _drive(fixture: dict):
         classify_runner=_body_keyed_runner(fixture),
         fix_dispatch=_fix_dispatch(fixture),
         fetch=fetch,
+        # Network-free thread-gate seams: no threads → the pre-merge thread gate is
+        # a silent no-op, so the parity grade stays the verdict-level auto-action
+        # SET (merge + exclusion), free of gh/GraphQL spawns.
+        threads_fetch=lambda pr, repo=None, cwd=None: [],
+        resolve_thread=lambda thread_id, cwd=None: True,
         gh_run=_GhRecorder(),
         clock=clock,
         sleep=clock.sleep,
