@@ -280,7 +280,7 @@ def test_errored_label_renders_in_the_round_the_bot_was_expected():
     # was computed before the mid-round exclusion landed).
     d = _errored_driver()
     assert d._bot_status_text(
-        "copilot", expected=["claude", "copilot", "codex", "gemini"],
+        "copilot", expected=["claude", "copilot", "codex", "gemini"]
     ) == "Could not review ❌"
 
 
@@ -289,7 +289,8 @@ def test_errored_label_falls_to_not_requested_when_round_skipped_the_bot():
     # this round.
     d = _errored_driver()
     assert d._bot_status_text(
-        "copilot", expected=["codex"]) == "Not requested 🙅"
+        "copilot", expected=["codex"]
+    ) == "Not requested 🙅"
 
 
 def test_errored_label_kept_when_bot_posted_despite_not_being_asked():
@@ -328,8 +329,7 @@ def test_round_table_row_shows_not_requested_for_skipped_errored_bot():
     # its row must be "Not requested 🙅", byte-identical to every other
     # skipped bot's row.
     d = _errored_driver()
-    rows = {r["bot_key"]: r
-            for r in d._round_table_rows([], [], expected=["codex"])}
+    rows = {r["bot_key"]: r for r in d._round_table_rows([], [], expected=["codex"])}
     assert rows["copilot"]["status"] == "Not requested 🙅"
 
 
