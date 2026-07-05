@@ -21,6 +21,19 @@ def _R(returncode=0, stdout="", stderr=""):
     return types.SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
 
 
+# The token-mint flow now opens with a consent gate (a `_ask_yes_no` rendered as a
+# single_select on a forced TTY) before it spawns `claude setup-token`. In tests
+# that must REACH the paste, the injected selector answers that consent prompt Yes
+# (index 0) and routes the org-scope prompt to `org_idx`. The two prompts are
+# distinguished by text: the org selector's prompt contains "organization".
+def _consenting_select(org_idx=0):
+    def ss(prompt, options, **kw):
+        if "organization" in (prompt or ""):
+            return org_idx
+        return 0   # consent prompt → Yes
+    return ss
+
+
 def _recorder(router):
     """Wrap a routing function as an injectable `run`, recording every argv.
 
@@ -356,14 +369,16 @@ def test_set_claude_secret_dual_credential_present(monkeypatch, repo_secrets, ex
 
 
 def test_set_claude_secret_neither_credential_proceeds(monkeypatch):
-    # Neither present → the wizard proceeds to offer minting (blank token → skipped).
+    # Neither present → the wizard proceeds to offer minting. Consent Yes reaches the
+    # paste; a blank token there routes to the by-hand instructions ("skipped").
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     run, _ = _recorder(_exists_router(owner_type="User", repo_secrets=[]))
     pal, buf = wizard._Palette(False), io.StringIO()
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
-        getpass_fn=lambda *a: "", pal=pal, stream=buf)
-    assert status == "skipped"   # offered, but a blank token aborts the set
+        getpass_fn=lambda *a: "", pal=pal, stream=buf,
+        single_select=_consenting_select())
+    assert status == "skipped"   # offered + consented, but a blank token aborts the set
 
 
 def test_set_claude_secret_anthropic_present_skips_org_secret_set(monkeypatch):
@@ -409,8 +424,8 @@ def test_set_claude_secret_org_optin_declined_stays_repo(monkeypatch):
     status = wizard._set_claude_secret(
         "acme/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "tok", pal=pal, stream=buf,
-        single_select=lambda *a, **k: 0,   # "this repository only"
-        validate_fn=lambda *a, **k: "valid")   # F10: skip the real isolated ping
+        single_select=_consenting_select(org_idx=0),   # consent Yes; "this repo only"
+        validate_fn=lambda *a, **k: ("valid", ""))   # F10: skip the real isolated ping
     assert status == "set"
     sets = [c["argv"] for c in calls if c["argv"][:3] == ["gh", "secret", "set"]]
     assert sets and all("--org" not in s for s in sets)
@@ -423,29 +438,31 @@ def test_set_claude_secret_org_optin_confirmed_goes_org(monkeypatch):
     status = wizard._set_claude_secret(
         "acme/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "tok", pal=pal, stream=buf,
-        single_select=lambda *a, **k: 1,   # "org-wide, scoped to this repo"
-        validate_fn=lambda *a, **k: "valid")   # F10: skip the real isolated ping
+        single_select=_consenting_select(org_idx=1),   # consent Yes; "org-wide"
+        validate_fn=lambda *a, **k: ("valid", ""))   # F10: skip the real isolated ping
     assert status == "set"
     assert any("--org" in c["argv"] for c in calls
               if c["argv"][:3] == ["gh", "secret", "set"])
 
 
 def test_set_claude_secret_personal_repo_never_offers_org(monkeypatch):
-    # A personal (User) account must never see the org opt-in selector at all.
+    # A personal (User) account must never see the org opt-in selector at all. The
+    # consent gate DOES render (a single_select on a TTY), so count only org prompts.
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     run, _ = _recorder(_full_secret_router(owner_type="User"))
     pal, buf = wizard._Palette(False), io.StringIO()
-    selector_calls = {"n": 0}
+    org_selector_calls = {"n": 0}
 
-    def ss(*a, **k):
-        selector_calls["n"] += 1
-        return 0
+    def ss(prompt, options, **kw):
+        if "organization" in (prompt or ""):
+            org_selector_calls["n"] += 1
+        return 0   # consent → Yes; org (never reached) → repo-only
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "tok", pal=pal, stream=buf, single_select=ss,
-        validate_fn=lambda *a, **k: "valid")   # F10: skip the real isolated ping
+        validate_fn=lambda *a, **k: ("valid", ""))   # F10: skip the real isolated ping
     assert status == "set"
-    assert selector_calls["n"] == 0
+    assert org_selector_calls["n"] == 0
 
 
 # ── _offer_install_claude_workflow (server-side vs local) ───────────────────────────
@@ -528,8 +545,9 @@ def _validating_run(returncode=0, stdout="", stderr=""):
 
 def test_validate_claude_token_valid_on_clean_ping():
     run, _ = _validating_run(returncode=0)
-    assert wizard._validate_claude_token(
-        "oat-CANDIDATE", run=run, which=lambda _b: "/usr/bin/claude") == "valid"
+    state, _detail = wizard._validate_claude_token(
+        "oat-CANDIDATE", run=run, which=lambda _b: "/usr/bin/claude")
+    assert state == "valid"
 
 
 @pytest.mark.parametrize("stderr", [
@@ -541,8 +559,9 @@ def test_validate_claude_token_valid_on_clean_ping():
 ])
 def test_validate_claude_token_invalid_on_auth_signature(stderr):
     run, _ = _validating_run(returncode=1, stderr=stderr)
-    assert wizard._validate_claude_token(
-        "oat-bad", run=run, which=lambda _b: "/usr/bin/claude") == "invalid"
+    state, _detail = wizard._validate_claude_token(
+        "oat-bad", run=run, which=lambda _b: "/usr/bin/claude")
+    assert state == "invalid"
 
 
 def test_validate_claude_token_unknown_without_binary():
@@ -552,16 +571,18 @@ def test_validate_claude_token_unknown_without_binary():
     def run(*a, **k):
         called["n"] += 1
         return _R()
-    assert wizard._validate_claude_token(
-        "oat", run=run, which=lambda _b: None) == "unknown"
+    state, _detail = wizard._validate_claude_token(
+        "oat", run=run, which=lambda _b: None)
+    assert state == "unknown"
     assert called["n"] == 0
 
 
 def test_validate_claude_token_unknown_on_timeout():
     def run(*a, **k):
         raise subprocess.TimeoutExpired(cmd="claude", timeout=25)
-    assert wizard._validate_claude_token(
-        "oat", run=run, which=lambda _b: "/usr/bin/claude") == "unknown"
+    state, _detail = wizard._validate_claude_token(
+        "oat", run=run, which=lambda _b: "/usr/bin/claude")
+    assert state == "unknown"
 
 
 def test_validate_claude_token_strips_wrapped_whitespace():
@@ -571,8 +592,9 @@ def test_validate_claude_token_strips_wrapped_whitespace():
     env carries the reconstructed token, no whitespace."""
     run, cap = _validating_run(returncode=0)
     wrapped = "sk-ant-oat01-Q1bZ...c0\n SddG...wAA"  # newline + leading space from the wrap
-    assert wizard._validate_claude_token(
-        wrapped, run=run, which=lambda _b: "/usr/bin/claude") == "valid"
+    state, _detail = wizard._validate_claude_token(
+        wrapped, run=run, which=lambda _b: "/usr/bin/claude")
+    assert state == "valid"
     assert cap["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-Q1bZ...c0SddG...wAA"
     assert not any(ch.isspace() for ch in cap["env"]["CLAUDE_CODE_OAUTH_TOKEN"])
 
@@ -580,8 +602,9 @@ def test_validate_claude_token_strips_wrapped_whitespace():
 def test_validate_claude_token_unknown_on_ambiguous_failure():
     # Non-zero exit but NO auth signature → "unknown", never "invalid".
     run, _ = _validating_run(returncode=1, stderr="network unreachable")
-    assert wizard._validate_claude_token(
-        "oat", run=run, which=lambda _b: "/usr/bin/claude") == "unknown"
+    state, _detail = wizard._validate_claude_token(
+        "oat", run=run, which=lambda _b: "/usr/bin/claude")
+    assert state == "unknown"
 
 
 def test_validate_claude_token_full_isolation(monkeypatch):
@@ -596,7 +619,7 @@ def test_validate_claude_token_full_isolation(monkeypatch):
         monkeypatch.setenv(c, "SHOULD-BE-POPPED")
     orig_cwd = os.getcwd()
     run, cap = _validating_run(returncode=0)
-    state = wizard._validate_claude_token(
+    state, _detail = wizard._validate_claude_token(
         candidate, run=run, which=lambda _b: "/usr/bin/claude")
     assert state == "valid"
     # the candidate IS set, and is the ONLY claude credential in the child env
@@ -628,11 +651,57 @@ def test_set_claude_secret_stores_only_after_valid(monkeypatch):
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "oat-GOOD", pal=pal, stream=buf,
-        validate_fn=lambda token, **k: "valid")
+        single_select=_consenting_select(),
+        validate_fn=lambda token, **k: ("valid", ""))
     assert status == "set"
     sets = [c for c in calls if c["argv"][:3] == ["gh", "secret", "set"]]
     assert sets and sets[0]["input"] == "oat-GOOD"
     assert all("oat-GOOD" not in tok for c in calls for tok in c["argv"])
+
+
+def test_set_claude_secret_consent_declined_defers_without_spawning(monkeypatch):
+    # The consent gate (new): declining "Set it now via `claude setup-token`?" must
+    # NOT spawn the token window nor prompt for a paste — it routes to the by-hand
+    # instructions ("skipped").
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _recorder(_full_secret_router(owner_type="User"))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    spawned = {"n": 0}
+    getpass_calls = {"n": 0}
+
+    def spawn(*a, **k):
+        spawned["n"] += 1
+        return None
+
+    def gp(*a):
+        getpass_calls["n"] += 1
+        return "oat"
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=spawn,
+        getpass_fn=gp, pal=pal, stream=buf,
+        single_select=lambda *a, **k: 1,   # consent → No (index 1)
+        validate_fn=lambda token, **k: ("valid", ""))
+    assert status == "skipped"
+    assert spawned["n"] == 0 and getpass_calls["n"] == 0
+    assert not any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
+    # the by-hand header + copy-paste commands are shown
+    out = buf.getvalue()
+    assert "by hand" in out and "claude setup-token" in out
+
+
+def test_set_claude_secret_invalid_shows_validator_detail(monkeypatch):
+    # The grown validator returns (state, detail); on "invalid" the one-line
+    # diagnostic is surfaced as a dim note beneath the warn.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, _ = _recorder(_full_secret_router(owner_type="User"))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "oat-BAD", pal=pal, stream=buf,
+        single_select=_consenting_select(),
+        validate_fn=lambda token, **k: ("invalid", "The token was rejected."))
+    assert status == "failed"
+    assert "The token was rejected." in buf.getvalue()
 
 
 def test_set_claude_secret_invalid_token_never_stored(monkeypatch):
@@ -645,11 +714,12 @@ def test_set_claude_secret_invalid_token_never_stored(monkeypatch):
 
     def vf(token, **k):
         attempts["n"] += 1
-        return "invalid"
+        return ("invalid", "")
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
-        getpass_fn=lambda *a: "oat-BAD", pal=pal, stream=buf, validate_fn=vf)
-    assert status == "failed"
+        getpass_fn=lambda *a: "oat-BAD", pal=pal, stream=buf,
+        single_select=_consenting_select(), validate_fn=vf)
+    assert status == "failed"   # 3× invalid exhausts the paste; routes to by-hand
     assert attempts["n"] == 3
     assert not any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
 
@@ -659,10 +729,11 @@ def test_set_claude_secret_invalid_then_valid_stores(monkeypatch):
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     run, calls = _recorder(_full_secret_router(owner_type="User"))
     pal, buf = wizard._Palette(False), io.StringIO()
-    verdicts = iter(["invalid", "valid"])
+    verdicts = iter([("invalid", ""), ("valid", "")])
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "oat", pal=pal, stream=buf,
+        single_select=_consenting_select(),
         validate_fn=lambda token, **k: next(verdicts))
     assert status == "set"
     assert any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
@@ -677,7 +748,8 @@ def test_set_claude_secret_unknown_token_stored_with_warning(monkeypatch):
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
         getpass_fn=lambda *a: "oat", pal=pal, stream=buf,
-        validate_fn=lambda token, **k: "unknown")
+        single_select=_consenting_select(),
+        validate_fn=lambda token, **k: ("unknown", ""))
     assert status == "set"
     assert "unverified" in buf.getvalue()
     assert any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
@@ -694,8 +766,9 @@ def test_set_claude_secret_validator_crash_fails_safe(monkeypatch):
         raise RuntimeError("validator bug")
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
-        getpass_fn=lambda *a: "oat", pal=pal, stream=buf, validate_fn=boom)
-    assert status == "failed"
+        getpass_fn=lambda *a: "oat", pal=pal, stream=buf,
+        single_select=_consenting_select(), validate_fn=boom)
+    assert status == "failed"   # a crashing validator fails safe → by-hand
     assert not any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
 
 
@@ -703,8 +776,9 @@ def test_set_claude_secret_validator_crash_fails_safe(monkeypatch):
 
 def test_set_claude_secret_present_and_401_enters_remint(monkeypatch):
     # The stored OAuth token is failing live (probe → True) → DON'T skip; enter the
-    # re-mint flow. A blank paste there aborts to "skipped" (NOT "present"), and the
-    # operator is told the reviews are failing.
+    # re-mint flow. Consent Yes reaches the paste; a blank paste there routes to the
+    # by-hand instructions ("skipped", NOT "present"), and the operator is told the
+    # reviews are failing.
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     run, _ = _recorder(_exists_router(owner_type="User",
                                       repo_secrets=["CLAUDE_CODE_OAUTH_TOKEN"]))
@@ -717,8 +791,9 @@ def test_set_claude_secret_present_and_401_enters_remint(monkeypatch):
         return True
     status = wizard._set_claude_secret(
         "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
-        getpass_fn=lambda *a: "", pal=pal, stream=buf, auth_probe=probe)
-    assert status == "skipped"          # entered the mint flow; a blank paste aborts
+        getpass_fn=lambda *a: "", pal=pal, stream=buf, auth_probe=probe,
+        single_select=_consenting_select())
+    assert status == "skipped"         # entered the mint flow; a blank paste → by-hand
     assert probe_calls["n"] == 1
     out = buf.getvalue()
     assert "failing" in out and "re-mint" in out

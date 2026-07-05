@@ -429,36 +429,37 @@ class TestUnconfiguredRepoStatus:
     def test_idle_bot_on_unconfigured_repo(self):
         d = _status_driver({}, repo="o/r")           # no global default, no entry
         assert d._repo_unconfigured is True
-        assert d._bot_status_text("claude") == "not configured (repo)"
+        assert d._bot_status_text("claude") == "Not configured (repo) 🔧"
 
-    def test_global_default_present_is_active(self):
+    def test_global_default_present_is_no_review_posted(self):
+        # A configured repo's expected-yet-never-seen reviewer posted no review.
         d = _status_driver({"active_reviewers": ["claude"]}, repo="o/r")
         assert d._repo_unconfigured is False
-        assert d._bot_status_text("claude") == "active"
+        assert d._bot_status_text("claude") == "No review posted 🔇"
 
-    def test_confirmed_repo_is_active(self):
+    def test_confirmed_repo_is_no_review_posted(self):
         cfg = {"repos": {"o/r": {"active_reviewers": ["claude"]}}}
         d = _status_driver(cfg, repo="o/r")
         assert d._repo_unconfigured is False
-        assert d._bot_status_text("claude") == "active"
+        assert d._bot_status_text("claude") == "No review posted 🔇"
 
     def test_repo_none_is_not_unconfigured(self):
         d = _status_driver({}, repo=None)
         assert d._repo_unconfigured is False
-        assert d._bot_status_text("claude") == "active"
+        assert d._bot_status_text("claude") == "No review posted 🔇"
 
-    def test_seen_bot_is_reviewed_not_unconfigured(self):
+    def test_seen_bot_is_active_not_unconfigured(self):
         d = _status_driver({}, repo="o/r")
         d._bot_state("claude").last_seen = 1.0
-        assert d._bot_status_text("claude") == "reviewed"
+        assert d._bot_status_text("claude") == "Active ✅"
 
     def test_lifecycle_status_outranks_unconfigured(self):
         # A real terminal signal (quota) must win over the unconfigured status —
-        # the new status only displaces the neutral "active".
+        # the new status only displaces the idle labels.
         d = _status_driver({}, repo="o/r")
         d.store.exclude_quota("claude")
         d._bot_state("claude").signal = detectors.SIGNAL_QUOTA
-        assert d._bot_status_text("claude") == "quota"
+        assert d._bot_status_text("claude") == "Quota exhausted ⚠️"
 
     def test_status_renders_in_table_and_box_stays_rectangular(self):
         d = _status_driver({}, repo="o/r")           # default fleet, unconfigured
@@ -466,7 +467,8 @@ class TestUnconfiguredRepoStatus:
         with redirect_stdout(buf):
             d._render_round(1, [], [])
         out = buf.getvalue()
-        assert "not configured (repo)" in out        # full label, not truncated
+        # Full label, not truncated (the cell strips the decorative 🔧 emoji).
+        assert "Not configured (repo)" in out
         box = [ln for ln in out.splitlines() if ln and ln[0] in "┌├└│"]
         widths = {_display_width(ln) for ln in box}
         assert len(widths) == 1, f"box not rectangular: {widths}"

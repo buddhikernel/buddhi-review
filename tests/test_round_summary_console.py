@@ -241,34 +241,208 @@ def test_store_excluded_without_signal_reads_as_excluded_not_unexpected():
 
 def test_bot_status_text_per_cause():
     d = _bare_driver()
-    # done / clean
+    # clean signal — an EXPLICIT all-clear (sentinel / LGTM) is "Approved 👍"
     d.done.add("claude")
     d._bot_state("claude").signal = detectors.SIGNAL_CLEAN
-    assert d._bot_status_text("claude") == "done"
+    assert d._bot_status_text("claude") == "Approved 👍"
     # quota / errored
     d._bot_state("copilot").signal = detectors.SIGNAL_QUOTA
     d.store.exclude_quota("copilot")
-    assert d._bot_status_text("copilot") == "quota"
+    assert d._bot_status_text("copilot") == "Quota exhausted ⚠️"
     d._bot_state("codex").signal = detectors.SIGNAL_ERRORED
     d.store.exclude_errored("codex")
-    assert d._bot_status_text("codex") == "errored"
+    assert d._bot_status_text("codex") == "Could not review ❌"
     # store-excluded with no signal → "excluded"
     d.store.exclude_permanent("gemini")
     assert d._bot_status_text("gemini") == "excluded"
 
 
-def test_bot_status_text_active_vs_reviewed():
+# ─────────────────────────────────────────────────────────────────────
+# Round-scoping of "Could not review ❌" (round-2 mislabel incident).
+# The label describes an EVENT (this round's attempt errored), not a
+# persistent state: in a later round the errored bot is deliberately NOT
+# re-summoned (expected_bots subtracts the errored exclusion), so its row
+# must read "Not requested 🙅" like any other bot the round skipped — the
+# incident run showed Copilot as "Could not review" in a round-2 table
+# where it was never asked.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _errored_driver():
     d = _bare_driver()
-    assert d._bot_status_text("claude") == "active"          # never seen
+    d._bot_state("copilot").signal = detectors.SIGNAL_ERRORED
+    d.store.exclude_errored("copilot")
+    return d
+
+
+def test_errored_label_renders_in_the_round_the_bot_was_expected():
+    # The error round: the bot is still in the round-START expected set (it
+    # was computed before the mid-round exclusion landed).
+    d = _errored_driver()
+    assert d._bot_status_text(
+        "copilot", expected=["claude", "copilot", "codex", "gemini"]
+    ) == "Could not review ❌"
+
+
+def test_errored_label_falls_to_not_requested_when_round_skipped_the_bot():
+    # Round 2+: not expected, posted nothing — the bot simply was not asked
+    # this round.
+    d = _errored_driver()
+    assert d._bot_status_text(
+        "copilot", expected=["codex"]
+    ) == "Not requested 🙅"
+
+
+def test_errored_label_kept_when_bot_posted_despite_not_being_asked():
+    # An unsolicited late posting that did NOT prove recovery (a genuine
+    # classified comment would have retracted the exclusion via the comeback
+    # before the table renders) keeps the honest error label.
+    d = _errored_driver()
+    assert d._bot_status_text(
+        "copilot", expected=["codex"], posted=1) == "Could not review ❌"
+
+
+def test_errored_label_kept_when_seen_this_round_without_a_classified_comment():
+    # The "seen this round" arm: a bot
+    # not in this round's expected set that still contributed something
+    # non-actionable this round (last_seen set, e.g. a re-posted error
+    # placeholder — seen but posted==0) keeps "Could not review ❌", not
+    # "Not requested 🙅". last_seen is the per-round stamp (_wait_for_quiescence
+    # resets it each round), so this only fires in a round the bot actually
+    # acted in.
+    d = _errored_driver()
+    d._bot_state("copilot").last_seen = 123.0   # contributed this round
+    assert d._bot_status_text(
+        "copilot", expected=["codex"], posted=0) == "Could not review ❌"
+
+
+def test_errored_label_unscoped_without_round_context():
+    # A caller with no round context (expected=None) keeps the label — the
+    # scoping engages only on the render path, which always passes the set.
+    d = _errored_driver()
+    assert d._bot_status_text("copilot") == "Could not review ❌"
+
+
+def test_round_table_row_shows_not_requested_for_skipped_errored_bot():
+    # Table-level integration: the round-2 card. Copilot is errored-excluded
+    # from round 1, absent from round 2's expected set, and posted nothing —
+    # its row must be "Not requested 🙅", byte-identical to every other
+    # skipped bot's row.
+    d = _errored_driver()
+    rows = {r["bot_key"]: r for r in d._round_table_rows([], [], expected=["codex"])}
+    assert rows["copilot"]["status"] == "Not requested 🙅"
+
+
+def test_bot_status_text_split_approved_vs_no_findings_vs_no_change():
+    # The done-for-the-run labels split three ways on HOW the reviewer got
+    # there: explicit all-clear → Approved; the zero-findings promotion (in
+    # `done` with NO clean signal) → Reviewed — no findings; a dismissed-
+    # substantive demotion → Reviewed — no change.
+    d = _bare_driver()
+    d._bot_state("claude").signal = detectors.SIGNAL_CLEAN
+    assert d._bot_status_text("claude") == "Approved 👍"
+    d.done.add("copilot")                       # promotion path: no signal
+    assert d._bot_status_text("copilot") == "Reviewed — no findings ✓"
+    d.reviewed_no_change.add("codex")           # dismissed-substantive demotion
+    assert d._bot_status_text("codex") == "Reviewed — no change ✓"
+    d.polishing.add("gemini")                   # cosmetic-only demotion
+    assert d._bot_status_text("gemini") == "Polish-only 🧹"
+
+
+def test_approved_label_is_sticky_across_a_later_hard_signal():
+    # A hard placeholder (quota / errored / PR-too-large) arriving AFTER an
+    # explicit all-clear overwrites the mutable BotState.signal — the sticky
+    # `approved` set must keep the sign-off's label either way round, never
+    # demoting it to the promotion's "Reviewed — no findings ✓".
+    d = _bare_driver()
+    # clean first, quota after (signal overwritten by the placeholder)
+    d.done.add("claude")
+    d.approved.add("claude")
+    d._bot_state("claude").signal = detectors.SIGNAL_QUOTA
+    d.store.exclude_quota("claude")
+    assert d._bot_status_text("claude") == "Approved 👍"
+    # quota first, clean after (signal ends CLEAN) — same label
+    d.done.add("copilot")
+    d.approved.add("copilot")
+    d._bot_state("copilot").signal = detectors.SIGNAL_CLEAN
+    d.store.exclude_quota("copilot")
+    assert d._bot_status_text("copilot") == "Approved 👍"
+
+
+def test_bot_status_text_active_vs_no_review_posted():
+    d = _bare_driver()
+    # Expected yet never seen this round → posted no review (the pre-split
+    # "silent" state, folded into the same label as a silent drop).
+    assert d._bot_status_text("claude") == "No review posted 🔇"
     d._bot_state("claude").last_seen = 12.0                  # contributed this round
-    assert d._bot_status_text("claude") == "reviewed"
+    assert d._bot_status_text("claude") == "Active ✅"
+    # A silent DROP renders the identical label (the old "silent (dropped)").
+    d.silent_dropped.add("gemini")
+    assert d._bot_status_text("gemini") == "No review posted 🔇"
 
 
 def test_round_table_rows_capitalize_unknown_reviewer_label():
     d = _bare_driver(cfg={"active_reviewers": ["mystery"], "auto_on_open": {"mystery": True}})
     rows = d._round_table_rows([], [])
-    assert rows[0]["bot_key"] == "mystery"
-    assert rows[0]["label"] == "Mystery"  # _REVIEWER_LABEL fallback to capitalize()
+    # full-roster view: the built-in four render first (canonical order), then
+    # the enabled unknown reviewer keeps its row after them
+    assert [r["bot_key"] for r in rows] == \
+        ["claude", "copilot", "codex", "gemini", "mystery"]
+    assert rows[-1]["label"] == "Mystery"  # _REVIEWER_LABEL fallback to capitalize()
+
+
+def test_round_table_rows_cover_full_roster_with_not_requested():
+    # A configured-but-inactive built-in reviewer still gets a row — labelled
+    # "Not requested 🙅" — while the enabled-but-quiet reviewers keep their
+    # existing "No review posted 🔇" label, and the order stays canonical.
+    d = _bare_driver(cfg={"active_reviewers": ["claude", "codex"],
+                          "auto_on_open": {"claude": False, "codex": True}})
+    rows = d._round_table_rows([], [])
+    assert [r["bot_key"] for r in rows] == ["claude", "copilot", "codex", "gemini"]
+    by = {r["bot_key"]: r for r in rows}
+    assert by["copilot"]["status"] == "Not requested 🙅"
+    assert by["gemini"]["status"] == "Not requested 🙅"
+    assert by["copilot"]["posted"] == 0 and by["gemini"]["posted"] == 0
+    assert by["claude"]["status"] == "No review posted 🔇"
+    assert by["codex"]["status"] == "No review posted 🔇"
+
+
+def test_skip_key_and_long_form_for_not_requested_bot():
+    d = _bare_driver(cfg={"active_reviewers": ["claude"],
+                          "auto_on_open": {"claude": False}})
+    assert d._skip_key("gemini") == "not-requested"
+    assert d._bot_status_text("gemini") == "Not requested 🙅"
+    # every skip key carries an honest long form
+    assert "not requested" in round_driver._SKIP_LONG["not-requested"]
+    # distinct from the repo-gate label — an unconfirmed-repo idle EXPECTED
+    # reviewer still reads "Not configured (repo) 🔧", never "Not requested 🙅"
+    assert d._bot_status_text("gemini") != round_driver._STATUS_NOT_CONFIGURED
+
+
+def test_not_requested_is_lowest_priority_real_state_wins():
+    # A not-summoned reviewer that engaged anyway is never masked as
+    # not-requested: an explicit all-clear renders "Approved 👍", and mere
+    # activity this round renders the same "Active ✅" an expected bot earns.
+    d = _bare_driver(cfg={"active_reviewers": ["claude"],
+                          "auto_on_open": {"claude": False}})
+    d.done.add("gemini")
+    d.approved.add("gemini")
+    d._bot_state("gemini").signal = detectors.SIGNAL_CLEAN
+    assert d._bot_status_text("gemini") == "Approved 👍"
+    d._bot_state("codex").last_seen = 12.0
+    assert d._bot_status_text("codex") == "Active ✅"
+
+
+def test_round_start_reset_clears_stale_stamp_for_not_requested_bot():
+    # A not-summoned bot that posted in an EARLIER round must fall back to
+    # "Not requested 🙅" in a later round it sat out — the round-start reset
+    # covers every tracked reviewer, not just the expected set.
+    d = _bare_driver(cfg={"active_reviewers": ["claude"],
+                          "auto_on_open": {"claude": False}})
+    d.fetch = lambda pr, repo=None, cwd=None: []
+    d._bot_state("gemini").last_seen = 5.0          # engaged in a prior round
+    d._wait_for_quiescence([], 0.0)                 # a round it sits out
+    assert d._bot_status_text("gemini") == "Not requested 🙅"
 
 
 # ------------------------------------------------- driver: end-to-end console
@@ -314,11 +488,12 @@ def _run_capture(timeline, cfg, **kw):
         return [c for t, c in timeline if t <= clock.t]
 
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=_Notifier()))
+    kw.setdefault("gh_run", _Gh())
     d = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg, adapter=adapter,
         classify_runner=lambda p: json.dumps({"label": "SUBSTANTIVE", "reason": "t"}),
         fix_dispatch=lambda c, r: FixOutcome(status="applied"),
-        fetch=fetch, gh_run=_Gh(), clock=clock, sleep=clock.sleep,
+        fetch=fetch, clock=clock, sleep=clock.sleep,
         notice=lambda *a, **k: "",
         # register_delay=0 keeps these console-render tests on the tight timing
         # they were written for (the post-summon register delay is exercised in
@@ -353,6 +528,47 @@ def test_expecting_line_is_canonical_and_table_renders_each_round():
     assert "summary" in out and "┌" in out and "TOTAL" in out
     # honest skip-reason logging fired once codex was excluded
     assert "skipping codex: quota exhausted" in out
+
+
+def test_full_roster_table_summons_only_the_active_set():
+    # With a two-bot fleet the console table still renders all four built-in
+    # reviewers — the inactive two as "Not requested 🙅" (the 🙅 stripped for the
+    # monospace box, so the cell reads "Not requested") — while the expecting
+    # line, the summons, and the polling stay on the active set only.
+    calls = []
+
+    class _RecGh(_Gh):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            calls.append(list(argv))
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+    timeline = [
+        (0, Comment(id="a", text="No issues found.", source="claude[bot]")),
+        (0, Comment(id="b", text="No issues found.", source="codex[bot]")),
+    ]
+    cfg = {"active_reviewers": ["claude", "codex"],
+           "auto_on_open": {"claude": False, "codex": True}}
+    outcome, out, _ = _run_capture(timeline, cfg, max_rounds=3, gh_run=_RecGh())
+    assert outcome.status == "clean"
+    r1 = [ln for ln in out.splitlines() if "Round 1 of" in ln and "expecting" in ln][0]
+    assert "expecting: claude, codex" in r1
+    assert "copilot" not in r1 and "gemini" not in r1
+    # all four built-ins have a table row; the two outside the fleet read
+    # "Not requested" (the canonical "Not requested 🙅" with its 🙅 stripped for
+    # the box, like every other status glyph)
+    for label in ("Claude", "Copilot", "Codex", "Gemini"):
+        assert any(ln.startswith("│") and label in ln for ln in out.splitlines())
+    not_req_box_lines = [ln for ln in out.splitlines() if ln.startswith("│") and "Not requested" in ln]
+    assert len(not_req_box_lines) == 2
+    assert all("🙅" not in ln for ln in not_req_box_lines)
+    # no summon ever targeted a not-requested bot: neither gemini's trigger
+    # comment nor copilot's review-request API call was posted. The positive
+    # control first — claude's round-1 summon MUST be visible through the same
+    # recorded seam, or the negative assertions below prove nothing.
+    bodies = [" ".join(argv) for argv in calls]
+    assert any(round_driver.TRIGGER_COMMENTS["claude"] in b for b in bodies)
+    assert not any(round_driver.TRIGGER_COMMENTS["gemini"] in b for b in bodies)
+    assert not any("requested_reviewers" in b for b in bodies)
 
 
 def test_max_rounds_auto_size_seam_via_diff_lines():

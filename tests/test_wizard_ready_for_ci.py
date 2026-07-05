@@ -80,7 +80,7 @@ def test_template_uses_standard_runner_only():
 
 
 def test_template_is_publish_clean():
-    """Adversarial claim #1: the shipped template leaks no paid/private/MONO surface
+    """Adversarial claim #1: the shipped template leaks no paid or private surface
     (it is scanned by the publish gate as installed product)."""
     text = _template_path().read_text(encoding="utf-8")
     assert g.scan_paid_and_publish(text) == []
@@ -162,6 +162,120 @@ def test_bake_multiline_command_keeps_each_line_indented():
     assert "          pip install -e ." in baked
     assert "          python -m pytest" in baked
     assert wizard._CI_COMMAND_MARKER not in baked
+
+
+# ── _installed_ci_command — workflow-level context guards ───────────────────────────
+
+def _wf(body: str) -> str:
+    """Wrap a YAML body in a minimal workflow skeleton."""
+    return f"name: ci\non: [push]\n{body}"
+
+
+def test_installed_ci_command_basic_extraction():
+    text = _wf("jobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) == "python -m pytest"
+
+
+def test_installed_ci_command_workflow_level_env_returns_none():
+    """A top-level ``env:`` block applies to every step; the stock template cannot
+    carry it, so the command must be treated as unextractable."""
+    text = _wf("env:\n  DB_URL: postgres://localhost/test\n"
+               "jobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_workflow_level_defaults_run_wd_returns_none():
+    """A workflow-level ``defaults.run.working-directory`` silently changes every
+    run step's directory; baking the command without it would run in the wrong dir."""
+    text = _wf("defaults:\n  run:\n    working-directory: src\n"
+               "jobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_workflow_level_defaults_run_shell_returns_none():
+    """A workflow-level ``defaults.run.shell`` changes the shell for every run step."""
+    text = _wf("defaults:\n  run:\n    shell: bash\n"
+               "jobs:\n  ci:\n    runs-on: ubuntu-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_job_level_env_still_returns_none():
+    """Job-level env guard must still fire even when workflow-level env is absent."""
+    text = _wf("jobs:\n  ci:\n    runs-on: ubuntu-latest\n"
+               "    env:\n      PYTHONPATH: src\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_macos_runner_returns_none():
+    """A gate on macos-latest carries macOS-only commands (Xcode); the stock template
+    pins ubuntu-latest, so rebaking would run them where they do not exist — fail
+    closed. (Regression: the missing runs-on guard shipped in PR #31.)"""
+    text = _wf("jobs:\n  ci:\n    runs-on: macos-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: xcodebuild test -scheme MyApp\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_windows_runner_returns_none():
+    text = _wf("jobs:\n  ci:\n    runs-on: windows-latest\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: pwsh ./run-tests.ps1\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_self_hosted_runner_returns_none():
+    text = _wf("jobs:\n  ci:\n    runs-on: self-hosted\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: ./gpu-tests.sh\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_self_hosted_labels_list_returns_none():
+    """A multi-label ``runs-on`` list (e.g. [self-hosted, gpu]) targets a specific
+    non-stock runner — unextractable."""
+    text = _wf("jobs:\n  ci:\n    runs-on: [self-hosted, gpu]\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: ./gpu-tests.sh\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_matrix_runner_returns_none():
+    """A ``${{ matrix.* }}`` runner cannot be statically resolved to the stock runner —
+    fail closed rather than assume ubuntu-latest."""
+    text = _wf("jobs:\n  ci:\n    runs-on: ${{ matrix.os }}\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_installed_ci_command_ubuntu_latest_single_element_list_extracts():
+    """A single-element list [ubuntu-latest] is the stock runner in list form — still
+    extractable."""
+    text = _wf("jobs:\n  ci:\n    runs-on: [ubuntu-latest]\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) == "python -m pytest"
+
+
+def test_installed_ci_command_missing_runs_on_still_extracts():
+    """An absent ``runs-on`` is accepted for robustness; the stock
+    template sets ubuntu-latest but omitting the key is treated as
+    equivalent — leave it extractable so the missing-key case is not
+    rejected."""
+    text = _wf("jobs:\n  ci:\n    steps:\n"
+               "      - uses: actions/checkout@v4\n"
+               "      - run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) == "python -m pytest"
 
 
 # ── _probe_ready_for_ci_workflow — P7 #4 probe-before-install ───────────────────────
@@ -505,3 +619,545 @@ def test_claude_app_guidance_not_duplicated(tmp_path):
             input_fn=lambda *a: "")
     out = buf.getvalue()
     assert out.count("github.com/apps/claude") == 1, "Claude App guidance must appear exactly once"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# R2 — the update path PRESERVES the installed gate's CI command, and the
+# Python detection is `.[test]`-aware.
+#
+# Live incident (2026-07-01): the versioned-update offer re-baked the generic
+# detected command (`pip install -e .`) over a hand-wired
+# `pip install -e '.[test]' …` gate — every gated run then failed in seconds on
+# `No module named pytest`, and the gate's extra scan step silently vanished.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# The live incident's shape: a real, customised, single-run-line gate (legacy
+# unmarked, so the version check offers an update).
+_CUSTOM_CMD = ("pip install -e '.[test]' build setuptools wheel && "
+               "python -m pytest -q && python tools/publish_gate.py scan")
+_CUSTOM_GATE = f"""\
+name: Ready-for-CI
+on:
+  pull_request:
+    types: [labeled, synchronize]
+jobs:
+  ci:
+    if: contains(github.event.pull_request.labels.*.name, 'ready-for-ci')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: CI
+        run: |
+          {_CUSTOM_CMD}
+"""
+
+
+def _gate(steps_yaml: str, job: str = "ci") -> str:
+    return f"jobs:\n  {job}:\n    runs-on: ubuntu-latest\n    steps:\n{steps_yaml}"
+
+
+# ── _installed_ci_command — extraction off the fetched installed text ────────────────
+
+def test_extract_verbatim_single_run_line():
+    assert wizard._installed_ci_command(_CUSTOM_GATE) == _CUSTOM_CMD
+
+
+def test_extract_multi_step_bails_on_step_isolation():
+    """Multi-step gates cannot be safely joined: each `run:` step in GitHub
+    Actions is a new shell, so `cd`/`export` in step N do NOT persist to
+    step N+1. Joining as `&&` would produce different (wrong) shell state."""
+    text = _gate("      - uses: actions/checkout@v4\n"
+                 "      - name: Install\n"
+                 "        run: pip install -e '.[test]'\n"
+                 "      - name: Test\n"
+                 "        run: python -m pytest -q\n"
+                 "      - name: Gate\n"
+                 "        run: python tools/publish_gate.py scan\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_extract_multiline_block_joins_lines_and_drops_comments():
+    text = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          # install first\n"
+                 "          pip install -e '.[test]'\n"
+                 "\n"
+                 "          python -m pytest -q\n")
+    assert wizard._installed_ci_command(text) == (
+        "pip install -e '.[test]' && python -m pytest -q")
+
+
+def test_extract_no_doubled_operator_when_lines_already_chain():
+    text = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          pip install -e . &&\n"
+                 "          python -m pytest\n")
+    assert wizard._installed_ci_command(text) == "pip install -e . && python -m pytest"
+
+
+def test_extract_folds_backslash_continuations():
+    text = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          pip install -e . \\\n"
+                 "            --no-build-isolation\n"
+                 "          python -m pytest\n")
+    assert wizard._installed_ci_command(text) == (
+        "pip install -e . --no-build-isolation && python -m pytest")
+
+
+def test_extract_bails_on_trailing_comment_before_more_commands():
+    """`pip install x  # editable` joined before `pytest` would comment pytest
+    OUT — a vacuously green gate. Unextractable, never a weaker chain."""
+    text = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          pip install -e .  # editable install\n"
+                 "          python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+    # …but a trailing comment on the LAST line is harmless and preserved.
+    solo = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          python -m pytest  # the whole suite\n")
+    assert wizard._installed_ci_command(solo) == "python -m pytest  # the whole suite"
+    # …and a glued '#' (pip URL fragment) is not a comment at all.
+    frag = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          pip install git+https://e.io/r.git#egg=x\n"
+                 "          python -m pytest\n")
+    assert wizard._installed_ci_command(frag) == (
+        "pip install git+https://e.io/r.git#egg=x && python -m pytest")
+
+
+def test_extract_single_line_round_trips_verbatim_without_join_rules():
+    """One line = no transformation = always safe to preserve, even when it
+    contains syntax the JOIN rules would refuse (a here-string's `<<<`)."""
+    text = _gate("      - name: CI\n"
+                 '        run: python check.py <<< "$CFG"\n')
+    assert wizard._installed_ci_command(text) == 'python check.py <<< "$CFG"'
+
+
+def test_extract_bails_when_a_step_dangles_a_continuation_before_another():
+    text = _gate("      - name: Install\n"
+                 "        run: pip install -e . \\\n"
+                 "      - name: Test\n"
+                 "        run: python -m pytest\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_extract_background_ampersand_joins_without_doubling():
+    text = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          server --port 1234 &\n"
+                 "          python -m pytest\n")
+    assert wizard._installed_ci_command(text) == (
+        "server --port 1234 & python -m pytest")
+
+
+def test_extract_bails_on_function_block_opener():
+    text = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          run_all() {\n"
+                 "            pytest\n"
+                 "          }\n"
+                 "          run_all\n")
+    assert wizard._installed_ci_command(text) is None
+
+
+def test_extract_bails_on_shell_control_flow_and_heredocs():
+    loop_text = _gate("      - name: CI\n"
+                      "        run: |\n"
+                      "          if [ -f Makefile ]; then\n"
+                      "            make ci\n"
+                      "          fi\n")
+    assert wizard._installed_ci_command(loop_text) is None
+    heredoc = _gate("      - name: CI\n"
+                    "        run: |\n"
+                    "          cat > cfg <<EOT\n"
+                    "          x=1\n"
+                    "          EOT\n")
+    assert wizard._installed_ci_command(heredoc) is None
+
+
+def test_extract_bails_on_control_flow_in_any_line_position():
+    """Adversarial (verify panel): keywords NOT at end-of-line must bail too —
+    `… && fi` / `&& then pytest` are syntax errors, never a bakeable chain."""
+    opener_with_cmd = _gate("      - name: CI\n"
+                            "        run: |\n"
+                            "          if true; then python -m pytest -q\n"
+                            "          fi\n")
+    assert wizard._installed_ci_command(opener_with_cmd) is None
+    keyword_at_start = _gate("      - name: CI\n"
+                             "        run: |\n"
+                             "          if test -f x\n"
+                             "          then pytest\n"
+                             "          else echo no\n"
+                             "          fi\n")
+    assert wizard._installed_ci_command(keyword_at_start) is None
+    # The multi-STEP shape: opener and closer as separate single-line steps —
+    # the single-line verbatim shortcut must not smuggle them past the check.
+    split_steps = _gate("      - name: Open\n"
+                        "        run: 'if [ -f Makefile ]; then make ci'\n"
+                        "      - name: Close\n"
+                        "        run: fi\n")
+    assert wizard._installed_ci_command(split_steps) is None
+    # …while a COMPLETE one-liner block in a single step stays preserved
+    # verbatim (no join happens, nothing can break).
+    one_liner = _gate("      - name: CI\n"
+                      "        run: 'if [ -f Makefile ]; then make ci; fi'\n")
+    assert wizard._installed_ci_command(one_liner) == (
+        "if [ -f Makefile ]; then make ci; fi")
+
+
+def test_extract_double_backslash_is_a_literal_not_a_continuation():
+    """Adversarial (verify panel, round 2): `echo built \\\\` ends in an ESCAPED
+    backslash — the line is complete. Folding `false` in as echo arguments
+    would make the gate vacuously green; it must be `&&`-joined instead."""
+    text = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          echo built \\\\\n"
+                 "          false\n")
+    assert wizard._installed_ci_command(text) == "echo built \\\\ && false"
+    glued = _gate("      - name: CI\n"
+                  "        run: |\n"
+                  "          echo tag=v1\\\\\n"
+                  "          false\n")
+    assert wizard._installed_ci_command(glued) == "echo tag=v1\\\\ && false"
+    # …and a dropped comment after an ESCAPED backslash is harmless (the line
+    # was complete), while after a real continuation it still bails.
+    escaped_then_comment = _gate("      - name: CI\n"
+                                 "        run: |\n"
+                                 "          echo built \\\\\n"
+                                 "          # note\n"
+                                 "          false\n")
+    assert wizard._installed_ci_command(escaped_then_comment) == (
+        "echo built \\\\ && false")
+
+
+def test_extract_bails_on_backslash_then_trailing_whitespace():
+    """Adversarial (verify panel, round 3): `echo built \\ ` (trailing SPACE
+    after the backslash) is a COMPLETE line in bash — the backslash escapes the
+    space, not the newline. Stripping erases that distinction, so folding would
+    glue `false` in as echo arguments (vacuously green). Unextractable."""
+    space = _gate("      - name: CI\n"
+                  "        run: |\n"
+                  "          echo built \\ \n"
+                  "          false\n")
+    assert wizard._installed_ci_command(space) is None
+    tab = _gate("      - name: CI\n"
+                "        run: |\n"
+                "          echo built \\\t\n"
+                "          false\n")
+    assert wizard._installed_ci_command(tab) is None
+
+
+def test_extract_never_raises_on_pathological_yaml():
+    """Adversarial (verify panel, round 3): PyYAML raises RecursionError (not a
+    YAMLError) on deep nesting — the best-effort reader must return None, never
+    kill the wizard with a traceback."""
+    assert wizard._installed_ci_command("jobs: " + "[" * 20000 + "]" * 20000) is None
+
+
+def test_extract_bails_on_operator_glued_comments():
+    """Adversarial (verify panel, round 2): bash starts a comment at any WORD
+    start — `echo x;# note` is commented after the `;` — so joining `&& false`
+    after it would be swallowed. Word-glued `#` (pip's `#egg=`) stays fine."""
+    semi = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 "          echo x;# editable install note\n"
+                 "          false\n")
+    assert wizard._installed_ci_command(semi) is None
+    amp = _gate("      - name: CI\n"
+                "        run: |\n"
+                "          echo x &#background note\n"
+                "          false\n")
+    assert wizard._installed_ci_command(amp) is None
+    cross_step = _gate("      - name: A\n"
+                       "        run: 'echo x;# note'\n"
+                       "      - name: B\n"
+                       "        run: 'python -m pytest'\n")
+    assert wizard._installed_ci_command(cross_step) is None
+
+
+def test_extract_bails_on_dropped_line_after_backslash_continuation():
+    """Adversarial (verify panel): `echo running gate \\` + a comment + `exit 1`
+    must NOT extract as the always-green `echo running gate exit 1` — the shell
+    binds the continuation to the COMMENT line, not to `exit 1`."""
+    comment_gap = _gate("      - name: CI\n"
+                        "        run: |\n"
+                        "          echo running gate \\\n"
+                        "          # note to self\n"
+                        "          exit 1\n")
+    assert wizard._installed_ci_command(comment_gap) is None
+    blank_gap = _gate("      - name: CI\n"
+                      "        run: |\n"
+                      "          echo running gate \\\n"
+                      "\n"
+                      "          exit 1\n")
+    assert wizard._installed_ci_command(blank_gap) is None
+
+
+def test_extract_none_for_placeholder_marker_only():
+    """A never-baked copy (the marker still in the run slot) has nothing to
+    preserve — extraction must say so, not return the literal marker."""
+    text = _gate("      - name: CI\n"
+                 "        run: |\n"
+                 f"          {wizard._CI_COMMAND_MARKER}\n")
+    assert wizard._installed_ci_command(text) is None
+    # The bundled template itself is exactly this shape.
+    assert wizard._installed_ci_command(
+        _template_path().read_text(encoding="utf-8")) is None
+
+
+def test_extract_none_for_unparseable_or_shapeless_yaml():
+    assert wizard._installed_ci_command(None) is None
+    assert wizard._installed_ci_command("") is None
+    assert wizard._installed_ci_command("jobs:\n  ci: [unclosed") is None  # YAML error
+    assert wizard._installed_ci_command("- just\n- a list\n") is None      # non-mapping
+    assert wizard._installed_ci_command("name: x\n") is None               # no jobs
+    assert wizard._installed_ci_command("jobs: {}\n") is None              # empty jobs
+    # steps present but uses:-only (no run anywhere)
+    assert wizard._installed_ci_command(
+        _gate("      - uses: actions/checkout@v4\n")) is None
+    # a non-string run value (YAML `run: 42` / `run: false` parse as scalars the
+    # Actions runner would still execute as text) → unextractable, never a
+    # silently shortened chain, and never a crash
+    assert wizard._installed_ci_command(
+        _gate("      - name: CI\n        run: 42\n")) is None
+    assert wizard._installed_ci_command(
+        _gate("      - name: A\n        run: 'echo ok'\n"
+              "      - name: B\n        run: false\n")) is None
+
+
+def test_extract_none_for_context_dependent_steps():
+    """Steps or jobs with working-directory / shell / env context fields must be
+    rejected — we cannot carry that context into the stock template's single slot."""
+    # Step-level working-directory
+    wd_step = _gate("      - name: CI\n"
+                    "        run: npm test\n"
+                    "        working-directory: frontend\n")
+    assert wizard._installed_ci_command(wd_step) is None
+
+    # Step-level shell override
+    shell_step = _gate("      - name: CI\n"
+                       "        run: make ci\n"
+                       "        shell: bash\n")
+    assert wizard._installed_ci_command(shell_step) is None
+
+    # Step-level env
+    env_step = _gate("      - name: CI\n"
+                     "        run: npm test\n"
+                     "        env:\n"
+                     "          NODE_ENV: test\n")
+    assert wizard._installed_ci_command(env_step) is None
+
+    # Job-level defaults.run.working-directory
+    wd_defaults = (
+        "on: [push]\n"
+        "jobs:\n"
+        "  ci:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    defaults:\n"
+        "      run:\n"
+        "        working-directory: frontend\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: npm test\n"
+    )
+    assert wizard._installed_ci_command(wd_defaults) is None
+
+    # Job-level defaults.run.shell
+    shell_defaults = (
+        "on: [push]\n"
+        "jobs:\n"
+        "  ci:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    defaults:\n"
+        "      run:\n"
+        "        shell: bash\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: make ci\n"
+    )
+    assert wizard._installed_ci_command(shell_defaults) is None
+
+    # Job-level env
+    job_env = (
+        "on: [push]\n"
+        "jobs:\n"
+        "  ci:\n"
+        "    runs-on: ubuntu-latest\n"
+        "    env:\n"
+        "      DB_URL: postgres://localhost/test\n"
+        "    steps:\n"
+        "      - uses: actions/checkout@v4\n"
+        "      - run: make test\n"
+    )
+    assert wizard._installed_ci_command(job_env) is None
+
+
+def test_extract_prefers_ci_job_and_tolerates_renamed_single_job():
+    renamed = _gate("      - name: CI\n        run: make verify\n", job="tests")
+    assert wizard._installed_ci_command(renamed) == "make verify"
+    two_jobs = (renamed + "  extra:\n    runs-on: ubuntu-latest\n    steps:\n"
+                          "      - name: Other\n        run: make other\n")
+    # several jobs, none named `ci` → ambiguous → not extractable
+    assert wizard._installed_ci_command(two_jobs) is None
+    with_ci = (_gate("      - name: CI\n        run: make ci-cmd\n")
+               + "  lint:\n    runs-on: ubuntu-latest\n    steps:\n"
+                 "      - name: Lint\n        run: make lint\n")
+    assert wizard._installed_ci_command(with_ci) == "make ci-cmd"
+
+
+# ── the update flow preserves the installed command ──────────────────────────────────
+
+def _content_router(installed_yaml, *, default="main", put_rc=0, pr_rc=0,
+                    pr_url="https://github.com/octocat/Hello-World/pull/9"):
+    """_install_router, but the installed gate's CONTENT is caller-provided."""
+    _b64 = base64.b64encode(installed_yaml.encode()).decode()
+
+    def router(argv, _inp):
+        joined = " ".join(argv)
+        if argv[:3] == ["gh", "repo", "view"]:
+            return _R(returncode=0, stdout=default + "\n")
+        if argv[:2] == ["gh", "pr"]:
+            return _R(returncode=pr_rc, stdout=(pr_url + "\n") if pr_rc == 0 else "")
+        if argv[:2] == ["gh", "api"]:
+            if "-X" in argv and "PUT" in argv:
+                return _R(returncode=put_rc)
+            if "tests-ready-for-ci.yml" in joined and "--jq" in argv and ".content" in argv:
+                return _R(returncode=0, stdout=_b64 + "\n")
+            if "/git/ref/heads/" in joined and "--jq" in argv:
+                return _R(returncode=0, stdout="deadbeef\n")
+            if argv[2].endswith("/git/refs"):
+                return _R(returncode=0)
+        return _R()
+    return router
+
+
+def _offer_recording(tmp_path, *, is_tty, router, input_answers=None):
+    """Like _offer, but records every prompt input_fn saw (to pin the default)."""
+    (tmp_path / "Makefile").write_text("ci:\n\techo hi\n", encoding="utf-8")
+    run, calls = _recorder(router)
+    buf = io.StringIO()
+    prompts = []
+
+    def in_fn(prompt=""):
+        prompts.append(prompt)
+        for k, v in (input_answers or {}).items():
+            if k in prompt:
+                return v
+        return ""
+    with _tty(is_tty):
+        result = wizard._offer_install_ready_for_ci(
+            REPO, str(tmp_path), run=run, pal=wizard._Palette(False), stream=buf,
+            input_fn=in_fn)
+    return result, buf.getvalue(), calls, prompts
+
+
+def _baked_put_content(calls):
+    put = next(c["argv"] for c in calls if "-X" in c["argv"] and "PUT" in c["argv"])
+    return base64.b64decode(
+        next(t for t in put if t.startswith("content=")).split("content=", 1)[1]).decode()
+
+
+def test_update_tty_defaults_to_the_installed_command_not_detection(tmp_path):
+    """The regression the incident exposed: a Makefile in the checkout means
+    detection says `make ci` — but the update's question must default to the
+    command the INSTALLED gate actually runs, and a blank accept bakes THAT."""
+    result, out, calls, prompts = _offer_recording(
+        tmp_path, is_tty=True, router=_content_router(_CUSTOM_GATE),
+        input_answers={"Install the label-gated CI workflow": "y"})
+    assert result == "pr"
+    cmd_prompt = next(p for p in prompts if "Command this gate runs" in p)
+    assert f"[{_CUSTOM_CMD}]" in cmd_prompt, "the default must be the installed command"
+    baked = _baked_put_content(calls)
+    assert f"          {_CUSTOM_CMD}" in baked
+    assert "          make ci\n" not in baked, "detection must not clobber the gate"
+    assert wizard._CI_COMMAND_MARKER not in baked
+
+
+def test_update_tty_entered_command_still_wins(tmp_path):
+    result, _, calls, _ = _offer_recording(
+        tmp_path, is_tty=True, router=_content_router(_CUSTOM_GATE),
+        input_answers={"Install the label-gated CI workflow": "y",
+                       "Command this gate runs at merge": "make verify"})
+    assert result == "pr"
+    assert "          make verify" in _baked_put_content(calls)
+
+
+def test_update_tty_placeholder_only_falls_back_to_detection(tmp_path):
+    """A never-baked installed copy has nothing to preserve — the question falls
+    back to the detected default exactly as before."""
+    never_baked = _gate("      - name: CI\n"
+                        "        run: |\n"
+                        f"          {wizard._CI_COMMAND_MARKER}\n")
+    result, _, calls, prompts = _offer_recording(
+        tmp_path, is_tty=True, router=_content_router(never_baked),
+        input_answers={"Install the label-gated CI workflow": "y"})
+    assert result == "pr"
+    cmd_prompt = next(p for p in prompts if "Command this gate runs" in p)
+    assert "[make ci]" in cmd_prompt
+    assert "          make ci" in _baked_put_content(calls)
+
+
+def test_update_non_tty_preserves_the_installed_command_verbatim(tmp_path):
+    result, out, calls, _ = _offer_recording(
+        tmp_path, is_tty=False, router=_content_router(_CUSTOM_GATE))
+    assert result == "pr"
+    assert "preserving the installed gate's CI command" in out
+    assert "auto-detected CI command" not in out, "never the generic re-bake on update"
+    assert f"          {_CUSTOM_CMD}" in _baked_put_content(calls)
+
+
+def test_update_non_tty_unextractable_warns_and_skips(tmp_path):
+    """Off-TTY with nothing extractable the update must NOT re-bake blind — it
+    skips with a warn row and opens no PR (detection was available: Makefile)."""
+    result, out, calls, _ = _offer_recording(
+        tmp_path, is_tty=False, router=_content_router("name: legacy ci\n"))
+    assert result is None
+    assert "couldn't be read" in out and "terminal" in out
+    assert not any("PUT" in c["argv"] for c in calls if "-X" in c["argv"])
+    assert not any(c["argv"][:2] == ["gh", "pr"] for c in calls)
+
+
+def test_fresh_install_flow_unchanged_by_r2(tmp_path):
+    """A fresh INSTALL (gate absent) keeps the detection-driven flow: the TTY
+    default is the detected command and non-TTY wires it with the same wording."""
+    result, _, _, prompts = _offer_recording(
+        tmp_path, is_tty=True, router=_install_router(),
+        input_answers={"Install the label-gated CI workflow": "y"})
+    assert result == "pr"
+    assert "[make ci]" in next(p for p in prompts if "Command this gate runs" in p)
+    result2, out2, _, _ = _offer_recording(tmp_path, is_tty=False,
+                                           router=_install_router())
+    assert result2 == "pr"
+    assert "auto-detected CI command" in out2
+
+
+# ── `.[test]`-aware Python detection ─────────────────────────────────────────────────
+
+def test_detect_python_installs_declared_test_extra(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='x'\n\n[project.optional-dependencies]\n"
+        'test = ["pytest>=7"]\n', encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    assert wizard._detect_ci_command(str(tmp_path)) == (
+        "python -m pip install -e '.[test]' && python -m pytest")
+
+
+def test_detect_python_without_test_extra_unchanged(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='x'\n\n[project.optional-dependencies]\n"
+        'dev = ["ruff"]\n', encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    assert wizard._detect_ci_command(str(tmp_path)) == (
+        "python -m pip install -e . && python -m pytest")
+
+
+def test_pyproject_test_extra_scoped_to_its_section():
+    # a `test =` key under ANOTHER table must not count
+    assert wizard._pyproject_test_extra(
+        "[tool.other]\ntest = ['x']\n") is False
+    # quoted key + spaced table header both count
+    assert wizard._pyproject_test_extra(
+        '[ project.optional-dependencies ]\n"test" = ["pytest"]\n') is True
+    assert wizard._pyproject_test_extra("") is False

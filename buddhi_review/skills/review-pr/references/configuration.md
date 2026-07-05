@@ -93,9 +93,13 @@ reviewer. See [`reviewer-setup.md`](reviewer-setup.md).
 ### When a reviewer posts nothing
 
 An **enabled** reviewer that produces no comments stays in the round table marked
-`active` — it is still expected, and the loop keeps polling for it (reviewers
-disabled in config are absent from the table entirely; reviewers excluded mid-run
-show `done`/`quota`/`PR too large`/`errored`). A reviewer that *never* posts
+`No review posted 🔇` — it is still expected, and the loop keeps polling for it.
+`Active ✅` only appears once the reviewer has engaged in the current round
+(reviewers disabled in config keep a `Not requested 🙅` row for completeness —
+never summoned or polled; reviewers
+excluded mid-run show `Approved 👍`/`Reviewed — no findings ✓`/`Reviewed — no change ✓`/`Quota exhausted ⚠️`/`PR too large 📦`/`Could not review ❌`/`Polish-only 🧹`; `Could not review ❌` is
+per-round — it marks the round whose review attempt errored, and a later round where that
+reviewer is no longer re-requested shows `Not requested 🙅`). A reviewer that *never* posts
 across the run points at an
 incomplete prerequisite setup: the vendor GitHub app / plan may not be installed,
 or for an `auto_on_open: true` bot "review on PR opened" may be off for this repo.

@@ -285,9 +285,25 @@ def test_errored_comeback_only_on_substantive_strictly_newer():
     assert not driver.store.is_excluded("claude")  # came back
 
 
-def test_errored_no_comeback_on_non_substantive_newer_comment():
-    # A newer COSMETIC/OUTDATED/INVALID comment is NOT proof of recovery.
-    for label in ("COSMETIC", "INVALID", "OUTDATED"):
+def test_errored_comeback_on_cosmetic_newer_comment():
+    # A newer COSMETIC comment IS proof of recovery — a cosmetic finding proves
+    # the bot produced review output, exactly as a substantive one does.
+    timeline = [
+        (0, Comment(id="a", text="I encountered an internal error while reviewing.",
+                    source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
+        (30, Comment(id="b", text="nit: trailing whitespace here",
+                     source="claude[bot]", created_at="2026-06-10T00:05:00Z")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=TWO_BOTS,
+                                    classify=label_runner("COSMETIC"))
+    driver.run()
+    assert not driver.store.is_excluded("claude")  # came back
+
+
+def test_errored_no_comeback_on_non_review_output_newer_comment():
+    # A newer OUTDATED/INVALID comment is NOT proof of recovery — only review
+    # output (SUBSTANTIVE / COSMETIC) retracts.
+    for label in ("INVALID", "OUTDATED"):
         timeline = [
             (0, Comment(id="a", text="I encountered an internal error while reviewing.",
                         source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
@@ -300,9 +316,27 @@ def test_errored_no_comeback_on_non_substantive_newer_comment():
         assert driver.store.is_excluded("claude"), f"label={label}"
 
 
-def test_errored_no_comeback_on_equal_missing_or_unparseable_timestamp():
-    # Equal / missing / unparseable → stay excluded, conservatively.
-    for second_stamp in ("2026-06-10T00:00:00Z", None, "N/A", "yesterday"):
+def test_errored_comeback_on_equal_stamp_same_review():
+    # An EQUAL stamp retracts: a review submission stamps its body and inline
+    # comments with the same created_at, so equal-stamp review output from the
+    # same bot is same-review evidence — the review that carried the false
+    # error signal also carried real output.
+    timeline = [
+        (0, Comment(id="a", text="I encountered an internal error while reviewing.",
+                    source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
+        (30, Comment(id="b", text="this null check is missing",
+                     source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=TWO_BOTS,
+                                    classify=label_runner("SUBSTANTIVE"))
+    driver.run()
+    assert not driver.store.is_excluded("claude")  # equal stamp → came back
+
+
+def test_errored_no_comeback_on_older_missing_or_unparseable_timestamp():
+    # Strictly-older / missing / unparseable → stay excluded, conservatively
+    # (an old comment posted BEFORE the error proves nothing about recovery).
+    for second_stamp in ("2026-06-09T23:59:59Z", None, "N/A", "yesterday"):
         timeline = [
             (0, Comment(id="a", text="I encountered an internal error while reviewing.",
                         source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
@@ -315,6 +349,119 @@ def test_errored_no_comeback_on_equal_missing_or_unparseable_timestamp():
         assert driver.store.is_excluded("claude"), f"stamp={second_stamp!r}"
 
 
+# --- record-time completed-review check: a body that IS review output must
+# never be recorded as an errored placeholder in the first place ------------
+# These call _classify_signal directly (not via run()) so the assertions pin
+# the RECORD-TIME decision itself — an end-to-end run would let the errored
+# comeback retract a wrongly-recorded signal and mask a record-time bug.
+
+
+def test_inline_finding_never_records_errored():
+    # An INLINE comment (path set) whose text trips the errored regex is a
+    # finding about the reviewed code, not a placeholder — it must flow to the
+    # kernel as actionable, and the bot must stay un-excluded.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    c = Comment(id="a",
+                text="The review process encountered an error here when the "
+                     "token is stale — handle that case.",
+                source="claude[bot]", created_at="2026-06-10T00:00:00Z",
+                path="src/auth.py")
+    assert driver._classify_signal(c, 0.0) == "claude"   # actionable
+    assert not driver.store.is_excluded("claude")
+    assert driver._bot_state("claude").error_created_at is None
+
+
+def test_review_body_with_same_submission_findings_never_records_errored():
+    # A review body that trips the errored regex but lands in the SAME fetch
+    # batch as a SAME-INSTANT inline finding from the same bot is a completed
+    # review's summary — the submission demonstrably produced output, so no
+    # errored signal is recorded.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    body = Comment(id="a", text="Failed to generate a review? No — see the "
+                                "inline notes.",
+                   source="claude[bot]", created_at="2026-06-10T00:00:00Z")
+    stamps = {"claude": ["2026-06-10T00:00:00Z"]}
+    assert driver._classify_signal(body, 0.0, batch_finding_stamps=stamps) == "claude"
+    assert not driver.store.is_excluded("claude")
+
+
+def test_stale_batch_findings_never_shield_a_new_placeholder():
+    # Round 1's first poll ingests the PR's WHOLE history, so a days-old
+    # inline finding rides the same batch as a genuinely new placeholder —
+    # it proves nothing about the new failure and must not shield it.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    ph = Comment(id="a", text="I encountered an internal error while reviewing.",
+                 source="claude[bot]", created_at="2026-06-10T00:00:00Z")
+    stamps = {"claude": ["2026-06-08T00:00:00Z"]}  # two days older
+    assert driver._classify_signal(ph, 0.0, batch_finding_stamps=stamps) is None
+    assert driver.store.is_excluded("claude")
+
+
+def test_other_bots_findings_never_shield_a_placeholder():
+    # The shield is per-bot: bot A's inline finding says nothing about bot B.
+    driver, clock, gh = make_driver([], cfg=TWO_BOTS)
+    ph = Comment(id="a", text="I encountered an internal error while reviewing.",
+                 source="claude[bot]", created_at="2026-06-10T00:00:00Z")
+    stamps = {"copilot": ["2026-06-10T00:00:00Z"]}
+    assert driver._classify_signal(ph, 0.0, batch_finding_stamps=stamps) is None
+    assert driver.store.is_excluded("claude")
+
+
+def test_shielded_errored_body_with_clean_phrasing_not_approved():
+    # A review body that trips the errored regex AND contains "no issues found"
+    # phrasing, shielded by a same-instant inline finding, must NOT be promoted
+    # to clean-approved. The bot errored; its inline findings are the actual
+    # review output. Crowning it "Approved" would satisfy the merge gate even
+    # though nobody truly reviewed the PR.
+    driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+    body = Comment(
+        id="a",
+        text="I encountered an internal error while reviewing some files. "
+             "No issues found in the rest.",
+        source="claude[bot]",
+        created_at="2026-06-10T00:00:00Z",
+    )
+    stamps = {"claude": ["2026-06-10T00:00:00Z"]}
+    result = driver._classify_signal(body, 0.0, batch_finding_stamps=stamps)
+    assert result == "claude"           # shielded → actionable, not suppressed
+    assert not driver.store.is_excluded("claude")  # not recorded as errored
+    assert "claude" not in driver.done      # NOT promoted to done
+    assert "claude" not in driver.approved  # NOT clean-approved
+
+
+def test_failure_placeholder_with_zero_output_phrasing_records_errored():
+    # "The review run failed; no comments were posted." — the zero-output
+    # sentence is the FAILURE's own consequence, not an all-clear. Clean-review
+    # phrasing inside an errored-matching body must NOT shield the signal: a
+    # failed reviewer crowned "Approved" would satisfy the never-merge-
+    # unreviewed gate and auto-merge a PR nobody reviewed.
+    for text in (
+        "The review run failed; no comments were posted.",
+        "Review run failed — no comments were generated.",
+    ):
+        timeline = [(0, Comment(id="a", text=text, source="claude[bot]",
+                                created_at="2026-06-10T00:00:00Z"))]
+        driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY)
+        driver.run()
+        assert driver.store.is_excluded("claude"), text
+        assert "claude" not in driver.done, text
+        assert "claude" not in driver.approved, text
+        assert "claude" not in driver.reviewed_ever, text
+
+
+def test_real_error_placeholder_still_records_errored():
+    # A genuine placeholder (no findings, no inline path) still records the
+    # errored exclusion — the record-time check narrows what COUNTS as
+    # errored, it does not disable the detector.
+    timeline = [
+        (0, Comment(id="a", text="I encountered an internal error while reviewing.",
+                    source="claude[bot]", created_at="2026-06-10T00:00:00Z")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY)
+    driver.run()
+    assert driver.store.is_excluded("claude")
+
+
 def test_strictly_newer_helper():
     from buddhi_review.round_driver import _strictly_newer
     assert _strictly_newer("2026-06-10T00:05:00Z", "2026-06-10T00:00:00Z")
@@ -323,6 +470,18 @@ def test_strictly_newer_helper():
     assert not _strictly_newer("N/A", "2026-06-10T00:00:00Z")                   # unparseable
     # mixed offsets must compare by instant, not lexicographically
     assert not _strictly_newer("2026-06-10T00:00:00+00:00", "2026-06-10T00:00:00Z")
+
+
+def test_same_instant_helper():
+    from buddhi_review.round_driver import _same_instant
+    assert _same_instant("2026-06-10T00:00:00Z", "2026-06-10T00:00:00Z")
+    # mixed offsets compare by instant, not lexicographically
+    assert _same_instant("2026-06-10T00:00:00+00:00", "2026-06-10T00:00:00Z")
+    assert not _same_instant("2026-06-10T00:05:00Z", "2026-06-10T00:00:00Z")
+    assert not _same_instant(None, "2026-06-10T00:00:00Z")   # missing
+    assert not _same_instant("N/A", "2026-06-10T00:00:00Z")  # unparseable
+    # a naive stamp never equals an aware one (conservative: stays excluded)
+    assert not _same_instant("2026-06-10T00:00:00", "2026-06-10T00:00:00Z")
 
 
 def test_human_comments_never_drive_bot_state():
@@ -895,19 +1054,191 @@ def test_reviewer_with_a_real_finding_is_not_polished():
     )
     driver.run()
     assert "claude" not in driver.polishing
+    assert "claude" not in driver.reviewed_no_change  # a FIXED finding survives
+
+
+# ---------------------------------------------------------------------------
+# Reviewed — no change: a dismissed-substantive reviewer is dropped with its
+# own label (never the polish mislabel) and never re-asked this run
+# ---------------------------------------------------------------------------
+
+def test_dismissed_substantive_reviewer_is_reviewed_no_change(capsys):
+    # copilot's substantive finding is dismissed by the fixer (skip — judged
+    # invalid / already-fixed → final "skipped-invalid", NO change applied):
+    # it renders "Reviewed — no change" and is dropped from re-request, while
+    # claude's FIXED finding drives round 2 exactly as today.
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": False}}
+
+    def classify(prompt):
+        return json.dumps({"label": "SUBSTANTIVE", "reason": "t"})
+
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+        (0, Comment(id="b", text="this validation is wrong", source="copilot[bot]")),
+        (90, Comment(id="c", text="No issues found.", source="claude[bot]")),
+    ]
+
+    def fix(c, r):
+        if c.id == "b":
+            return FixOutcome(status="skipped", detail="already handled upstream")
+        return FixOutcome(status="applied")
+
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=classify, fix=fix,
+        max_rounds=3, answer_waiter=lambda esc, **k: {},
+    )
+    driver.run()
+    out = capsys.readouterr().out
+    # The demotion: its own set + its own log line, never the polish bucket.
+    assert "copilot" in driver.reviewed_no_change
+    assert "copilot" not in driver.polishing
+    assert ("[round] → excluding copilot from subsequent rounds this run "
+            "(reviewed — no change: every finding dismissed on "
+            "reassessment)") in out
+    # Anti-loop: copilot is summoned round 1 only, never re-asked.
+    assert len(gh.matching("requested_reviewers")) == 1
+    assert len(gh.matching("@claude review")) == 2       # claude re-asked as today
+    # The SAME round's table already shows the terminal label, not "Active",
+    # and never the polish mislabel.
+    copilot_rows = [ln for ln in out.splitlines()
+                    if ln.startswith("│") and " Copilot" in ln]
+    assert copilot_rows and all("Reviewed — no change" in ln for ln in copilot_rows)
+    assert all("Polish-only" not in ln for ln in copilot_rows)
+
+
+def test_mixed_dismissed_substantive_and_cosmetic_is_reviewed_no_change(capsys):
+    # A reviewer whose substantive finding was dismissed AND whose cosmetic nit
+    # was applied lands in reviewed-no-change (the dismissed-substantive signal
+    # outranks plain polish — mirroring the reassessed-away precedence).
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": False}}
+
+    def classify(prompt):
+        label = "COSMETIC" if "nit:" in prompt else "SUBSTANTIVE"
+        return json.dumps({"label": label, "reason": "t"})
+
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="copilot[bot]")),
+        (0, Comment(id="b", text="nit: rename tmp", source="copilot[bot]")),
+    ]
+
+    def fix(c, r):
+        if c.id == "a":
+            return FixOutcome(status="rejected", detail="fix-verify REJECT")
+        return FixOutcome(status="applied")
+
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=classify, fix=fix,
+        max_rounds=3, answer_waiter=lambda esc, **k: {},
+    )
+    driver.run()
+    out = capsys.readouterr().out
+    assert "copilot" in driver.reviewed_no_change
+    assert "copilot" not in driver.polishing
+    row1 = next(ln for ln in out.splitlines()
+                if ln.startswith("│") and " Copilot" in ln)
+    assert "Reviewed — no change" in row1 and "Polish-only" not in row1
+
+
+def test_failed_fix_escalation_keeps_reviewer_engaged():
+    # A fix that FAILED (→ escalated) is not a dismissal — the comment is still
+    # pending, so the reviewer stays in the re-request gate. copilot's LANDED
+    # substantive fix drives round 2, where claude must be re-asked.
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": False}}
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+        (0, Comment(id="b", text="this validation is wrong", source="copilot[bot]")),
+        (90, Comment(id="c", text="No issues found.", source="claude[bot]")),
+        (91, Comment(id="d", text="No issues found.", source="copilot[bot]")),
+    ]
+
+    def fix(c, r):
+        if c.id == "a":
+            return FixOutcome(status="transient-failed", detail="x")
+        return FixOutcome(status="applied")
+
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        max_rounds=3, answer_waiter=lambda esc, **k: {"fix-a": "1"},
+    )
+    driver.run()
+    assert "claude" not in driver.reviewed_no_change
+    assert "claude" not in driver.polishing
+    assert len(gh.matching("@claude review")) == 2       # re-asked in round 2
+
+
+def test_deferred_fix_keeps_reviewer_engaged():
+    # Decision-only run (no fixer wired): the substantive comment is deferred,
+    # not dismissed — the reviewer is never demoted and stays in the expected
+    # set (its row reads "Active", not a terminal drop label).
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=None,
+        answer_waiter=lambda esc, **k: {},
+    )
+    driver.run()
+    assert "claude" not in driver.reviewed_no_change
+    assert "claude" not in driver.polishing
+    assert "claude" in driver.expected_bots()            # still engaged
+
+
+def test_clean_approval_survives_a_later_quota_placeholder(capsys):
+    # End-to-end: claude posts "No issues found." and THEN a quota placeholder
+    # in the same round. The placeholder overwrites the clean signal, but the
+    # sticky approval keeps the label "Approved" — never the promotion's
+    # "Reviewed — no findings" (the sign-off already happened).
+    cfg = {"active_reviewers": ["claude", "gemini"],
+           "auto_on_open": {"claude": False, "gemini": True}}
+    timeline = [
+        (0, Comment(id="ok", text="No issues found.", source="claude[bot]",
+                    created_at="2026-07-01T00:00:00Z")),
+        # gemini stays silent, holding the round open past the placeholder.
+        (30, Comment(id="q", text="Rate limit exceeded for this model.",
+                     source="claude[bot]", created_at="2026-07-01T00:00:30Z")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=cfg)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "claude" in driver.approved and "claude" in driver.done
+    row1 = next(ln for ln in out.splitlines()
+                if ln.startswith("│") and " Claude" in ln)
+    assert "Approved" in row1
+    assert "Reviewed — no findings" not in row1
+
+
+def test_same_round_table_shows_polish_only(capsys):
+    # The demotions land BEFORE the table renders: a cosmetic-only reviewer's
+    # own round already reads "Polish-only", not a stale "Active".
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": False}}
+    timeline = [(0, Comment(id="b", text="nit: rename tmp", source="copilot[bot]"))]
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=label_runner("COSMETIC"), fix=fix,
+        max_rounds=3, answer_waiter=lambda esc, **k: {},
+    )
+    driver.run()
+    out = capsys.readouterr().out
+    row1 = next(ln for ln in out.splitlines()
+                if ln.startswith("│") and " Copilot" in ln)
+    assert "Polish-only" in row1 and "Active" not in row1
 
 
 def test_rr_clears_soft_exclusions_but_keeps_hard_buckets():
-    # --rr re-pings everyone: the soft buckets (voluntarily-done + polish) are
-    # cleared at run start so a previously-satisfied reviewer is summoned again; a
-    # hard bucket (quota) survives.
+    # --rr re-pings everyone: the soft buckets (voluntarily-done + polish +
+    # reviewed-no-change) are cleared at run start so a previously-satisfied
+    # reviewer is summoned again; a hard bucket (quota) survives.
     driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY, rr=True)
     driver.done.add("claude")               # a stale voluntarily-done…
-    driver.polishing.add("claude")          # …and a stale polish drop
+    driver.polishing.add("claude")          # …a stale polish drop…
+    driver.reviewed_no_change.add("claude")  # …and a stale no-change drop
     driver.store.exclude_quota("copilot")   # a HARD bucket that must survive
     driver.run()
     assert "claude" not in driver.done          # soft buckets cleared by --rr
     assert "claude" not in driver.polishing
+    assert "claude" not in driver.reviewed_no_change
     assert driver.store.is_excluded("copilot")  # hard bucket untouched
     assert gh.matching("@claude review")        # claude summoned (soft exclusion cleared)
 

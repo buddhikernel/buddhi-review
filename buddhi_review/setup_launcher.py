@@ -332,7 +332,7 @@ def main(argv=None):
             result["strategy"], f"a new terminal window ({result['strategy']})")
         print(f"Opened the buddhi-review setup wizard in {where}.")
         print("Complete the steps there — this session stays active. When the "
-              "wizard finishes, re-run /review-pr or /create-pr.")
+              "wizard finishes, re-run /review-pr or /open-pr.")
     # The headless fallback already printed instructions; exit 0 either way.
     return 0
 

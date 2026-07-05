@@ -139,8 +139,8 @@ def test_scanner_catches_paid_monolith_modules(mod):
 
 def test_free_module_names_not_flagged():
     """The legit free modules must NOT trip the paid-monolith scan (no over-reach
-    onto free's own create_pr / merge / config / loop / notifier / status_code)."""
-    for legit in ("from buddhi_review import create_pr",
+    onto free's own open_pr / merge / config / loop / notifier / status_code)."""
+    for legit in ("from buddhi_review import open_pr",
                   "import buddhi_review.merge",
                   "from buddhi_review import config, loop, notifier",
                   "resp.status_code == 200",

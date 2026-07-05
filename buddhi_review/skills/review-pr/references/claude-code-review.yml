@@ -1,4 +1,4 @@
-# buddhi-managed-version: 1
+# buddhi-managed-version: 2
 # ^ Buddhi tracks this file's version so `review-pr setup` can offer to update an
 #   outdated installed copy (the old one stays in the update PR's git history).
 name: Claude Code Review
@@ -272,4 +272,104 @@ jobs:
             exit 1
           fi
           echo "No Claude authentication failure detected."
+          exit 0
+
+      # Surface a usage-limit silence as a machine-readable PR marker comment.
+      # A rate-limited Claude run (subscription 5-hour/weekly window exhausted,
+      # or Agent-SDK credit balance empty) dies in <1s with is_error:true and
+      # ZERO comments posted, while the action still concludes `success` — on
+      # the PR it is indistinguishable from a misconfigured reviewer, and the
+      # local review loop burned its full silent-review window on exactly this.
+      # This step greps the execution file for the two usage-limit signatures
+      # and posts ONE marker comment the loop parses:
+      #   <!-- claude-review-unavailable-v1 type=rate_limited resets_at=<epoch> -->
+      #   <!-- claude-review-unavailable-v1 type=credits_exhausted -->
+      # The loop releases Claude from its wait immediately, labels the round
+      # "Rate-limited", and re-summons Claude in the first round after
+      # resets_at passes; resets_at comes from the SDK's rejected
+      # rate_limit_event.rate_limit_info.resetsAt epoch, and when it is absent
+      # resets_at=0 and the loop retries Claude next round instead of timing it.
+      #
+      # The comment authenticates as github-actions[bot] — deliberately NOT a
+      # claude[bot] review signal (the loop's bot_key never maps it to claude,
+      # so it can never read as a posted review or a clean sentinel); it is a
+      # side-channel marker only. Fail-safe toward silence: every guard exits 0
+      # and the posting itself is best-effort, so this step can never turn a
+      # clean review red or break the run in a third-party repo (it is copied
+      # verbatim, self-contained, no repo files).
+      - name: Surface a Claude usage-limit silence on the PR
+        if: always()
+        shell: bash
+        env:
+          CLAUDE_EXECUTION_FILE: ${{ steps.claude_review.outputs.execution_file }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.issue.number || github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -uo pipefail
+          f="${CLAUDE_EXECUTION_FILE:-}"
+          if [ -z "$f" ] || [ ! -s "$f" ]; then
+            echo "No Claude execution file to inspect — nothing to surface."
+            exit 0
+          fi
+          if ! command -v jq >/dev/null 2>&1; then
+            echo "jq unavailable — skipping the usage-limit surface check."
+            exit 0
+          fi
+          # A cleanly-successful run (result message with is_error:false) never
+          # gets a marker, even if limit-ish phrases appear in commentary or PR
+          # diff content — same clean-success gate as the auth tripwire above.
+          clean_success="$(jq -r 'any(.. | objects | select(.type == "result"); .is_error == false)' "$f" 2>/dev/null || echo false)"
+          if [ "$clean_success" = "true" ]; then
+            echo "Claude run completed cleanly — no usage-limit marker needed."
+            exit 0
+          fi
+          # Scope the text scan to SDK-emitted messages (result/assistant/system),
+          # never user messages, so tool_result bodies and diff content cannot
+          # fabricate a marker.
+          texts="$(jq -r '.. | objects | select(.type == "result" or .type == "assistant" or .type == "system") | (.result // empty), (.. | objects | .text // empty)' "$f" 2>/dev/null || true)"
+          # Only a REJECTED rate_limit_event proves the limit blocked this run.
+          # The SDK emits a rate_limit_event on EVERY rate-limit-info change (its
+          # rate_limit_info.status is one of allowed|allowed_warning|rejected),
+          # so essentially every run that made ≥1 API call carries a benign
+          # status:"allowed" event with a valid resetsAt for the CURRENT window.
+          # Gating on mere PRESENCE would mislabel any non-clean run that failed
+          # for an UNRELATED reason (API 500, tool crash) as rate_limited and
+          # mask the real error. Gate on status=="rejected"; the text-grep in
+          # the elif below still covers SDK shape drift.
+          has_rl_event="$(jq -r 'any(.. | objects | select(.type == "rate_limit_event"); .rate_limit_info.status == "rejected")' "$f" 2>/dev/null || echo false)"
+          marker=""
+          human=""
+          # Credit exhaustion first: if both signatures somehow appear, the
+          # terminal condition wins (a credit top-up is admin action; a window
+          # reset is not).
+          if grep -qiE 'credit balance is too low' <<<"$texts"; then
+            marker="<!-- claude-review-unavailable-v1 type=credits_exhausted -->"
+            human="⏳ Claude review unavailable — the Anthropic API credit balance is exhausted, so this run posted no review. Top up credits (or switch the repo secret back to a subscription token) to restore Claude reviews."
+          elif [ "$has_rl_event" = "true" ] || grep -qiE 'hit your (session|usage|weekly|5-hour) limit|(session|usage) limit reached' <<<"$texts"; then
+            # Take the REJECTED event's resetsAt — an earlier status:"allowed"
+            # event can carry a DIFFERENT window's reset (e.g. a five_hour
+            # allowed event preceding a seven_day rejection), and picking the
+            # first in document order would re-summon Claude against the wrong,
+            # earlier window. `first // 0` still degrades to 0 (unknown reset →
+            # next-round retry) when no rejected event carries a resetsAt.
+            resets_at="$(jq -r '[.. | objects | select(.type == "rate_limit_event" and .rate_limit_info.status == "rejected") | .rate_limit_info.resetsAt // empty] | map(select(. != null and . != "")) | first // 0' "$f" 2>/dev/null || echo 0)"
+            case "$resets_at" in (*[!0-9]*|'') resets_at=0;; esac
+            if [ "$resets_at" -gt 0 ]; then
+              when="$(date -u -d "@$resets_at" '+%H:%M UTC on %Y-%m-%d' 2>/dev/null || date -u -r "$resets_at" '+%H:%M UTC on %Y-%m-%d' 2>/dev/null || echo 'the window reset')"
+            else
+              when="the window reset"
+            fi
+            marker="<!-- claude-review-unavailable-v1 type=rate_limited resets_at=${resets_at} -->"
+            human="⏳ Claude review unavailable — the Claude subscription usage window is exhausted (resets at ${when}), so this run posted no review."
+          else
+            echo "No usage-limit signature in the Claude execution output."
+            exit 0
+          fi
+          # Best-effort post; a failure here must never fail the check.
+          if gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$(printf '%s\n%s' "$marker" "$human")"; then
+            echo "Posted usage-limit marker: $marker"
+          else
+            echo "Could not post the usage-limit marker comment (non-fatal)."
+          fi
           exit 0

@@ -28,7 +28,11 @@ The rule tables and the pure scan helpers are imported by the pytest suite
 exactly one definition. ``tools/`` and ``tests/`` are deliberately NOT part of
 the scanned product surface: they are the gate's own scaffolding and enumerate
 the forbidden vocabulary as assertion literals by design (and never reach the
-installed wheel — only ``buddhi_review/`` does).
+installed wheel — only ``buddhi_review/`` does). The fast source-surface
+pre-check (``tests/test_oss_purity.py``) separately covers ``tests/**/*.py``
+and the root/docs markdown with a per-file scaffolding allowlist, so the
+public-repo-only files get the same scan without tripping on the gate's own
+vocabulary literals.
 """
 from __future__ import annotations
 
@@ -70,10 +74,15 @@ _FORBIDDEN_SUBSTR = (
 #                        glue "oob" to a word char so ``\boob\b`` never matches
 #                        them, and the prose "OOB source"/"Signaled-OOB" is
 #                        scrubbed via _KERNEL_SEAM_ALLOWLIST before this runs.
+#   mono               — the private reference tree's internal label; a bare
+#                        "MONO" cross-reference in a comment is a private-tree
+#                        leak. Whole-word so ``monotonic`` / ``monospace`` /
+#                        "monolith" never trip (``_`` is a word char, so glued
+#                        identifiers don't match either).
 # (``dashboard_server`` / ``dashboard_refresh`` are covered by the ``dashboard_``
 # family stem in _PAID_MODULE_NAMES below.)
 _FORBIDDEN_WORD = (
-    "review_loop", "app1", "app2", "oob",
+    "review_loop", "app1", "app2", "oob", "mono",
 )
 # ``stage0`` / ``Stage-0`` are matched as substrings *after* the kernel-seam
 # scrub. The only legitimate free uses — the ``buddhi.stage0.conditioning``

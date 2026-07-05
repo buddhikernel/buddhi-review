@@ -7,7 +7,7 @@ description: >
 when_to_use: >
   When the user asks to review an open PR, run the bot review loop, or merge a PR
   after automated review. Also handles `/review-pr setup`.
-argument-hint: "[pr-number] [owner/repo] [--rr|--rr-active]"
+argument-hint: "[pr-number] [owner/repo] [--rr|--rr-active|--rr-none]"
 arguments:
   - $pr
   - $repo
@@ -58,6 +58,8 @@ Decisions the loop needs from you are surfaced as **clearance requests**
     look again.
   - `--rr-active` — round 1 re-requests only bots still actively engaged; exits
     cleanly if none remain. The usual choice after resolving a business question.
+  - `--rr-none` — skips re-requesting reviews entirely; resolves any existing
+    review comments and merges. Use when no new review round is needed.
 
 ### Clearance requests (business questions) are answered from your terminal
 
@@ -197,7 +199,7 @@ Run the launcher command — it returns immediately, so this is safe to run in t
 foreground:
 
 ```bash
-python3 -m buddhi_review review-pr <PR_NUMBER> --repo "$OWNER_REPO" --cwd "$TARGET_CWD" [--rr or --rr-active if the user passed it]
+python3 -m buddhi_review review-pr <PR_NUMBER> --repo "$OWNER_REPO" --cwd "$TARGET_CWD" [--rr or --rr-active or --rr-none if the user passed it]
 ```
 
 This is the front door: it selects the review engine, **detaches the loop** (so the

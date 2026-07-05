@@ -40,20 +40,20 @@ pip install buddhi-review
 
 This pulls the kernel ([`buddhikernel`](https://github.com/buddhikernel/buddhi)) and
 `PyYAML`, and installs the `buddhi-review` command. The package also includes two
-Claude Code skills: `/review-pr`, which reviews an open PR, and `/create-pr`, which
+Claude Code skills: `/review-pr`, which reviews an open PR, and `/open-pr`, which
 opens and then reviews a PR. They are included in the package but are not added to
 Claude Code automatically. Install them by copying each skill to
 `~/.claude/skills/<name>/SKILL.md`:
 
 <details>
-<summary><b>Install the /review-pr and /create-pr skills</b></summary>
+<summary><b>Install the /review-pr and /open-pr skills</b></summary>
 
 ```bash
 SKILLS=$(python3 -c "import buddhi_review, os; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'skills'))" 2>/dev/null)
 if [ -d "$SKILLS" ]; then
   mkdir -p ~/.claude/skills/
-  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/create-pr
-  cp -R "$SKILLS"/review-pr "$SKILLS"/create-pr ~/.claude/skills/
+  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/open-pr ~/.claude/skills/create-pr
+  cp -R "$SKILLS"/review-pr "$SKILLS"/open-pr ~/.claude/skills/
   echo "✓ Skills installed to ~/.claude/skills/ — restart Claude Code to load them"
 else
   echo "✗ Error: Could not locate buddhi_review skills. Ensure buddhi-review is installed in the active Python environment."
@@ -145,7 +145,7 @@ check still ends with `SELF-CHECK OK`.
 /review-pr <pr>
 
 # 4. Open a PR from your local work and review it in one step.
-/create-pr
+/open-pr
 ```
 
 To drive the CLI directly or detach the loop as a background process, see

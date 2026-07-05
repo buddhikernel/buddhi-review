@@ -70,7 +70,7 @@ def _init_clone(tmp_path):
     return bare, work
 
 
-def _branch_with_mismatched_upstream(work, branch="feat/cockpit",
+def _branch_with_mismatched_upstream(work, branch="feat/compass",
                                      upstream="old-base", commit=True):
     """Create `branch` whose configured upstream is the DIFFERENTLY-NAMED (and,
     since `upstream` is never created on origin, DANGLING) `origin/<upstream>`.
@@ -88,9 +88,9 @@ def _branch_with_mismatched_upstream(work, branch="feat/cockpit",
 def test_push_argv_explicit_when_upstream_remote_configured(tmp_path):
     _, work = _init_clone(tmp_path)
     _branch_with_mismatched_upstream(work)
-    assert commit_push._resolve_push_target(str(work)) == ("origin", "feat/cockpit")
+    assert commit_push._resolve_push_target(str(work)) == ("origin", "feat/compass")
     assert commit_push._push_argv(str(work)) == [
-        "git", "push", "origin", "HEAD:refs/heads/feat/cockpit"]
+        "git", "push", "origin", "HEAD:refs/heads/feat/compass"]
 
 
 def test_explicit_refspec_push_succeeds_over_mismatched_dangling_upstream(tmp_path):
@@ -110,7 +110,7 @@ def test_explicit_refspec_push_succeeds_over_mismatched_dangling_upstream(tmp_pa
 
     # …and the branch landed on origin under its OWN name at the local SHA.
     landed = _git_rc(work, "ls-remote", "origin",
-                     "refs/heads/feat/cockpit").stdout.split()
+                     "refs/heads/feat/compass").stdout.split()
     assert landed and landed[0] == _rev(work, "HEAD")
 
 
@@ -123,7 +123,7 @@ def test_commit_and_push_uses_explicit_refspec_end_to_end(tmp_path):
         str(work), message="fix: round 1", test_gate=False, notice=_silent)
     assert out == "pushed"
     landed = _git_rc(work, "ls-remote", "origin",
-                     "refs/heads/feat/cockpit").stdout.split()
+                     "refs/heads/feat/compass").stdout.split()
     assert landed and landed[0] == _rev(work, "HEAD")
 
 

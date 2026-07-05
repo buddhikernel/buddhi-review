@@ -58,7 +58,7 @@ buddhi-review = "buddhi_review.cli:main"
 # Review-loop backends are discovered through this generic entry-points group; the
 # front-door dispatcher runs the highest-priority active one (else the free engine).
 # The skill ships only the free backend. A separately-installed package may register
-# its own backend under the same group to take over /review-pr and /create-pr.
+# its own backend under the same group to take over /review-pr and /open-pr.
 [project.entry-points."buddhi_review.backends"]
 free = "buddhi_review.backends:FreeBackend"
 

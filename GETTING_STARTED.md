@@ -38,8 +38,8 @@ to its skills directory:
 SKILLS=$(python3 -c "import buddhi_review, os; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'skills'))" 2>/dev/null)
 if [ -d "$SKILLS" ]; then
   mkdir -p ~/.claude/skills/
-  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/create-pr
-  cp -R "$SKILLS"/review-pr "$SKILLS"/create-pr ~/.claude/skills/
+  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/open-pr ~/.claude/skills/create-pr
+  cp -R "$SKILLS"/review-pr "$SKILLS"/open-pr ~/.claude/skills/
   echo "✓ Skills installed to ~/.claude/skills/ — restart Claude Code to load them"
 else
   echo "✗ Error: Could not locate buddhi_review skills. Ensure buddhi-review is installed in the active Python environment."
@@ -167,7 +167,7 @@ Two entry points:
 /review-pr <pr>
 
 # …or open a PR from your current branch and review it in one step:
-/create-pr
+/open-pr
 ```
 
 Both commands launch the review loop as a detached process and immediately return
@@ -203,10 +203,12 @@ log from line 1 in a new terminal. The log basename carries the repo name (`<rep
 the part after `/` in `owner/repo`), so reviewing the same PR number in two different
 repos never writes to the same file.
 
-Each round prints a summary table, one row per enabled reviewer, showing what each
-reviewer posted and its current status — `reviewed`, `active`, `done`, `quota`,
-`PR too large`, `errored`, `polishing`, `silent (dropped)`, `excluded`, or
-`not configured (repo)`:
+Each round prints a summary table — one row per enabled reviewer plus any other that
+posted, shown for completeness — with what each reviewer posted and its status:
+`Active ✅`, `Approved 👍`, `Reviewed — no findings ✓`, `Reviewed — no change ✓`,
+`Polish-only 🧹`, `Quota exhausted ⚠️`, `PR too large 📦`, `Could not review ❌`,
+`No review posted 🔇`, `Not configured (repo) 🔧`, `Not requested 🙅`, or the internal
+fallback `excluded`:
 
 ```text
 Round 1 of 10 summary

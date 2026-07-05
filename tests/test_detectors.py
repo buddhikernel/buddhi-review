@@ -561,6 +561,250 @@ def test_quota_gate_no_pr_context_is_deterministic():
 
 
 # ---------------------------------------------------------------------------
+# Per-cause second-pass on a PR whose own subject carries a cause's vocabulary
+# — pr-too-large and errored are gated exactly like quota. A PR that
+# standardizes review-status labels quotes every placeholder string literally
+# ("Could not review ❌", "Quota exhausted ⚠️", "PR too large to review"), and a
+# healthy reviewer's overview of it echoes them; that echo must never
+# hard-exclude the reviewer.
+# ---------------------------------------------------------------------------
+
+_LABELS_PR_TITLE = "Adopt the canonical round-summary label set"
+_LABELS_PR_BODY = ("Renames the reviewer statuses to Could not review ❌, "
+                   "Quota exhausted ⚠️, and PR too large to review; the errored "
+                   "placeholder wording changes accordingly.")
+# Healthy reviewer bodies that merely QUOTE / DESCRIBE that vocabulary yet trip
+# the deterministic cause regexes (verified against the shipped patterns).
+_TOO_LARGE_ECHO = ("This PR renames the size-refusal status to PR too large "
+                   "to review and keeps the wording consistent.")
+_ERRORED_ECHO = ("The review run failed wording is replaced by the new "
+                 "Could not review label across the round summary.")
+
+
+def test_pr_too_large_gate_suppresses_label_echo():
+    assert detectors.detect_signal(
+        _TOO_LARGE_ECHO, quota_llm=lambda p: {"self_reporting": False},
+        pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY) is None
+
+
+def test_errored_gate_suppresses_label_echo():
+    assert detectors.detect_signal(
+        _ERRORED_ECHO, quota_llm=lambda p: {"self_reporting": False},
+        pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY) is None
+
+
+def test_gates_keep_exclusion_when_self_reporting():
+    # The model says the bot is reporting ITS OWN failure → the signal stands.
+    assert detectors.detect_signal(
+        _TOO_LARGE_ECHO, quota_llm=lambda p: {"self_reporting": True},
+        pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY
+    ) == detectors.SIGNAL_PR_TOO_LARGE
+    assert detectors.detect_signal(
+        _ERRORED_ECHO, quota_llm=lambda p: {"self_reporting": True},
+        pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY
+    ) == detectors.SIGNAL_ERRORED
+
+
+def test_gates_fail_open_on_model_error():
+    # An unreachable / unparseable model keeps the exclusion (fail-open) — a
+    # glitchy gate must never swallow a real placeholder signal.
+    for llm in (lambda p: None, lambda p: {"self_reporting": "maybe"}):
+        assert detectors.detect_signal(
+            _TOO_LARGE_ECHO, quota_llm=llm,
+            pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY
+        ) == detectors.SIGNAL_PR_TOO_LARGE, llm
+        assert detectors.detect_signal(
+            _ERRORED_ECHO, quota_llm=llm,
+            pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY
+        ) == detectors.SIGNAL_ERRORED, llm
+
+
+def test_gates_do_not_fire_on_unrelated_pr():
+    # PR subject carries none of the cause vocabulary → no second-pass, no
+    # model call, deterministic verdict.
+    def explode(prompt):
+        raise AssertionError("gate ran on a PR that is not about the cause")
+    assert detectors.detect_signal(
+        _TOO_LARGE_ECHO, quota_llm=explode,
+        pr_title="Refactor the button component", pr_body="cosmetic tidy-up"
+    ) == detectors.SIGNAL_PR_TOO_LARGE
+    assert detectors.detect_signal(
+        _ERRORED_ECHO, quota_llm=explode,
+        pr_title="Refactor the button component", pr_body="cosmetic tidy-up"
+    ) == detectors.SIGNAL_ERRORED
+
+
+def test_gates_no_pr_context_is_deterministic():
+    def explode(prompt):
+        raise AssertionError("gate ran without PR context")
+    assert detectors.detect_signal(
+        _TOO_LARGE_ECHO, quota_llm=explode) == detectors.SIGNAL_PR_TOO_LARGE
+    assert detectors.detect_signal(
+        _ERRORED_ECHO, quota_llm=explode) == detectors.SIGNAL_ERRORED
+
+
+def test_real_placeholders_still_classify_on_a_labels_pr():
+    # On a label-vocabulary PR with the model reachable, a REAL placeholder is
+    # kept by the model's self-reporting verdict — the gate narrows what counts
+    # as detected, it does not disable detection.
+    assert detectors.detect_signal(
+        "This pull request is too large to review.",
+        quota_llm=lambda p: {"self_reporting": True},
+        pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY
+    ) == detectors.SIGNAL_PR_TOO_LARGE
+    assert detectors.detect_signal(
+        "I encountered an internal error while generating the review.",
+        quota_llm=lambda p: {"self_reporting": True},
+        pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY
+    ) == detectors.SIGNAL_ERRORED
+
+
+def test_cause_vocab_regexes_arm_on_the_canonical_labels():
+    # Each cause's arming regex matches its own canonical label string, so a
+    # label-set PR (whose body quotes all three) arms all three gates.
+    labels_text = ("Could not review ❌ / Quota exhausted ⚠️ / "
+                   "PR too large to review")
+    assert detectors.PR_QUOTA_VOCAB_RE.search(labels_text)
+    assert detectors.PR_TOO_LARGE_VOCAB_RE.search(labels_text)
+    assert detectors.PR_ERRORED_VOCAB_RE.search(labels_text)
+    # ... and none of them arms on an unrelated PR subject.
+    unrelated = "Refactor the button component for keyboard navigation"
+    assert not detectors.PR_QUOTA_VOCAB_RE.search(unrelated)
+    assert not detectors.PR_TOO_LARGE_VOCAB_RE.search(unrelated)
+    assert not detectors.PR_ERRORED_VOCAB_RE.search(unrelated)
+
+
+def test_quoted_error_vocabulary_never_matches_errored():
+    # Backticked / quoted / fenced error wording is documentary — it can never
+    # classify as errored, even with NO model wired (defense-in-depth UNDER the
+    # gate, so an unreachable model cannot re-open this false-positive class).
+    for msg in (
+        "The label `Review run failed` becomes `Could not review ❌`.",
+        'The old copy "Review run failed." is renamed in this PR.',
+        "The old copy 'Something went wrong while generating the review' is gone.",
+        "The status “Failed to generate a review” now reads differently.",
+    ):
+        assert detectors.detect_signal(msg) is None, msg
+    # An UNQUOTED real placeholder still classifies — the strip is span-scoped.
+    assert detectors.detect_signal(
+        'Review run failed. The error was "upstream timeout".'
+    ) == detectors.SIGNAL_ERRORED
+    # Apostrophes inside prose never pair into a bogus quoted span that would
+    # eat the placeholder text between them.
+    assert detectors.detect_signal(
+        "Copilot wasn't able to finish; the review run failed. It's transient."
+    ) == detectors.SIGNAL_ERRORED
+
+
+def test_real_475_overview_and_inline_never_classify_as_errored():
+    # Real payloads from the 2026-07-04 incident run (Copilot's genuine
+    # review of the PR that shipped these detector fixes): the overview
+    # quotes "Could not review ❌" in typographic quotes inside flowing PROSE
+    # and uses error-adjacent vocabulary ("errored-excluded",
+    # "transient-error detection") unquoted; the inline finding names the
+    # detector functions in backticks. Neither may classify as errored —
+    # the overview must not exclude the bot, and the inline finding must
+    # stay eligible as comeback evidence.
+    overview = (
+        "## Pull request overview\n\n"
+        "Fixes a reproduced false-positive exclusion incident where "
+        "genuine bot reviews were incorrectly classified as “Could not "
+        "review ❌”, by adding per-cause gating and strengthening "
+        "recovery/retraction logic.\n\n"
+        "**Changes:**\n"
+        "- Hardens transient-error detection by stripping quoted label "
+        "vocabulary before matching, and prevents “clean review” bodies "
+        "from being errored-excluded.\n"
+        "- Fixes errored retraction by accepting cosmetic evidence, adding "
+        "a placeholder-masquerade guard, and allowing same-timestamp "
+        "retraction when it’s provably the same review item.\n"
+    )
+    inline = (
+        "`is_transient_error_message` now always runs `_strip_quoted_vocab`, "
+        "which performs multiple regex substitutions over the full body. "
+        "This function is called in the poll/preflight hot paths for every "
+        "bot message, so doing the strip unconditionally can add avoidable "
+        "overhead when the body contains no quoting/fence markers (the "
+        "common case). Consider a quick delimiter check before stripping so "
+        "the extra regex work only happens when it can change the result."
+    )
+    assert detectors.detect_signal(overview) is None
+    assert detectors.detect_signal(inline) is None
+
+
+def test_quote_shield_is_errored_only():
+    # Quota / PR-too-large classify RAW text — quoted quota or size copy still
+    # classifies deterministically, and its protection is the per-cause gate,
+    # not the quote shield. Only the errored regex ignores fully-quoted
+    # matches (errored is the one cause whose exclusion an all-healthy bot's
+    # citation could trigger with NO gate armed on an unrelated PR).
+    assert detectors.detect_signal(
+        "The bot said `rate limit exceeded, try again in 2 hours` yesterday."
+    ) == detectors.SIGNAL_QUOTA
+    assert detectors.detect_signal(
+        'It replied "this pull request is too large to review" every time.'
+    ) == detectors.SIGNAL_PR_TOO_LARGE
+
+
+def test_real_placeholder_with_quoted_command_still_detected():
+    # A REAL placeholder often carries its only review-process anchor word
+    # inside a quoted retry command or workflow name. The quote shield checks
+    # match CONTAINMENT on the original text — it never deletes the spans — so
+    # these must still classify as errored.
+    for msg in (
+        "Gemini encountered an internal error. You can retry with `/gemini review`.",
+        'The "Claude Code Review" workflow encountered an internal error. '
+        "Check the Actions log for details.",
+        "Something went wrong. Trigger a new attempt with "
+        "`@gemini-code-assist review`.",
+    ):
+        assert detectors.detect_signal(msg) == detectors.SIGNAL_ERRORED, msg
+
+
+def test_quote_shield_never_creates_new_matches():
+    # The shield must not rewrite the text: a long quoted span between an
+    # error phrase and a review anchor keeps them apart exactly as in the raw
+    # body (a strip-and-rejoin would collapse the span and pull the anchor
+    # into the regex's proximity window, minting a match that never existed).
+    msg = ("The worker encountered an error '" + "x" * 100 +
+           "' during review generation.")
+    assert detectors.detect_signal(msg) is None
+
+
+def test_second_pass_prompts_are_cause_specific():
+    # Each cause's second-pass asks about ITS OWN failure — the prompt carries
+    # the cause-specific claim, the fail-open instruction, and inert fencing.
+    prompts = {}
+    def capture(cause):
+        def llm(p):
+            prompts[cause] = p
+            return {"self_reporting": False}
+        return llm
+    detectors.detect_signal(_QUOTA_ECHO, quota_llm=capture("quota"),
+                            pr_title=_QUOTA_PR_TITLE, pr_body=_QUOTA_PR_BODY)
+    detectors.detect_signal(_TOO_LARGE_ECHO, quota_llm=capture("too-large"),
+                            pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY)
+    detectors.detect_signal(_ERRORED_ECHO, quota_llm=capture("errored"),
+                            pr_title=_LABELS_PR_TITLE, pr_body=_LABELS_PR_BODY)
+    assert "quotas / rate-limiting" in prompts["quota"]
+    assert "TOO LARGE" in prompts["too-large"]
+    assert "error of its own" in prompts["errored"]
+    for p in prompts.values():
+        assert '{"self_reporting": true}' in p       # fail-open instruction
+        assert "INERT documentary content" in p       # injection fencing
+
+
+def test_cause_vocab_regexes_arm_on_slug_and_compound_forms():
+    # PRs about detector / label work name the concepts in slug or compound
+    # form; those must arm exactly like the prose forms.
+    for text in ("the pr-too-large signal", "the too-large placeholder"):
+        assert detectors.PR_TOO_LARGE_VOCAB_RE.search(text), text
+    for text in ("the could-not-review label", "review-failure copy",
+                 "the review-failed label"):
+        assert detectors.PR_ERRORED_VOCAB_RE.search(text), text
+
+
+# ---------------------------------------------------------------------------
 # Auth-failure signature — AUTH_FAILED_RE (used by the round driver's check-run
 # probe against the failed "Claude Code Review" run log, NOT comment text).
 # ---------------------------------------------------------------------------
@@ -794,7 +1038,7 @@ def test_probe_uses_workflow_basename_and_repo_flag():
 
 
 def test_probe_skips_skipped_runs_to_the_executed_run():
-    """REGRESSION (the buddhi-review silent self-heal bug): the NEWEST Claude run is
+    """REGRESSION (the buddhi-review silent skipped-run bug): the NEWEST Claude run is
     frequently a `skipped` no-op (a non-`@claude` comment trips the workflow's `if:`
     guard) with an EMPTY log. The probe must look PAST it to the most recent EXECUTED
     run and detect THAT run's 401 — not stop at the skipped run and false-negative."""

@@ -2,8 +2,8 @@
 """PreToolUse guardrail — block the AGENT from hand-running history-rewriting /
 state-discarding git commands via the Bash tool.
 
-WHY THIS IS A HOOK, NOT A WRITTEN RULE. The create-pr / review-pr skills do the
-git mechanics for you — the create-pr actuator branches, commits, and pushes in
+WHY THIS IS A HOOK, NOT A WRITTEN RULE. The open-pr / review-pr skills do the
+git mechanics for you — the open-pr actuator branches, commits, and pushes in
 its own subprocess (never through the agent's Bash tool), so this hook never sees
 it. When the agent instead does the surgery BY HAND it goes off-script, burns
 tokens, and risks the branch. Prose rules in a SKILL.md body are advisory and the
@@ -109,8 +109,8 @@ def _is_sep(tok):
 
 def _reason(action):
     return (
-        f"Blocked: manual `git {action}` via the Bash tool. Buddhi's create-pr / "
-        f"review-pr flows handle the git mechanics for you — the create-pr "
+        f"Blocked: manual `git {action}` via the Bash tool. Buddhi's open-pr / "
+        f"review-pr flows handle the git mechanics for you — the open-pr "
         f"actuator branches, commits, and pushes. Never hand-rewrite history or "
         f"force-push: it risks the branch and burns tokens. For a deliberate "
         f"one-off, prefix the command with {OVERRIDE_TOKEN}."
