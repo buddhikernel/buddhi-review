@@ -137,7 +137,7 @@ def review_policy_pack(daily_interrupt_budget: int = 25) -> PolicyPack:
             # additionally makes every ask take the high-stakes bypass. Together:
             # no valid business question is ever deferred for budget. The ceiling
             # is kept > 0 (the kernel requires >= 1) but is inert under this bar.
-            daily_interrupt_budget=daily_interrupt_budget,
+            daily_interrupt_budget=max(1, daily_interrupt_budget),
             base=0.0,
             cap=0.0,
             high_stakes_threshold=0.0,

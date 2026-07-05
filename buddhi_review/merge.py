@@ -186,9 +186,10 @@ def wait_for_ci_green(
     Returns True ONLY when CI is GREEN (the caller may merge); False on a failed
     label attach, a red verdict, or a poll that never settles (the caller blocks
     the merge and hands the PR back). The poll is bounded by ``attempts`` so it
-    can never deadlock, and an absent / all-skipped rollup is treated as pending
-    (never green), so it can never merge a PR CI did not actually run on. ``run``
-    / ``sleep`` are injectable so the round driver can drive it on a fake clock."""
+    can never deadlock, an absent rollup is treated as pending (never green), and a
+    non-empty all-skipped rollup is treated as green (CI ran; every job intentionally
+    skipped). ``run`` / ``sleep`` are injectable so the round driver can drive it on
+    a fake clock."""
     if not _attach_ready_for_ci(pr, repo=repo, cwd=cwd, run=run, sleep=sleep):
         notice("premerge-ci",
                f"could not attach `ready-for-ci` label to PR #{pr} — label-gated "
