@@ -1061,12 +1061,22 @@ def detect_claude_workflow_present(
     if CLAUDE_WORKFLOW_YML_ENV in os.environ:
         return bool(os.environ[CLAUDE_WORKFLOW_YML_ENV].strip())
     try:
-        proc = run(
-            ["gh", "api",
-             f"repos/{repo or '{owner}/{repo}'}/contents/{CLAUDE_WORKFLOW_PATH}",
-             "--jq", ".content"],
-            cwd=cwd,
-        )
+        try:
+            proc = run(
+                ["gh", "api",
+                 f"repos/{repo or '{owner}/{repo}'}/contents/{CLAUDE_WORKFLOW_PATH}",
+                 "--jq", ".content"],
+                cwd=cwd,
+                timeout=_GH_TIMEOUT,
+            )
+        except TypeError:
+            # Injected runner doesn't accept timeout= (e.g. test fakes); retry without.
+            proc = run(
+                ["gh", "api",
+                 f"repos/{repo or '{owner}/{repo}'}/contents/{CLAUDE_WORKFLOW_PATH}",
+                 "--jq", ".content"],
+                cwd=cwd,
+            )
     except (OSError, subprocess.SubprocessError):
         return False
     output = (proc.stdout or "").strip()
