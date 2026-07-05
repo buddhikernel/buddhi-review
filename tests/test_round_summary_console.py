@@ -317,15 +317,15 @@ def test_round_table_rows_capitalize_unknown_reviewer_label():
 
 def test_round_table_rows_cover_full_roster_with_not_requested():
     # A configured-but-inactive built-in reviewer still gets a row — labelled
-    # "Not requested ·" — while the enabled-but-quiet reviewers keep their
+    # "Not requested 🙅" — while the enabled-but-quiet reviewers keep their
     # existing "No review posted 🔇" label, and the order stays canonical.
     d = _bare_driver(cfg={"active_reviewers": ["claude", "codex"],
                           "auto_on_open": {"claude": False, "codex": True}})
     rows = d._round_table_rows([], [])
     assert [r["bot_key"] for r in rows] == ["claude", "copilot", "codex", "gemini"]
     by = {r["bot_key"]: r for r in rows}
-    assert by["copilot"]["status"] == "Not requested ·"
-    assert by["gemini"]["status"] == "Not requested ·"
+    assert by["copilot"]["status"] == "Not requested 🙅"
+    assert by["gemini"]["status"] == "Not requested 🙅"
     assert by["copilot"]["posted"] == 0 and by["gemini"]["posted"] == 0
     assert by["claude"]["status"] == "No review posted 🔇"
     assert by["codex"]["status"] == "No review posted 🔇"
@@ -335,11 +335,11 @@ def test_skip_key_and_long_form_for_not_requested_bot():
     d = _bare_driver(cfg={"active_reviewers": ["claude"],
                           "auto_on_open": {"claude": False}})
     assert d._skip_key("gemini") == "not-requested"
-    assert d._bot_status_text("gemini") == "Not requested ·"
+    assert d._bot_status_text("gemini") == "Not requested 🙅"
     # every skip key carries an honest long form
     assert "not requested" in round_driver._SKIP_LONG["not-requested"]
     # distinct from the repo-gate label — an unconfirmed-repo idle EXPECTED
-    # reviewer still reads "Not configured (repo) 🔧", never "Not requested ·"
+    # reviewer still reads "Not configured (repo) 🔧", never "Not requested 🙅"
     assert d._bot_status_text("gemini") != round_driver._STATUS_NOT_CONFIGURED
 
 
@@ -359,14 +359,14 @@ def test_not_requested_is_lowest_priority_real_state_wins():
 
 def test_round_start_reset_clears_stale_stamp_for_not_requested_bot():
     # A not-summoned bot that posted in an EARLIER round must fall back to
-    # "Not requested ·" in a later round it sat out — the round-start reset
+    # "Not requested 🙅" in a later round it sat out — the round-start reset
     # covers every tracked reviewer, not just the expected set.
     d = _bare_driver(cfg={"active_reviewers": ["claude"],
                           "auto_on_open": {"claude": False}})
     d.fetch = lambda pr, repo=None, cwd=None: []
     d._bot_state("gemini").last_seen = 5.0          # engaged in a prior round
     d._wait_for_quiescence([], 0.0)                 # a round it sits out
-    assert d._bot_status_text("gemini") == "Not requested ·"
+    assert d._bot_status_text("gemini") == "Not requested 🙅"
 
 
 # ------------------------------------------------- driver: end-to-end console
@@ -456,7 +456,8 @@ def test_expecting_line_is_canonical_and_table_renders_each_round():
 
 def test_full_roster_table_summons_only_the_active_set():
     # With a two-bot fleet the console table still renders all four built-in
-    # reviewers — the inactive two as "Not requested ·" — while the expecting
+    # reviewers — the inactive two as "Not requested 🙅" (the ⚪ stripped for the
+    # monospace box, so the cell reads "Not requested") — while the expecting
     # line, the summons, and the polling stay on the active set only.
     calls = []
 
@@ -477,10 +478,11 @@ def test_full_roster_table_summons_only_the_active_set():
     assert "expecting: claude, codex" in r1
     assert "copilot" not in r1 and "gemini" not in r1
     # all four built-ins have a table row; the two outside the fleet read
-    # "Not requested ·"
+    # "Not requested" (the canonical "Not requested 🙅" with its ⚪ stripped for
+    # the box, like every other status glyph)
     for label in ("Claude", "Copilot", "Codex", "Gemini"):
         assert any(ln.startswith("│") and label in ln for ln in out.splitlines())
-    assert out.count("Not requested ·") == 2
+    assert out.count("Not requested") == 2
     # no summon ever targeted a not-requested bot: neither gemini's trigger
     # comment nor copilot's review-request API call was posted. The positive
     # control first — claude's round-1 summon MUST be visible through the same

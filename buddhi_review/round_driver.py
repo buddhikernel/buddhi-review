@@ -392,7 +392,7 @@ _STATUS_SHORT: Dict[str, str] = {
     "done": "Reviewed — no findings ✓",
     "no-change": "Reviewed — no change ✓",
     "quota": "Quota exhausted ⚠️",
-    "pr-too-large": "PR too large to review",
+    "pr-too-large": "PR too large 📦",
     "errored": "Could not review ❌",
     "rate-limited": "Rate-limited ⏳",
     "polish": "Polish-only 🧹",
@@ -402,7 +402,7 @@ _STATUS_SHORT: Dict[str, str] = {
     # its row is a quiet "for completeness" entry, distinct from the repo-gate
     # "Not configured (repo) 🔧" (cannot run here) and from "No review posted 🔇"
     # (was expected, stayed silent).
-    "not-requested": "Not requested ·",
+    "not-requested": "Not requested 🙅",
 }
 # Render-time statuses for reviewers with NO skip key (still expected).
 # "Active ✅" only ever means "engaged this round"; an expected reviewer that
@@ -933,7 +933,7 @@ class RoundDriver:
         """One summary row per reviewer (canonical order) from this round's
         classified comments + each reviewer's terminal status. The table is the
         COMPLETE view: every built-in reviewer gets a row every round — one
-        outside the enabled fleet renders "Not requested ·" — plus a row for any
+        outside the enabled fleet renders "Not requested 🙅" — plus a row for any
         reviewer that actually posted. Display only: summoning, polling, and
         expectation stay on the enabled fleet."""
         counts: Dict[str, Dict[str, int]] = {}
