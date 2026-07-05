@@ -89,6 +89,31 @@ Interactive-only and best-effort; if you cannot prompt, proceed with defaults.
    CWD=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
    ```
 
+   **Auto-target the worktree this session worked in.** When the work was done in
+   a NEW worktree off `main` (the standing rule), the session's `$PWD` can still
+   point at the spawn checkout while the real work sits in a `git -C <worktree>`
+   elsewhere. Consult the resolver — it returns the session's recorded worktree
+   only when that worktree is a live checkout of the target repo and differs from
+   `$PWD`, else it echoes `$CWD` unchanged:
+
+   ```bash
+   TARGET_REPO=$(git -C "$CWD" remote get-url origin 2>/dev/null)
+   # $CLAUDE_CODE_SESSION_ID is a real Claude Code env var (a plain UUID, no prefix),
+   # exported into every Bash tool call. The git-guardrail PreToolUse hook receives
+   # the same value as the `session_id` field in its stdin JSON payload, so the key
+   # it registers and the key looked up here are byte-identical.
+   RESOLVED=$(python3 -m buddhi_review.worktree_target resolve \
+     --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$TARGET_REPO" --cwd "$CWD" 2>/dev/null)
+   if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CWD" ]; then
+     CWD="$RESOLVED"
+     echo "Auto-selected this session's worktree: $CWD"
+   fi
+   ```
+
+   If an explicit `owner/repo` argument was given, pass it as `--repo` instead of
+   the origin URL. This is silent (no ask) — it only prefers the session's own
+   worktree over a stale `$PWD`; every other step runs unchanged.
+
 2. **Author the PR title + body** from the work on the branch, and pick a branch
    prefix (`feat` / `fix` / `refactor`) — used only when the work is sitting on the
    base branch and a new branch must be created.
