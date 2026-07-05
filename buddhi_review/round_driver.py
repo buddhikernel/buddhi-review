@@ -1301,13 +1301,13 @@ class RoundDriver:
         whose id is in this baseline was left before the current re-request (an
         earlier commit or a prior round) and never marks a bot done; a +1 with a
         fresh id (added after this snapshot) does. Called at preflight and before
-        every re-request. On a fetch error the baseline is left UNCHANGED — a prior
-        good baseline is kept, and if none was ever taken it stays None so the fold
-        stays fail-closed (a stale +1 can never look fresh against a phantom empty
-        baseline)."""
+        every re-request. On a fetch error the baseline is set to None so the fold
+        stays fail-closed until the next successful snapshot — a stale +1 that
+        landed after the last good capture cannot masquerade as fresh."""
         try:
             reactions = self.fetch_reactions(self.pr, repo=self.repo, cwd=self.cwd)
         except (subprocess.SubprocessError, OSError, RuntimeError):
+            self._reaction_baseline = None
             return
         self._reaction_baseline = {r.id for r in reactions}
 
@@ -1320,7 +1320,7 @@ class RoundDriver:
         clean-review path. Returns True iff a fresh +1 was folded (round activity).
         Fail-CLOSED when no baseline has been established (``None``): without a
         real stale snapshot, fresh cannot be told from stale, so nothing is folded.
-        Also fail-open (no fold) on this fetch's own error."""
+        Also fail-closed (no fold) on this fetch's own error."""
         if self._reaction_baseline is None:
             return False  # no baseline yet → cannot distinguish fresh from stale
         try:
