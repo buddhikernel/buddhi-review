@@ -1810,12 +1810,19 @@ class RoundDriver:
             self.notice("premerge-check",
                         f"PR #{self.pr}: {reason} — waiting for CI to settle "
                         f"before merge", status="do")
-            if merge.wait_for_ci_settle(
+            if not merge.wait_for_ci_settle(
                     self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run,
                     notice=self.notice, sleep=self.sleep):
+                self._premerge_ci_red = True  # CI failed / never settled
+                return False
+            # CI settled green — re-check full mergeability: BLOCKED (missing required
+            # reviews) is evaluated after pending checks in check_pr_mergeable, so the
+            # initial pass may have short-circuited on "pending" before reaching it.
+            ok, reason = merge.check_pr_mergeable(
+                self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run)
+            if ok:
                 return True
-            self._premerge_ci_red = True  # CI failed / never settled
-            return False
+            # not mergeable after settle — fall through to the shared hand-back below
         if reason.startswith("checks failing"):
             self._premerge_ci_red = True  # a red check → the 'CI is red' hand-back
         self.notice("premerge-check",

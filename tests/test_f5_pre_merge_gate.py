@@ -427,17 +427,24 @@ def test_label_ci_all_skipped_rollup_greens_and_merges():
 # 6. #43 / #44 — general pre-merge mergeability gate (NON-label auto-merge path)
 # ===========================================================================
 
-def _mergeable_gh(view_payload, *, checks_seq=None):
-    """A gh fake: answers `gh pr view --json mergeable,…` with ``view_payload``,
-    and (optionally) `gh pr checks` from ``checks_seq`` (one rows-list per poll,
+def _mergeable_gh(view_payload, *, checks_seq=None, view_seq=None):
+    """A gh fake: answers `gh pr view --json mergeable,…` with ``view_payload``
+    (or successive entries from ``view_seq`` if provided, last repeated), and
+    (optionally) `gh pr checks` from ``checks_seq`` (one rows-list per poll,
     last repeated). Everything else rc=0/empty."""
-    box = {"poll": 0}
+    box = {"poll": 0, "view_poll": 0}
 
     def run(argv, *, cwd=None, timeout=None):
         joined = " ".join(argv)
         if argv[:3] == ["gh", "pr", "view"] and "mergeable" in joined:
+            if view_seq is not None:
+                i = min(box["view_poll"], len(view_seq) - 1)
+                box["view_poll"] += 1
+                payload = view_seq[i]
+            else:
+                payload = view_payload
             return subprocess.CompletedProcess(
-                argv, 0, stdout=json.dumps(view_payload), stderr="")
+                argv, 0, stdout=json.dumps(payload), stderr="")
         if argv[:3] == ["gh", "pr", "checks"] and checks_seq is not None:
             i = min(box["poll"], len(checks_seq) - 1)
             box["poll"] += 1
@@ -500,16 +507,20 @@ def test_nonlabel_failing_check_blocks_merge():
 
 def test_nonlabel_pending_check_settles_green_then_merges():
     # check_pr_mergeable reports pending checks on the last fix push; the gate
-    # waits them out (#44) and merges once CI settles green.
+    # waits them out (#44) and merges once CI settles green. The re-check after
+    # settle uses a clean view so check_pr_mergeable also returns ok.
     timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]"))]
-    view = {"mergeable": "UNKNOWN", "mergeStateStatus": "UNSTABLE",
-            "statusCheckRollup": [{"__typename": "CheckRun", "name": "tests",
-                                   "status": "IN_PROGRESS", "conclusion": None}],
-            "isDraft": False}
+    view_pending = {"mergeable": "UNKNOWN", "mergeStateStatus": "UNSTABLE",
+                    "statusCheckRollup": [{"__typename": "CheckRun", "name": "tests",
+                                           "status": "IN_PROGRESS", "conclusion": None}],
+                    "isDraft": False}
+    view_clean = {"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                  "statusCheckRollup": [], "isDraft": False}
     checks = [[{"name": "tests", "bucket": "pending", "state": ""}],
               [{"name": "tests", "bucket": "pending", "state": ""}],
               [{"name": "tests", "bucket": "pass", "state": "SUCCESS"}]]
-    gh = _RecordingRun(_mergeable_gh(view, checks_seq=checks))
+    gh = _RecordingRun(_mergeable_gh(None, checks_seq=checks,
+                                     view_seq=[view_pending, view_clean]))
     driver, clock, _ = make_driver(timeline, cfg=CLAUDE_ONLY, gh=gh, auto_merge=True)
     outcome = driver.run()
     assert outcome.merged is True
@@ -526,6 +537,28 @@ def test_nonlabel_pending_check_never_settles_blocks_merge():
             "isDraft": False}
     checks = [[{"name": "tests", "bucket": "pending", "state": ""}]]  # always pending
     gh = _RecordingRun(_mergeable_gh(view, checks_seq=checks))
+    driver, clock, _ = make_driver(timeline, cfg=CLAUDE_ONLY, gh=gh, auto_merge=True)
+    outcome = driver.run()
+    assert outcome.merged is False
+    assert gh.matching("gh", "merge", "--squash") == []
+
+
+def test_nonlabel_pending_settles_green_but_blocked_blocks_merge():
+    # Regression for the BLOCKED-after-settle hole: initial check_pr_mergeable sees
+    # pending checks (BLOCKED is evaluated after pending in check_pr_mergeable, so
+    # the initial call short-circuits before reaching the BLOCKED check). CI settles
+    # green via wait_for_ci_settle, but the PR is still BLOCKED (missing required
+    # reviews). The re-check after settle must detect BLOCKED and block the merge.
+    timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]"))]
+    view_pending = {"mergeable": "UNKNOWN", "mergeStateStatus": "UNSTABLE",
+                    "statusCheckRollup": [{"__typename": "CheckRun", "name": "tests",
+                                           "status": "IN_PROGRESS", "conclusion": None}],
+                    "isDraft": False}
+    view_blocked = {"mergeable": "MERGEABLE", "mergeStateStatus": "BLOCKED",
+                    "statusCheckRollup": [], "isDraft": False}
+    checks = [[{"name": "tests", "bucket": "pass", "state": "SUCCESS"}]]
+    gh = _RecordingRun(_mergeable_gh(None, checks_seq=checks,
+                                     view_seq=[view_pending, view_blocked]))
     driver, clock, _ = make_driver(timeline, cfg=CLAUDE_ONLY, gh=gh, auto_merge=True)
     outcome = driver.run()
     assert outcome.merged is False
