@@ -66,7 +66,7 @@ def _load() -> dict:
         return {}
     out = {}
     for sid, rec in sessions.items():
-        if isinstance(sid, str) and isinstance(rec, dict) and rec.get("worktree"):
+        if isinstance(sid, str) and isinstance(rec, dict) and isinstance(rec.get("worktree"), str) and rec.get("worktree"):
             out[sid] = rec
     return out
 
@@ -159,7 +159,7 @@ def all_entries():
 
     try:
         recs = [r for r in _load().values()
-                if isinstance(r, dict) and r.get("worktree")]
+                if isinstance(r, dict) and isinstance(r.get("worktree"), str) and r.get("worktree")]
         recs.sort(key=_ts, reverse=True)
         return [{"worktree": r.get("worktree"), "repo": r.get("repo"), "ts": _ts(r)}
                 for r in recs]

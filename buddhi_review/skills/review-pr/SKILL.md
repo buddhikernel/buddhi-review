@@ -125,6 +125,12 @@ Resolve `OWNER/REPO` and `CWD`:
    only when that worktree is a live checkout of `OWNER_REPO` and differs from
    `$CWD`, else it echoes `$CWD` unchanged:
 
+   <!-- `CLAUDE_CODE_SESSION_ID` is exported by the Claude Code harness to every
+        Bash tool invocation as a plain UUID (no "session_" prefix) — the same
+        format the git-guardrail hook stores via `data.get("session_id")`, so the
+        resolver lookup key matches exactly. Not to be confused with the remote-
+        bridge vars (`CLAUDE_CODE_BRIDGE_SESSION_ID` / `CLAUDE_CODE_REMOTE_SESSION_ID`)
+        which are set only during remote/cloud connections and carry a prefix. -->
    ```bash
    RESOLVED=$(python3 -m buddhi_review.worktree_target resolve \
      --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD" 2>/dev/null)

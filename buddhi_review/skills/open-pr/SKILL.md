@@ -98,6 +98,10 @@ Interactive-only and best-effort; if you cannot prompt, proceed with defaults.
 
    ```bash
    TARGET_REPO=$(git -C "$CWD" remote get-url origin 2>/dev/null)
+   # $CLAUDE_CODE_SESSION_ID is a real Claude Code env var (a plain UUID, no prefix),
+   # exported into every Bash tool call. The git-guardrail PreToolUse hook receives
+   # the same value as the `session_id` field in its stdin JSON payload, so the key
+   # it registers and the key looked up here are byte-identical.
    RESOLVED=$(python3 -m buddhi_review.worktree_target resolve \
      --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$TARGET_REPO" --cwd "$CWD" 2>/dev/null)
    if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CWD" ]; then
