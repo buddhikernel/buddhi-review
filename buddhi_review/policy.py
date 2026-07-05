@@ -96,9 +96,19 @@ ESCALATION_CRITERIA = (
 
 
 def review_policy_pack(daily_interrupt_budget: int = 25) -> PolicyPack:
-    """The concrete review pack. ``daily_interrupt_budget`` paces how many human
-    escalations the loop will admit before raising its bar (the kernel's bounded
-    cognitive budget); high-stakes questions bypass the bar."""
+    """The concrete review pack.
+
+    The interrupt-budget pacing is NEUTRALIZED here (kernel untouched): every
+    genuine business question — a comment whose correct resolution is the owner's
+    to make — must reach the owner, never be silently deferred because an earlier
+    ask "spent the budget". The kernel's graduated ask bar and its high-stakes
+    bypass are both flattened to zero (``base = cap = high_stakes_threshold =
+    0.0``), so :func:`buddhi.decisions.aggregate_budget.aggregate_budget` always
+    ADMITs a valid ask regardless of how many were admitted before. The
+    ``daily_interrupt_budget`` parameter is retained for API stability but no
+    longer gates any ask (the flat-zero bar is spend-independent). The unrelated
+    exclusion lattice (an excluded reviewer's source) is untouched — only the
+    budget pacing is removed."""
     return PolicyPack(
         name="buddhi-review",
         version="1",
@@ -122,9 +132,14 @@ def review_policy_pack(daily_interrupt_budget: int = 25) -> PolicyPack:
             max_options=4,
         ),
         budget=BudgetKnobs(
-            daily_interrupt_budget=daily_interrupt_budget,
-            base=0.5,
-            cap=0.95,
-            high_stakes_threshold=0.9,
+            # A flat-zero bar (base == cap) never rises with spend, so the
+            # graduated ask bar admits every ask; a zero high-stakes threshold
+            # additionally makes every ask take the high-stakes bypass. Together:
+            # no valid business question is ever deferred for budget. The ceiling
+            # is kept > 0 (the kernel requires >= 1) but is inert under this bar.
+            daily_interrupt_budget=max(1, daily_interrupt_budget),
+            base=0.0,
+            cap=0.0,
+            high_stakes_threshold=0.0,
         ),
     )

@@ -297,6 +297,62 @@ def test_unexpected_error_never_loses_the_outcome(monkeypatch):
     assert "by hand" in line[1]
 
 
+# ── #52: the Bucket-A "ready" verdict consults LIVE GitHub mergeability ──────────
+def _gh_with_mergeable(payload, *, base="main", head="feature/pr-7",
+                       current_branch="feature/pr-7"):
+    """A fake seam that answers the rebase lookups (base/head/current) AND the
+    `gh pr view --json mergeable,…` query with ``payload``."""
+    def run(argv, *, cwd=None, timeout=None):
+        joined = " ".join(argv)
+        if argv[:3] == ["gh", "pr", "view"] and "mergeable" in joined:
+            import json as _json
+            return subprocess.CompletedProcess(argv, 0, stdout=_json.dumps(payload), stderr="")
+        if "baseRefName" in joined and base:
+            out = base + "\n"
+        elif "headRefName" in joined and head:
+            out = head + "\n"
+        elif "rev-parse" in joined and "--abbrev-ref" in joined and current_branch:
+            out = current_branch + "\n"
+        else:
+            out = ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+    return run
+
+
+def test_handback_not_ready_when_github_reports_conflict(stub_rebase):
+    # A clean, unmerged exit where a real review happened and no cached CI-red flag
+    # fired — but GitHub reports the PR non-mergeable → NOT "ready to merge"; the
+    # live reason is surfaced ("merge at your discretion — …merge conflicts").
+    stub_rebase["ret"] = ("rebased", "")
+    nr = NoticeRec()
+    gh = _gh_with_mergeable({"mergeable": "CONFLICTING", "mergeStateStatus": "DIRTY"})
+    d = make_driver(nr, gh=gh)
+    d._run_start_fleet = {"claude"}
+    d.reviewed_ever = {"claude"}            # a genuine review happened
+    d._maybe_exit_rebase(RunOutcome("clean", 1, merged=False))
+    line = nr.landing()[-1]
+    assert line[2] == "fallback"
+    assert "ready to merge" not in line[1]
+    assert "merge conflicts" in line[1]
+    assert "merge at your discretion" in line[1]
+
+
+def test_handback_ready_when_github_reports_mergeable(stub_rebase):
+    # Same shape, but GitHub reports mergeable → the live check passes and the
+    # hand-back is honestly "ready to merge".
+    stub_rebase["ret"] = ("rebased", "")
+    nr = NoticeRec()
+    gh = _gh_with_mergeable({"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+                             "statusCheckRollup": [], "isDraft": False})
+    d = make_driver(nr, gh=gh)
+    d._run_start_fleet = {"claude"}
+    d.reviewed_ever = {"claude"}
+    d._maybe_exit_rebase(RunOutcome("clean", 1, merged=False))
+    line = nr.landing()[-1]
+    assert line[2] == "done"
+    assert "ready to merge" in line[1]
+
+
 # ── Wired through run(): a clean hand-back triggers the exit-rebase ──────────────
 def test_run_triggers_exit_rebase_on_clean_handback(stub_rebase):
     nr = NoticeRec()

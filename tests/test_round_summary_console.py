@@ -590,3 +590,67 @@ def test_max_rounds_auto_size_seam_via_diff_lines():
     d_fallback = RoundDriver("7", cfg=CFG, classify_runner=lambda p: "{}",
                              max_rounds=None, diff_lines=None)
     assert d_fallback.max_rounds == round_driver.MAX_ROUNDS_FALLBACK == 10
+
+
+# ---------------------------------------------------------------------------
+# #50 — per-round silent-reviewer prerequisite guidance note (dim [reviewer-silent])
+# ---------------------------------------------------------------------------
+from test_round_driver import CLAUDE_ONLY, make_driver  # noqa: E402
+
+
+def test_silent_guidance_note_for_summoned_reviewer(capsys):
+    # An auto_on_open=false reviewer the loop summoned that then posts nothing this
+    # round → a dim [reviewer-silent] prerequisite note, forking on auto_on_open=false.
+    driver, _, _ = make_driver([], cfg=CLAUDE_ONLY)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "[reviewer-silent]" in out
+    assert "summoned this round" in out            # the auto_on_open=false wording
+    assert "Claude" in out
+
+
+def test_silent_guidance_note_for_auto_on_open_reviewer(capsys):
+    # An auto_on_open=true reviewer the loop does NOT summon that stays silent →
+    # the note forks to the "review on PR open" wording instead.
+    cfg = {"active_reviewers": ["gemini"], "auto_on_open": {"gemini": True}}
+    driver, _, _ = make_driver([], cfg=cfg)
+    driver.run()
+    out = capsys.readouterr().out
+    assert "[reviewer-silent]" in out
+    assert "review on PR open" in out              # the auto_on_open=true wording
+
+
+def test_silent_guidance_note_is_once_per_run(capsys):
+    # The note is emitted at most once per bot per run (the _silent_noted guard).
+    driver, _, _ = make_driver([], cfg=CLAUDE_ONLY)
+    driver.requested_ever.add("claude")            # genuinely summoned → expected
+    driver._emit_silent_reviewer_guidance(["claude"])
+    driver._emit_silent_reviewer_guidance(["claude"])
+    out = capsys.readouterr().out
+    assert out.count("[reviewer-silent]") == 1
+    assert "claude" in driver._silent_noted
+
+
+def test_silent_guidance_skips_a_reviewer_that_responded(capsys):
+    driver, _, _ = make_driver([], cfg=CLAUDE_ONLY)
+    driver.requested_ever.add("claude")
+    driver._bot_state("claude").last_seen = 0.0    # responded this round
+    driver._emit_silent_reviewer_guidance(["claude"])
+    assert "[reviewer-silent]" not in capsys.readouterr().out
+
+
+def test_silent_guidance_skips_an_unsummonable_reviewer(capsys):
+    # Never summoned + auto_on_open=false → the loop could not have expected a
+    # review, so it is not nagged.
+    driver, _, _ = make_driver([], cfg=CLAUDE_ONLY)
+    driver._emit_silent_reviewer_guidance(["claude"])   # requested_ever empty
+    assert "[reviewer-silent]" not in capsys.readouterr().out
+
+
+def test_silent_guidance_skips_a_known_excluded_reviewer(capsys):
+    # A reviewer excluded for a known cause (quota) is not a setup gap → no note.
+    driver, _, _ = make_driver([], cfg=CLAUDE_ONLY)
+    driver.requested_ever.add("claude")
+    driver.store.exclude_quota("claude")
+    driver._emit_silent_reviewer_guidance(["claude"])
+    assert "[reviewer-silent]" not in capsys.readouterr().out

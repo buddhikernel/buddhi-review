@@ -562,6 +562,14 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _dim(text: str) -> str:
+    """``text`` wrapped in the dim SGR when stdout is a colour TTY; plain text
+    otherwise (honours ``NO_COLOR`` / ``BUDDHI_LOOP_NO_COLOR`` and non-TTY)."""
+    if not _colour_enabled(sys.stdout):
+        return text
+    return f"\033[2m{text}\033[0m"
+
+
 def _print_refusal_banner(title: str, body: str) -> None:
     """A loud red bordered console banner. Honours ``NO_COLOR`` /
     ``BUDDHI_LOOP_NO_COLOR`` and a non-TTY stream (the glyph + text still print,
@@ -847,10 +855,21 @@ class RoundDriver:
         #   non-empty check that distinguishes "no reviewers by design" (quiet)
         #   from "reviewers expected but none reviewed" (loud block).
         self._run_start_fleet: Set[str] = set()
-        # _premerge_ci_red: set when the pre-merge label-gated CI gate failed at a
-        #   clean exit — used so a manual-landing rebase reports the honest state
-        #   ("CI is red — merge at your discretion") instead of "ready to merge".
+        # _premerge_ci_red: set when the pre-merge CI gate failed at a clean exit
+        #   (the label-gated poll went red/never-settled, OR the non-label
+        #   mergeability gate saw a failing/never-settling check) — used so a
+        #   manual-landing rebase reports the honest state ("CI is red — merge at
+        #   your discretion") instead of "ready to merge".
         self._premerge_ci_red: bool = False
+        # _claude_trigger_failed: True once an "@claude review" summon failed to
+        #   post and was never later re-posted successfully. Drives the additive
+        #   #g9a NOTIFICATION (never a block): a clean exit where the loop's
+        #   primary reviewer never saw the code yet another reviewer did.
+        self._claude_trigger_failed: bool = False
+        # _silent_noted: bots that have already received the once-per-run per-round
+        #   silent-reviewer guidance note (the dim [reviewer-silent] prerequisite
+        #   hint that precedes the run-end persistent-silent banner).
+        self._silent_noted: Set[str] = set()
 
     # ------------------------------------------------------------------ state
 
@@ -1014,6 +1033,45 @@ class RoundDriver:
                       expected: Optional[Sequence[str]] = None) -> None:
         _render_round_table(round_no, self.max_rounds,
                              self._round_table_rows(actionable, results, expected))
+        if expected is not None:
+            self._emit_silent_reviewer_guidance(expected)
+
+    def _emit_silent_reviewer_guidance(self, expected: Sequence[str]) -> None:
+        """#50: a dim, once-per-run guidance NOTE for a reviewer that was expected
+        this round yet posted nothing — the prerequisite-setup hint that precedes
+        the run-end persistent-silent banner. Fires only for a GENUINELY-expected
+        reviewer (summoned, or ``auto_on_open``): a reviewer that responded, is
+        excluded for a known reason (quota / errored / rate-limited), or was never
+        summonable is skipped. The wording forks on ``auto_on_open`` (summoned in
+        round 1 vs. expected to review on PR open). This is guidance, not a status
+        cell — the round table already renders such a reviewer "No review posted 🔇"."""
+        for bot in _canonical(expected):
+            if bot in self._silent_noted:
+                continue
+            if self._bot_state(bot).last_seen is not None:
+                continue  # responded this round → not silent
+            if self.store.is_excluded(bot) or bot in self._rate_limited_until:
+                continue  # a known cause (quota / errored / rate-limited), not a setup gap
+            if not self._was_review_expected(bot):
+                continue  # never summonable → don't nag
+            self._silent_noted.add(bot)
+            label = _REVIEWER_LABEL.get(bot, bot.capitalize())
+            try:
+                auto = bool(auto_on_open(self.cfg, bot, self.repo))
+            except Exception:
+                auto = False
+            if auto:
+                note = (f"{label} is enabled but posted nothing within its review "
+                        f"window. It is configured to review on PR open (not summoned "
+                        f"by the loop), so confirm its prerequisites (app / plan / "
+                        f"workflow / secret, whichever applies) are set on this repo "
+                        f"AND that automatic review on open is actually enabled here.")
+            else:
+                note = (f"{label} was summoned this round but posted nothing. A silence "
+                        f"here usually means its prerequisite setup is incomplete — "
+                        f"confirm the app / plan / workflow / secret / trigger for this "
+                        f"reviewer is configured on this repo.")
+            print(_dim(f"  [reviewer-silent] {note}"))
 
     # ------------------------------------------------------------- re-request
 
@@ -1066,13 +1124,19 @@ class RoundDriver:
             if proc.returncode != 0:
                 self.notice("re-request", f"{bot} re-request failed: "
                             f"{(proc.stderr or '').strip()[:120]}", status="fallback")
+                if bot == "claude":
+                    self._claude_trigger_failed = True  # #g9a: primary reviewer not summoned
                 return False
             # The summon landed — so a later silence is the reviewer's, not a
             # failed request (never flag a bot we could not actually summon).
             self.requested_ever.add(bot)
+            if bot == "claude":
+                self._claude_trigger_failed = False  # a later success clears the flag
             return True
         except (subprocess.SubprocessError, OSError) as exc:
             self.notice("re-request", f"{bot} re-request failed: {exc}", status="fallback")
+            if bot == "claude":
+                self._claude_trigger_failed = True
             return False
 
     # ------------------------------------------------------------- quiescence
@@ -1656,6 +1720,10 @@ class RoundDriver:
     def _clean_exit(self, rounds: int) -> RunOutcome:
         print("[round] clean — every expected reviewer is done/excluded and "
               "no actionable comments remain")
+        # #g9a NOTIFICATION (never a block, never gates the flow below): if the
+        # loop's primary reviewer (@claude) was expected but its trigger never
+        # landed and it never reviewed — yet another reviewer did — say so loudly.
+        self._maybe_warn_claude_never_reviewed()
         if self.auto_merge:
             # ── SAFETY gate (parity of the reference loop's never-merge-unreviewed
             # backstop): never auto-merge code that no expected reviewer actually
@@ -1685,7 +1753,7 @@ class RoundDriver:
                 self._block_unreviewed_merge(fleet)
                 return RunOutcome("clean", rounds, False, self.actions)
             # (c) >=1 expected reviewer genuinely reviewed (incl. a clean approval)
-            #     → the merge may proceed (subject to the label-gated CI gate).
+            #     → the merge may proceed, subject to the pre-merge gates.
             if label_gated_ci(self.cfg, self.repo):
                 ci_ok = merge.wait_for_ci_green(
                     self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run,
@@ -1696,11 +1764,152 @@ class RoundDriver:
                     # it so the manual-landing rebase reports the honest state.
                     self._premerge_ci_red = True
                     return RunOutcome("clean", rounds, False, self.actions)
+            else:
+                # #43/#44: without label-gated CI the label path's `wait_for_ci_green`
+                # never runs, so this general mergeability gate is the pre-merge guard
+                # on the non-label auto-merge path — it blocks a conflicted / draft /
+                # behind / blocked / red PR, and waits out an in-flight check on the
+                # last fix push before merging.
+                if not self._premerge_gate_ok():
+                    return RunOutcome("clean", rounds, False, self.actions)
+            merged = merge.squash_merge(
+                self.pr, repo=self.repo, enabled=True, cwd=self.cwd,
+                run=self.gh_run, notice=self.notice,
+            )
+            return RunOutcome("clean", rounds, merged, self.actions)
+        # ── auto-merge OFF ──────────────────────────────────────────────────────
+        # #g9b: when running attended (a TTY), offer an interactive squash-merge
+        # after confirming GitHub would accept it; a headless run (nohup / CI,
+        # stdin not a terminal) never prompts — no input() is called — and simply
+        # leaves the PR open for the operator to land.
+        if sys.stdin.isatty():
+            merged = self._interactive_merge_prompt()
+            return RunOutcome("clean", rounds, merged, self.actions)
         merged = merge.squash_merge(
-            self.pr, repo=self.repo, enabled=self.auto_merge, cwd=self.cwd,
+            self.pr, repo=self.repo, enabled=False, cwd=self.cwd,
             run=self.gh_run, notice=self.notice,
         )
         return RunOutcome("clean", rounds, merged, self.actions)
+
+    def _premerge_gate_ok(self) -> bool:
+        """#43/#44 non-label pre-merge gate. Returns True iff the merge may proceed.
+        Blocks (False) on a GitHub-side non-mergeable state — conflicts / draft /
+        behind / blocked / failing checks — and, when checks are still in flight
+        from the last fix push, waits them out before allowing the merge. Fail-soft:
+        an errored/unreadable ``gh`` read never blocks (``check_pr_mergeable``
+        returns mergeable). A CI-red / never-settling block also sets
+        ``_premerge_ci_red`` so the manual-landing hand-back reports 'CI is red'; a
+        structural block (conflict / behind / …) leaves the flag unset so the
+        post-rebase live re-check reports the honest current reason (a rebase may
+        even have resolved a 'behind')."""
+        ok, reason = merge.check_pr_mergeable(
+            self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run)
+        if ok:
+            return True
+        if merge.reason_is_pending_checks(reason):
+            self.notice("premerge-check",
+                        f"PR #{self.pr}: {reason} — waiting for CI to settle "
+                        f"before merge", status="do")
+            if not merge.wait_for_ci_settle(
+                    self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run,
+                    notice=self.notice, sleep=self.sleep):
+                self._premerge_ci_red = True  # CI failed / never settled
+                return False
+            # CI settled green — re-check full mergeability: BLOCKED (missing required
+            # reviews) is evaluated after pending checks in check_pr_mergeable, so the
+            # initial pass may have short-circuited on "pending" before reaching it.
+            ok, reason = merge.check_pr_mergeable(
+                self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run)
+            if ok:
+                return True
+            # not mergeable after settle — fall through to the shared hand-back below
+        if reason.startswith("checks failing"):
+            self._premerge_ci_red = True  # a red check → the 'CI is red' hand-back
+        self.notice("premerge-check",
+                    f"PR #{self.pr} is not mergeable ({reason}) — not merging; "
+                    f"handing back", status="stop",
+                    hint="resolve it on GitHub, then re-run")
+        return False
+
+    def _review_permits_merge(self) -> bool:
+        """The never-merge-unreviewed backstop's verdict, independent of the merge
+        trigger: True iff at least one expected reviewer genuinely reviewed, OR the
+        operator deliberately expected none (``--rr-none``). False when a configured
+        fleet was expected but nobody reviewed, or no reviewers exist and it was not
+        a deliberate ``--rr-none`` — in both, a merge would land code nothing saw.
+        This is the same three-way distinction the auto-merge SAFETY gate applies;
+        the interactive path consults it so an attended merge is offered only for a
+        PR that was actually reviewed."""
+        if self.rr_none:
+            return True
+        fleet = set(self._run_start_fleet)
+        if not fleet:
+            return False  # (a) no reviewers configured → nothing reviewed
+        return bool(fleet & self.reviewed_ever)  # (c) someone reviewed vs (b) nobody
+
+    def _interactive_merge_prompt(self) -> bool:
+        """#g9b: auto-merge is off and we are attached to a terminal — offer to
+        squash-merge now, but only for a PR that was actually reviewed and that
+        GitHub would accept. Returns True iff the operator confirmed AND the merge
+        landed. The caller gates on ``sys.stdin.isatty()``, so a headless run never
+        reaches here."""
+        # The never-merge-unreviewed backstop applies to the interactive path too:
+        # do not offer to merge a PR that no expected reviewer reviewed (a configured
+        # fleet that stayed silent, or no reviewers at all). Auto-merge OFF used to
+        # always leave the PR open, so this keeps the interactive convenience from
+        # inviting a merge of code nothing saw.
+        if not self._review_permits_merge():
+            self.notice("merge-prompt",
+                        f"PR #{self.pr} was not reviewed by any expected reviewer — "
+                        f"not offering an interactive merge; leaving it open",
+                        status="skip",
+                        hint="review it yourself, then `gh pr merge` when ready")
+            return False
+        ok, reason = merge.check_pr_mergeable(
+            self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run)
+        if not ok:
+            self.notice("merge-prompt",
+                        f"PR #{self.pr} is not mergeable yet ({reason}) — not "
+                        f"offering an interactive merge; handing it back",
+                        status="skip")
+            return False
+        try:
+            suffix = f" ({self.repo})" if self.repo else ""
+            answer = input(f"Merge PR #{self.pr}{suffix} now? (yes/no): ").strip().lower()
+        except (EOFError, OSError):
+            print("stdin lost — skipping the interactive merge prompt.")
+            return False
+        if answer not in ("yes", "y"):
+            print("Merge skipped — run `gh pr merge` when ready.")
+            return False
+        return merge.squash_merge(
+            self.pr, repo=self.repo, enabled=True, cwd=self.cwd,
+            run=self.gh_run, notice=self.notice)
+
+    def _maybe_warn_claude_never_reviewed(self) -> None:
+        """#g9a NOTIFICATION (never a block): the loop's primary reviewer (@claude)
+        was expected but its review trigger never landed and it never reviewed —
+        yet at least one OTHER expected reviewer did, so the run reaches a clean
+        exit with the strongest reviewer having never seen the code. Emit a loud
+        console banner so the operator knows; the run still finishes normally (the
+        generalized SAFETY gate already guarantees SOMEONE reviewed). Distinct from
+        the auth-failure banner (a 401 AFTER the trigger posted) and the persistent-
+        silent banner (a summonable reviewer that stayed quiet)."""
+        fleet = set(self._run_start_fleet)
+        if not self._claude_trigger_failed:
+            return
+        if "claude" not in fleet or "claude" in self.reviewed_ever:
+            return
+        if not (fleet & self.reviewed_ever):
+            return  # nobody reviewed → the SAFETY gate handles that (block), not this note
+        _print_refusal_banner(
+            f"PRIMARY REVIEWER SKIPPED — @claude never reviewed PR #{self.pr}",
+            f"The '@claude review' trigger could not be posted, so Claude — the "
+            f"loop's primary reviewer — never saw this code. Another reviewer did "
+            f"review it, so the run is finishing normally, but the strongest review "
+            f"was missed. Confirm '@claude review' can be posted on this repo (the "
+            f"Claude GitHub App is installed and the CLAUDE_CODE_OAUTH_TOKEN secret "
+            f"is set) before relying on this PR's review.")
 
     # --------------------------------------------------- PR metadata (lazy, cached)
 
@@ -1760,7 +1969,18 @@ class RoundDriver:
             return "no reviewers are configured for this repo"
         if not (fleet & self.reviewed_ever):
             return "no expected reviewer actually reviewed this PR"
-        return None  # Bucket A — a genuine clean review; ready to merge
+        # #52: a genuine review happened and no cached CI-red flag fired — but
+        # GitHub itself may still refuse the merge (conflicts / behind / branch
+        # protection / a red or pending check). On the non-label / auto-merge-off
+        # path nothing set _premerge_ci_red, so consult GitHub live here: a
+        # hand-back is called "ready to merge" only when GitHub truly would merge
+        # it. Fail-soft (check_pr_mergeable returns mergeable on any gh error), so
+        # a transient blip never downgrades a genuinely-ready PR.
+        ok, reason = merge.check_pr_mergeable(
+            self.pr, repo=self.repo, cwd=self.cwd, run=self.gh_run)
+        if not ok:
+            return f"GitHub will not merge it yet ({reason})"
+        return None  # Bucket A — a genuine clean review, GitHub-mergeable; ready to merge
 
     def _maybe_exit_rebase(self, outcome: RunOutcome) -> None:
         """Exit-rebase wrapper that can never lose the run's outcome: the rebase is
