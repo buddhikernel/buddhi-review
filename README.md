@@ -16,6 +16,10 @@ written with Claude Code, the four-reviewer panel—Claude, Codex, Gemini, and
 Copilot—found 681 valid bugs. Claude found just 3.8% of them, and half surfaced only
 in round 2 or later.
 
+<picture>
+  <img src="docs/assets/demo.gif" alt="buddhi-review running its loop on a pull request: a cross-vendor AI panel posts findings, the loop classifies and applies fixes across rounds, then a round summary shows each reviewer's status" width="100%">
+</picture>
+
 New here? Run `pip install buddhi-review`, then follow
 **[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
 to your first reviewed PR.
