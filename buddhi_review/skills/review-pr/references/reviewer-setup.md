@@ -126,7 +126,9 @@ An **enabled** reviewer that produces no comments stays in the round table marke
 each round. `Active ✅` only appears once the reviewer has engaged in the current
 round (reviewers disabled in config keep a `Not requested 🙅` row for
 completeness — never summoned or polled; reviewers
-excluded mid-run show `Approved 👍`/`Reviewed — no findings ✓`/`Reviewed — no change ✓`/`Quota exhausted ⚠️`/`PR too large 📦`/`Could not review ❌`/`Polish-only 🧹`). If a reviewer
+excluded mid-run show `Approved 👍`/`Reviewed — no findings ✓`/`Reviewed — no change ✓`/`Quota exhausted ⚠️`/`PR too large 📦`/`Could not review ❌`/`Polish-only 🧹`; `Could not review ❌` is
+per-round — it marks the round whose review attempt errored, and a later round where that
+reviewer is no longer re-requested shows `Not requested 🙅`). If a reviewer
 *never* posts across the whole run, that is the
 signal your prerequisite setup is incomplete — check, for that bot:
 

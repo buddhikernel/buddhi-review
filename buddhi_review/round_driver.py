@@ -908,8 +908,15 @@ class RoundDriver:
             reason = _SKIP_LONG.get(self._skip_key(bot), "not expected")
             print(f"[round] skipping {bot}: {reason}")
 
-    def _bot_status_text(self, bot: str) -> str:
-        """The round-summary Status cell for ``bot``."""
+    def _bot_status_text(self, bot: str, *, expected: Optional[Sequence[str]] = None,
+                         posted: int = 0) -> str:
+        """The round-summary Status cell for ``bot``.
+
+        ``expected`` is THIS round's expected set as computed at round start
+        (before any mid-round exclusion), ``posted`` this round's classified-
+        comment count for ``bot`` — both feed the round-scoping of the errored
+        label below. ``expected=None`` (a caller with no round context) keeps
+        the label un-scoped."""
         key = self._skip_key(bot)
         if key is None:
             if self._bot_state(bot).last_seen is not None:
@@ -926,16 +933,40 @@ class RoundDriver:
             # not absent — activity earns the same "Active ✅" an expected
             # reviewer gets, never the not-requested fallback.
             return _STATUS_ACTIVE
+        if (key == "errored" and expected is not None
+                and bot not in expected and posted == 0
+                and self._bot_state(bot).last_seen is None):
+            # ROUND-SCOPED (round-2 mislabel incident, 2026-07-04): "Could not
+            # review ❌" describes an EVENT — the round's attempt produced an
+            # error placeholder. In LATER rounds the bot is deliberately NOT
+            # re-summoned (expected_bots subtracts the errored exclusion), so
+            # the honest per-round verdict is "Not requested 🙅" — the same
+            # rendering every other skipped bot gets (e.g. polish-only).
+            # Unlike quota / PR-too-large — persistent STATE that stays true
+            # each round — a transient error says nothing about a round in
+            # which the bot never ran. In the round the error fired, the bot
+            # is still in the round-START expected set, so the label renders
+            # there. Two arms keep it honest when the bot DID act this round
+            # without being expected: ``posted`` (a classified comment — a
+            # genuine one retracts via the comeback before the table renders)
+            # and ``last_seen`` (any contribution this round, reset per round
+            # in _wait_for_quiescence — e.g. a re-posted error placeholder,
+            # which is seen but not a classified comment). Either keeps
+            # "Could not review ❌"; only a round the bot truly sat out reads
+            # "Not requested 🙅".
+            return _STATUS_SHORT["not-requested"]
         return _STATUS_SHORT.get(key, key)
 
     def _round_table_rows(self, actionable: Sequence[Comment],
-                          results: Sequence[CommentResult]) -> List[dict]:
+                          results: Sequence[CommentResult],
+                          expected: Optional[Sequence[str]] = None) -> List[dict]:
         """One summary row per reviewer (canonical order) from this round's
         classified comments + each reviewer's terminal status. The table is the
         COMPLETE view: every built-in reviewer gets a row every round — one
         outside the enabled fleet renders "Not requested 🙅" — plus a row for any
         reviewer that actually posted. Display only: summoning, polling, and
-        expectation stay on the enabled fleet."""
+        expectation stay on the enabled fleet. ``expected`` is this round's
+        round-start expected set (round-scopes the errored label)."""
         counts: Dict[str, Dict[str, int]] = {}
         for c, r in zip(actionable, results):
             bot = detectors.bot_for_login(c.source)
@@ -953,16 +984,18 @@ class RoundDriver:
         for bot in roster:
             d = counts.get(bot, {})
             row = {"bot_key": bot, "label": _REVIEWER_LABEL.get(bot, bot.capitalize()),
-                   "status": self._bot_status_text(bot)}
+                   "status": self._bot_status_text(
+                       bot, expected=expected, posted=d.get("posted", 0))}
             for k in _TABLE_COUNT_KEYS:
                 row[k] = d.get(k, 0)
             rows.append(row)
         return rows
 
     def _render_round(self, round_no: int, actionable: Sequence[Comment],
-                      results: Sequence[CommentResult]) -> None:
+                      results: Sequence[CommentResult],
+                      expected: Optional[Sequence[str]] = None) -> None:
         _render_round_table(round_no, self.max_rounds,
-                             self._round_table_rows(actionable, results))
+                             self._round_table_rows(actionable, results, expected))
 
     # ------------------------------------------------------------- re-request
 
@@ -1477,7 +1510,7 @@ class RoundDriver:
             self._record_round_attendance(expected)  # silent-streak bookkeeping
 
             if not actionable:
-                self._render_round(round_no, [], [])  # status-only round summary
+                self._render_round(round_no, [], [], expected)  # status-only round summary
                 return self._clean_exit(round_no)
 
             results = process_comments(
@@ -1503,7 +1536,7 @@ class RoundDriver:
             # one whose real findings were ALL dismissed on reassessment must
             # not be re-asked (it would loop against the same verdict).
             self._update_polishing(actionable, results, round_actions)
-            self._render_round(round_no, actionable, results)  # per-reviewer round summary
+            self._render_round(round_no, actionable, results, expected)  # per-reviewer round summary
 
             if self.adapter.escalation.delivered:
                 answers = self.answer_waiter(self.adapter.escalation)

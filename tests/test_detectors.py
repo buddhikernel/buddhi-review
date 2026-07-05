@@ -696,6 +696,42 @@ def test_quoted_error_vocabulary_never_matches_errored():
     ) == detectors.SIGNAL_ERRORED
 
 
+def test_real_475_overview_and_inline_never_classify_as_errored():
+    # Real payloads from the 2026-07-04 incident run (Copilot's genuine
+    # review of the PR that shipped these detector fixes): the overview
+    # quotes "Could not review ❌" in typographic quotes inside flowing PROSE
+    # and uses error-adjacent vocabulary ("errored-excluded",
+    # "transient-error detection") unquoted; the inline finding names the
+    # detector functions in backticks. Neither may classify as errored —
+    # the overview must not exclude the bot, and the inline finding must
+    # stay eligible as comeback evidence.
+    overview = (
+        "## Pull request overview\n\n"
+        "Fixes a reproduced false-positive exclusion incident where "
+        "genuine bot reviews were incorrectly classified as “Could not "
+        "review ❌”, by adding per-cause gating and strengthening "
+        "recovery/retraction logic.\n\n"
+        "**Changes:**\n"
+        "- Hardens transient-error detection by stripping quoted label "
+        "vocabulary before matching, and prevents “clean review” bodies "
+        "from being errored-excluded.\n"
+        "- Fixes errored retraction by accepting cosmetic evidence, adding "
+        "a placeholder-masquerade guard, and allowing same-timestamp "
+        "retraction when it’s provably the same review item.\n"
+    )
+    inline = (
+        "`is_transient_error_message` now always runs `_strip_quoted_vocab`, "
+        "which performs multiple regex substitutions over the full body. "
+        "This function is called in the poll/preflight hot paths for every "
+        "bot message, so doing the strip unconditionally can add avoidable "
+        "overhead when the body contains no quoting/fence markers (the "
+        "common case). Consider a quick delimiter check before stripping so "
+        "the extra regex work only happens when it can change the result."
+    )
+    assert detectors.detect_signal(overview) is None
+    assert detectors.detect_signal(inline) is None
+
+
 def test_quote_shield_is_errored_only():
     # Quota / PR-too-large classify RAW text — quoted quota or size copy still
     # classifies deterministically, and its protection is the per-cause gate,
