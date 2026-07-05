@@ -298,7 +298,7 @@ def _review_thread_from_raw(raw: dict) -> Optional[ReviewThread]:
     comments = raw.get("comments")
     nodes = comments.get("nodes") if isinstance(comments, dict) else None
     root: Optional[str] = None
-    if nodes:
+    if isinstance(nodes, list) and nodes:
         first = nodes[0]
         if isinstance(first, dict) and first.get("databaseId") is not None:
             root = str(first["databaseId"])
@@ -378,6 +378,9 @@ def fetch_review_threads(
         except (json.JSONDecodeError, TypeError) as exc:
             raise RuntimeError(
                 f"failed to parse gh api graphql reviewThreads response: {exc}") from exc
+        if data and data.get("errors"):
+            raise RuntimeError(
+                f"gh api graphql reviewThreads returned errors: {data['errors']}")
         rt = ((((data or {}).get("data") or {}).get("repository") or {})
               .get("pullRequest") or {}).get("reviewThreads") or {}
         for node in (rt.get("nodes") or []):
