@@ -378,6 +378,9 @@ def fetch_review_threads(
         except (json.JSONDecodeError, TypeError) as exc:
             raise RuntimeError(
                 f"failed to parse gh api graphql reviewThreads response: {exc}") from exc
+        if not isinstance(data, dict):
+            raise RuntimeError(
+                f"unexpected JSON type from gh api graphql reviewThreads: {type(data).__name__}")
         if data and data.get("errors"):
             raise RuntimeError(
                 f"gh api graphql reviewThreads returned errors: {data['errors']}")

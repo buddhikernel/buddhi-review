@@ -261,6 +261,24 @@ def test_gate_fails_soft_on_requery_error():
     assert ft.resolved == ["PRRT_1"]         # own thread was still resolved
 
 
+def test_gate_blocks_on_resolve_fail_plus_requery_error():
+    # Compound failure: the resolve mutation reported failure (returned False) AND
+    # the confirming re-query errors. The thread's true state is unconfirmed, so the
+    # gate must NOT fail-open into a merge — it blocks and hands back.
+    class RequeryBoom(FakeThreads):
+        def fetch(self, pr, repo=None, cwd=None):
+            self.fetches += 1
+            if self.fetches >= 2:            # fail ONLY on the re-query
+                raise RuntimeError("graphql blip")
+            return super().fetch(pr, repo=repo, cwd=cwd)
+
+    ft = RequeryBoom([_thread("PRRT_1", "c1", resolved=False)])
+    ft.resolve_fail = True                   # resolve() returns False (silent fail)
+    driver = _driver_with_gate([_fixed("c1")], ft)
+    assert driver._thread_gate_ok() is False
+    assert ft.resolved == ["PRRT_1"]         # attempted, but it reported failure
+
+
 def test_gate_matches_all_resolved_finals():
     # Every genuine-done disposition resolves its own thread.
     for final in ("fixed", "skipped", "skipped-invalid",

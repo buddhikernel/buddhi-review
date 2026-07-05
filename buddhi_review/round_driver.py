@@ -2174,7 +2174,13 @@ class RoundDriver:
         slip through. Fail-soft everywhere else: a ``gh`` / GraphQL read error (the
         reader raises) is NOT an unresolved thread, so it logs and proceeds,
         mirroring ``check_pr_mergeable``'s fail-open contract — a transient blip
-        never wedges a mergeable PR."""
+        never wedges a mergeable PR.
+
+        The one exception to fail-soft is the confirming re-query: it fails open ONLY
+        when every ``resolve_thread`` call reported success. If a resolve mutation
+        FAILED (the resolver returns False on a gh error) and the re-read ALSO errors,
+        the threads' true state is genuinely unconfirmed, so the gate blocks rather
+        than laundering unconfirmed state into a merge."""
         try:
             threads = self.fetch_threads(self.pr, repo=self.repo, cwd=self.cwd)
         except (subprocess.SubprocessError, OSError, RuntimeError):
@@ -2198,13 +2204,19 @@ class RoundDriver:
         own = [t for t in unresolved
                if t.root_comment_id is not None and t.root_comment_id in handled]
         foreign = [t for t in unresolved if t not in own]
+        all_resolves_ok = True
         for t in own:
             try:
-                self.resolve_thread(t.id, cwd=self.cwd)
+                # The resolver reports failure by RETURNING False (it swallows gh /
+                # GraphQL errors internally), not by raising — so track the return
+                # value, not just exceptions. A failed resolve means the thread may
+                # still be unresolved; the re-query below is normally the source of
+                # truth, but if it ALSO errors we must not fail-open (see below).
+                if not self.resolve_thread(t.id, cwd=self.cwd):
+                    all_resolves_ok = False
             except (subprocess.SubprocessError, OSError, RuntimeError):
-                # Best-effort — the re-query below is the source of truth. A resolve
-                # that silently failed simply leaves the thread unresolved there.
-                pass
+                # A raising resolve is likewise unconfirmed.
+                all_resolves_ok = False
         if foreign:
             # An unresolved thread the loop never handled → definitely not merge-
             # ready, decided on the first (good) read; no re-query, so a transient
@@ -2220,11 +2232,22 @@ class RoundDriver:
         try:
             threads2 = self.fetch_threads(self.pr, repo=self.repo, cwd=self.cwd)
         except (subprocess.SubprocessError, OSError, RuntimeError):
-            # Fail-soft on the confirming re-query too (own threads were already
-            # resolved above; a blip must not wedge the now-clean PR).
-            print(f"[thread-gate] could not re-read PR #{self.pr} review threads "
-                  f"after resolving — proceeding")
-            return True
+            if all_resolves_ok:
+                # Fail-soft on the confirming re-query too: every resolve mutation
+                # reported success, so the run's own threads ARE resolved on GitHub;
+                # a transient re-read blip must not wedge the now-clean PR.
+                print(f"[thread-gate] could not re-read PR #{self.pr} review threads "
+                      f"after resolving — proceeding (all resolve mutations succeeded)")
+                return True
+            # A resolve mutation reported failure AND the confirming re-read errored:
+            # the thread's true state is genuinely unconfirmed. Do NOT fail-open into
+            # a merge on unconfirmed state — block and hand back instead.
+            self.notice("thread-gate",
+                        f"PR #{self.pr}: could not confirm this run's review-thread "
+                        f"resolution (a resolve call failed and the confirming re-read "
+                        f"also errored) — not merging; handing back", status="stop",
+                        hint="resolve the open thread(s) on GitHub, then re-run")
+            return False
         remaining = [t for t in threads2 if not t.is_resolved]
         if remaining:
             self.notice("thread-gate",
