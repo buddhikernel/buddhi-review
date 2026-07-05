@@ -755,11 +755,14 @@ class RoundDriver:
         self.cwd = cwd or os.getcwd()
         self.cfg = cfg if cfg is not None else load_config()
         # An unconfirmed repo (no repos[<repo>] entry) with NO global default to
-        # fall back to is running purely on the built-in default fleet — surfaced
-        # in the round table as "not configured (repo)" so an idle reviewer there
-        # does not read as a neutral "active". The common confirmed / global-
-        # default install is NOT flagged. (The launch gate only lets this state
-        # through under the BUDDHI_ALLOW_UNCONFIRMED_REPO bypass.)
+        # fall back to is running purely on the built-in default fleet. This flag
+        # drives ONLY the one-time operator console notice below — it is a repo-
+        # REGISTRATION fact, orthogonal to any per-reviewer availability, so it no
+        # longer paints the round table (which would falsely badge the
+        # undetectable Copilot/Codex/Gemini "Not configured"). The per-reviewer
+        # table badge is driven by _repo_gate_excluded instead. The common
+        # confirmed / global-default install is NOT flagged. (The launch gate only
+        # lets this state through under the BUDDHI_ALLOW_UNCONFIRMED_REPO bypass.)
         self._repo_unconfigured = (
             bool(self.repo)
             and repo_entry(self.cfg, self.repo) is None
@@ -785,6 +788,35 @@ class RoundDriver:
         self.wall_clock = wall_clock
         self.sleep = sleep
         self.notice = notice
+        # ── Per-reviewer repo-availability gate ───────────────────────────────
+        # Badge a reviewer that posted no review by what the loop can ACTUALLY,
+        # RELIABLY detect with its user token. Only Claude is detectable (a
+        # user-scoped Contents-API GET of claude-code-review.yml), so the gate set
+        # can hold only "claude". It is populated ONCE before round 1 (see
+        # _populate_repo_gate) and is monotonic for the run — never re-evaluated or
+        # cleared mid-round. Empty until the probe runs.
+        self._repo_gate_excluded: Set[str] = set()
+        self._repo_gate_probed = False
+        # Preserve the operator cue that a repo was never registered in Buddhi.
+        # The per-reviewer gate badges ONLY Claude, so retiring the old blanket
+        # "Not configured (repo)" table badge — which painted ALL four reviewers,
+        # including the undetectable Copilot/Codex/Gemini — removes the only signal
+        # that a repo has no confirmed fleet. Re-emit that signal ONCE here, as a
+        # console notice (NOT a per-round table badge). Under the launch gate an
+        # unregistered repo with no global default only reaches driver
+        # construction via BUDDHI_ALLOW_UNCONFIRMED_REPO, so this cue rides that
+        # bypass path.
+        if self._repo_unconfigured:
+            self.notice(
+                "repo not registered",
+                f"{self.repo} has no confirmed reviewer fleet and no global "
+                f"default — running on the built-in default fleet. Reviewer "
+                f"availability is only detectable for Claude here; a silent "
+                f"Copilot/Codex/Gemini row reads 'No review posted', not "
+                f"'Not configured'.",
+                status="fallback",
+                hint="confirm reviewers via the setup wizard",
+            )
         self.times = times or RoundTimes()
         # Round budget: an explicit value wins; otherwise BUDDHI_MAX_ROUNDS env,
         # then auto-size from the diff (uncapped), then the fallback.
@@ -1013,12 +1045,18 @@ class RoundDriver:
         if key is None:
             if self._bot_state(bot).last_seen is not None:
                 return _STATUS_ACTIVE  # engaged this round
-            # Idle on a repo running with no confirmed fleet and no global
-            # default → say so honestly. Otherwise the reviewer was expected
-            # yet posted nothing (an unsummonable reviewer is never
-            # silent-dropped, but it still posted no review) — the same
-            # "No review posted 🔇" as a silent drop.
-            return (_STATUS_NOT_CONFIGURED if self._repo_unconfigured
+            # Idle reviewer, no lifecycle signal. Badge ONLY what the loop can
+            # reliably detect per-reviewer with its user token. Claude alone is
+            # detectable (a Contents-API GET of claude-code-review.yml), so an
+            # absent workflow puts "claude" in _repo_gate_excluded → "Not
+            # configured (repo) 🔧". Copilot/Codex/Gemini are NEVER in that set —
+            # Copilot's summon 422 is overloaded (enabled-but-busy vs not-enabled,
+            # and can succeed-silently, cli/cli#11245) and a Codex/Gemini App
+            # install needs an App JWT the loop's user token cannot mint (GET
+            # repos/{repo}/installation → 404) — so their silence is the ONLY
+            # honest signal and MUST stay "No review posted 🔇", never a "Not
+            # configured" the loop cannot verify.
+            return (_STATUS_NOT_CONFIGURED if bot in self._repo_gate_excluded
                     else _STATUS_SHORT["silent"])
         if key == "not-requested" and self._bot_state(bot).last_seen is not None:
             # A not-summoned reviewer that posted anyway THIS round is engaged,
@@ -1822,10 +1860,33 @@ class RoundDriver:
             print(f"[preflight] {len(self._preflight_batch)} pre-existing comment(s) "
                   f"to process in round 1 without waiting")
 
+    def _populate_repo_gate(self) -> None:
+        """Populate ``self._repo_gate_excluded`` ONCE, before round 1, from the
+        per-reviewer availability probe. Only Claude is reliably detectable with
+        the loop's user token (a Contents-API GET of claude-code-review.yml), so
+        an ABSENT workflow excludes "claude" — its idle row badges "Not configured
+        (repo) 🔧". Copilot/Codex/Gemini are NEVER probed here and never enter the
+        set: Copilot's summon 422 is overloaded (enabled-but-busy vs not-enabled,
+        and it can succeed-silently — cli/cli#11245) and a Codex/Gemini App
+        install can only be read with an App JWT the loop's user token cannot mint
+        (GET repos/{repo}/installation → 404), so their silence is the ONLY honest
+        signal. Monotonic for the run: guarded so it never re-evaluates or flips a
+        badge mid-round. Fail-closed — the probe treats any gh/auth/timeout error
+        as an absent workflow."""
+        if self._repo_gate_probed:
+            return
+        self._repo_gate_probed = True
+        if not detectors.detect_claude_workflow_present(
+                self.repo, cwd=self.cwd, run=self.gh_run):
+            self._repo_gate_excluded.add("claude")
+
     def run(self) -> RunOutcome:
         """Snapshot the run-start fleet (for the SAFETY gate's empty-vs-silent
         distinction), drive the round loop, and ALWAYS emit the persistent
         silent-reviewer warning at run end (every exit path, via ``finally``)."""
+        # Probe per-reviewer availability ONCE, before round 1 — its result is
+        # monotonic for the run (see _populate_repo_gate).
+        self._populate_repo_gate()
         if self.rr:
             # --rr re-pings everyone: clear the SOFT exclusions (voluntarily-done
             # + polish-only + reviewed-no-change) so a previously-satisfied

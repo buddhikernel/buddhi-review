@@ -414,8 +414,11 @@ def test_skip_key_and_long_form_for_not_requested_bot():
     assert d._bot_status_text("gemini") == "Not requested 🙅"
     # every skip key carries an honest long form
     assert "not requested" in round_driver._SKIP_LONG["not-requested"]
-    # distinct from the repo-gate label — an unconfirmed-repo idle EXPECTED
-    # reviewer still reads "Not configured (repo) 🔧", never "Not requested 🙅"
+    # distinct from the repo-gate label: an operator-off reviewer (removed from
+    # the fleet) reads "Not requested 🙅", never the repo-gate "Not configured
+    # (repo) 🔧". Under the per-reviewer model a non-Claude reviewer is never
+    # gate-excluded, so it could not read "Not configured" here regardless — only
+    # an absent Claude workflow earns that badge.
     assert d._bot_status_text("gemini") != round_driver._STATUS_NOT_CONFIGURED
 
 
