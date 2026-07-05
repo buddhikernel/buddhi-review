@@ -1349,8 +1349,8 @@ class RoundDriver:
             st.last_seen = now
             self.done.add(bot)
             self._reaction_done.add(bot)    # mark as reaction-done for quota re-check
-            self.approved.add(bot)          # sticky "Approved 👍" (a later hard
-            st.signal = detectors.SIGNAL_CLEAN  #   signal must not demote it)
+            self.approved.add(bot)          # sticky: a later hard signal must not demote "Approved 👍"
+            st.signal = detectors.SIGNAL_CLEAN
             self.reviewed_ever.add(bot)     # a +1 IS a genuine clean review
             self.responded_ever.add(bot)
             if bot in self.silent_dropped:
@@ -1649,7 +1649,17 @@ class RoundDriver:
             # A fresh +1 reaction (no comment) is a voluntarily-done signal — fold
             # it AFTER the comment classify so a hard signal on a comment wins, and
             # so the reacting bot quiesces (its round-open hold is released).
-            reacted = self._fold_reactions(now)
+            # Skip the gh API call when no expected reviewer is still pending
+            # (no signal, not done, not excluded) — it cannot produce a fold.
+            if any(
+                self._bot_state(b).signal is None
+                and b not in self.done
+                and not self.store.is_excluded(b)
+                for b in expected
+            ):
+                reacted = self._fold_reactions(now)
+            else:
+                reacted = False
             if fresh or reacted:
                 last_activity = now
             if all(self._quiesced(b, now, round_start) for b in expected):
