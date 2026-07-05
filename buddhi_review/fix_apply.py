@@ -404,9 +404,13 @@ _ALREADY_FIXED_MARKERS = (
     "nonexistent",
     "previously fixed",
     "prior commit",
-    "resolved in",
-    "addressed in",
 )
+
+# "resolved in" / "addressed in" need word-boundary matching: plain substring
+# would fire on "unresolved in" or "unaddressed in", misclassifying an
+# invalid-SKIP as already-fixed.
+_ALREADY_FIXED_RE = re.compile(
+    r'(?<!\bun)(?:resolved|addressed)\s+in\b', re.IGNORECASE)
 
 
 def skip_kind(reason: str) -> str:
@@ -415,7 +419,9 @@ def skip_kind(reason: str) -> str:
     suggested fix would break something). The fixer states which in its one-line
     reason; parse it instead of collapsing both into one bucket name."""
     low = (reason or "").lower()
-    if any(m in low for m in _ALREADY_FIXED_MARKERS):
+    if any(m in low for m in _ALREADY_FIXED_MARKERS) or bool(
+        _ALREADY_FIXED_RE.search(reason or "")
+    ):
         return "already fixed"
     return "invalid"
 
