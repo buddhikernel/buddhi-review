@@ -354,6 +354,14 @@ def test_present_false_repo_none_when_gh_cannot_resolve():
     assert detectors.detect_claude_workflow_present(None, run=run) is False
 
 
+def test_present_false_on_jq_null_literal():
+    # jq --jq .content emits the literal string "null" when .content is absent
+    # (e.g. path resolves to a directory and the API returns a JSON array).
+    # That string is non-empty but must NOT be treated as workflow-present.
+    run = lambda argv, *, cwd=None: _completed(stdout="null\n")
+    assert detectors.detect_claude_workflow_present("octo/repo", run=run) is False
+
+
 def test_present_true_via_env_seam(monkeypatch):
     # A seeded workflow YAML represents a present workflow; gh is never invoked.
     monkeypatch.setenv(detectors.CLAUDE_WORKFLOW_YML_ENV, "on:\n  issue_comment:\n")

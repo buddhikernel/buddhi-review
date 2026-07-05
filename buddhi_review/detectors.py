@@ -1069,7 +1069,10 @@ def detect_claude_workflow_present(
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+    output = (proc.stdout or "").strip()
+    # jq emits the literal string "null" when .content is absent (e.g. path is a
+    # directory); treat that the same as empty — file not present.
+    return proc.returncode == 0 and bool(output) and output != "null"
 
 
 # ── Repo-scoped token-401 probe (the setup wizard's re-mint evidence) ───────────────
