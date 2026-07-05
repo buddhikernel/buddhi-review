@@ -44,7 +44,8 @@ polish + reviewed-no-change) at run start; the hard buckets are never cleared. `
 ``--rr-active`` also widen the round-1 summon set (``--rr``) or exit clean when
 nothing is active (``--rr-active``). ``--rr-none`` is the opposite pole: nobody
 is summoned or polled (``expected_bots()`` is empty), the comments already on the
-PR are still fixed and resolved, and the run merges on a clean exit even with
+PR are still fixed and resolved, and the run merges on a clean exit (when auto-merge
+is enabled) even with
 zero reviews — the one explicit lift of the never-merge-unreviewed backstop.
 
 Clock, sleep, the comment fetch, and the ``gh`` runner are all injectable —
@@ -780,8 +781,8 @@ class RoundDriver:
         # --rr-none: summon nobody, poll nobody. expected_bots() returns [] so no
         # reviewer is nudged/polled/waited-on; existing comments are still fixed
         # (the first _wait_for_quiescence ingest returns them and all([]) quiesces
-        # instantly), then _clean_exit merges even with zero reviews — the one
-        # explicit lift of the never-merge-unreviewed block.
+        # instantly), then _clean_exit merges even with zero reviews (when auto_merge
+        # is set) — the one explicit lift of the never-merge-unreviewed block.
         self.rr_none = rr_none
         self.push = push
         self.test_gate = test_gate

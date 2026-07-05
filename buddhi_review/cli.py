@@ -276,7 +276,8 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                    help="round 1: only still-active reviewers; exit clean if none")
     g.add_argument("--rr-none", action="store_true",
                    help="summon NO reviewers: fix/resolve the comments already on "
-                        "the PR and merge on a clean exit, even with zero reviews. "
+                        "the PR and merge on a clean exit (if --auto-merge is "
+                        "enabled), even with zero reviews. "
                         "The one explicit way to lift the never-merge-unreviewed "
                         "block (zero reviewers is then deliberate, not an "
                         "accidentally-silent fleet)")
