@@ -106,6 +106,7 @@ def _review_pr(args: argparse.Namespace) -> int:
         fix_pr_description=args.fix_pr_description,
         rr=args.rr,
         rr_active=args.rr_active,
+        rr_none=args.rr_none,
     )
 
 
@@ -183,6 +184,7 @@ def _run_loop(args: argparse.Namespace) -> int:
         auto_merge=args.auto_merge,
         rr=args.rr,
         rr_active=args.rr_active,
+        rr_none=args.rr_none,
         test_gate=(args.test_failure_mode != "off"),
     )
     try:
@@ -272,6 +274,12 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                         "exclusions (voluntarily-done + polish), keeps the hard ones")
     g.add_argument("--rr-active", action="store_true",
                    help="round 1: only still-active reviewers; exit clean if none")
+    g.add_argument("--rr-none", action="store_true",
+                   help="summon NO reviewers: fix/resolve the comments already on "
+                        "the PR and merge on a clean exit, even with zero reviews. "
+                        "The one explicit way to lift the never-merge-unreviewed "
+                        "block (zero reviewers is then deliberate, not an "
+                        "accidentally-silent fleet)")
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -114,6 +114,8 @@ def _loop_argv(pr: str, repo: Optional[str], cwd: Optional[str], opts: dict) -> 
         argv.append("--rr")
     if opts.get("rr_active"):
         argv.append("--rr-active")
+    if opts.get("rr_none"):
+        argv.append("--rr-none")
     return argv
 
 
