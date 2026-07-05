@@ -456,7 +456,7 @@ def test_expecting_line_is_canonical_and_table_renders_each_round():
 
 def test_full_roster_table_summons_only_the_active_set():
     # With a two-bot fleet the console table still renders all four built-in
-    # reviewers — the inactive two as "Not requested 🙅" (the ⚪ stripped for the
+    # reviewers — the inactive two as "Not requested 🙅" (the 🙅 stripped for the
     # monospace box, so the cell reads "Not requested") — while the expecting
     # line, the summons, and the polling stay on the active set only.
     calls = []
@@ -478,11 +478,13 @@ def test_full_roster_table_summons_only_the_active_set():
     assert "expecting: claude, codex" in r1
     assert "copilot" not in r1 and "gemini" not in r1
     # all four built-ins have a table row; the two outside the fleet read
-    # "Not requested" (the canonical "Not requested 🙅" with its ⚪ stripped for
+    # "Not requested" (the canonical "Not requested 🙅" with its 🙅 stripped for
     # the box, like every other status glyph)
     for label in ("Claude", "Copilot", "Codex", "Gemini"):
         assert any(ln.startswith("│") and label in ln for ln in out.splitlines())
-    assert out.count("Not requested") == 2
+    not_req_box_lines = [ln for ln in out.splitlines() if ln.startswith("│") and "Not requested" in ln]
+    assert len(not_req_box_lines) == 2
+    assert all("🙅" not in ln for ln in not_req_box_lines)
     # no summon ever targeted a not-requested bot: neither gemini's trigger
     # comment nor copilot's review-request API call was posted. The positive
     # control first — claude's round-1 summon MUST be visible through the same

@@ -149,8 +149,8 @@ back to you. Here is what you see while it flies:
   plus any other that posted, shown for completeness — with what each posted
   and its status (`Active`, `Approved`, `Reviewed — no findings`,
   `Reviewed — no change`, `Polish-only`, `Quota exhausted`,
-  `PR too large to review`, `Could not review`, `No review posted`,
-  `Not configured (repo)`, `Not requested ·` for a reviewer outside the
+  `PR too large 📦`, `Could not review`, `No review posted`,
+  `Not configured (repo)`, `Not requested 🙅` for a reviewer outside the
   enabled fleet, or the internal fallback `excluded`), so a
   reviewer that drops out of the expected set never disappears without a
   reason:
