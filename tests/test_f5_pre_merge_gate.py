@@ -21,7 +21,7 @@ import subprocess
 
 import pytest
 
-from buddhi_review import merge, round_driver
+from buddhi_review import gh_ingest, merge, round_driver
 from buddhi_review.loop import Comment
 from test_round_driver import CLAUDE_ONLY, GhRecorder, label_runner, make_driver
 from buddhi_review.actuators import FixDispatch
@@ -206,6 +206,50 @@ def test_label_ci_off_skips_attach_and_merges_normally():
     assert outcome.merged is True
     assert gh.matching("--add-label", "ready-for-ci") == []
     assert gh.matching("pr", "checks") == []
+
+
+# ===========================================================================
+# 3. Thread-resolution gate — one gate ahead of BOTH pre-merge paths
+# ===========================================================================
+
+def test_thread_gate_blocks_before_label_ci_fork():
+    # An unresolved human thread must stop the merge BEFORE the label-gated CI
+    # path even runs — proving the one thread gate sits ahead of the CI fork.
+    from test_round_driver import FakeThreads
+
+    timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]"))]
+    ft = FakeThreads([gh_ingest.ReviewThread(
+        id="PRRT_human", is_resolved=False, root_comment_id="human99")])
+    gh = CiGh([{"name": "tests", "bucket": "pass", "state": "SUCCESS"}])
+    driver, clock, _ = make_driver(
+        timeline, cfg=LABEL_CI, gh=gh, auto_merge=True,
+        threads_fetch=ft.fetch, resolve_thread=ft.resolve)
+    outcome = driver.run()
+    assert outcome.merged is False
+    assert gh.matching("gh", "merge", "--squash") == []      # never merged
+    assert gh.matching("--add-label", "ready-for-ci") == []  # CI fork never entered
+    assert gh.matching("pr", "checks") == []
+    assert ft.resolved == []                                 # human thread untouched
+
+
+def test_thread_gate_passes_then_label_ci_runs_and_merges():
+    # With the thread gate satisfied (own thread resolved) AND CI green, both
+    # pre-merge gates pass and the PR merges.
+    from test_round_driver import FakeThreads
+
+    timeline = [(0, Comment(id="a", text="this variable is unused",
+                            source="claude[bot]", path="app.py"))]
+    ft = FakeThreads([gh_ingest.ReviewThread(
+        id="PRRT_1", is_resolved=False, root_comment_id="a")])
+    gh = CiGh([{"name": "tests", "bucket": "pass", "state": "SUCCESS"}])
+    driver, clock, _ = make_driver(
+        timeline, cfg=LABEL_CI, gh=gh, auto_merge=True,
+        threads_fetch=ft.fetch, resolve_thread=ft.resolve)
+    outcome = driver.run()
+    assert outcome.merged is True
+    assert ft.resolved == ["PRRT_1"]                    # own thread resolved first
+    assert gh.matching("--add-label", "ready-for-ci")   # then the CI fork ran
+    assert gh.matching("gh", "merge", "--squash")       # then merged
 
 
 # --- direct merge-module unit coverage of the verdict collapse + poll ----------
