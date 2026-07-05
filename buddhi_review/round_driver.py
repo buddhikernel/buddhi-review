@@ -42,7 +42,11 @@ merge gate subtracts the derived union.
 ``--rr`` re-pings everyone: it clears the soft buckets (voluntarily-done +
 polish + reviewed-no-change) at run start; the hard buckets are never cleared. ``--rr`` /
 ``--rr-active`` also widen the round-1 summon set (``--rr``) or exit clean when
-nothing is active (``--rr-active``).
+nothing is active (``--rr-active``). ``--rr-none`` is the opposite pole: nobody
+is summoned or polled (``expected_bots()`` is empty), the comments already on the
+PR are still fixed and resolved, and the run merges on a clean exit (when auto-merge
+is enabled) even with
+zero reviews — the one explicit lift of the never-merge-unreviewed backstop.
 
 Clock, sleep, the comment fetch, and the ``gh`` runner are all injectable —
 the test suite drives rounds with a fake clock and never sleeps or touches the
@@ -731,6 +735,7 @@ class RoundDriver:
         auto_merge: bool = False,
         rr: bool = False,
         rr_active: bool = False,
+        rr_none: bool = False,
         push: bool = True,
         test_gate: bool = True,
         answer_waiter: Optional[Callable[..., Dict[str, Optional[str]]]] = None,
@@ -773,6 +778,12 @@ class RoundDriver:
         self.auto_merge = auto_merge
         self.rr = rr
         self.rr_active = rr_active
+        # --rr-none: summon nobody, poll nobody. expected_bots() returns [] so no
+        # reviewer is nudged/polled/waited-on; existing comments are still fixed
+        # (the first _wait_for_quiescence ingest returns them and all([]) quiesces
+        # instantly), then _clean_exit merges even with zero reviews (when auto_merge
+        # is set) — the one explicit lift of the never-merge-unreviewed block.
+        self.rr_none = rr_none
         self.push = push
         self.test_gate = test_gate
         self.answer_waiter = answer_waiter or escalation_wait.wait_for_delivered
@@ -847,6 +858,13 @@ class RoundDriver:
         """The expected-bot gate: enabled reviewers minus voluntarily-done, minus
         the soft driver drops (polish-only + silent + reviewed-no-change), minus the derived union of
         the three hard exclusion buckets."""
+        if self.rr_none:
+            # --rr-none: the operator asked for zero reviewers — so nobody is
+            # expected. An empty set means _summon targets nobody, the poll never
+            # waits (all([]) quiesces at once), and _run_start_fleet is empty,
+            # which the _clean_exit rr-none gates read as an intentional (not
+            # accidental) no-review merge.
+            return []
         return [
             b for b in active_reviewers(self.cfg, self.repo)
             if b not in self.done
@@ -1497,14 +1515,26 @@ class RoundDriver:
         for round_no in range(1, self.max_rounds + 1):
             self._apply_rate_limit_comeback()
             expected = _canonical(self.expected_bots())
-            if not expected:
+            if not expected and not self.rr_none:
                 if self.rr_active and round_no == 1:
                     print("[round] --rr-active: no still-active reviewers — clean exit")
                 return self._clean_exit(round_no - 1)
 
-            self._log_skipped(expected)  # honest skip-reason logging
-            print(f"[round] Round {round_no} of {self.max_rounds} — expecting: "
-                  f"{', '.join(expected)}")
+            if self.rr_none:
+                # --rr-none: no reviewer is summoned or polled (expected is empty).
+                # The first _wait_for_quiescence ingest still returns the comments
+                # already on the PR, and all([]) quiesces the round instantly, so
+                # existing comments are fixed and the run then merges via the
+                # _clean_exit rr-none gates. Skip the skipped-reviewer log + the
+                # "expecting" banner: every reviewer is sidelined on purpose, which
+                # is not the silent disappearance those lines exist to explain.
+                if round_no == 1:
+                    print("[round] --rr-none: summoning no reviewers — fixing any "
+                          "comments already on the PR, then merging on a clean exit")
+            else:
+                self._log_skipped(expected)  # honest skip-reason logging
+                print(f"[round] Round {round_no} of {self.max_rounds} — expecting: "
+                      f"{', '.join(expected)}")
             self._summon(round_no, expected)
             actionable = self._wait_for_quiescence(expected, self.clock())
             self._record_round_attendance(expected)  # silent-streak bookkeeping
@@ -1627,21 +1657,26 @@ class RoundDriver:
             # reviewed. Three-way distinction (the run-start fleet snapshot is the
             # discriminator) ─────────────────────────────────────────────────────
             fleet = set(self._run_start_fleet)
-            if not fleet:
+            if not fleet and not self.rr_none:
                 # (a) zero reviewers by design → quiet no-auto-merge. There is
                 #     nothing to gate on, so leaving the PR open is the safe,
-                #     unalarming outcome (no review ever happened).
+                #     unalarming outcome (no review ever happened). EXCEPTION:
+                #     under --rr-none the empty fleet is the operator's explicit
+                #     "resolve existing comments and merge" request, so it falls
+                #     through to the merge below instead of this skip.
                 self.notice("squash-merge",
                             f"no reviewers configured for this repo — leaving "
                             f"PR #{self.pr} open (nothing reviewed it)",
                             status="skip",
                             hint="add reviewers via the setup wizard, or merge by hand")
                 return RunOutcome("clean", rounds, False, self.actions)
-            if not (fleet & self.reviewed_ever):
+            if fleet and not (fleet & self.reviewed_ever):
                 # (b) reviewers were expected but NONE genuinely reviewed → loud
                 #     handback + block. A quota/error placeholder is a response,
                 #     not a review, so it never lands in reviewed_ever (filtered in
-                #     _classify_signal) and cannot satisfy this gate.
+                #     _classify_signal) and cannot satisfy this gate. Guarded on a
+                #     non-empty fleet so --rr-none (empty fleet) is never blocked
+                #     here — it has already passed (a) and merges at (c).
                 self._block_unreviewed_merge(fleet)
                 return RunOutcome("clean", rounds, False, self.actions)
             # (c) >=1 expected reviewer genuinely reviewed (incl. a clean approval)
@@ -1710,6 +1745,11 @@ class RoundDriver:
         # pre-merge CI (when gated) was not red.
         if self._premerge_ci_red:
             return "the pre-merge CI is red"
+        if self.rr_none:
+            # --rr-none asked for no review by design, so an empty fleet here is
+            # not "unconfigured" — the comments were fixed and the PR is ready.
+            # (Only reached when auto-merge is off; the auto-merge path merges.)
+            return None
         fleet = set(self._run_start_fleet)
         if not fleet:
             return "no reviewers are configured for this repo"
