@@ -1349,7 +1349,7 @@ class RoundDriver:
             st.last_seen = now
             self.done.add(bot)
             self._reaction_done.add(bot)    # mark as reaction-done for quota re-check
-            self.approved.add(bot)          # sticky: a later hard signal must not demote "Approved 👍"
+            self.approved.add(bot)          # hard causes (quota/errored/PR-too-large) can still evict this
             st.signal = detectors.SIGNAL_CLEAN
             self.reviewed_ever.add(bot)     # a +1 IS a genuine clean review
             self.responded_ever.add(bot)
