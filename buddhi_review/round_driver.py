@@ -1429,17 +1429,19 @@ class RoundDriver:
           CLASSIFICATION_FAILED) has nothing left to fix; dropped from
           re-request for the rest of the run.
         * **reviewed — no change** — a reviewer whose real findings this round
-          all ended dismissed with NO change applied (``final ==
-          "skipped-invalid"``): the fixer judged the comment invalid /
-          already-fixed / not applicable, or a fix-verify REJECT rolled the
-          attempted change back. A substantive comment the loop decided not
-          to act on is not cosmetic — it gets its own label — and re-asking
-          that reviewer would loop it against the same verdict, so it too is
-          dropped from re-request.
+          all ended dismissed with NO change applied (``final`` in
+          ``{"skipped-invalid", "skipped-already-fixed"}``): the fixer judged
+          the comment invalid / already-fixed / not applicable via a genuine
+          validity judgment. A substantive comment the loop decided not to act
+          on is not cosmetic — it gets its own label — and re-asking that
+          reviewer would loop it against the same verdict, so it too is dropped
+          from re-request. A fix-verify REJECT is NOT a dismissal (``final ==
+          "rejected"``): the finding still stands, so its reviewer keeps its
+          re-request slot and the REJECT is escalated at the round-level gate.
 
-        A finding that was FIXED, escalated, or deferred keeps its reviewer in
-        the re-request gate (a fix earns a re-review; an escalation is still
-        pending); CLASSIFICATION_FAILED counts as a real finding
+        A finding that was FIXED, rejected, escalated, or deferred keeps its
+        reviewer in the re-request gate (a fix earns a re-review; a REJECT/
+        escalation is still pending); CLASSIFICATION_FAILED counts as a real finding
         unconditionally (it rides the escalation exit). A reviewer that went
         voluntarily-done or is hard-excluded (quota / PR-too-large / errored)
         is never demoted here."""
@@ -1456,7 +1458,7 @@ class RoundDriver:
             if label not in _REAL_FINDING_LABELS:
                 continue
             if (label != "CLASSIFICATION_FAILED"
-                    and finals.get(c.id) == "skipped-invalid"):
+                    and finals.get(c.id) in ("skipped-invalid", "skipped-already-fixed")):
                 dismissed.add(bot)
             else:
                 surviving.add(bot)
@@ -1626,9 +1628,12 @@ class RoundDriver:
             # / PR-description / outdated / invalid-only round — or a substantive
             # comment the fixer skipped, or a substantive fix that changed nothing
             # — is a clean finish: the applied fixes were committed above, so exit
-            # clean without re-summoning anyone. The file-change check reads the
-            # commit result when pushing (``pushed`` = real changes committed);
-            # with pushing off it probes the worktree directly.
+            # clean without re-summoning anyone. (A verify-REJECT does NOT reach
+            # here as a clean finish: it escalated at the round-level gate above,
+            # so an unanswered/stop REJECT already handed back or stopped the run.)
+            # The file-change check reads the commit result when pushing
+            # (``pushed`` = real changes committed); with pushing off it probes
+            # the worktree directly.
             round_substantive = any(
                 r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
                 for r, a in zip(results, round_actions)

@@ -30,7 +30,7 @@ from typing import Callable, Optional
 from buddhi_review import plan_profile
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.classify import REWRITE_LABELS
-from buddhi_review.fix_apply import FixOutcome, apply_fix
+from buddhi_review.fix_apply import FixOutcome, apply_fix, skip_kind
 from buddhi_review.loop import Comment, CommentResult
 from buddhi_review.notifier import Ask
 
@@ -200,7 +200,7 @@ def rewrite_pr_description(
 class ActionResult:
     comment_id: str
     disposition: str
-    final: str  # fixed | skipped-invalid | skipped | escalated | deferred | already-resolved
+    final: str  # fixed | skipped-invalid | skipped-already-fixed | skipped | rejected | escalated | deferred | already-resolved
     detail: str = ""
     # Carried up from FixOutcome: a fix whose rollback could not be proven clean
     # poisons the shared worktree. The round driver halts before pushing on this,
@@ -284,24 +284,53 @@ def act_on_result(
             return ActionResult(comment.id, d, "deferred", "no fixer wired (decision-only run)")
         outcome = fix_dispatch(comment, result)
         rb = outcome.rollback_failed
+
+        def _escalate(question: str) -> None:
+            # Deliver a per-comment Ask on the SAME ``fix-<id>`` rail the round
+            # driver's escalation gate reads (a "Stop the run" answer stops; an
+            # unanswered one hands back). Shared by the transient-failure and the
+            # verify-REJECT paths so both surface for a human identically.
+            ask = Ask(
+                id=f"fix-{comment.id}",
+                question=question,
+                options=[
+                    "Apply the change manually (the loop moves on)",
+                    "Skip this comment",
+                    "Stop the run",
+                ],
+                recommended_index=0,
+                detail=outcome.detail,
+            )
+            adapter.escalation.delivered.append(ask)
+            adapter.escalation.notifier.send(ask)
+
         if outcome.status == "applied":
             return ActionResult(comment.id, d, "fixed", outcome.detail, rollback_failed=rb)
-        if outcome.status in ("skipped", "rejected"):
-            return ActionResult(comment.id, d, "skipped-invalid", outcome.detail, rollback_failed=rb)
+        if outcome.status == "skipped":
+            # A genuine validity judgment — the fixer decided nothing should be
+            # applied. Render the honest sub-label it stated in its reason
+            # (already-fixed vs invalid); both dismiss the finding downstream.
+            final = ("skipped-already-fixed"
+                     if skip_kind(outcome.detail) == "already fixed"
+                     else "skipped-invalid")
+            return ActionResult(comment.id, d, final, outcome.detail, rollback_failed=rb)
+        if outcome.status == "rejected":
+            # A fix-verify REJECT: the fixer produced a candidate patch and the
+            # verify pass refused it (rolled back). NOT a dismissal and NOT "no
+            # change needed" — the finding still stands. Surface it for a human
+            # like a failed fix so it is never silently counted as clean progress
+            # toward auto-merge, and keep its own honest ``rejected`` label rather
+            # than laundering it as ``skipped-invalid``.
+            _escalate(
+                f"The automated fix for comment {comment.id} was REJECTED by the "
+                f"pre-commit verify pass (the change was refused and rolled back) "
+                f"— how should it be handled?"
+            )
+            return ActionResult(comment.id, d, "rejected", outcome.detail, rollback_failed=rb)
         # transient-failed → escalate rather than retrying on another model
-        ask = Ask(
-            id=f"fix-{comment.id}",
-            question=f"The automated fix for comment {comment.id} failed — how should it be handled?",
-            options=[
-                "Apply the change manually (the loop moves on)",
-                "Skip this comment",
-                "Stop the run",
-            ],
-            recommended_index=0,
-            detail=outcome.detail,
+        _escalate(
+            f"The automated fix for comment {comment.id} failed — how should it be handled?"
         )
-        adapter.escalation.delivered.append(ask)
-        adapter.escalation.notifier.send(ask)
         return ActionResult(comment.id, d, "escalated", outcome.detail, rollback_failed=rb)
     if d == "escalate":
         # The kernel delivered the pre-reasoned ask via ConsoleEscalation in

@@ -572,10 +572,10 @@ def test_stop_answer_on_failed_fix_stops_the_run():
 
 def test_reject_rollback_failure_halts_before_push():
     # A fix-verify REJECT whose rollback could not be proven clean poisons the
-    # shared worktree. Its disposition is "rejected" (→ skipped-invalid, NO
-    # escalation), so the escalation gate never fires for it — yet the round MUST
-    # still halt before the push, or the un-rolled-back, explicitly-refused residue
-    # would ride the sibling's repo-wide `git add -A` onto the PR.
+    # shared worktree. Its disposition is "rejected" and it escalates for a human;
+    # here the escalation is answered with {} (proceed), so the round MUST still
+    # halt at the poisoned-worktree gate before the push, or the un-rolled-back,
+    # explicitly-refused residue would ride the sibling's `git add -A` onto the PR.
     timeline = [
         (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
         (0, Comment(id="b", text="rename this helper", source="claude[bot]")),
@@ -595,8 +595,9 @@ def test_reject_rollback_failure_halts_before_push():
 
 
 def test_reject_clean_rollback_does_not_false_halt():
-    # Same shape but the rollback SUCCEEDED (rollback_failed=False): the gate must
-    # NOT fire, so the sibling's applied fix pushes and the run proceeds normally.
+    # Same shape but the rollback SUCCEEDED (rollback_failed=False): the poison
+    # gate must NOT fire, and here the REJECT escalation is answered with {}
+    # (proceed), so the sibling's applied fix pushes and the run proceeds normally.
     timeline = [
         (0, Comment(id="a", text="this null check is missing", source="claude[bot]")),
         (0, Comment(id="b", text="rename this helper", source="claude[bot]")),
@@ -613,6 +614,25 @@ def test_reject_clean_rollback_does_not_false_halt():
     outcome = driver.run()
     assert outcome.status != "needs-human"    # the gate did NOT false-halt
     assert gh.matching("git", "push")         # clean rollback → sibling fix pushed
+
+
+def test_reject_unanswered_escalation_hands_back_never_merges():
+    # A verify-REJECT is surfaced for a human like a failed fix (never silently
+    # dismissed). With a clean rollback the poison gate does NOT fire, so what
+    # keeps the rejected finding from auto-merging is the escalation: left
+    # unanswered, the loop hands back (needs-human) rather than counting the
+    # rejected finding as clean progress and merging it unfixed.
+    timeline = [(0, Comment(id="a", text="this null check is missing",
+                            source="claude[bot]"))]
+    fix: FixDispatch = lambda c, r: FixOutcome(
+        status="rejected", rollback_failed=False, detail="verify REJECT")
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        auto_merge=True, answer_waiter=lambda esc, **k: {"fix-a": None},
+    )
+    outcome = driver.run()
+    assert outcome.status == "needs-human"    # unanswered REJECT → hand back
+    assert not gh.matching("gh", "merge")     # a standing rejected finding never auto-merges
 
 
 def test_transient_rollback_failure_escalates_then_gate_still_halts():
@@ -1063,10 +1083,10 @@ def test_reviewer_with_a_real_finding_is_not_polished():
 # ---------------------------------------------------------------------------
 
 def test_dismissed_substantive_reviewer_is_reviewed_no_change(capsys):
-    # copilot's substantive finding is dismissed by the fixer (skip — judged
-    # invalid / already-fixed → final "skipped-invalid", NO change applied):
-    # it renders "Reviewed — no change" and is dropped from re-request, while
-    # claude's FIXED finding drives round 2 exactly as today.
+    # copilot's substantive finding is dismissed by the fixer (a genuine SKIP
+    # citing "already handled upstream" → final "skipped-already-fixed", NO change
+    # applied): it renders "Reviewed — no change" and is dropped from re-request,
+    # while claude's FIXED finding drives round 2 exactly as today.
     cfg = {"active_reviewers": ["claude", "copilot"],
            "auto_on_open": {"claude": False, "copilot": False}}
 
@@ -1108,9 +1128,11 @@ def test_dismissed_substantive_reviewer_is_reviewed_no_change(capsys):
 
 
 def test_mixed_dismissed_substantive_and_cosmetic_is_reviewed_no_change(capsys):
-    # A reviewer whose substantive finding was dismissed AND whose cosmetic nit
-    # was applied lands in reviewed-no-change (the dismissed-substantive signal
-    # outranks plain polish — mirroring the reassessed-away precedence).
+    # A reviewer whose substantive finding was dismissed (a genuine invalid SKIP)
+    # AND whose cosmetic nit was applied lands in reviewed-no-change (the
+    # dismissed-substantive signal outranks plain polish — mirroring the
+    # reassessed-away precedence). A verify-REJECT would NOT dismiss (it escalates
+    # + stays engaged); the dismissal here is a genuine validity-judgment SKIP.
     cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": False}}
 
     def classify(prompt):
@@ -1124,7 +1146,7 @@ def test_mixed_dismissed_substantive_and_cosmetic_is_reviewed_no_change(capsys):
 
     def fix(c, r):
         if c.id == "a":
-            return FixOutcome(status="rejected", detail="fix-verify REJECT")
+            return FixOutcome(status="skipped", detail="SKIP: the cited path is unreachable")
         return FixOutcome(status="applied")
 
     driver, clock, gh = make_driver(
