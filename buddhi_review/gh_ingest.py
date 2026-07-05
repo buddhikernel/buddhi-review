@@ -420,7 +420,15 @@ def resolve_review_thread(
         proc = run(argv, cwd=cwd)
     except (OSError, subprocess.SubprocessError):
         return False
-    return proc.returncode == 0
+    if proc.returncode != 0:
+        return False
+    try:
+        data = json.loads(proc.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if isinstance(data, dict) and data.get("errors"):
+        return False
+    return True
 
 
 def ingest_source(
