@@ -1024,6 +1024,67 @@ def detect_claude_auto_on_open(
     return workflow_triggers_on_open(text)
 
 
+def detect_claude_workflow_present(
+    repo: Optional[str],
+    *,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> bool:
+    """Whether ``repo``'s ``claude-code-review.yml`` EXISTS on the default branch.
+
+    The NARROW presence question — deliberately NOT the auto-on-open trigger
+    shape :func:`detect_claude_auto_on_open` answers. The shipped template is
+    mention-driven (that function returns ``False``) yet is fully present and
+    configured, so trigger shape must NEVER gate presence: this asks only "is the
+    file there?". Claude is the ONE reviewer whose configuration a user-scoped
+    ``gh`` token can read — a single Contents-API GET of the workflow file. A
+    successful, non-empty fetch ⇒ present (``True``).
+
+    Fail-closed: a missing file, a ``gh`` absence / auth / network / timeout
+    error, or an empty body ⇒ ``False`` (absent), so a caller treats an
+    unverifiable Claude as not-configured rather than asserting a presence it
+    could not confirm (mirrors :func:`detect_claude_auto_on_open`, which collapses
+    every failure mode to one "absent" outcome). Pure read — nothing here writes
+    config or wires the round loop.
+
+    ``repo=None`` is a supported loop mode: like the loop's other ``gh`` calls
+    (e.g. the re-request POST), the endpoint falls back to the ``{owner}/{repo}``
+    placeholder that ``gh api`` substitutes from ``cwd``'s git remote — so a
+    present workflow still reads present on a ``--repo``-less run, and only a real
+    "``gh`` can't resolve the repo" error fails closed. Passing the wrong ``cwd``
+    (no git remote) therefore reads absent, which is the honest fail-closed
+    outcome (presence unconfirmable).
+
+    ``BUDDHI_CLAUDE_WORKFLOW_YML``, when set, short-circuits the ``gh`` call
+    (network-free tests): a non-empty value ⇒ present (``True``), an
+    empty/whitespace value ⇒ absent (``False``) — ``gh`` is never invoked."""
+    if CLAUDE_WORKFLOW_YML_ENV in os.environ:
+        return bool(os.environ[CLAUDE_WORKFLOW_YML_ENV].strip())
+    try:
+        try:
+            proc = run(
+                ["gh", "api",
+                 f"repos/{repo or '{owner}/{repo}'}/contents/{CLAUDE_WORKFLOW_PATH}",
+                 "--jq", ".content"],
+                cwd=cwd,
+                timeout=_GH_TIMEOUT,
+            )
+        except TypeError:
+            # Injected runner doesn't accept timeout= (e.g. test fakes); retry without.
+            proc = run(
+                ["gh", "api",
+                 f"repos/{repo or '{owner}/{repo}'}/contents/{CLAUDE_WORKFLOW_PATH}",
+                 "--jq", ".content"],
+                cwd=cwd,
+            )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    output = (proc.stdout or "").strip()
+    # jq emits the literal string "null" when .content is absent (e.g. path is a
+    # directory); treat that the same as empty — file not present.
+    return proc.returncode == 0 and bool(output) and output != "null"
+
+
 # ── Repo-scoped token-401 probe (the setup wizard's re-mint evidence) ───────────────
 # GitHub Actions secrets are WRITE-ONLY: nothing — not the wizard, not the loop —
 # can read back a stored ``CLAUDE_CODE_OAUTH_TOKEN`` to test it. The only evidence a

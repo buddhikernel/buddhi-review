@@ -286,3 +286,87 @@ def test_detect_env_seam_mention_driven_false(monkeypatch):
         "on:\n  issue_comment:\n    types: [created]\n",
     )
     assert detectors.detect_claude_auto_on_open("octo/repo") is False
+
+
+# ---------------------------------------------------------------------------
+# detect_claude_workflow_present — the NARROW presence probe (is the file there?)
+# It answers a DIFFERENT question than auto_on_open: a mention-driven template is
+# present-but-False for auto_on_open, yet MUST read present here.
+# ---------------------------------------------------------------------------
+
+def test_present_true_on_successful_fetch():
+    captured = {}
+
+    def run(argv, *, cwd=None):
+        captured["argv"] = argv
+        return _completed(stdout=_b64("on:\n  issue_comment:\n"))
+
+    assert detectors.detect_claude_workflow_present("octo/repo", run=run) is True
+    assert captured["argv"][:2] == ["gh", "api"]
+    assert detectors.CLAUDE_WORKFLOW_PATH in captured["argv"][2]
+
+
+def test_present_true_for_mention_driven_template():
+    # The shipped template is mention-driven (auto_on_open → False) but is fully
+    # present: presence must NOT gate on trigger shape.
+    text = _TEMPLATE.read_text(encoding="utf-8")
+    run = lambda argv, *, cwd=None: _completed(stdout=_b64(text))
+    assert detectors.detect_claude_auto_on_open("octo/repo", run=run) is False
+    assert detectors.detect_claude_workflow_present("octo/repo", run=run) is True
+
+
+def test_present_false_on_missing_workflow():
+    # gh api 404 → non-zero rc → absent (fail-closed).
+    run = lambda argv, *, cwd=None: _completed(returncode=1, stderr="HTTP 404")
+    assert detectors.detect_claude_workflow_present("octo/repo", run=run) is False
+
+
+def test_present_false_on_empty_body():
+    run = lambda argv, *, cwd=None: _completed(stdout="   \n")
+    assert detectors.detect_claude_workflow_present("octo/repo", run=run) is False
+
+
+def test_present_false_on_runner_error_fails_closed():
+    def run(argv, *, cwd=None):
+        raise OSError("gh not found")
+
+    assert detectors.detect_claude_workflow_present("octo/repo", run=run) is False
+
+
+def test_present_repo_none_uses_owner_repo_placeholder():
+    # repo=None is a supported loop mode: like the loop's other gh calls, the
+    # endpoint uses the {owner}/{repo} placeholder gh substitutes from cwd's
+    # remote — so a present workflow still reads present on a --repo-less run.
+    captured = {}
+
+    def run(argv, *, cwd=None):
+        captured["argv"] = argv
+        return _completed(stdout=_b64("on:\n  issue_comment:\n"))
+
+    assert detectors.detect_claude_workflow_present(None, run=run) is True
+    assert "repos/{owner}/{repo}/contents/" in captured["argv"][2]
+
+
+def test_present_false_repo_none_when_gh_cannot_resolve():
+    # No git remote / gh can't resolve the placeholder → non-zero rc → fail-closed
+    # absent (honest: presence unconfirmable).
+    run = lambda argv, *, cwd=None: _completed(returncode=1, stderr="no default remote")
+    assert detectors.detect_claude_workflow_present(None, run=run) is False
+
+
+def test_present_false_on_jq_null_literal():
+    # jq --jq .content emits the literal string "null" when .content is absent
+    # (e.g. path resolves to a directory and the API returns a JSON array).
+    # That string is non-empty but must NOT be treated as workflow-present.
+    run = lambda argv, *, cwd=None: _completed(stdout="null\n")
+    assert detectors.detect_claude_workflow_present("octo/repo", run=run) is False
+
+
+def test_present_true_via_env_seam(monkeypatch):
+    # A seeded workflow YAML represents a present workflow; gh is never invoked.
+    monkeypatch.setenv(detectors.CLAUDE_WORKFLOW_YML_ENV, "on:\n  issue_comment:\n")
+
+    def run(argv, *, cwd=None):
+        raise AssertionError("env seam set → must not call gh")
+
+    assert detectors.detect_claude_workflow_present("octo/repo", run=run) is True

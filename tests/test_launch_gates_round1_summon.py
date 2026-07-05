@@ -419,20 +419,107 @@ class TestPerRepoRound1Summon:
         assert "@claude review" in rec.comment_bodies()
 
 
-# ── "not configured (repo)" round-table status ───────────────────────────────
-def _status_driver(cfg, *, repo=REPO):
+# ── per-reviewer repo-availability round-table status ────────────────────────
+def _gh_claude(present, *, error=False):
+    """A gh_run fake for the Claude-workflow presence probe.
+
+    ``present=True``  → the Contents-API GET returns a non-empty (base64) body;
+    ``present=False`` → a 404 (workflow absent on the default branch);
+    ``error=True``    → the runner raises (the fail-closed path). Every non-probe
+    gh/git call returns a plain success so an unrelated driver spawn is a no-op."""
+    def run(argv, *, cwd=None, timeout=None):
+        if error:
+            raise OSError("gh unavailable")
+        is_contents = argv[:2] == ["gh", "api"] and any("contents/" in a for a in argv)
+        if is_contents:
+            if present:
+                return subprocess.CompletedProcess(argv, 0, stdout="YWJjZA==\n", stderr="")
+            return subprocess.CompletedProcess(argv, 1, stdout="", stderr="Not Found")
+        return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+    return run
+
+
+def _status_driver(cfg, *, repo=REPO, gh=None, notice=None):
+    kw = {}
+    if gh is not None:
+        kw["gh_run"] = gh
+    if notice is not None:
+        kw["notice"] = notice
     return RoundDriver("7", repo=repo, cwd="/x", cfg=cfg,
-                       classify_runner=lambda p: "{}", clean_llm=None)
+                       classify_runner=lambda p: "{}", clean_llm=None, **kw)
 
 
 class TestUnconfiguredRepoStatus:
-    def test_idle_bot_on_unconfigured_repo(self):
-        d = _status_driver({}, repo="o/r")           # no global default, no entry
+    # Badge a reviewer that posted no review by what the loop can RELIABLY detect
+    # with its user token. Only Claude is detectable (a Contents-API GET of its
+    # workflow), so an ABSENT claude-code-review.yml renders "Not configured (repo)
+    # 🔧". Copilot/Codex/Gemini are never per-reviewer-detectable, so their silence
+    # is honest — "No review posted 🔇", NEVER a "Not configured" the loop can't
+    # verify. The probe runs once before round 1 (_populate_repo_gate).
+
+    def test_absent_claude_workflow_excludes_claude(self):
+        # (a) absent workflow → Claude "Not configured (repo) 🔧".
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=False))
         assert d._repo_unconfigured is True
+        d._populate_repo_gate()
+        assert "claude" in d._repo_gate_excluded
         assert d._bot_status_text("claude") == "Not configured (repo) 🔧"
 
+    def test_idle_bot_on_unconfigured_repo(self):
+        # Same as above via the render path: an idle Claude on an unregistered
+        # repo whose workflow is absent reads the distinct repo-gate badge.
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=False))
+        assert d._repo_unconfigured is True
+        d._populate_repo_gate()
+        assert d._bot_status_text("claude") == "Not configured (repo) 🔧"
+
+    def test_present_claude_workflow_does_not_exclude_claude(self):
+        # (b) present workflow → Claude NOT excluded → honest silence, never the
+        # repo-gate badge, even on an otherwise-unregistered repo.
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=True))
+        d._populate_repo_gate()
+        assert "claude" not in d._repo_gate_excluded
+        assert d._bot_status_text("claude") == "No review posted 🔇"
+
+    def test_probe_gh_error_fails_closed_excludes_claude(self):
+        # (c) probe gh-error → fail-closed: an unverifiable Claude is treated as
+        # absent (excluded), never assumed present.
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=True, error=True))
+        d._populate_repo_gate()
+        assert "claude" in d._repo_gate_excluded
+        assert d._bot_status_text("claude") == "Not configured (repo) 🔧"
+
+    def test_unregistered_repo_non_claude_reviewers_render_honest_silence(self):
+        # (d) On a totally-unregistered repo, Copilot/Codex/Gemini render honest
+        # silence — NOT "Not configured" — because none of the three is
+        # per-reviewer-detectable with the loop's user token. Only Claude (absent)
+        # earns the repo-gate badge. The one-time operator notice fires on
+        # construction.
+        rec = NoticeRec()
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=False), notice=rec)
+        d._populate_repo_gate()
+        for bot in ("copilot", "codex", "gemini"):
+            assert bot not in d._repo_gate_excluded
+            assert d._bot_status_text(bot) == "No review posted 🔇"
+            assert d._bot_status_text(bot) != round_driver._STATUS_NOT_CONFIGURED
+        assert d._bot_status_text("claude") == "Not configured (repo) 🔧"
+        # the one-time operator cue fired once on driver construction
+        assert [c["action"] for c in rec.calls] == ["repo not registered"]
+        assert rec.statuses() == ["fallback"]
+
+    def test_probe_is_monotonic_for_the_run(self):
+        # The gate is populated once and never re-evaluated: a second probe call
+        # (even with a now-"present" runner) does not clear the exclusion.
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=False))
+        d._populate_repo_gate()
+        assert d._repo_gate_excluded == {"claude"}
+        d.gh_run = _gh_claude(present=True)           # workflow "appears" mid-run
+        d._populate_repo_gate()                        # no-op — already probed
+        assert d._repo_gate_excluded == {"claude"}
+
     def test_global_default_present_is_no_review_posted(self):
-        # A configured repo's expected-yet-never-seen reviewer posted no review.
+        # A configured repo (global default) is not repo-unconfigured; with the
+        # probe unrun, Claude is not excluded → honest silence.
         d = _status_driver({"active_reviewers": ["claude"]}, repo="o/r")
         assert d._repo_unconfigured is False
         assert d._bot_status_text("claude") == "No review posted 🔇"
@@ -448,21 +535,42 @@ class TestUnconfiguredRepoStatus:
         assert d._repo_unconfigured is False
         assert d._bot_status_text("claude") == "No review posted 🔇"
 
-    def test_seen_bot_is_active_not_unconfigured(self):
-        d = _status_driver({}, repo="o/r")
+    def test_repo_none_present_workflow_is_honest_silence(self):
+        # repo=None is a supported loop mode (gh infers {owner}/{repo} from cwd, as
+        # the loop's other gh calls do). A PRESENT Claude workflow there reads
+        # present → honest silence, NEVER a false "Not configured (repo)".
+        d = _status_driver({}, repo=None, gh=_gh_claude(present=True))
+        d._populate_repo_gate()
+        assert "claude" not in d._repo_gate_excluded
+        assert d._bot_status_text("claude") == "No review posted 🔇"
+
+    def test_repo_none_absent_workflow_is_genuinely_detected(self):
+        # repo=None + an absent workflow is genuinely detected via the placeholder
+        # (gh 404) → the honest repo-gate badge, not a false silence.
+        d = _status_driver({}, repo=None, gh=_gh_claude(present=False))
+        d._populate_repo_gate()
+        assert d._bot_status_text("claude") == "Not configured (repo) 🔧"
+
+    def test_seen_bot_is_active_not_excluded(self):
+        # Activity this round outranks the repo-gate: even an excluded Claude that
+        # engaged reads "Active ✅".
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=False))
+        d._populate_repo_gate()
         d._bot_state("claude").last_seen = 1.0
         assert d._bot_status_text("claude") == "Active ✅"
 
-    def test_lifecycle_status_outranks_unconfigured(self):
-        # A real terminal signal (quota) must win over the unconfigured status —
-        # the new status only displaces the idle labels.
-        d = _status_driver({}, repo="o/r")
+    def test_lifecycle_status_outranks_repo_gate(self):
+        # A real terminal signal (quota) must win over the repo-gate badge —
+        # the gate only displaces the idle "No review posted" label.
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=False))
+        d._populate_repo_gate()
         d.store.exclude_quota("claude")
         d._bot_state("claude").signal = detectors.SIGNAL_QUOTA
         assert d._bot_status_text("claude") == "Quota exhausted ⚠️"
 
     def test_status_renders_in_table_and_box_stays_rectangular(self):
-        d = _status_driver({}, repo="o/r")           # default fleet, unconfigured
+        d = _status_driver({}, repo="o/r", gh=_gh_claude(present=False))
+        d._populate_repo_gate()                        # claude workflow absent
         buf = io.StringIO()
         with redirect_stdout(buf):
             d._render_round(1, [], [])
