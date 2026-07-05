@@ -100,6 +100,7 @@ def _drive(timeline, cfg, **kw):
         return [c for t, c in timeline if t <= clock.t]
 
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=_Notifier()))
+    kw.setdefault("preflight", False)  # timeline comments arrive during the round
     d = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg, adapter=adapter,
         classify_runner=_classify,

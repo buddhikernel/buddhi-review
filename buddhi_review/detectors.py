@@ -634,6 +634,25 @@ def _quota_exhausted_via_llm(
     return bool(obj and obj.get("quota") is True)
 
 
+def quota_exhausted_via_llm(
+    text: str, quota_llm: Callable[[str], Optional[Dict]]
+) -> bool:
+    """UNGATED tier-2 quota check for the between-rounds re-check.
+
+    :func:`detect_signal` only reaches its LLM quota tier when
+    :data:`_QUOTA_GATE_KEYWORDS_RE` fires, so quota wording with NO gate keyword
+    slips past in-round. This entry runs the same low-effort detector without the
+    keyword gate, so a novel-wording quota message the poll classified as a
+    finding can still exclude the bot between rounds. The review-feedback guard is
+    kept (a message that reads as review prose — bullets, recommendation verbs, a
+    code block — is never re-checked), so a genuine finding that merely mentions
+    rate limits is not mistaken for the reviewer's own quota. Conservative — a
+    None / unparseable / non-true result reads as NOT quota."""
+    if not text or _REVIEW_FEEDBACK_RE.search(text):
+        return False
+    return _quota_exhausted_via_llm(text, quota_llm)
+
+
 # Per-cause prompt fragments for the second-pass: (what the PR's subject
 # involves, what the bot would be self-reporting). Shared prompt shape, one
 # cause-specific claim — so each disambiguation asks exactly the question its

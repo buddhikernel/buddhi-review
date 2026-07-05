@@ -489,6 +489,7 @@ def _run_capture(timeline, cfg, **kw):
 
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=_Notifier()))
     kw.setdefault("gh_run", _Gh())
+    kw.setdefault("preflight", False)  # timeline comments arrive during the round
     d = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg, adapter=adapter,
         classify_runner=lambda p: json.dumps({"label": "SUBSTANTIVE", "reason": "t"}),

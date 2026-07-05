@@ -732,6 +732,7 @@ class RoundDriver:
         clean_llm: Optional[Callable[[str], Optional[dict]]] = None,
         quota_llm: Optional[Callable[[str], Optional[dict]]] = None,
         fetch: Optional[Callable[..., List[Comment]]] = None,
+        reactions_fetch: Optional[Callable[..., List["gh_ingest.Reaction"]]] = None,
         gh_run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], datetime] = _utcnow,
@@ -744,6 +745,7 @@ class RoundDriver:
         rr: bool = False,
         rr_active: bool = False,
         rr_none: bool = False,
+        preflight: bool = True,
         push: bool = True,
         test_gate: bool = True,
         answer_waiter: Optional[Callable[..., Dict[str, Optional[str]]]] = None,
@@ -772,6 +774,10 @@ class RoundDriver:
         # tests → deterministic-only classification.
         self.quota_llm = quota_llm
         self.fetch = fetch or gh_ingest.fetch_comments
+        # The PR-body reactions reader (same injectable/env-seamed shape as
+        # ``fetch``): a bare +1 from a reviewer is a voluntarily-done signal that
+        # never arrives as a comment, so it is read here instead.
+        self.fetch_reactions = reactions_fetch or gh_ingest.fetch_reactions
         # commit_push's runner accepts both cwd= and timeout=, so one injected
         # fake covers every gh/git/test spawn the driver makes.
         self.gh_run = gh_run or commit_push._default_run
@@ -792,6 +798,12 @@ class RoundDriver:
         # instantly), then _clean_exit merges even with zero reviews (when auto_merge
         # is set) — the one explicit lift of the never-merge-unreviewed block.
         self.rr_none = rr_none
+        # Whether to snapshot the PR's pre-existing review state before round 1
+        # (see _preflight_snapshot). On by default — a launched loop always meets
+        # a PR that may already carry reviews. Off only skips that pre-pass; the
+        # round loop is unchanged. The --rr / --rr-active / --rr-none modes skip
+        # preflight regardless (they redefine round 1 themselves).
+        self.preflight = preflight
         self.push = push
         self.test_gate = test_gate
         self.answer_waiter = answer_waiter or escalation_wait.wait_for_delivered
@@ -824,6 +836,49 @@ class RoundDriver:
         self.silent_dropped: Set[str] = set()
         self.bots: Dict[str, BotState] = {}
         self.processed_ids: Set[str] = set()
+        # ── PR-state snapshot machinery ───────────────────────────────────────
+        # _preflight_batch: actionable comments already on the PR before round 1
+        #   (folded through _classify_signal at run start), processed in round 1
+        #   without a poll window. Consumed once — cleared when round 1 reads it.
+        self._preflight_batch: List[Comment] = []
+        # _preflight_responders: every bot that posted ANYTHING at preflight
+        #   (clean / finding / hard signal). Round 1 does not poll or re-summon
+        #   these — they already gave their verdict this run and won't re-post
+        #   until re-requested after a fix — so an already-reviewed PR never burns
+        #   the min-bot wait. Their attendance is credited via responded_ever.
+        self._preflight_responders: Set[str] = set()
+        # _preflight_seen: every bot that posted ANYTHING at preflight (a verdict
+        #   OR mere chatter). A chatter-only bot is NOT a responder (round 1 still
+        #   polls it), but it WAS seen — round 1 stamps it seen so it quiesces on
+        #   the normal window rather than holding the round open as a never-seen
+        #   bot would (matching how a fresh-launch round treats a bot that spoke).
+        self._preflight_seen: Set[str] = set()
+        # _reaction_baseline: reaction ids considered STALE — captured at
+        #   preflight and re-captured before every re-request. A +1 whose id is in
+        #   this set was left before the current review round (an earlier commit /
+        #   a prior round) and never marks a bot done; a +1 with a fresh id does.
+        #   None (the initial value) means "no baseline has been established yet"
+        #   — DISTINCT from an empty set ("captured, zero reactions present"). A
+        #   fold never treats any +1 as fresh while the baseline is None, so a
+        #   failed capture can never let a stale +1 masquerade as fresh (fail
+        #   closed, never fail open with no baseline).
+        self._reaction_baseline: Optional[Set[str]] = None
+        # _reaction_done: subset of `done` added via a +1 reaction fold (not a
+        #   text-based clean review). Used by the between-rounds quota re-check to
+        #   apply the ungated LLM pass even to reaction-done bots — their comment
+        #   texts were NOT checked for quota in-round, so a novel-wording quota
+        #   message the keyword gate missed must still be catchable here. Cleared
+        #   by --rr alongside done / approved.
+        self._reaction_done: Set[str] = set()
+        # _round_baseline: per-bot comment/review ids known through the end of the
+        #   last completed round (preflight seeds round 1's). An item whose id is
+        #   NOT in its bot's baseline is new-since-the-last-re-request — the only
+        #   items the between-rounds quota re-check reconsiders. Run-scoped.
+        self._round_baseline: Dict[str, Set[str]] = {}
+        # _round_new_comments: the fresh comments the CURRENT round's poll ingested
+        #   (new since the last poll, by processed_ids). Reset each round; feeds
+        #   the between-rounds quota re-check.
+        self._round_new_comments: List[Comment] = []
         # _rate_limited_until: bot → the UTC datetime its provider usage
         #   window resets (from a workflow rate_limited marker). While an
         #   entry is present the bot is excluded from re-request; the timed
@@ -1246,6 +1301,122 @@ class RoundDriver:
             self.notice("rate-limited-comeback",
                         f"{bot} usage window has reset — re-requesting", status="done")
 
+    # -------------------------------------------------------- reaction signals
+
+    def _capture_reaction_baseline(self) -> None:
+        """Snapshot the reaction ids currently on the PR as the STALE set. A +1
+        whose id is in this baseline was left before the current re-request (an
+        earlier commit or a prior round) and never marks a bot done; a +1 with a
+        fresh id (added after this snapshot) does. Called at preflight and before
+        every re-request. On a fetch error the baseline is set to None so the fold
+        stays fail-closed until the next successful snapshot — a stale +1 that
+        landed after the last good capture cannot masquerade as fresh."""
+        try:
+            reactions = self.fetch_reactions(self.pr, repo=self.repo, cwd=self.cwd)
+        except (subprocess.SubprocessError, OSError, RuntimeError):
+            self._reaction_baseline = None
+            return
+        self._reaction_baseline = {r.id for r in reactions}
+
+    def _fold_reactions(self, now: float) -> bool:
+        """Fetch the PR's reactions and fold every FRESH ``+1`` (id not in the
+        stale baseline) from a recognized reviewer login into the SAME clean-review
+        outcome the sentinel uses — the bot is voluntarily done (``Approved 👍``).
+        A +1 NEVER overrides a hard cause (quota / PR-too-large / errored) or an
+        already-recorded signal: the bot's state is checked first, exactly like the
+        clean-review path. Returns True iff a fresh +1 was folded (round activity).
+        Fail-CLOSED when no baseline has been established (``None``): without a
+        real stale snapshot, fresh cannot be told from stale, so nothing is folded.
+        Also fail-closed (no fold) on this fetch's own error."""
+        if self._reaction_baseline is None:
+            return False  # no baseline yet → cannot distinguish fresh from stale
+        try:
+            reactions = self.fetch_reactions(self.pr, repo=self.repo, cwd=self.cwd)
+        except (subprocess.SubprocessError, OSError, RuntimeError):
+            return False
+        folded = False
+        for r in reactions:
+            if r.content != "+1" or r.id in self._reaction_baseline:
+                continue  # not a thumbs-up, or a stale +1 from an earlier round
+            bot = detectors.bot_for_login(r.source)
+            if bot is None:
+                continue
+            st = self._bot_state(bot)
+            # A +1 defers to any recorded state: a hard signal (quota / errored /
+            # PR-too-large), an existing clean sign-off, or an already-done bot.
+            if st.signal is not None or bot in self.done or self.store.is_excluded(bot):
+                continue
+            st.last_seen = now
+            self.done.add(bot)
+            self._reaction_done.add(bot)    # mark as reaction-done for quota re-check
+            self.approved.add(bot)          # hard causes (quota/errored/PR-too-large) can still evict this
+            st.signal = detectors.SIGNAL_CLEAN
+            self.reviewed_ever.add(bot)     # a +1 IS a genuine clean review
+            self.responded_ever.add(bot)
+            if bot in self.silent_dropped:
+                self.silent_dropped.discard(bot)
+            folded = True
+            print(f"[reaction] {bot}: +1 — voluntarily done")
+        return folded
+
+    # ----------------------------------------------------- round-baseline re-check
+
+    def _note_baseline(self, comments: Sequence[Comment]) -> None:
+        """Record each comment's id under its bot in the per-bot round baseline —
+        the set of ids known through the end of the round that just ran (preflight
+        seeds round 1's). Items already here are never re-checked for quota; items
+        that arrive after are new-since-the-last-re-request."""
+        for c in comments:
+            bot = detectors.bot_for_login(c.source)
+            if bot is not None:
+                self._round_baseline.setdefault(bot, set()).add(c.id)
+
+    def _recheck_quota_between_rounds(self, fresh: Sequence[Comment]) -> None:
+        """Between-round quota re-check over this round's new-since-baseline items.
+
+        The poll's inline quota detector reaches the model ONLY when the keyword
+        gate fires (hot-path economy), so a quota message with novel wording can
+        be classified as an ordinary finding in-round. Left unre-checked, the loop
+        would keep re-requesting a bot that already signalled it is unavailable.
+        This runs the landed LLM quota tier (``self.quota_llm`` — never a new
+        model role) UNGATED over each still-expected, not-yet-excluded bot's
+        new-since-baseline items; a quota verdict excludes the bot for the run and
+        retracts its (mis-recorded) review from the merge gate. No-op when
+        ``quota_llm`` is unset (deterministic runs are unchanged)."""
+        if self.quota_llm is None:
+            return
+        for c in fresh:
+            bot = detectors.bot_for_login(c.source)
+            if bot is None:
+                continue
+            if c.id in self._round_baseline.get(bot, set()):
+                continue  # known before this round's re-request — already handled
+            if bot in self.done and bot not in self._reaction_done:
+                continue  # text-based clean sign-off already passed quota check in-round
+            st = self._bot_state(bot)
+            already_excluded = self.store.is_excluded(bot)
+            # Fast skip only when there is nothing left to do: already hard-excluded
+            # AND not lingering in reviewed_ever. Do NOT skip merely because a
+            # signal is set — a bot hard-excluded by ANOTHER comment in this batch
+            # can still carry a novel-wording quota message the poll mis-recorded as
+            # a review, and that entry must be purged or it satisfies the merge gate.
+            if already_excluded and bot not in self.reviewed_ever:
+                continue
+            if detectors.quota_exhausted_via_llm(c.text, self.quota_llm):
+                if not already_excluded:
+                    self.store.exclude_quota(bot)
+                    st.signal = detectors.SIGNAL_QUOTA
+                # A quota message is never a review — drop the entry the poll
+                # mis-recorded so it can never satisfy the never-merge gate, even
+                # when the bot is already excluded for another comment this batch.
+                self.reviewed_ever.discard(bot)
+                self.done.discard(bot)           # quota hard-cause evicts any prior clean fold
+                self.approved.discard(bot)       # quota hard-cause wins over any prior +1 fold
+                self._reaction_done.discard(bot)  # keep in sync with done
+                self.notice("exclusion",
+                            f"{bot} excluded for the run: quota exhausted "
+                            f"(detected on a between-rounds re-check)", status="skip")
+
     def _classify_signal(self, comment: Comment, now: float,
                          batch_finding_stamps: Optional[Dict[str, List[Optional[str]]]] = None,
                          ) -> Optional[str]:
@@ -1428,7 +1599,8 @@ class RoundDriver:
                         "after its error signal — back in the re-request gate",
                         status="done")
 
-    def _wait_for_quiescence(self, expected: Sequence[str], round_start: float) -> List[Comment]:
+    def _wait_for_quiescence(self, expected: Sequence[str], round_start: float,
+                             preseen: Iterable[str] = ()) -> List[Comment]:
         # Round-scope the silence timer: a re-requested bot is "not seen yet THIS
         # round" and must be held to MIN_BOT_WAIT, never instantly quiesced on a
         # last_seen stamp left over from a prior round. Without this every round
@@ -1439,11 +1611,21 @@ class RoundDriver:
         # bot's stale stamp must never render "Active ✅" in a round it sat out.
         for st in self.bots.values():
             st.last_seen = None
+        # ``preseen`` bots (chatter-only preflight responders) DID speak before the
+        # round — stamp them seen at round_start so they quiesce on the normal
+        # window instead of holding the round open as a never-seen bot would. A
+        # real review arriving during that window still resets the timer normally.
+        for b in preseen:
+            self._bot_state(b).last_seen = round_start
         actionable: List[Comment] = []
+        # Reset the round's new-comment record (feeds the between-rounds quota
+        # re-check). Every comment the poll ingests this round lands here.
+        self._round_new_comments = []
         last_activity = round_start
         while True:
             now = self.clock()
             fresh = self._ingest_new()
+            self._round_new_comments.extend(fresh)
             # Workflow-surfaced Claude usage-limit marker (managed-version 2).
             # Scanned on the fresh batch (author-pinned to github-actions[bot],
             # which bot_for_login never maps, so the classify loop below can
@@ -1465,7 +1647,21 @@ class RoundDriver:
                 bot = self._classify_signal(c, now, batch_finding_stamps=finding_stamps)
                 if bot is not None:
                     actionable.append(c)
-            if fresh:
+            # A fresh +1 reaction (no comment) is a voluntarily-done signal — fold
+            # it AFTER the comment classify so a hard signal on a comment wins, and
+            # so the reacting bot quiesces (its round-open hold is released).
+            # Skip the gh API call when no expected reviewer is still pending
+            # (no signal, not done, not excluded) — it cannot produce a fold.
+            if any(
+                self._bot_state(b).signal is None
+                and b not in self.done
+                and not self.store.is_excluded(b)
+                for b in expected
+            ):
+                reacted = self._fold_reactions(now)
+            else:
+                reacted = False
+            if fresh or reacted:
                 last_activity = now
             if all(self._quiesced(b, now, round_start) for b in expected):
                 return actionable
@@ -1552,6 +1748,80 @@ class RoundDriver:
 
     # ------------------------------------------------------------------- run
 
+    def _preflight_snapshot(self) -> None:
+        """Before round 1, ingest every review/comment already on the PR and fold
+        it through the SAME classification path the poll uses, so the loop starts
+        already knowing who responded. Seeds ``self.done`` / ``self.approved``
+        (clean reviews), the store's hard buckets (quota / PR-too-large / errored),
+        ``reviewed_ever`` / ``responded_ever``, and ``self._rate_limited_until`` —
+        reusing the poll's own code, so preflight and the poll can never diverge in
+        how they read a comment. Actionable pre-existing comments are collected
+        into ``self._preflight_batch`` (processed in round 1 with no poll wait);
+        every responding bot is recorded in ``self._preflight_responders`` so
+        round 1 neither re-summons nor waits on a reviewer that already spoke.
+
+        Runs ONLY on a default launch — the ``--rr`` / ``--rr-active`` / ``--rr-none``
+        modes keep their existing round-1 semantics untouched. ``processed_ids``
+        de-dup guarantees the round-1 poll never re-processes a folded comment, and
+        the marker scan here fires at most once across preflight + poll."""
+        now = self.clock()
+        fresh = self._ingest_new()
+        # Establish the stale-reaction baseline: every reaction already on the PR
+        # predates the loop's first re-request, so a +1 here never marks a bot done.
+        self._capture_reaction_baseline()
+        if not fresh:
+            return
+        # Honour a pre-existing rate-limit marker BEFORE round 1 (so claude is
+        # released ahead of the poll, not first seen inside it). Same fresh batch,
+        # so _ingest_new's processed_ids de-dup makes it fire exactly once.
+        self._scan_unavailable_markers(fresh)
+        # Per-bot inline-finding stamps (identical to the poll) for the errored
+        # record-time completed-review check.
+        finding_stamps: Dict[str, List[Optional[str]]] = {}
+        for c in fresh:
+            if c.path or c.diff_hunk:
+                b = detectors.bot_for_login(c.source)
+                if b is not None:
+                    finding_stamps.setdefault(b, []).append(c.created_at)
+        for c in fresh:
+            rb = detectors.bot_for_login(c.source)
+            bot = self._classify_signal(c, now, batch_finding_stamps=finding_stamps)
+            if bot is not None:
+                self._preflight_batch.append(c)
+            if rb is not None:
+                # Posted something at preflight → responded (protects it from the
+                # persistent-silent warning), and was SEEN (so round 1 treats it
+                # like a bot that already spoke this round — it quiesces on the
+                # normal window instead of holding the round open as a never-seen
+                # bot would).
+                self.responded_ever.add(rb)
+                self._preflight_seen.add(rb)
+                # But it counts as an already-given VERDICT — one round 1 need not
+                # wait on — only if it reached a terminal state (a clean sign-off,
+                # a hard/rate exclusion) or handed over an actionable finding.
+                # Mere issue-channel chatter is NOT a verdict: that bot stays in
+                # the round-1 poll so its real review is still awaited.
+                if (bot is not None or rb in self.done
+                        or self.store.is_excluded(rb) or rb in self._rate_limited_until):
+                    self._preflight_responders.add(rb)
+        # The between-round quota re-check must cover the preflight batch too: a
+        # novel-wording quota message already on the PR would otherwise be recorded
+        # as a genuine review and satisfy the never-merge gate. Run it BEFORE the
+        # baseline is seeded (the re-check skips already-baselined ids), so the same
+        # safety net the poll path enjoys applies to pre-existing comments.
+        self._recheck_quota_between_rounds(fresh)
+        # These pre-existing comments are round 1's baseline — new comments that
+        # arrive after are attributed to (and re-checked in) the round they land in.
+        self._note_baseline(fresh)
+        # last_seen is a round-scoped stamp; clear the marks the fold set so the
+        # first real round starts clean (round 1's poll resets them too, but a
+        # round-1 fast exit — empty fleet — skips that reset).
+        for st in self.bots.values():
+            st.last_seen = None
+        if self._preflight_batch:
+            print(f"[preflight] {len(self._preflight_batch)} pre-existing comment(s) "
+                  f"to process in round 1 without waiting")
+
     def run(self) -> RunOutcome:
         """Snapshot the run-start fleet (for the SAFETY gate's empty-vs-silent
         distinction), drive the round loop, and ALWAYS emit the persistent
@@ -1562,10 +1832,18 @@ class RoundDriver:
             # reviewer is summoned again. The hard buckets (quota / PR-too-large
             # / errored) are never cleared.
             self.done.clear()
+            self._reaction_done.clear()
             self.approved.clear()
             self.polishing.clear()
             self.reviewed_no_change.clear()
+        # Snapshot the run-start fleet BEFORE preflight folds responders into
+        # done/exclusions, so the SAFETY gate still measures the FULL expected
+        # fleet: a PR everyone already approved has an empty round-1 expected set
+        # but a non-empty run-start fleet + reviewed_ever, so it merges (case c)
+        # rather than reading as "no reviewers configured" (case a).
         self._run_start_fleet = set(self.expected_bots())
+        if self.preflight and not (self.rr or self.rr_active or self.rr_none):
+            self._preflight_snapshot()
         try:
             outcome = self._run_loop()
             # On a manual-landing hand-back, rebase the loop's OWN branch onto the
@@ -1581,7 +1859,18 @@ class RoundDriver:
         for round_no in range(1, self.max_rounds + 1):
             self._apply_rate_limit_comeback()
             expected = _canonical(self.expected_bots())
-            if not expected and not self.rr_none:
+            # Round 1 consumes the preflight batch — actionable comments already on
+            # the PR, folded through _classify_signal at run start. Consumed once;
+            # later rounds always see an empty batch.
+            preflight_batch: List[Comment] = []
+            if round_no == 1 and self._preflight_batch:
+                preflight_batch = self._preflight_batch
+                self._preflight_batch = []
+            # A round with no expected reviewer AND no pre-existing work left is a
+            # clean finish. Preflight having folded every responder into
+            # done/exclusions is exactly how an already-reviewed PR reaches this
+            # with round_no == 1, so the poll wait is skipped entirely.
+            if not expected and not self.rr_none and not preflight_batch:
                 if self.rr_active and round_no == 1:
                     print("[round] --rr-active: no still-active reviewers — clean exit")
                 return self._clean_exit(round_no - 1)
@@ -1601,9 +1890,36 @@ class RoundDriver:
                 self._log_skipped(expected)  # honest skip-reason logging
                 print(f"[round] Round {round_no} of {self.max_rounds} — expecting: "
                       f"{', '.join(expected)}")
-            self._summon(round_no, expected)
-            actionable = self._wait_for_quiescence(expected, self.clock())
-            self._record_round_attendance(expected)  # silent-streak bookkeeping
+            # Round 1 neither re-summons nor waits on a preflight responder — it
+            # already gave its verdict this run and will not re-post until it is
+            # re-requested after a fix, so polling it would burn the min-bot wait
+            # on an already-reviewed PR. Later rounds re-request + poll it as usual.
+            poll_expected = ([b for b in expected if b not in self._preflight_responders]
+                             if round_no == 1 else list(expected))
+            # Snapshot the stale-reaction set before re-requesting: a +1 already on
+            # the PR is stale; one arriving after the re-request is a fresh signal.
+            self._capture_reaction_baseline()
+            self._summon(round_no, poll_expected)
+            # A chatter-only preflight bot that is still polled this round was seen
+            # before it (it spoke at preflight), so it must not hold the round open
+            # as a never-seen bot — stamp it seen at the poll's start.
+            preseen = (self._preflight_seen & set(poll_expected)) if round_no == 1 else ()
+            polled = self._wait_for_quiescence(poll_expected, self.clock(), preseen=preseen)
+            self._record_round_attendance(poll_expected)  # silent-streak bookkeeping
+
+            # Pre-existing comments need no poll window — they ride this round with
+            # whatever the poll surfaced.
+            actionable = list(preflight_batch) + polled
+            # Their authors posted (at preflight); stamp them seen so the round
+            # table renders them engaged rather than silent.
+            for c in preflight_batch:
+                b = detectors.bot_for_login(c.source)
+                if b is not None:
+                    self._bot_state(b).last_seen = self.clock()
+            # Between-round quota re-check over this round's new-since-baseline
+            # items, then fold those ids into the baseline for the next round.
+            self._recheck_quota_between_rounds(self._round_new_comments)
+            self._note_baseline(self._round_new_comments)
 
             if not actionable:
                 self._render_round(round_no, [], [], expected)  # status-only round summary

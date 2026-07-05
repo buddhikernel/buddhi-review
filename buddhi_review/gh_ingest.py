@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Sequence
 
 from buddhi.stage0.conditioning import RawItem
@@ -29,7 +30,21 @@ from buddhi.stage0.conditioning import RawItem
 from buddhi_review.loop import Comment
 
 COMMENTS_JSON_ENV = "BUDDHI_REVIEW_COMMENTS_JSON"
+# Reactions seam — a JSON list of raw reaction dicts (same shape gh returns)
+# short-circuits the gh call, mirroring COMMENTS_JSON_ENV.
+REACTIONS_JSON_ENV = "BUDDHI_REVIEW_REACTIONS_JSON"
 _GH_TIMEOUT = 60
+
+
+@dataclass(frozen=True)
+class Reaction:
+    """One reaction on the PR body (issues/<pr>/reactions). ``content`` is the
+    GitHub reaction name (``+1``, ``eyes``, …); ``source`` is the reacting login.
+    Only bot-authored reactions are ever constructed — a human's +1 must never
+    read as a reviewer sign-off."""
+    id: str
+    content: str
+    source: str
 
 
 def _default_run(argv: Sequence[str], *, cwd: Optional[str] = None) -> "subprocess.CompletedProcess[str]":
@@ -168,6 +183,70 @@ def fetch_pr_diff_lines(
     if not isinstance(additions, int) or not isinstance(deletions, int):
         return None
     return additions + deletions
+
+
+def _reaction_from_raw(raw: dict) -> Optional[Reaction]:
+    """Map one raw reaction dict → :class:`Reaction`, or None when it is
+    malformed OR not bot-authored. GitHub reserves the ``[bot]`` login suffix for
+    Apps (a human cannot register it), and some App accounts report
+    ``type == "User"`` (verified for the Codex connector), so the suffix is the
+    reliable bot signal; ``type == "Bot"`` is accepted as a secondary one. Every
+    non-bot reaction is dropped here so a human's +1 can never reach the fold."""
+    rid = raw.get("id")
+    content = raw.get("content")
+    if rid is None or not isinstance(content, str) or not content:
+        return None
+    user = raw.get("user") or {}
+    if not isinstance(user, dict):
+        return None
+    login = str(user.get("login") or "")
+    is_bot = login.endswith("[bot]") or user.get("type") == "Bot"
+    if not login or not is_bot:
+        return None
+    return Reaction(id=str(rid), content=content, source=login)
+
+
+def fetch_reactions(
+    pr: str,
+    *,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> List[Reaction]:
+    """Fetch the reactions on the PR body (``issues/<pr>/reactions``) as
+    :class:`Reaction` objects, keeping only bot-authored ones. A Codex-style
+    reviewer signals "reviewed, no issues" with a bare ``+1`` reaction and no
+    comment, so this is the only place that signal is observable. Same two seams
+    as :func:`fetch_comments`: ``BUDDHI_REVIEW_REACTIONS_JSON`` and an injectable
+    ``run``. Network errors raise — the caller decides how to degrade."""
+    seeded = os.environ.get(REACTIONS_JSON_ENV)
+    if seeded is not None:
+        raws = _parse_payload(seeded)
+        return [r for r in map(_reaction_from_raw, raws) if r is not None]
+
+    repo_path = repo or "{owner}/{repo}"
+    endpoint = f"repos/{repo_path}/issues/{pr}/reactions"
+    try:
+        proc = run(["gh", "api", "--paginate", endpoint], cwd=cwd)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise RuntimeError(f"failed to execute 'gh' CLI: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300]
+        raise RuntimeError(
+            f"gh api {endpoint} failed (rc={proc.returncode}): {detail}"
+        )
+    reactions: List[Reaction] = []
+    seen = set()
+    try:
+        for raw in _decode_concatenated(proc.stdout):
+            r = _reaction_from_raw(raw)
+            if r is not None and r.id not in seen:
+                seen.add(r.id)
+                reactions.append(r)
+    except ValueError as exc:
+        raise RuntimeError(
+            f"failed to parse gh api response for {endpoint}: {exc}") from exc
+    return reactions
 
 
 def _decode_concatenated(text: str) -> Iterable[dict]:

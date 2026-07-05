@@ -10,7 +10,7 @@ deletes the seam and injects its own runner.
 """
 import pytest
 
-from buddhi_review import fix_apply
+from buddhi_review import fix_apply, gh_ingest
 
 
 def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
@@ -31,5 +31,10 @@ def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
 def _hermetic_pr_intent(monkeypatch):
     fix_apply.reset_pr_intent()
     monkeypatch.setenv(fix_apply.PR_INTENT_JSON_ENV, '{"title": "", "body": ""}')
+    # The round driver reads PR-body reactions (a +1 = voluntarily-done). Pin the
+    # reactions seam to empty so any driver constructed without an injected
+    # reactions fetch stays network-free; a reactions test either injects its own
+    # fetch or sets this env in its own body.
+    monkeypatch.setenv(gh_ingest.REACTIONS_JSON_ENV, "[]")
     yield
     fix_apply.reset_pr_intent()

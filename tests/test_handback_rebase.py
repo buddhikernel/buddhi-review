@@ -49,6 +49,7 @@ def gh_run(base="main", head="feature/pr-7", current_branch="feature/pr-7"):
 
 
 def make_driver(notice, *, gh=None, cfg=None, **kw):
+    kw.setdefault("preflight", False)  # these tests model a fresh launch
     return RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg if cfg is not None else {},
         adapter=ReviewAdapter(escalation=ConsoleEscalation()),
