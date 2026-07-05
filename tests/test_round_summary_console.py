@@ -257,6 +257,82 @@ def test_bot_status_text_per_cause():
     assert d._bot_status_text("gemini") == "excluded"
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Round-scoping of "Could not review ❌" (round-2 mislabel incident).
+# The label describes an EVENT (this round's attempt errored), not a
+# persistent state: in a later round the errored bot is deliberately NOT
+# re-summoned (expected_bots subtracts the errored exclusion), so its row
+# must read "Not requested 🙅" like any other bot the round skipped — the
+# incident run showed Copilot as "Could not review" in a round-2 table
+# where it was never asked.
+# ─────────────────────────────────────────────────────────────────────
+
+
+def _errored_driver():
+    d = _bare_driver()
+    d._bot_state("copilot").signal = detectors.SIGNAL_ERRORED
+    d.store.exclude_errored("copilot")
+    return d
+
+
+def test_errored_label_renders_in_the_round_the_bot_was_expected():
+    # The error round: the bot is still in the round-START expected set (it
+    # was computed before the mid-round exclusion landed).
+    d = _errored_driver()
+    assert d._bot_status_text(
+        "copilot", expected=["claude", "copilot", "codex", "gemini"]
+    ) == "Could not review ❌"
+
+
+def test_errored_label_falls_to_not_requested_when_round_skipped_the_bot():
+    # Round 2+: not expected, posted nothing — the bot simply was not asked
+    # this round.
+    d = _errored_driver()
+    assert d._bot_status_text(
+        "copilot", expected=["codex"]
+    ) == "Not requested 🙅"
+
+
+def test_errored_label_kept_when_bot_posted_despite_not_being_asked():
+    # An unsolicited late posting that did NOT prove recovery (a genuine
+    # classified comment would have retracted the exclusion via the comeback
+    # before the table renders) keeps the honest error label.
+    d = _errored_driver()
+    assert d._bot_status_text(
+        "copilot", expected=["codex"], posted=1) == "Could not review ❌"
+
+
+def test_errored_label_kept_when_seen_this_round_without_a_classified_comment():
+    # The "seen this round" arm: a bot
+    # not in this round's expected set that still contributed something
+    # non-actionable this round (last_seen set, e.g. a re-posted error
+    # placeholder — seen but posted==0) keeps "Could not review ❌", not
+    # "Not requested 🙅". last_seen is the per-round stamp (_wait_for_quiescence
+    # resets it each round), so this only fires in a round the bot actually
+    # acted in.
+    d = _errored_driver()
+    d._bot_state("copilot").last_seen = 123.0   # contributed this round
+    assert d._bot_status_text(
+        "copilot", expected=["codex"], posted=0) == "Could not review ❌"
+
+
+def test_errored_label_unscoped_without_round_context():
+    # A caller with no round context (expected=None) keeps the label — the
+    # scoping engages only on the render path, which always passes the set.
+    d = _errored_driver()
+    assert d._bot_status_text("copilot") == "Could not review ❌"
+
+
+def test_round_table_row_shows_not_requested_for_skipped_errored_bot():
+    # Table-level integration: the round-2 card. Copilot is errored-excluded
+    # from round 1, absent from round 2's expected set, and posted nothing —
+    # its row must be "Not requested 🙅", byte-identical to every other
+    # skipped bot's row.
+    d = _errored_driver()
+    rows = {r["bot_key"]: r for r in d._round_table_rows([], [], expected=["codex"])}
+    assert rows["copilot"]["status"] == "Not requested 🙅"
+
+
 def test_bot_status_text_split_approved_vs_no_findings_vs_no_change():
     # The done-for-the-run labels split three ways on HOW the reviewer got
     # there: explicit all-clear → Approved; the zero-findings promotion (in
