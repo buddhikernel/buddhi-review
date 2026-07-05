@@ -2183,11 +2183,27 @@ class RoundDriver:
         than laundering unconfirmed state into a merge."""
         try:
             threads = self.fetch_threads(self.pr, repo=self.repo, cwd=self.cwd)
-        except (subprocess.SubprocessError, OSError, RuntimeError):
+        except (subprocess.SubprocessError, OSError):
             # Fail-soft: a transient read error is NOT an unresolved thread, so it
             # must never wedge a mergeable PR. A plain console warning (not an
             # auto-action notice) — the gate simply could not run, it took no
             # merge decision, mirroring the silent degrade of the reaction fold.
+            print(f"[thread-gate] could not read PR #{self.pr} review threads — "
+                  f"proceeding (a transient read error is not an unresolved thread)")
+            return True
+        except RuntimeError as _exc:
+            if "requires an explicit owner/repo" in str(_exc):
+                # A missing or malformed repo string is a non-transient configuration
+                # error — gh_ingest.fetch_review_threads needs owner/repo for GraphQL
+                # variables and cannot degrade gracefully. Block rather than silently
+                # skip the thread check and allow an auto-merge with open threads.
+                self.notice("thread-gate",
+                            f"PR #{self.pr}: cannot check review threads — "
+                            f"no owner/repo configured for GraphQL thread reader",
+                            status="stop",
+                            hint="re-run with --repo owner/name to enable the thread gate")
+                return False
+            # Other RuntimeErrors (GraphQL blips, gh network failures) are transient.
             print(f"[thread-gate] could not read PR #{self.pr} review threads — "
                   f"proceeding (a transient read error is not an unresolved thread)")
             return True

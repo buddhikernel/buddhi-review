@@ -245,6 +245,21 @@ def test_gate_fails_soft_on_reader_error():
     assert ft.resolved == []
 
 
+def test_gate_blocks_on_missing_repo_config_error():
+    # A missing/invalid repo raises RuntimeError("…requires an explicit owner/repo")
+    # from gh_ingest.fetch_review_threads — that is a non-transient config error, NOT
+    # a transient gh blip, so the gate must block (return False) rather than fail-soft.
+    class MissingRepoFetch:
+        resolved = []
+        def fetch(self, pr, repo=None, cwd=None):
+            raise RuntimeError("fetch_review_threads requires an explicit owner/repo")
+        def resolve(self, thread_id, cwd=None):
+            return True
+
+    driver = _driver_with_gate([], MissingRepoFetch())
+    assert driver._thread_gate_ok() is False
+
+
 def test_gate_fails_soft_on_requery_error():
     # The first read succeeds and only own threads are unresolved; a transient
     # error at the confirming re-query must not wedge the (already-resolved) PR.
