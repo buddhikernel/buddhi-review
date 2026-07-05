@@ -54,16 +54,28 @@ def test_garbage_becomes_classification_failed_and_escalates():
     assert r.disposition == "escalate"  # a real finding, never polish-only
 
 
-def test_shared_budget_paces_escalations_across_the_batch():
-    # With a tiny interrupt budget, only the first business question is ESCALATED;
-    # the kernel DENIES the rest over the raised bar (deferred, not dropped).
+def test_every_valid_business_question_is_surfaced_never_budget_deferred():
+    # The interrupt-budget pacing is neutralized: EVERY valid business question is
+    # surfaced to the owner, none deferred-under-budget — even with the smallest
+    # possible daily budget, and even for a long stream of questions. (The old
+    # behavior paced escalations out after the first; that divergence is removed.)
     adapter = ReviewAdapter(daily_interrupt_budget=1)
-    runner = _runner_for({f"q{i}": "BUSINESS_QUESTION" for i in range(3)})
-    comments = [Comment(id=f"c{i}", text=f"q{i}", source=f"rev{i}") for i in range(3)]
+    runner = _runner_for({f"q{i}": "BUSINESS_QUESTION" for i in range(8)})
+    comments = [Comment(id=f"c{i}", text=f"q{i}", source=f"rev{i}") for i in range(8)]
     results = process_comments(comments, adapter=adapter, classify_runner=runner)
     dispositions = [r.disposition for r in results]
-    assert dispositions[0] == "escalate"
-    assert "defer" in dispositions[1:]  # budget paced at least one escalation out
+    assert all(d == "escalate" for d in dispositions)  # every ask surfaced
+    assert "defer" not in dispositions                  # nothing budget-deferred
+
+
+def test_budget_neutralized_at_the_policy_knobs():
+    # The neutralization lives entirely in the policy pack's BudgetKnobs (kernel
+    # untouched): a flat-zero graduated bar (base == cap) plus a zero high-stakes
+    # threshold, so aggregate_budget can never DENY a valid ask for budget.
+    from buddhi_review.policy import review_policy_pack
+    knobs = review_policy_pack().budget
+    assert knobs.base == 0.0 and knobs.cap == 0.0
+    assert knobs.high_stakes_threshold == 0.0
 
 
 def test_process_comment_threads_touched_path_and_diff_to_the_classifier():

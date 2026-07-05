@@ -90,3 +90,18 @@ def test_rr_none_does_not_block_merge_when_nobody_reviewed():
     outcome = driver.run()
     assert not driver.reviewed_ever          # nobody reviewed
     assert outcome.merged is True            # ...yet it merged
+
+
+def test_rr_none_merge_path_unaffected_by_claude_notification(capsys):
+    # --rr-none summons nobody, so the @claude trigger never fires and the
+    # primary-reviewer-skipped NOTIFICATION (#g9a) can never apply: the deliberate
+    # zero-reviewer merge proceeds with no banner.
+    driver, clock, gh = make_driver(
+        [], cfg=CLAUDE_ONLY, auto_merge=True, rr_none=True,
+        answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    out = capsys.readouterr().out
+    assert driver._claude_trigger_failed is False       # never summoned → never failed
+    assert "PRIMARY REVIEWER SKIPPED" not in out
+    assert outcome.merged is True
+    assert gh.matching("gh", "merge", "--squash")

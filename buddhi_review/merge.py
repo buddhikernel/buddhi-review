@@ -7,11 +7,17 @@ itself via :func:`buddhi_review.transparency.automation_notice`.
 When the repo opts into **label-gated CI** (``config.label_gated_ci``), CI is
 deferred to a ``ready-for-ci`` label instead of running on every push. The
 round driver calls :func:`wait_for_ci_green` at clean exit, BEFORE the merge:
-it attaches the label (creating it if absent), then polls ``gh pr checks`` to a
-GREEN verdict and only then lets the merge proceed. A red, never-settling, or
-absent check set blocks the merge (the loop hands the PR back) — the gate never
-false-greens on an empty / all-skipped rollup, and it is bounded so it can never
-deadlock.
+it attaches the label (creating it if absent, retrying a transient label-add
+blip), then polls ``gh pr checks`` to a GREEN verdict and only then lets the
+merge proceed. A red, never-settling, or absent check set blocks the merge (the
+loop hands the PR back) — the gate never false-greens on an ABSENT rollup (a
+non-empty all-skipped rollup DOES count as green — CI ran, every job was
+intentionally skipped), and it is bounded so it can never deadlock.
+
+On a repo WITHOUT label-gated CI, :func:`check_pr_mergeable` is the general
+pre-merge gate: it asks GitHub whether the PR is mergeable (conflicts / draft /
+behind / branch-protection / failing or pending checks) before the merge, and
+:func:`wait_for_ci_settle` waits out an in-flight check on the last fix push.
 """
 from __future__ import annotations
 
@@ -39,12 +45,20 @@ def _default_run(argv: Sequence[str], *, cwd: Optional[str] = None) -> "subproce
 _CI_SETTLE_SECS = 15.0     # let GitHub register the label-triggered check run
 _CI_POLL_ATTEMPTS = 30     # 30 × 30s ≈ 15 min ceiling (bounded — never deadlocks)
 _CI_POLL_INTERVAL = 30.0
+# The `ready-for-ci` label add is one `gh pr edit` call and can hit a transient
+# GitHub blip; retry it a few times before declaring the gate un-attachable (a
+# failed attach means the label-gated workflow never fires, which blocks merge).
+# Only the ADD retries — the `gh label create` bootstrap stays one best-effort call.
+LABEL_ADD_ATTEMPTS = 3
+LABEL_ADD_BACKOFF_S = 2.0
 
 # `gh pr checks --json … bucket` collapses each check to one of five buckets;
-# the raw `state` is the fallback when a row omits the bucket. A check is only
-# GREEN when at least one check PASSED and nothing is failing or still settling —
-# an empty / all-skipped rollup is NOT green (it means CI never actually ran), so
-# the gate keeps waiting (then times out and blocks) rather than merging blind.
+# the raw `state` is the fallback when a row omits the bucket. A NON-EMPTY rollup
+# with nothing failing and nothing still settling is GREEN — even when every row
+# is SKIPPED (CI ran and every job was intentionally skipped by path filters /
+# conditional matrices; that must not wedge the merge forever). An ABSENT / empty
+# rollup is NOT green — it means the checks never registered, so the gate keeps
+# waiting (then times out and blocks) rather than merging blind.
 _FAIL_BUCKETS = {"fail", "cancel"}
 _PASS_BUCKETS = {"pass"}
 _SKIP_BUCKETS = {"skipping"}
@@ -59,14 +73,17 @@ def _ci_verdict(rows: Optional[List[dict]]) -> str:
 
     * ``red``     — any check is failing/cancelled/errored (fail FAST, even while
       others are still running).
-    * ``green``   — at least one check PASSED and none is failing or pending
-      (skipped checks are neutral — they neither block nor satisfy the floor).
-    * ``pending`` — anything else: a check still running, an all-skipped set, OR
-      an empty/absent rollup (checks not registered yet). NEVER green on absent
-      checks, so the gate can never merge code CI never actually ran on."""
+    * ``green``   — a NON-EMPTY rollup with nothing failing and nothing pending,
+      i.e. every real check has resolved to pass OR skip. An all-SKIPPED rollup is
+      green (CI ran, every job was intentionally skipped — it must not wedge the
+      merge forever).
+    * ``pending`` — anything else: a check still running, OR an empty/absent
+      rollup (checks not registered yet). NEVER green on absent checks, so the
+      gate can never merge code CI never actually ran on."""
     if not rows:
         return "pending"  # no checks registered yet — never treat absence as green
     saw_pass = False
+    saw_skip = False
     saw_pending = False
     for r in rows:
         if not isinstance(r, dict):
@@ -78,12 +95,16 @@ def _ci_verdict(rows: Optional[List[dict]]) -> str:
         if bucket in _PASS_BUCKETS or (not bucket and state in _PASS_STATES):
             saw_pass = True
         elif bucket in _SKIP_BUCKETS or (not bucket and state in _SKIP_STATES):
-            continue  # skipped: neutral — does not satisfy the "any check" floor
+            saw_skip = True  # skipped: a real, resolved check — counts toward "CI ran"
         else:
             saw_pending = True  # pending bucket, unknown bucket, or empty state
     if saw_pending:
         return "pending"
-    return "green" if saw_pass else "pending"  # all-skipped ⇒ keep waiting, not green
+    # Non-empty (guarded above), nothing failing, nothing pending → GREEN, even if
+    # every row was skipped. A rollup that yielded no recognizable check row at all
+    # (e.g. only malformed entries) stays pending — we green only on a real pass or
+    # a real skip.
+    return "green" if (saw_pass or saw_skip) else "pending"
 
 
 def _fetch_pr_checks(
@@ -114,12 +135,18 @@ def _fetch_pr_checks(
 def _attach_ready_for_ci(
     pr: str, *, repo: Optional[str], cwd: Optional[str],
     run: Callable[..., "subprocess.CompletedProcess[str]"],
+    sleep: Callable[[float], None] = time.sleep,
+    attempts: int = LABEL_ADD_ATTEMPTS,
+    backoff_s: float = LABEL_ADD_BACKOFF_S,
 ) -> bool:
     """Attach the ``ready-for-ci`` label so the label-gated CI workflow fires.
     Self-bootstrapping: creates the label (neutral gray) first — ``gh label
     create`` exits non-zero when it already exists (the steady state), which is
     ignored; the add is authoritative. Idempotent (``--add-label`` is a no-op
-    when already present). Returns True iff the add succeeded."""
+    when already present). The label ADD is retried up to ``attempts`` times with
+    a linear backoff (``backoff_s * attempt`` between failed tries) so a transient
+    GitHub blip does not wrongly block the merge; the ``gh label create`` bootstrap
+    stays a single best-effort call. Returns True iff an add succeeded."""
     create = ["gh", "label", "create", "ready-for-ci", "--color", "cccccc"]
     edit = ["gh", "pr", "edit", str(pr), "--add-label", "ready-for-ci"]
     if repo:
@@ -129,11 +156,17 @@ def _attach_ready_for_ci(
         run(create, cwd=cwd)  # already-exists exit is fine; the add below is authoritative
     except (subprocess.SubprocessError, OSError):
         pass  # create failure is non-fatal — the add surfaces a real problem
-    try:
-        proc = run(edit, cwd=cwd)
-    except (subprocess.SubprocessError, OSError):
-        return False
-    return getattr(proc, "returncode", 1) == 0
+    attempts = max(1, attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            proc = run(edit, cwd=cwd)
+        except (subprocess.SubprocessError, OSError):
+            proc = None
+        if proc is not None and getattr(proc, "returncode", 1) == 0:
+            return True
+        if attempt < attempts:
+            sleep(backoff_s * attempt)  # transient blip — linear backoff, then retry
+    return False
 
 
 def wait_for_ci_green(
@@ -156,7 +189,7 @@ def wait_for_ci_green(
     can never deadlock, and an absent / all-skipped rollup is treated as pending
     (never green), so it can never merge a PR CI did not actually run on. ``run``
     / ``sleep`` are injectable so the round driver can drive it on a fake clock."""
-    if not _attach_ready_for_ci(pr, repo=repo, cwd=cwd, run=run):
+    if not _attach_ready_for_ci(pr, repo=repo, cwd=cwd, run=run, sleep=sleep):
         notice("premerge-ci",
                f"could not attach `ready-for-ci` label to PR #{pr} — label-gated "
                f"CI would not fire; not merging", status="stop",
@@ -173,6 +206,134 @@ def wait_for_ci_green(
         verdict = _ci_verdict(_fetch_pr_checks(pr, repo, cwd, run))
         if verdict == "green":
             notice("premerge-ci", f"PR #{pr} CI is green — proceeding to merge",
+                   status="done")
+            return True
+        if verdict == "red":
+            notice("premerge-ci",
+                   f"PR #{pr} CI is red — not merging; handing back for a human",
+                   status="stop", hint="fix the failing checks, then re-run")
+            return False
+        if attempt < attempts:  # pending → wait and re-poll
+            sleep(interval)
+    notice("premerge-ci",
+           f"PR #{pr} CI did not settle (still pending after {attempts} polls) — "
+           f"not merging; handing back", status="stop",
+           hint="check the PR's checks on GitHub, then re-run")
+    return False
+
+
+# ── General pre-merge mergeability gate (the NON-label-CI path) ─────────────────
+# GitHub check-rollup conclusions, bucketed. A CheckRun carries `conclusion` (or
+# null + `status` while running); a StatusContext carries `state`. SKIPPED is in
+# NEITHER set — a skipped check neither fails nor blocks (consistent with the
+# all-skipped-is-green rule above).
+_ROLLUP_FAIL = {"FAILURE", "ERROR", "TIMED_OUT", "ACTION_REQUIRED",
+                "CANCELLED", "STARTUP_FAILURE", "STALE"}
+_ROLLUP_PENDING = {"PENDING", "IN_PROGRESS", "QUEUED", "EXPECTED", "WAITING", "REQUESTED"}
+_PENDING_REASON_PREFIX = "checks still pending"
+
+
+def _inspect_rollup(rollup: Optional[Sequence[dict]]) -> "tuple[List[str], int]":
+    """Bucket ``statusCheckRollup`` rows into (failing_names, pending_count).
+    A non-required check that is FAILING or IN_PROGRESS keeps ``mergeStateStatus``
+    CLEAN/UNSTABLE, so the rollup is inspected directly rather than trusting the
+    state. Skipped checks fall through (they neither fail nor block)."""
+    failing: List[str] = []
+    pending = 0
+    for c in rollup or []:
+        if not isinstance(c, dict):
+            continue
+        conc = (c.get("conclusion") or c.get("state") or c.get("status") or "").upper()
+        if conc in _ROLLUP_FAIL:
+            failing.append(c.get("name") or c.get("context") or "?")
+        elif conc in _ROLLUP_PENDING:
+            pending += 1
+    return failing, pending
+
+
+def reason_is_pending_checks(reason: str) -> bool:
+    """True iff a :func:`check_pr_mergeable` reason denotes only in-flight checks
+    (as opposed to a terminal block like a conflict). The caller waits those out
+    via :func:`wait_for_ci_settle` rather than handing the PR back immediately."""
+    return bool(reason) and reason.startswith(_PENDING_REASON_PREFIX)
+
+
+def check_pr_mergeable(
+    pr: str,
+    *,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> "tuple[bool, str]":
+    """Best-effort pre-merge safety gate: ask GitHub whether the PR is mergeable
+    before firing ``gh pr merge``. Returns ``(ok, reason)`` — ``ok=True`` means
+    it is safe to proceed; ``ok=False`` means GitHub would refuse the merge and
+    the loop should hand the PR back (``reason`` names why).
+
+    Blocks on: a draft PR, merge conflicts (``mergeable=CONFLICTING`` /
+    ``mergeStateStatus=DIRTY``), a base branch that is ahead (``BEHIND`` — needs a
+    rebase), branch protection (``BLOCKED``), any FAILING rollup check, and any
+    still-PENDING rollup check. Fail-SOFT: any ``gh`` error / non-zero exit /
+    unparseable output returns ``(True, "")`` — a transient blip must never wedge
+    a mergeable PR, and ``gh pr merge`` stays the authoritative final check."""
+    cmd = ["gh", "pr", "view", str(pr), "--json",
+           "mergeable,mergeStateStatus,statusCheckRollup,isDraft"]
+    if repo:
+        cmd += ["-R", repo]
+    try:
+        proc = run(cmd, cwd=cwd)
+    except (subprocess.SubprocessError, OSError):
+        return True, ""
+    if getattr(proc, "returncode", 1) != 0:
+        return True, ""
+    try:
+        data = json.loads((getattr(proc, "stdout", "") or "{}"))
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return True, ""
+    if not isinstance(data, dict):
+        return True, ""
+    mergeable = (data.get("mergeable") or "").upper()
+    state = (data.get("mergeStateStatus") or "").upper()
+    if data.get("isDraft"):
+        return False, "the PR is still a draft"
+    if mergeable == "CONFLICTING" or state == "DIRTY":
+        return False, "merge conflicts"
+    if state == "BEHIND":
+        return False, "the base branch is ahead — needs a rebase"
+    failing, pending = _inspect_rollup(data.get("statusCheckRollup") or [])
+    if failing:
+        joined = " | ".join(failing[:3])
+        tail = f" (+{len(failing) - 3} more)" if len(failing) > 3 else ""
+        return False, f"checks failing: {joined}{tail}"
+    if pending:
+        return False, f"{_PENDING_REASON_PREFIX} ({pending})"
+    if state == "BLOCKED":
+        return False, "blocked by branch protection (reviews or required checks)"
+    return True, ""
+
+
+def wait_for_ci_settle(
+    pr: str,
+    *,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+    notice: Callable[..., str] = automation_notice,
+    sleep: Callable[[float], None] = time.sleep,
+    attempts: int = _CI_POLL_ATTEMPTS,
+    interval: float = _CI_POLL_INTERVAL,
+) -> bool:
+    """Non-label pre-merge CI wait: after the last fix push the checks may still be
+    in flight, so poll ``_ci_verdict(_fetch_pr_checks(...))`` until it settles.
+    Returns True on ``green`` (safe to merge), False on ``red`` or on a poll that
+    never settles (hand the PR back). Bounded by ``attempts`` (same 30×30s ceiling
+    as the label path) so it can never deadlock; ``run``/``sleep`` are injectable
+    for a fake clock."""
+    attempts = max(1, attempts)
+    for attempt in range(1, attempts + 1):
+        verdict = _ci_verdict(_fetch_pr_checks(pr, repo, cwd, run))
+        if verdict == "green":
+            notice("premerge-ci", f"PR #{pr} CI settled green — proceeding to merge",
                    status="done")
             return True
         if verdict == "red":
