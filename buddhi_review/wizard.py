@@ -1762,8 +1762,8 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     validated by a real, isolated ``claude -p ping`` BEFORE it is saved: ``"valid"``
     → store; ``"invalid"`` → warn + re-prompt (bounded ~3, then give up without
     storing — an invalid token NEVER reaches ``gh secret set``); ``"unknown"`` →
-    loud warn + store anyway (a transient/offline check never blocks setup). The
-    token value is never echoed or logged.
+    warn + exit without storing (unverified tokens are never written to GitHub,
+    even transiently). The token value is never echoed or logged.
 
     Part B — re-mint a stored-but-broken token (``auth_probe``, defaulting to
     :func:`detectors.latest_run_token_auth_failed`). GitHub Actions secrets are
@@ -1847,9 +1847,10 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
               "token below.", pal, stream)
 
     # Part A — paste → verify-before-store, with bounded re-prompts on a rejected
-    # token. The token is stored ONLY once it authenticates ("valid") or its status
-    # is genuinely "unknown" (no claude binary / inconclusive); an "invalid" token
-    # never reaches the writer. The token value is never echoed or logged.
+    # token. The token is stored ONLY once it authenticates ("valid"); "unknown"
+    # (inconclusive — no claude binary, timeout, unrecognized error) exits without
+    # storing. An "invalid" token never reaches the writer. The token value is never
+    # echoed or logged.
     validate = validate_fn or _validate_claude_token
     token = ""
     max_attempts = 3
