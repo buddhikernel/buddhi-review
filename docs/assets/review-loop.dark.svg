@@ -1,0 +1,52 @@
+<svg viewBox="0 0 860 452" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<defs>
+<marker id="ar" markerWidth="9" markerHeight="9" refX="6" refY="3" orient="auto"><path d="M0,0 L6,3 L0,6 Z" fill="#8b949e"/></marker>
+</defs>
+<text x="30" y="32" font-size="18" font-weight="700" fill="#e6edf3">What a Buddhi review loop does each round</text>
+<text x="30" y="54" font-size="12.5" fill="#adbac7">Not one model, not the same bots every round, and not a merge without your say-so.</text>
+
+<rect x="30" y="70" width="140" height="30" rx="15" fill="none" stroke="#30363d" stroke-width="1"/>
+<text x="100" y="89" text-anchor="middle" font-size="12.5" fill="#e6edf3">Pull request</text>
+<path d="M100,100 L100,115" fill="none" stroke="#8b949e" stroke-width="1.5" marker-end="url(#ar)"/>
+
+<rect x="30" y="118" width="250" height="200" rx="10" fill="none" stroke="#30363d" stroke-width="1"/>
+<text x="46" y="146" font-size="14" font-weight="700" fill="#e6edf3">1 &#183; Cross-vendor panel</text>
+<circle cx="51" cy="170" r="5" fill="#C2410C"/><text x="64" y="174" font-size="12.5" fill="#e6edf3">Claude</text>
+<circle cx="161" cy="170" r="5" fill="#2A78D6"/><text x="174" y="174" font-size="12.5" fill="#e6edf3">Codex</text>
+<circle cx="51" cy="196" r="5" fill="#1BAF7A"/><text x="64" y="200" font-size="12.5" fill="#e6edf3">Gemini</text>
+<circle cx="161" cy="196" r="5" fill="#8B95A5"/><text x="174" y="200" font-size="12.5" fill="#e6edf3">Copilot</text>
+<text x="46" y="244" font-size="11.5" fill="#adbac7">Four labs. Their errors</text>
+<text x="46" y="260" font-size="11.5" fill="#adbac7">don&#8217;t correlate, so one</text>
+<text x="46" y="276" font-size="11.5" fill="#adbac7">panel misses far less.</text>
+
+<rect x="305" y="118" width="250" height="200" rx="10" fill="none" stroke="#30363d" stroke-width="1"/>
+<text x="321" y="146" font-size="13.5" font-weight="700" fill="#e6edf3">2 &#183; Kernel judges each finding</text>
+<text x="321" y="177" font-size="13" font-weight="700" fill="#e6edf3">Fix</text><text x="321" y="192" font-size="10.5" fill="#adbac7">substantive &#183; cosmetic</text>
+<text x="450" y="177" font-size="13" font-weight="700" fill="#e6edf3">Ask you</text><text x="450" y="192" font-size="10.5" fill="#adbac7">a judgment call</text>
+<text x="321" y="224" font-size="13" font-weight="700" fill="#e6edf3">Skip</text><text x="321" y="239" font-size="10.5" fill="#adbac7">invalid &#183; outdated</text>
+<text x="450" y="224" font-size="13" font-weight="700" fill="#e6edf3">Defer</text><text x="450" y="239" font-size="10.5" fill="#adbac7">budget spent</text>
+<text x="321" y="276" font-size="11.5" fill="#adbac7">Decides per finding &#8212; never blind auto-fix.</text>
+
+<rect x="580" y="118" width="250" height="200" rx="10" fill="none" stroke="#30363d" stroke-width="1"/>
+<text x="596" y="146" font-size="14" font-weight="700" fill="#e6edf3">3 &#183; Re-review each round</text>
+<text x="596" y="173" font-size="12" fill="#e6edf3">Re-request only the bots that</text>
+<text x="596" y="189" font-size="12" fill="#e6edf3">raised a substantive finding.</text>
+<text x="596" y="215" font-size="11.5" fill="#adbac7">Bots that approved, found</text>
+<text x="596" y="231" font-size="11.5" fill="#adbac7">nothing, or were cosmetic-only</text>
+<text x="596" y="247" font-size="11.5" fill="#adbac7">are dropped from re-request.</text>
+<text x="596" y="284" font-size="12" font-weight="700" fill="#e6edf3">Repeat until a clean round.</text>
+
+<path d="M281,208 L303,208" fill="none" stroke="#8b949e" stroke-width="1.5" marker-end="url(#ar)"/>
+<path d="M556,208 L578,208" fill="none" stroke="#8b949e" stroke-width="1.5" marker-end="url(#ar)"/>
+
+<path d="M596,318 L596,338 L150,338 L150,320" fill="none" stroke="#8b949e" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#ar)"/>
+<text x="373" y="333" text-anchor="middle" font-size="11" fill="#adbac7">re-review the fixed code, next round</text>
+
+<path d="M705,318 L705,360" fill="none" stroke="#8b949e" stroke-width="1.5" marker-end="url(#ar)"/>
+<text x="715" y="352" font-size="11" fill="#adbac7">clean round</text>
+
+<rect x="30" y="360" width="800" height="76" rx="10" fill="none" stroke="#30363d" stroke-width="1"/>
+<text x="46" y="386" font-size="14" font-weight="700" fill="#e6edf3">4 &#183; When a round comes back clean</text>
+<text x="46" y="410" font-size="12.5" fill="#e6edf3">run tests / CI&#160;&#160;&#8594;&#160;&#160;green&#160;&#160;&#8594;&#160;&#160;squash-merge&#160;&#160;&#8594;&#160;&#160;landed</text>
+<text x="46" y="428" font-size="10.5" fill="#8b949e">The tests / CI gate runs when the repo enables it. Auto-merge is opt-in and off by default.</text>
+</svg>

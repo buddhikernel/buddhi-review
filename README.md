@@ -319,18 +319,10 @@ human judgment follow the separate escalation path described in
 A clean round is not proof that the code is correct. It means only that the panel
 found nothing further to act on within the configured review budget.
 
-```mermaid
-flowchart LR
-  PR[Pull request] --> R{Panel review<br/>of the current code}
-  R --> C1[Reviewer<br/>lab A]
-  R --> C2[Reviewer<br/>lab B]
-  R --> C3[Reviewer<br/>lab C]
-  C1 & C2 & C3 --> F[Collect + dedupe findings]
-  F --> Q{New findings<br/>to act on?}
-  Q -- "yes" --> FIX[Fix, then re-review the FIXED code]
-  FIX --> R
-  Q -- "no: clean round" --> DONE[Converged, clear to land]
-```
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/review-loop.dark.svg">
+  <img src="docs/assets/review-loop.svg" alt="What a Buddhi review loop does each round: a cross-vendor panel of four labs (Claude, Codex, Gemini, Copilot) reviews the code; the kernel judges each finding as fix, ask-you, skip, or defer; each round re-requests only the bots that raised a substantive finding, dropping bots that approved or were cosmetic-only, and repeats until a clean round; then tests and CI must pass before an opt-in auto-merge lands the PR." width="100%">
+</picture>
 
 <details>
 <summary><b>The research behind this</b></summary>
