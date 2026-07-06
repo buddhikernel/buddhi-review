@@ -1,0 +1,46 @@
+<svg viewBox="0 0 430 420" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<text x="16.0" y="20.0" font-size="16" font-weight="700" fill="#e6edf3">Claude’s share of the valid bugs, per review run</text>
+<text x="16.0" y="39.0" font-size="12" fill="#adbac7">Each bar is one qualifying run with 10 or more valid bugs (all 20 of them).</text>
+<text x="16.0" y="55.0" font-size="12" fill="#adbac7">Bar height: the share of that run’s bugs that Claude caught. The bold line</text>
+<text x="16.0" y="71.0" font-size="12" fill="#adbac7">is the aggregate over all 88 qualifying runs (681 bugs). Ledger data, repo</text>
+<text x="16.0" y="87.0" font-size="12" fill="#adbac7">anonymized.</text>
+<line x1="46" y1="272.0" x2="414" y2="272.0" stroke="#2a3038" stroke-width="1"/>
+<text x="40.0" y="276.0" font-size="12" text-anchor="end" fill="#8b949e">0%</text>
+<line x1="46" y1="230.0" x2="414" y2="230.0" stroke="#2a3038" stroke-width="1"/>
+<text x="40.0" y="234.0" font-size="12" text-anchor="end" fill="#8b949e">10%</text>
+<line x1="46" y1="188.0" x2="414" y2="188.0" stroke="#2a3038" stroke-width="1"/>
+<text x="40.0" y="192.0" font-size="12" text-anchor="end" fill="#8b949e">20%</text>
+<line x1="46" y1="146.0" x2="414" y2="146.0" stroke="#2a3038" stroke-width="1"/>
+<text x="40.0" y="150.0" font-size="12" text-anchor="end" fill="#8b949e">30%</text>
+<line x1="46" y1="104.0" x2="414" y2="104.0" stroke="#2a3038" stroke-width="1"/>
+<text x="40.0" y="108.0" font-size="12" text-anchor="end" fill="#8b949e">40%</text>
+<rect x="46.0" y="119.3" width="14.4" height="152.7" fill="#C2410C" opacity="0.9"/>
+<rect x="64.6" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="83.2" y="188.0" width="14.4" height="84.0" fill="#C2410C" opacity="0.9"/>
+<rect x="101.8" y="245.8" width="14.4" height="26.2" fill="#C2410C" opacity="0.9"/>
+<rect x="120.4" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="139.0" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="157.7" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="176.3" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="194.9" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="213.5" y="252.0" width="14.4" height="20.0" fill="#C2410C" opacity="0.9"/>
+<rect x="232.1" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="250.7" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="269.3" y="257.5" width="14.4" height="14.5" fill="#C2410C" opacity="0.9"/>
+<rect x="288.0" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="306.5" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="325.1" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="343.8" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="362.4" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<rect x="381.0" y="237.0" width="14.4" height="35.0" fill="#C2410C" opacity="0.9"/>
+<rect x="399.6" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
+<line x1="46" y1="256.0" x2="414" y2="256.0" stroke="#e6edf3" stroke-width="2.2"/>
+<text x="414.0" y="251.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Claude = 3.8%</text>
+<text x="16.0" y="305.0" font-size="12" fill="#8b949e">Flat stubs are zero. In 14 of these 20 runs Claude reviewed the code and</text>
+<text x="16.0" y="321.0" font-size="12" fill="#8b949e">caught nothing.</text>
+<text x="16.0" y="338.0" font-size="13" font-weight="700" fill="#ff7b72">Across all 88 qualifying runs, Claude caught 3.8% of the valid</text>
+<text x="16.0" y="355.0" font-size="13" font-weight="700" fill="#ff7b72">bugs. Reviewers from other vendors caught 96.2%.</text>
+<text x="16.0" y="371.0" font-size="12" fill="#8b949e">Claude caught 18 of the 189 high or critical bugs (9.5%). Of the high or</text>
+<text x="16.0" y="387.0" font-size="12" fill="#8b949e">critical bugs found in round 2 or later, 93.5% came from a non-Claude</text>
+<text x="16.0" y="403.0" font-size="12" fill="#8b949e">reviewer.</text>
+</svg>

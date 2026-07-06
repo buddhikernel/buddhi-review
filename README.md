@@ -206,6 +206,8 @@ more favorably. In these runs, Claude missed most of the valid bugs found by the
 cross-vendor panel.
 
 <picture>
+  <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.mobile.dark.svg">
+  <source media="(max-width: 600px)" srcset="docs/assets/who-catches-the-bugs.mobile.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.dark.svg">
   <img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
 </picture>
@@ -230,6 +232,8 @@ inspect the code after those comments are addressed, they cannot catch bugs that
 fixes themselves introduce or expose.
 
 <picture>
+  <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/when-bugs-surface.mobile.dark.svg">
+  <source media="(max-width: 600px)" srcset="docs/assets/when-bugs-surface.mobile.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/when-bugs-surface.dark.svg">
   <img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%">
 </picture>
@@ -246,6 +250,8 @@ The chart below breaks down every qualifying run with 20 or more valid bugs, sev
 in total, reviewer by reviewer.
 
 <picture>
+  <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/reviewer-drilldown.mobile.dark.svg">
+  <source media="(max-width: 600px)" srcset="docs/assets/reviewer-drilldown.mobile.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/reviewer-drilldown.dark.svg">
   <img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
 </picture>
