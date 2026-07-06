@@ -18,8 +18,8 @@
 <text x="63" y="256" font-size="13" fill="#57606a">Different labs have different blind spots.</text>
 <rect x="359" y="156" width="262" height="182" rx="11" fill="#eef1f4" stroke="#b6bec8" stroke-width="1.5"/>
 <text x="373" y="181" font-size="15" font-weight="700" fill="#1f2328">2 · Decide each finding</text>
-<rect x="373" y="147" width="95" height="18" rx="9" fill="#eef1f4" stroke="#b6bec8" stroke-width="1"/>
-<text x="420" y="159" font-size="12" text-anchor="middle" fill="#57606a">Buddhi kernel</text>
+<rect x="512" y="147" width="95" height="18" rx="9" fill="#eef1f4" stroke="#b6bec8" stroke-width="1"/>
+<text x="560" y="159" font-size="12" text-anchor="middle" fill="#57606a">Buddhi kernel</text>
 <text x="373" y="208" font-size="13" font-weight="700" fill="#1f2328">Fix</text>
 <text x="442" y="208" font-size="13" fill="#57606a">code or PR description</text>
 <text x="373" y="229" font-size="13" font-weight="700" fill="#9a5b00">Ask you</text>
