@@ -252,6 +252,89 @@ def test_claude_secret_checked_even_when_workflow_present(monkeypatch, tmp_path)
         "the secret check must run even when the Claude workflow is already present"
 
 
+# ── multi-line paste: a token wrapped by a narrow console is reconstructed ────────
+
+
+def test_read_pasted_secret_rejoins_wrapped_token(monkeypatch):
+    """getpass returns only the first line of a wrapped token; the drained
+    continuation is appended and ALL whitespace stripped into the true token."""
+    monkeypatch.setattr(wizard, "_drain_buffered_stdin", lambda: "\n Y-second__part")
+    out = wizard._read_pasted_secret("p: ", lambda p: "sk-ant-oat01-first")
+    assert out == "sk-ant-oat01-firstY-second__part"
+
+
+def test_read_pasted_secret_single_line_is_trimmed(monkeypatch):
+    """No continuation to drain → a single-line paste is returned trimmed of stray
+    surrounding whitespace, unchanged otherwise."""
+    monkeypatch.setattr(wizard, "_drain_buffered_stdin", lambda: "")
+    out = wizard._read_pasted_secret("p: ", lambda p: "  sk-ant-oat01-clean  ")
+    assert out == "sk-ant-oat01-clean"
+
+
+def test_drain_buffered_stdin_is_noop_without_tty(monkeypatch):
+    """Not a TTY (pytest / piped) → nothing to drain; returns '' and never blocks."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: False)
+    assert wizard._drain_buffered_stdin() == ""
+
+
+def test_claude_multiline_paste_is_reconstructed_and_stored(monkeypatch):
+    """End-to-end: a token pasted wrapped across lines is drained, reconstructed,
+    validated, and stored as its true single-line form (the reported bug — a wrapped
+    paste used to be truncated at the newline and fail to authenticate)."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "_gh_secret_exists", lambda *a, **k: None)  # not present
+    monkeypatch.setattr(wizard, "_ask_yes_no", lambda *a, **k: True)        # consent granted
+    monkeypatch.setattr(wizard, "_drain_buffered_stdin", lambda: "\n eeeeFFFF__gggg-HHHH")
+    stored = {}
+
+    def _store(repo, name, token, **k):
+        stored["t"] = token
+        return (True, "", "repo")
+
+    monkeypatch.setattr(wizard, "_set_secret_scoped", _store)
+    seen = {}
+
+    def _validate(tok, **k):
+        seen["validated"] = tok
+        return ("valid", "")
+
+    status = wizard._set_claude_secret(
+        "acme/widgets",
+        run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=""),
+        spawn_command=lambda *a, **k: {"spawned": True},
+        getpass_fn=lambda *a, **k: "sk-ant-oat01-AAAAccccDDDD",
+        pal=wizard._Palette(False), stream=io.StringIO(),
+        owner_type="User", validate_fn=_validate)
+    clean = "sk-ant-oat01-AAAAccccDDDDeeeeFFFF__gggg-HHHH"
+    assert status == "set"
+    assert seen["validated"] == clean     # validated the reconstructed token
+    assert stored["t"] == clean           # stored the reconstructed token
+
+
+def test_claude_inconclusive_verdict_is_not_stored(monkeypatch):
+    """An inconclusive ('unknown') verdict must NOT store the token or reach the
+    org-scope prompt — an unverified token is never written to GitHub."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "_gh_secret_exists", lambda *a, **k: None)  # not present
+    monkeypatch.setattr(wizard, "_ask_yes_no", lambda *a, **k: True)        # consent granted
+    stored = []
+
+    def _store(repo, name, token, **k):
+        stored.append(token)
+        return (True, "", "repo")
+
+    monkeypatch.setattr(wizard, "_set_secret_scoped", _store)
+    status = wizard._set_claude_secret(
+        "buddhikernel/repo",
+        run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=""),
+        spawn_command=lambda *a, **k: {"spawned": True},
+        getpass_fn=lambda *a, **k: "sk-maybe",
+        pal=wizard._Palette(False), stream=io.StringIO(),
+        owner_type="User", validate_fn=lambda tok, **k: ("unknown", "inconclusive"))
+    assert status == "failed"          # gave up without saving
+    assert stored == []                # nothing written to GitHub
+
+
 def test_step_reviewers_guides_claude_github_app_install(tmp_path):
     """The Claude path must PROMINENTLY guide installing github.com/apps/claude —
     the workflow + token alone 401 and post nothing (the buddhi-review PR #3
