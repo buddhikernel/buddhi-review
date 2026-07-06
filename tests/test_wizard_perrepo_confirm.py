@@ -32,6 +32,10 @@ def _interactive(monkeypatch):
     # (which requires _read_key / a real TTY).  Replace it with a bridge that reads
     # the test's input_fn instead, so yes/no questions are driveable from tests.
     monkeypatch.setattr(wizard, "single_select", _yn_bridge)
+    # Default behaviour = flag OFF (auto-promote first-run, never ask). Clear any
+    # ambient BUDDHI_ASK_GLOBAL_DEFAULT so the default-path tests are deterministic;
+    # the flag-path tests opt in with monkeypatch.setenv.
+    monkeypatch.delenv("BUDDHI_ASK_GLOBAL_DEFAULT", raising=False)
 
 
 # ── Injected seams ─────────────────────────────────────────────────────────────────
@@ -169,46 +173,84 @@ def test_label_gated_ci_off_skips_the_confirm(tmp_path):
     assert not any("Confirm: enable label-gated CI" in p for p, _ in captured)
 
 
-# ── Global-default promotion (P7 #3 — name the subject) ─────────────────────────────
+# ── Global-default: DEFAULT behaviour — auto-promote first-run, never ask ───────────
 
-def test_global_default_promotion_writes_top_level_fleet(tmp_path):
+def _seed_global_default(cfg_path, fleet):
+    config.set_repo_keys("seed/seed", {"active_reviewers": list(fleet)}, cfg_path)
+    cfg = config.load_config(cfg_path)
+    cfg["active_reviewers"] = list(fleet)
+    from buddhi_review.wizard import write_config
+    write_config(cfg, cfg_path)
+
+
+def test_first_run_auto_promotes_and_never_asks(tmp_path):
+    """First system-wide setup (no global default yet): the confirmed fleet is
+    auto-promoted to the global default WITHOUT a prompt — so cross-repo runs have a
+    fall-back and this first repo doubles as the global default."""
     cfg_path = tmp_path / "config.yaml"
+    captured = []
+    rc, out = _confirm(
+        cfg_path, reviewers={COPILOT, CODEX},
+        ss_answers={"Auto-merge default for": 0, "Label-gated CI default for": 0},
+        captured=captured)
+    assert rc == 0
+    cfg = _read(cfg_path)
+    # Auto-promoted: the top-level fleet is now the global default …
+    assert config.has_global_default(cfg) is True
+    assert cfg["active_reviewers"] == ["copilot", "codex"]
+    # … and the same fleet is written as this repo's confirmed entry.
+    assert config.repo_entry(cfg, REPO) is not None
+    assert "set as global default" in out
+    # The promotion question was NEVER shown.
+    assert not any("GLOBAL default" in p for p, _ in captured)
+
+
+def test_subsequent_run_leaves_established_default_and_never_asks(tmp_path):
+    """With a global default already set, confirming a NEW repo neither re-promotes
+    nor asks — the established default is left untouched; only the repo entry lands."""
+    cfg_path = tmp_path / "config.yaml"
+    _seed_global_default(cfg_path, ["copilot", "claude"])
+    captured = []
+    rc, out = _confirm(
+        cfg_path, repo="acme/widgets", reviewers={CODEX},
+        ss_answers={"Auto-merge default for": 0, "Label-gated CI default for": 0,
+                    "Does Codex auto-review": 1},
+        captured=captured)
+    assert rc == 0
+    cfg = _read(cfg_path)
+    # The established global default is unchanged.
+    assert cfg["active_reviewers"] == ["copilot", "claude"]
+    # The new repo IS confirmed, but was NOT promoted.
+    assert config.repo_entry(cfg, "acme/widgets") is not None
+    assert "set as global default" not in out
+    assert not any("GLOBAL default" in p for p, _ in captured)
+
+
+# ── Flag restores the interactive promotion prompt (BUDDHI_ASK_GLOBAL_DEFAULT) ──────
+
+def test_flag_restores_promotion_prompt_and_promotes_on_yes(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUDDHI_ASK_GLOBAL_DEFAULT", "1")
+    cfg_path = tmp_path / "config.yaml"
+    captured = []
     rc, out = _confirm(
         cfg_path, reviewers={COPILOT, CODEX},
         ss_answers={"GLOBAL default": 0,            # Yes — promote
-                    "Auto-merge default for": 0, "Label-gated CI default for": 0})
+                    "Auto-merge default for": 0, "Label-gated CI default for": 0},
+        captured=captured)
     assert rc == 0
     cfg = _read(cfg_path)
     assert config.has_global_default(cfg) is True
     assert cfg["active_reviewers"] == ["copilot", "codex"]
-    # The per-repo entry is still written.
     assert config.repo_entry(cfg, REPO) is not None
     assert "set as global default" in out
+    # Under the flag the prompt WAS shown.
+    assert any("GLOBAL default" in p for p, _ in captured)
 
 
-def test_global_default_question_names_its_subject(tmp_path):
-    """P7 #3: the global-default prompt names the concrete fleet AND which reviewers
-    auto-post on PR open — no bare 'these'."""
-    cfg_path = tmp_path / "config.yaml"
-    captured = []
-    _confirm(
-        cfg_path, reviewers={COPILOT, CODEX},
-        ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
-                    "Label-gated CI default for": 0,
-                    # copilot auto-posts on open, codex does not (G3 labeled select)
-                    "Does Copilot auto-review": 0, "Does Codex auto-review": 1},
-        captured=captured)
-    gd = [(p, opts) for p, opts in captured if "GLOBAL default" in p]
-    assert gd, "the global-default question must be asked"
-    prompt, opts = gd[0]
-    # The fleet is named in the prompt (the question's subject).
-    assert "copilot, codex" in prompt
-    # The option detail names which reviewers auto-post on open (copilot, not codex).
-    details = " ".join(d for _, d in opts)
-    assert "auto-posts on PR open: copilot" in details
-
-
-def test_no_promotion_leaves_global_default_unset(tmp_path):
+def test_flag_prompt_no_leaves_default_unset(tmp_path, monkeypatch):
+    """Flag ON + user answers 'No' → the repo is confirmed but NOT promoted (the
+    old behaviour, faithfully restored)."""
+    monkeypatch.setenv("BUDDHI_ASK_GLOBAL_DEFAULT", "1")
     cfg_path = tmp_path / "config.yaml"
     rc, out = _confirm(
         cfg_path, reviewers={COPILOT},
@@ -221,17 +263,33 @@ def test_no_promotion_leaves_global_default_unset(tmp_path):
     assert "set as global default" not in out
 
 
-# ── Empty-fleet guard (never silently wipe an existing global default) ──────────────
+def test_flag_global_default_question_names_its_subject(tmp_path, monkeypatch):
+    """P7 #3 (flag path): the restored prompt names the concrete fleet AND which
+    reviewers auto-post on PR open — no bare 'these'."""
+    monkeypatch.setenv("BUDDHI_ASK_GLOBAL_DEFAULT", "1")
+    cfg_path = tmp_path / "config.yaml"
+    captured = []
+    _confirm(
+        cfg_path, reviewers={COPILOT, CODEX},
+        ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
+                    "Label-gated CI default for": 0,
+                    # copilot auto-posts on open, codex does not (G3 labeled select)
+                    "Does Copilot auto-review": 0, "Does Codex auto-review": 1},
+        captured=captured)
+    gd = [(p, opts) for p, opts in captured if "GLOBAL default" in p]
+    assert gd, "the global-default question must be asked under the flag"
+    prompt, opts = gd[0]
+    # The fleet is named in the prompt (the question's subject).
+    assert "copilot, codex" in prompt
+    # The option detail names which reviewers auto-post on open (copilot, not codex).
+    details = " ".join(d for _, d in opts)
+    assert "auto-posts on PR open: copilot" in details
 
-def _seed_global_default(cfg_path, fleet):
-    config.set_repo_keys("seed/seed", {"active_reviewers": list(fleet)}, cfg_path)
-    cfg = config.load_config(cfg_path)
-    cfg["active_reviewers"] = list(fleet)
-    from buddhi_review.wizard import write_config
-    write_config(cfg, cfg_path)
 
+# ── Empty-fleet wipe guard (flag path only — never silently wipe a global default) ──
 
-def test_empty_fleet_promotion_keeps_existing_global_default_by_default(tmp_path):
+def test_flag_empty_fleet_promotion_keeps_existing_global_default_by_default(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUDDHI_ASK_GLOBAL_DEFAULT", "1")
     cfg_path = tmp_path / "config.yaml"
     _seed_global_default(cfg_path, ["copilot", "claude"])
     rc, out = _confirm(
@@ -248,7 +306,8 @@ def test_empty_fleet_promotion_keeps_existing_global_default_by_default(tmp_path
     assert "Keeping your existing global default" in out
 
 
-def test_empty_fleet_promotion_clears_global_default_when_chosen(tmp_path):
+def test_flag_empty_fleet_promotion_clears_global_default_when_chosen(tmp_path, monkeypatch):
+    monkeypatch.setenv("BUDDHI_ASK_GLOBAL_DEFAULT", "1")
     cfg_path = tmp_path / "config.yaml"
     _seed_global_default(cfg_path, ["copilot", "claude"])
     rc, _ = _confirm(

@@ -118,6 +118,17 @@ def _upsell_suppressed() -> bool:
     return upsell.upsell_suppressed()
 
 
+def _ask_global_default() -> bool:
+    """``BUDDHI_ASK_GLOBAL_DEFAULT`` truthy → restore the interactive "also set this
+    fleet as your GLOBAL default?" prompt in the per-repo confirm flow. Default
+    (unset/falsy): no prompt — the FIRST system-wide setup (no global default yet)
+    auto-promotes its fleet to the global default so cross-repo runs have a
+    fall-back, and every later per-repo confirm leaves the established default
+    untouched. The flag lets the promotion question be brought back wholesale."""
+    return os.environ.get("BUDDHI_ASK_GLOBAL_DEFAULT", "").strip().lower() in (
+        "1", "true", "yes")
+
+
 # ── Interactive TTY input primitives ──────────────────────────────────────────────
 
 def _is_tty() -> bool:
@@ -127,6 +138,48 @@ def _is_tty() -> bool:
         return sys.stdin.isatty() and sys.stdout.isatty()
     except (ImportError, ValueError, OSError, AttributeError):
         return False
+
+
+def _drain_buffered_stdin() -> str:
+    """Return any input ALREADY sitting in the TTY buffer right now, read hidden and
+    WITHOUT blocking. A multi-line paste — a token copied from a narrow terminal
+    wraps, so the clipboard carries newlines — dumps its whole content into the
+    buffer at once, but getpass returns only the first line; this recovers the
+    continuation the paste left behind. Returns '' when nothing is pending, stdin
+    isn't a TTY, or the platform lacks termios (so a single-line paste is untouched
+    and never blocks)."""
+    if not _is_tty():
+        return ""
+    try:
+        import select
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        chunks = []
+        try:
+            tty.setraw(fd)
+            while select.select([sys.stdin], [], [], 0)[0]:
+                ch = sys.stdin.read(1)
+                if not ch:
+                    break
+                chunks.append(ch)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        return "".join(chunks)
+    except Exception:
+        return ""
+
+
+def _read_pasted_secret(prompt: str, getpass_fn: Callable) -> str:
+    """Read a hidden secret that may arrive as a MULTI-LINE paste. getpass returns
+    only the first line, so a token copied from a narrow console window (wrapped
+    across lines, sometimes with a leading indent) would be truncated. Drain the
+    buffered continuation the paste left behind, then strip ALL whitespace so the
+    wrapped pieces are rejoined into the token's true single-line form. A real
+    sk-ant-oat token carries no internal whitespace, so this is lossless."""
+    first = getpass_fn(prompt) or ""
+    return "".join((first + _drain_buffered_stdin()).split())
 
 
 def _read_key() -> str:
@@ -1800,12 +1853,12 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
-            # Strip ALL whitespace, not just the ends: a token copied from a wrapped /
-            # small terminal window carries an internal newline (+ indent space), and a
-            # real sk-ant-oat OAuth token contains no whitespace — so joining the split
-            # pieces reconstructs the intended token instead of failing validation.
-            token = "".join(getpass_fn(
-                f"  Paste the {name} (input hidden), or blank to skip: ").split())
+            # A token copied from a wrapped / small terminal window carries an internal
+            # newline (+ indent space) — getpass returns only its first line, so read via
+            # the multi-line-aware helper that drains the wrapped continuation and rejoins
+            # the pieces into the real single-line token (a real sk-ant-oat token has none).
+            token = _read_pasted_secret(
+                f"  Paste the {name} (input hidden), or blank to skip: ", getpass_fn)
         except (EOFError, KeyboardInterrupt):
             token = ""
         if not token:
@@ -1823,15 +1876,15 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
         if state == "valid":
             break
         if state == "unknown":
-            # Couldn't prove it good OR bad — warn loudly, then store it anyway so a
-            # transient / offline check never blocks setup.
-            _row("warn", f"Couldn't verify the token — storing {name} unverified.",
-                 pal, stream)
+            # A "valid" verdict is the ONLY thing that stores — an UNVERIFIED token is
+            # never written to GitHub. "unknown" = the test couldn't confirm the token
+            # either way (an unrecognized error, a timeout, or no CLI). Do NOT store it
+            # and do NOT ask where it should live; surface the reason + the by-hand path.
+            _row("warn", f"Couldn't verify this token — not saving an unverified {name} "
+                         "on GitHub.", pal, stream)
             if detail:
                 _note(str(detail), pal, stream)
-            _note("If Claude's reviews 401 on this repo later, re-run setup to re-mint it.",
-                  pal, stream)
-            break
+            return _manual("failed")  # inconclusive → nothing verified to store
         # "invalid": the token didn't authenticate.
         _row("warn", "That token didn't authenticate — it may be mis-pasted, expired, "
                      "or for the wrong account.", pal, stream)
@@ -1907,10 +1960,11 @@ def _offer_gh_token(*, run, getpass_fn, pal, stream, input_fn=input) -> None:
     max_attempts = 2  # one paste + one bounded re-prompt, then skip (never loop)
     for attempt in range(1, max_attempts + 1):
         try:
-            # Strip ALL whitespace (not just the ends): a token copied from a wrapped
-            # terminal carries an internal newline; a real token contains none.
-            token = "".join(getpass_fn(
-                "  Paste a GitHub token (input hidden), or blank to skip: ").split())
+            # Multi-line-aware read: a token copied from a wrapped/narrow terminal wraps
+            # across lines (getpass would keep only the first) — drain the continuation
+            # and strip all whitespace (a real token contains none).
+            token = _read_pasted_secret(
+                "  Paste a GitHub token (input hidden), or blank to skip: ", getpass_fn)
         except (EOFError, KeyboardInterrupt):
             token = ""
         if not token:
@@ -2365,29 +2419,38 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
         pal=pal, stream=stream, multi_select=multi_select, single_select=single_select,
         input_fn=input_fn, seed=seed)
 
-    set_gd = step_set_global_default(repo, has_gd, reviewers, auto_on_open, pal=pal,
-                                     stream=stream, single_select=single_select,
-                                     input_fn=input_fn)
-    # Guard the global-default WIPE: confirming a repo with an EMPTY fleet (e.g. the
-    # user deselected every reviewer) must not silently clear an existing non-empty
-    # global default. Ask, defaulting to KEEP — this repo's entry is still written.
-    if set_gd and not reviewers and has_gd:
-        current = list(config.active_reviewers(existing))
-        if current:
-            _row("warn", f"Your global default fleet is {', '.join(current)}. Setting "
-                         "an EMPTY fleet as the global default clears it for every repo "
-                         "with no confirmed reviewers.", pal, stream)
-            keep = single_select(
-                "  Clear your global default reviewer fleet?",
-                [("No — keep my current global default",
-                  f"leaves {', '.join(current)} in place; still writes this repo's entry"),
-                 ("Yes — clear it",
-                  "every repo with no confirmed fleet then has no reviewers")],
-                preselect=0, pal=pal, stream=stream, input_fn=input_fn)
-            if keep == 0:
-                set_gd = False
-                _row("info", "Keeping your existing global default; writing only this "
-                             "repo's entry.", pal, stream)
+    if _ask_global_default():
+        # BUDDHI_ASK_GLOBAL_DEFAULT restores the interactive promotion prompt.
+        set_gd = step_set_global_default(repo, has_gd, reviewers, auto_on_open, pal=pal,
+                                         stream=stream, single_select=single_select,
+                                         input_fn=input_fn)
+        # Guard the global-default WIPE: confirming a repo with an EMPTY fleet (e.g. the
+        # user deselected every reviewer) must not silently clear an existing non-empty
+        # global default. Ask, defaulting to KEEP — this repo's entry is still written.
+        if set_gd and not reviewers and has_gd:
+            current = list(config.active_reviewers(existing))
+            if current:
+                _row("warn", f"Your global default fleet is {', '.join(current)}. Setting "
+                             "an EMPTY fleet as the global default clears it for every repo "
+                             "with no confirmed reviewers.", pal, stream)
+                keep = single_select(
+                    "  Clear your global default reviewer fleet?",
+                    [("No — keep my current global default",
+                      f"leaves {', '.join(current)} in place; still writes this repo's entry"),
+                     ("Yes — clear it",
+                      "every repo with no confirmed fleet then has no reviewers")],
+                    preselect=0, pal=pal, stream=stream, input_fn=input_fn)
+                if keep == 0:
+                    set_gd = False
+                    _row("info", "Keeping your existing global default; writing only this "
+                                 "repo's entry.", pal, stream)
+    else:
+        # Default: no prompt. The FIRST system-wide setup (no global default yet)
+        # auto-promotes its fleet to the global default so cross-repo runs have a
+        # fall-back; every later per-repo confirm leaves the established default
+        # untouched. set_gd stays False when a global default already exists, so the
+        # empty-fleet wipe can never fire in this branch.
+        set_gd = not has_gd
 
     am = step_repo_auto_merge(repo, _repo_auto_merge_default(existing, repo), pal=pal,
                               stream=stream, single_select=single_select, input_fn=input_fn)

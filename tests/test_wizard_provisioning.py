@@ -739,9 +739,10 @@ def test_set_claude_secret_invalid_then_valid_stores(monkeypatch):
     assert any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
 
 
-def test_set_claude_secret_unknown_token_stored_with_warning(monkeypatch):
-    # "unknown" (no binary / inconclusive) → store anyway so a transient check never
-    # blocks setup, but warn that it is unverified.
+def test_set_claude_secret_unknown_token_is_not_stored(monkeypatch):
+    # "unknown" (inconclusive) → do NOT store: an unverified token is never written to
+    # GitHub and the org-scope prompt is skipped. Returns "failed" (store-on-unknown was
+    # dropped — a transient/ambiguous check must not silently persist an unverified token).
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     run, calls = _recorder(_full_secret_router(owner_type="User"))
     pal, buf = wizard._Palette(False), io.StringIO()
@@ -750,9 +751,9 @@ def test_set_claude_secret_unknown_token_stored_with_warning(monkeypatch):
         getpass_fn=lambda *a: "oat", pal=pal, stream=buf,
         single_select=_consenting_select(),
         validate_fn=lambda token, **k: ("unknown", ""))
-    assert status == "set"
-    assert "unverified" in buf.getvalue()
-    assert any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
+    assert status == "failed"
+    assert "not saving" in buf.getvalue()
+    assert not any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
 
 
 def test_set_claude_secret_validator_crash_fails_safe(monkeypatch):
@@ -934,6 +935,21 @@ def test_offer_gh_token_stores_after_valid_probe(monkeypatch):
     assert all("ghp_PASTED" not in tok for tok in calls[0]["argv"])  # never on argv
     out = buf.getvalue()
     assert "octocat" in out and "GH_TOKEN written" in out
+
+
+def test_offer_gh_token_multiline_paste_is_reconstructed(monkeypatch):
+    # A GH token pasted wrapped across lines: getpass returns only line 1, the drained
+    # continuation is appended, and the whole is probed + stored as one token.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
+    monkeypatch.setattr(wizard, "_drain_buffered_stdin", lambda: "\n PASTED2")
+    run, calls = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
+    seen = _capture_upsert(monkeypatch)
+    pal, buf = wizard._Palette(False), io.StringIO()
+    wizard._offer_gh_token(run=run, getpass_fn=lambda *a: "ghp_PASTED1", pal=pal,
+                           stream=buf, input_fn=lambda *a: "y")
+    assert seen["mapping"] == {"GH_TOKEN": "ghp_PASTED1PASTED2"}      # reconstructed
+    assert calls[0]["env"]["GH_TOKEN"] == "ghp_PASTED1PASTED2"        # probed reconstructed
 
 
 def test_offer_gh_token_invalid_never_stored_bounded_reprompt(monkeypatch):
