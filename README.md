@@ -22,6 +22,10 @@ in round 2 or later.
   <strong>A Buddhi review loop: five rounds of cross-vendor review, fixes, and re-review before the PR lands.</strong>
   <br><br>
   <picture>
+    <source media="(prefers-reduced-motion: reduce) and (prefers-color-scheme: dark)" srcset="docs/assets/demo-poster-dark.webp">
+    <source media="(prefers-reduced-motion: reduce)" srcset="docs/assets/demo-poster.webp">
+    <source media="(min-width: 768px) and (prefers-color-scheme: dark)" srcset="docs/assets/demo-slow-dark.webp">
+    <source media="(min-width: 768px)" srcset="docs/assets/demo-slow.webp">
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/demo-dark.webp">
     <img src="docs/assets/demo.webp" alt="buddhi-review running its loop on a pull request: a cross-vendor AI panel posts findings, the loop classifies and applies fixes across rounds, then a round summary shows each reviewer's status" width="76%">
   </picture>
