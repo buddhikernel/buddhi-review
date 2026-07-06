@@ -44,16 +44,16 @@
 <text x="234" y="659" font-size="12" font-weight="700" fill="#1a7f37">✓ Clean round</text>
 <rect x="42" y="671" width="360" height="224" rx="11" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
 <text x="58" y="698" font-size="15" font-weight="700" fill="#1f2328">4 · Validate and land</text>
-<rect x="58" y="716" width="106" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
-<text x="111" y="731" font-size="13" text-anchor="middle" fill="#1f2328">Run tests / CI</text>
-<path d="M111,742 L111,757" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
-<rect x="58" y="764" width="151" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
-<text x="134" y="779" font-size="13" text-anchor="middle" fill="#1f2328">Require green checks</text>
-<path d="M134,790 L134,805" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
-<rect x="58" y="812" width="109" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
-<text x="112" y="827" font-size="13" text-anchor="middle" fill="#1f2328">Squash-merge</text>
+<rect x="169.0" y="716" width="106" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
+<text x="222" y="731" font-size="13" text-anchor="middle" fill="#1f2328">Run tests / CI</text>
+<path d="M222.0,742 L222.0,757" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="146.5" y="764" width="151" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
+<text x="222" y="779" font-size="13" text-anchor="middle" fill="#1f2328">Require green checks</text>
+<path d="M222.0,790 L222.0,805" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="167.5" y="812" width="109" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
+<text x="222" y="827" font-size="13" text-anchor="middle" fill="#1f2328">Squash-merge</text>
 <text x="58" y="860" font-size="12" fill="#8b949e">Tests and CI decide whether the PR can land. Auto-merge</text>
 <text x="58" y="876" font-size="12" fill="#8b949e">is optional, off by default.</text>
 <path d="M42,571 L26,571 L26,208 L39,208" fill="none" stroke="#6e7781" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#ar)"/>
-<text x="13" y="390" transform="rotate(-90,13,390)" text-anchor="middle" font-size="12" fill="#57606a">Re-review the fixed code</text>
+<text x="13" y="390" transform="rotate(-90,13,390)" text-anchor="middle" font-size="12" fill="#57606a">Substantive fixes applied — review the updated code</text>
 </svg>
