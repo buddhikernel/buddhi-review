@@ -1,5 +1,4 @@
 <svg viewBox="0 0 860 480" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
-<rect width="860" height="480" fill="#fff"/>
 <text x="30" y="36" font-size="19" font-weight="700" fill="#111">Valid bugs caught by each reviewer, per run</text>
 <text x="30" y="57" font-size="12.5" fill="#555">Every qualifying run with 20 or more valid bugs (all 7 of them). Segment length: the number of that run&#8217;s bugs each reviewer caught.</text>
 <text x="55.1" y="110" font-size="12.5" font-weight="700" fill="#333" text-anchor="end">Run A</text>

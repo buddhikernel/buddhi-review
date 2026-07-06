@@ -19,10 +19,11 @@ in round 2 or later.
 <br>
 
 <p align="center">
-  <strong>A Buddhi review loop: five rounds of cross-vendor review,<br>fixes, and re-review before the PR lands automatically.</strong>
+  <strong>A Buddhi review loop: five rounds of cross-vendor review, fixes, and re-review before the PR lands.</strong>
   <br><br>
   <picture>
-    <img src="docs/assets/demo.gif" alt="buddhi-review running its loop on a pull request: a cross-vendor AI panel posts findings, the loop classifies and applies fixes across rounds, then a round summary shows each reviewer's status" width="76%">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/demo-dark.webp">
+    <img src="docs/assets/demo.webp" alt="buddhi-review running its loop on a pull request: a cross-vendor AI panel posts findings, the loop classifies and applies fixes across rounds, then a round summary shows each reviewer's status" width="76%">
   </picture>
 </p>
 
@@ -200,7 +201,10 @@ This pattern is consistent with the self-preference effect
 more favorably. In these runs, Claude missed most of the valid bugs found by the
 cross-vendor panel.
 
-<picture><img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%"></picture>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.dark.svg">
+  <img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
+</picture>
 
 - **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
   such runs. Runs with fewer bugs are left out of the bars, because a percentage
@@ -221,7 +225,10 @@ Most PR-review tools stop after a single round of comments. Because they never
 inspect the code after those comments are addressed, they cannot catch bugs that the
 fixes themselves introduce or expose.
 
-<picture><img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%"></picture>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/when-bugs-surface.dark.svg">
+  <img src="docs/assets/when-bugs-surface.svg" alt="Share of bugs caught in round 2 or later, per review run, with the all-runs aggregate line" width="100%">
+</picture>
 
 - **Bars:** the same 20 runs as the chart above, here showing the share of each
   run's bugs that was found in round 2 or later.
@@ -234,7 +241,10 @@ fixes themselves introduce or expose.
 The chart below breaks down every qualifying run with 20 or more valid bugs, seven
 in total, reviewer by reviewer.
 
-<picture><img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%"></picture>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/reviewer-drilldown.dark.svg">
+  <img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
+</picture>
 
 | Run | Valid bugs | Found by Claude | Claude % | Found in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
 |---|---|---|---|---|---|---|---|
