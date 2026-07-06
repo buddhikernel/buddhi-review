@@ -1,0 +1,59 @@
+<svg viewBox="0 0 404 863" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<defs><marker id="ar" markerWidth="11" markerHeight="11" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#6e7781"/></marker></defs>
+<text x="28" y="39" font-size="20" font-weight="700" fill="#1f2328">How a Buddhi review loop works</text>
+<text x="28" y="59" font-size="12" fill="#57606a">Different labs. Targeted re-review. Auto-merge only when</text>
+<text x="28" y="75" font-size="12" fill="#57606a">enabled.</text>
+<rect x="143" y="94" width="130" height="30" rx="15" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="208" y="114" font-size="13" text-anchor="middle" fill="#1f2328">Pull request</text>
+<path d="M208.0,128 L208.0,144" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="28" y="148" width="360" height="117" rx="11" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="42" y="173" font-size="15" font-weight="700" fill="#1f2328">1 · Review across vendors</text>
+<circle cx="47" cy="196" r="5" fill="#C2410C"/>
+<text x="58" y="200" font-size="13" fill="#1f2328">Claude</text>
+<circle cx="220" cy="196" r="5" fill="#2A78D6"/>
+<text x="231" y="200" font-size="13" fill="#1f2328">Codex</text>
+<circle cx="47" cy="218" r="5" fill="#1BAF7A"/>
+<text x="58" y="222" font-size="13" fill="#1f2328">Gemini</text>
+<circle cx="220" cy="218" r="5" fill="#8B95A5"/>
+<text x="231" y="222" font-size="13" fill="#1f2328">Copilot</text>
+<text x="42" y="248" font-size="13" fill="#57606a">Different labs have different blind spots.</text>
+<path d="M208.0,269 L208.0,285" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="28" y="289" width="360" height="182" rx="11" fill="#eef1f4" stroke="#b6bec8" stroke-width="1.5"/>
+<text x="42" y="314" font-size="15" font-weight="700" fill="#1f2328">2 · Decide each finding</text>
+<rect x="42" y="280" width="95" height="18" rx="9" fill="#eef1f4" stroke="#b6bec8" stroke-width="1"/>
+<text x="90" y="292" font-size="12" text-anchor="middle" fill="#57606a">Buddhi kernel</text>
+<text x="42" y="341" font-size="13" font-weight="700" fill="#1f2328">Fix</text>
+<text x="111" y="341" font-size="13" fill="#57606a">code or PR description</text>
+<text x="42" y="362" font-size="13" font-weight="700" fill="#9a5b00">Ask you</text>
+<text x="111" y="362" font-size="13" fill="#57606a">genuine judgment needed</text>
+<text x="42" y="383" font-size="13" font-weight="700" fill="#1f2328">Skip</text>
+<text x="111" y="383" font-size="13" fill="#57606a">invalid or outdated</text>
+<text x="42" y="404" font-size="13" font-weight="700" fill="#1f2328">Defer</text>
+<text x="111" y="404" font-size="13" fill="#57606a">interruption limit reached</text>
+<line x1="42" y1="418" x2="374" y2="418" stroke="#d0d7de" stroke-width="0.75"/>
+<text x="42" y="438" font-size="12" fill="#8b949e">Every finding gets an explicit disposition — never blind</text>
+<text x="42" y="454" font-size="12" fill="#8b949e">auto-fix.</text>
+<path d="M208.0,475 L208.0,491" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="28" y="495" width="360" height="132" rx="11" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="42" y="520" font-size="15" font-weight="700" fill="#1f2328">3 · Re-review the fixed code</text>
+<text x="42" y="547" font-size="13" fill="#1f2328">Re-request reviewers that found substantive issues.</text>
+<text x="42" y="566" font-size="13" fill="#57606a">Skip those that approved, found nothing, or were</text>
+<text x="42" y="584" font-size="13" fill="#57606a">cosmetic-only.</text>
+<text x="42" y="610" font-size="13" font-weight="700" fill="#1f2328">Repeat until clean — or the round budget is reached.</text>
+<path d="M208.0,631 L208.0,655" fill="none" stroke="#6e7781" stroke-width="2.5" marker-end="url(#ar)"/>
+<text x="220" y="647" font-size="12" font-weight="700" fill="#1a7f37">✓ Clean round</text>
+<rect x="28" y="659" width="360" height="188" rx="11" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="42" y="684" font-size="15" font-weight="700" fill="#1f2328">4 · Validate and land</text>
+<rect x="42" y="697" width="106" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
+<text x="95" y="712" font-size="13" text-anchor="middle" fill="#1f2328">Run tests / CI</text>
+<path d="M58,720 L58,732" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="42" y="733" width="151" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
+<text x="118" y="748" font-size="13" text-anchor="middle" fill="#1f2328">Require green checks</text>
+<path d="M58,756 L58,768" fill="none" stroke="#6e7781" stroke-width="2" marker-end="url(#ar)"/>
+<rect x="42" y="769" width="109" height="23" rx="6" fill="#eef1f4" stroke="#d0d7de" stroke-width="0.75"/>
+<text x="96" y="784" font-size="13" text-anchor="middle" fill="#1f2328">Squash-merge</text>
+<text x="42" y="814" font-size="12" fill="#8b949e">Tests and CI decide whether the PR can land. Auto-merge is</text>
+<text x="42" y="830" font-size="12" fill="#8b949e">optional, off by default.</text>
+<path d="M28,561 L9,561 L9,206 L25,206" fill="none" stroke="#6e7781" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#ar)"/>
+<text x="18" y="384" transform="rotate(-90,18,384)" text-anchor="middle" font-size="12" fill="#57606a">re-review the fixed code</text>
+</svg>

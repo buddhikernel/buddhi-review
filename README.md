@@ -320,8 +320,10 @@ A clean round is not proof that the code is correct. It means only that the pane
 found nothing further to act on within the configured review budget.
 
 <picture>
+  <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/review-loop.mobile.dark.svg">
+  <source media="(max-width: 600px)" srcset="docs/assets/review-loop.mobile.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/review-loop.dark.svg">
-  <img src="docs/assets/review-loop.svg" alt="What a Buddhi review loop does each round: a cross-vendor panel of four labs (Claude, Codex, Gemini, Copilot) reviews the code; the kernel judges each finding as fix, ask-you, skip, or defer; each round re-requests only the bots that raised a substantive finding, dropping bots that approved or were cosmetic-only, and repeats until a clean round; then tests and CI must pass before an opt-in auto-merge lands the PR." width="100%">
+  <img src="docs/assets/review-loop.svg" alt="How a Buddhi review loop works: a cross-vendor panel of four labs (Claude, Codex, Gemini, Copilot) reviews the code; the kernel decides each finding as fix, ask-you, skip, or defer; each round re-requests only reviewers that raised a substantive finding, dropping those that approved, found nothing, or were cosmetic-only, and repeats until clean or the round budget is reached; then tests and CI must pass before an opt-in auto-merge." width="100%">
 </picture>
 
 <details>
