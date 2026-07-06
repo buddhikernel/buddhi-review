@@ -159,11 +159,13 @@ def _drain_buffered_stdin() -> str:
         chunks = []
         try:
             tty.setraw(fd)
-            while select.select([sys.stdin], [], [], 0)[0]:
-                ch = sys.stdin.read(1)
-                if not ch:
+            while select.select([fd], [], [], 0)[0]:
+                b = os.read(fd, 4096)
+                if not b:
                     break
-                chunks.append(ch)
+                if b'\x03' in b:  # Ctrl-C in raw mode — re-raise so cancellation works
+                    raise KeyboardInterrupt
+                chunks.append(b.decode(errors="ignore"))
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)
         return "".join(chunks)
@@ -2449,8 +2451,10 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
         # auto-promotes its fleet to the global default so cross-repo runs have a
         # fall-back; every later per-repo confirm leaves the established default
         # untouched. set_gd stays False when a global default already exists, so the
-        # empty-fleet wipe can never fire in this branch.
-        set_gd = not has_gd
+        # empty-fleet wipe can never fire in this branch. Require a non-empty fleet
+        # so a first run with zero confirmed reviewers doesn't establish a vacuous
+        # global default that silently suppresses reviewers on every other repo.
+        set_gd = not has_gd and bool(reviewers)
 
     am = step_repo_auto_merge(repo, _repo_auto_merge_default(existing, repo), pal=pal,
                               stream=stream, single_select=single_select, input_fn=input_fn)
