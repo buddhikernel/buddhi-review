@@ -244,14 +244,20 @@ def _read_hidden_tty(prompt: str) -> Optional[str]:
                 num_bytes = 1
             remaining = b""
             if num_bytes > 1:
-                remaining = os.read(fd, num_bytes - 1)
+                # os.read may return fewer bytes than requested; loop to completion.
+                need = num_bytes - 1
+                while len(remaining) < need:
+                    chunk = os.read(fd, need - len(remaining))
+                    if not chunk:
+                        break
+                    remaining += chunk
             return (first_byte + remaining).decode("utf-8", "replace")
         except OSError:
             return ""
 
     def _more_pending():
         try:
-            return bool(select.select([fd], [], [], 0)[0])
+            return bool(select.select([fd], [], [], 0.05)[0])
         except Exception:
             return False
 
