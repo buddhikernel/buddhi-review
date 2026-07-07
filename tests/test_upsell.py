@@ -86,11 +86,28 @@ def test_format_nudge_is_contextual_per_status():
     needs = upsell.format_nudge("needs-human")
     rounds = upsell.format_nudge("max-rounds")
     assert needs and rounds and needs != rounds
-    # Each names a concrete benefit + the Cmd-clickable domain + the silence hint.
+    # Each names a concrete benefit + the Cmd-clickable domain + the free
+    # setup-wizard command the reader can type + the silence hint.
     for line in (needs, rounds):
         assert line.startswith("↑ Upgrade to ")
         assert "https://buddhikernel.com" in line
+        assert "/review-pr setup" in line
         assert "BUDDHI_NO_UPSELL=1" in line
+
+
+def test_nudge_offers_the_free_setup_wizard():
+    # Alongside the domain, the nudge offers the free OSS setup wizard as a plain
+    # command the reader types themselves — never auto-launched. The two affordances
+    # coexist on the one line; neither replaces the other.
+    for status in ("needs-human", "max-rounds"):
+        line = upsell.format_nudge(status)
+        assert "/review-pr setup" in line
+        assert "run /review-pr setup" in line  # framed as "run it yourself", not a launch
+        assert "https://buddhikernel.com" in line
+    # The added affordance keeps the line publish-clean (names no paid mechanism).
+    line = upsell.format_nudge("needs-human")
+    assert g.scan_paid_and_publish(line) == [], line
+    assert g.scan_entitlement(line) == [], line
 
 
 def test_format_nudge_skips_non_handback_statuses():
