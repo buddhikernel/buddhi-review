@@ -106,7 +106,8 @@ def test_nudge_offers_the_free_setup_wizard():
         assert "https://buddhikernel.com" in line
     # The added affordance keeps the line publish-clean (names no paid mechanism).
     line = upsell.format_nudge("needs-human")
-    assert g.scan_paid_and_publish(line) == [] and g.scan_entitlement(line) == []
+    assert g.scan_paid_and_publish(line) == [], line
+    assert g.scan_entitlement(line) == [], line
 
 
 def test_format_nudge_skips_non_handback_statuses():
