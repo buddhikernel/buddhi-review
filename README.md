@@ -213,8 +213,7 @@ cross-vendor panel.
 </picture>
 
 - **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
-  such runs. Runs with fewer bugs are left out of the bars, because a percentage
-  computed over a handful of bugs swings too widely to read.
+  such runs.
 - **Line:** Claude's share across all 88 qualifying runs, which is 3.8%.
 
 ### One round is not a complete review
