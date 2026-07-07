@@ -1,69 +1,67 @@
-<svg viewBox="0 0 430 549" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
+<svg viewBox="0 0 430 517" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
 <text x="16.0" y="20.0" font-size="16" font-weight="700" fill="#e6edf3">Valid bugs caught by each reviewer, per run</text>
 <text x="16.0" y="39.0" font-size="12" fill="#adbac7">Every qualifying run with 20 or more valid bugs (all 7 of them).</text>
-<text x="16.0" y="55.0" font-size="12" fill="#adbac7">Segment length: the number of that run’s bugs each reviewer</text>
-<text x="16.0" y="71.0" font-size="12" fill="#adbac7">caught.</text>
-<text x="52.0" y="104.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run A</text>
-<rect x="58.0" y="88" width="84.8" height="23" fill="#2A78D6"/>
-<text x="100.4" y="103.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">5</text>
-<rect x="142.8" y="88" width="152.6" height="23" fill="#1BAF7A"/>
-<text x="219.0" y="103.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">9</text>
-<rect x="295.3" y="88" width="118.7" height="23" fill="#8B95A5"/>
-<text x="354.7" y="103.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">7</text>
-<text x="58.0" y="122.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: 0 of 21, no all-clear</text>
-<text x="52.0" y="152.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run B</text>
-<rect x="58.0" y="136" width="189.3" height="23" fill="#1BAF7A"/>
-<text x="152.7" y="151.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">25</text>
-<rect x="247.3" y="136" width="166.7" height="23" fill="#8B95A5"/>
-<text x="330.7" y="151.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">22</text>
-<text x="58.0" y="170.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: 0 of 47, no all-clear</text>
-<text x="52.0" y="200.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run C</text>
-<rect x="58.0" y="184" width="226.5" height="23" fill="#1BAF7A"/>
-<text x="171.3" y="199.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">14</text>
-<rect x="284.5" y="184" width="129.5" height="23" fill="#8B95A5"/>
-<text x="349.3" y="199.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">8</text>
-<text x="58.0" y="218.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: all-clear, 0 of 22</text>
-<text x="52.0" y="248.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run D</text>
-<rect x="58.0" y="232" width="16.9" height="23" fill="#C2410C"/>
-<text x="66.5" y="247.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">2</text>
-<rect x="74.9" y="232" width="211.9" height="23" fill="#1BAF7A"/>
-<text x="180.9" y="247.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">25</text>
-<rect x="286.8" y="232" width="127.2" height="23" fill="#8B95A5"/>
-<text x="350.4" y="247.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">15</text>
-<text x="58.0" y="266.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: 2 of 42</text>
-<text x="52.0" y="296.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run E</text>
-<rect x="58.0" y="280" width="12.3" height="23" fill="#C2410C"/>
-<rect x="70.3" y="280" width="319.2" height="23" fill="#1BAF7A"/>
-<text x="229.9" y="295.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">26</text>
-<rect x="389.5" y="280" width="24.5" height="23" fill="#8B95A5"/>
-<text x="401.7" y="295.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">2</text>
-<text x="58.0" y="314.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: 1 of 29</text>
-<text x="52.0" y="344.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run F</text>
-<rect x="58.0" y="328" width="29.7" height="23" fill="#2A78D6"/>
-<text x="72.8" y="343.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">2</text>
-<rect x="87.7" y="328" width="296.7" height="23" fill="#1BAF7A"/>
-<text x="236.0" y="343.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">20</text>
-<rect x="384.3" y="328" width="29.7" height="23" fill="#8B95A5"/>
-<text x="399.2" y="343.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">2</text>
-<text x="58.0" y="362.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: all-clear, 0 of 24</text>
-<text x="52.0" y="392.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run G</text>
-<rect x="58.0" y="376" width="249.2" height="23" fill="#1BAF7A"/>
-<text x="182.6" y="391.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">14</text>
-<rect x="307.2" y="376" width="106.8" height="23" fill="#8B95A5"/>
-<text x="360.6" y="391.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">6</text>
-<text x="58.0" y="410.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: all-clear, 0 of 20</text>
-<rect x="16" y="423" width="11" height="11" rx="2" fill="#C2410C"/>
-<text x="32.0" y="432.0" font-size="12" fill="#adbac7">Claude</text>
-<rect x="91" y="423" width="11" height="11" rx="2" fill="#2A78D6"/>
-<text x="107.0" y="432.0" font-size="12" fill="#adbac7">Codex</text>
-<rect x="162" y="423" width="11" height="11" rx="2" fill="#1BAF7A"/>
-<text x="178.0" y="432.0" font-size="12" fill="#adbac7">Gemini</text>
-<rect x="236" y="423" width="11" height="11" rx="2" fill="#8B95A5"/>
-<text x="252.0" y="432.0" font-size="12" fill="#adbac7">Copilot</text>
-<text x="16.0" y="457.0" font-size="12" fill="#8b949e">On Runs C, F, and G, Claude posted an explicit all-clear (“No</text>
-<text x="16.0" y="473.0" font-size="12" fill="#8b949e">issues found.”); the other reviewers subsequently identified 66</text>
-<text x="16.0" y="489.0" font-size="12" fill="#8b949e">valid bugs. On Runs A and B, Claude left review comments rather</text>
-<text x="16.0" y="505.0" font-size="12" fill="#8b949e">than an all-clear, but none of those comments identified a valid</text>
-<text x="16.0" y="521.0" font-size="12" fill="#8b949e">bug. Each bug is credited to one catching reviewer. Ledger data,</text>
-<text x="16.0" y="537.0" font-size="12" fill="#8b949e">repo anonymized.</text>
+<text x="16.0" y="55.0" font-size="12" fill="#adbac7">Segment length: the number of that run’s bugs each reviewer caught.</text>
+<text x="52.0" y="88.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run A</text>
+<rect x="58.0" y="72" width="84.8" height="23" fill="#2A78D6"/>
+<text x="100.4" y="87.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">5</text>
+<rect x="142.8" y="72" width="152.6" height="23" fill="#1BAF7A"/>
+<text x="219.0" y="87.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">9</text>
+<rect x="295.3" y="72" width="118.7" height="23" fill="#8B95A5"/>
+<text x="354.7" y="87.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">7</text>
+<text x="58.0" y="106.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: 0 of 21, no all-clear</text>
+<text x="52.0" y="136.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run B</text>
+<rect x="58.0" y="120" width="189.3" height="23" fill="#1BAF7A"/>
+<text x="152.7" y="135.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">25</text>
+<rect x="247.3" y="120" width="166.7" height="23" fill="#8B95A5"/>
+<text x="330.7" y="135.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">22</text>
+<text x="58.0" y="154.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: 0 of 47, no all-clear</text>
+<text x="52.0" y="184.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run C</text>
+<rect x="58.0" y="168" width="226.5" height="23" fill="#1BAF7A"/>
+<text x="171.3" y="183.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">14</text>
+<rect x="284.5" y="168" width="129.5" height="23" fill="#8B95A5"/>
+<text x="349.3" y="183.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">8</text>
+<text x="58.0" y="202.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: all-clear, 0 of 22</text>
+<text x="52.0" y="232.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run D</text>
+<rect x="58.0" y="216" width="16.9" height="23" fill="#C2410C"/>
+<text x="66.5" y="231.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">2</text>
+<rect x="74.9" y="216" width="211.9" height="23" fill="#1BAF7A"/>
+<text x="180.9" y="231.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">25</text>
+<rect x="286.8" y="216" width="127.2" height="23" fill="#8B95A5"/>
+<text x="350.4" y="231.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">15</text>
+<text x="58.0" y="250.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: 2 of 42</text>
+<text x="52.0" y="280.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run E</text>
+<rect x="58.0" y="264" width="12.3" height="23" fill="#C2410C"/>
+<rect x="70.3" y="264" width="319.2" height="23" fill="#1BAF7A"/>
+<text x="229.9" y="279.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">26</text>
+<rect x="389.5" y="264" width="24.5" height="23" fill="#8B95A5"/>
+<text x="401.7" y="279.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">2</text>
+<text x="58.0" y="298.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: 1 of 29</text>
+<text x="52.0" y="328.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run F</text>
+<rect x="58.0" y="312" width="29.7" height="23" fill="#2A78D6"/>
+<text x="72.8" y="327.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">2</text>
+<rect x="87.7" y="312" width="296.7" height="23" fill="#1BAF7A"/>
+<text x="236.0" y="327.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">20</text>
+<rect x="384.3" y="312" width="29.7" height="23" fill="#8B95A5"/>
+<text x="399.2" y="327.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">2</text>
+<text x="58.0" y="346.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: all-clear, 0 of 24</text>
+<text x="52.0" y="376.0" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">Run G</text>
+<rect x="58.0" y="360" width="249.2" height="23" fill="#1BAF7A"/>
+<text x="182.6" y="375.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">14</text>
+<rect x="307.2" y="360" width="106.8" height="23" fill="#8B95A5"/>
+<text x="360.6" y="375.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">6</text>
+<text x="58.0" y="394.0" font-size="12" font-weight="700" fill="#EA7A47">Claude: all-clear, 0 of 20</text>
+<rect x="16" y="407" width="11" height="11" rx="2" fill="#C2410C"/>
+<text x="32.0" y="416.0" font-size="12" fill="#adbac7">Claude</text>
+<rect x="91" y="407" width="11" height="11" rx="2" fill="#2A78D6"/>
+<text x="107.0" y="416.0" font-size="12" fill="#adbac7">Codex</text>
+<rect x="162" y="407" width="11" height="11" rx="2" fill="#1BAF7A"/>
+<text x="178.0" y="416.0" font-size="12" fill="#adbac7">Gemini</text>
+<rect x="236" y="407" width="11" height="11" rx="2" fill="#8B95A5"/>
+<text x="252.0" y="416.0" font-size="12" fill="#adbac7">Copilot</text>
+<text x="16.0" y="441.0" font-size="12" fill="#8b949e">On Runs C, F, and G, Claude posted an explicit all-clear (“No issues</text>
+<text x="16.0" y="457.0" font-size="12" fill="#8b949e">found.”); the other reviewers subsequently identified 66 valid bugs. On</text>
+<text x="16.0" y="473.0" font-size="12" fill="#8b949e">Runs A and B, Claude left review comments rather than an all-clear,</text>
+<text x="16.0" y="489.0" font-size="12" fill="#8b949e">but none of those comments identified a valid bug. Each bug is</text>
+<text x="16.0" y="505.0" font-size="12" fill="#8b949e">credited to one catching reviewer. Ledger data, repo anonymized.</text>
 </svg>
