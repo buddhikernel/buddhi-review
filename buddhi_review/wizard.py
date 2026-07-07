@@ -219,6 +219,7 @@ def _read_hidden_tty(prompt: str) -> Optional[str]:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)     # restore, NO flush
         except Exception:
             pass
+        sys.stdout.write("\x1b[?2004h")   # re-enable bracketed paste (mirror the disable above)
         sys.stdout.write("\n")
         sys.stdout.flush()
 
