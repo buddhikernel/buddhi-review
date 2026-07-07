@@ -3,7 +3,9 @@
 When the free skill finishes a review run and the run ended at a point it handed
 work BACK to a human (it could not carry it through on its own), this module emits
 a single transient, non-blocking line: a benefit-named upgrade nudge tied to what
-just happened, plus a Cmd-clickable domain. It is the only place in the OSS tree
+just happened, a Cmd-clickable domain, and a plain ``/review-pr setup`` suggestion
+the reader can type to open the free setup wizard themselves (never auto-launched).
+It is the only place in the OSS tree
 that may reference a paid upgrade (execution-plan §E item 9 / §D4), and it does so
 under hard limits:
 
@@ -39,6 +41,14 @@ from buddhi_review.transparency import _colour_enabled
 # ``https://`` URL is what terminals reliably auto-linkify for Cmd-click.
 DOMAIN = "buddhikernel.com"
 _URL = f"https://{DOMAIN}"
+
+# The free OSS onboarding wizard's slash command — the second, equally non-committal
+# affordance in the nudge. It is a plain suggestion the reader can TYPE to open the
+# per-repo setup wizard themselves; the skill never auto-launches it. This is the
+# free ``/review-pr setup`` command the skill documents (GETTING_STARTED / SKILL),
+# which configures reviewers and is where the upgrade path lives — it names no paid
+# product or mechanism, so it stays inside the OSS-purity gate.
+_SETUP_CMD = "/review-pr setup"
 
 # A run's terminal status (``RunOutcome.status``) → the single concrete benefit the
 # nudge names for that hand-back moment. Only the two "the loop could not finish on
@@ -170,12 +180,14 @@ def paid_backend_active(backends: Optional[List] = None) -> bool:
 
 def format_nudge(status: str) -> Optional[str]:
     """The uncoloured nudge line for a run-terminal ``status``, or ``None`` when the
-    status is not a hand-back moment we nudge on. Pure (no env, no I/O) — the text
-    contract the tests pin."""
+    status is not a hand-back moment we nudge on. Carries two equally non-committal
+    affordances — the Cmd-clickable domain and the ``/review-pr setup`` command the
+    reader can type to open the free wizard themselves. Pure (no env, no I/O) — the
+    text contract the tests pin."""
     benefit = _BENEFIT_BY_STATUS.get(status)
     if not benefit:
         return None
-    return f"↑ Upgrade to {benefit} — {_URL}   (BUDDHI_NO_UPSELL=1 to silence)"
+    return f"↑ Upgrade to {benefit} — {_URL} or run {_SETUP_CMD}   (BUDDHI_NO_UPSELL=1 to silence)"
 
 
 def _emit(text: str, stream: TextIO) -> None:
