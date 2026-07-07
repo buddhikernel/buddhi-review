@@ -1,7 +1,7 @@
 <svg viewBox="0 0 430 517" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif">
 <text x="16.0" y="20.0" font-size="16" font-weight="700" fill="#1f2328">Valid bugs caught by each reviewer, per run</text>
-<text x="16.0" y="39.0" font-size="12" fill="#57606a">Every qualifying run with 20 or more valid bugs (all 7 of them).</text>
-<text x="16.0" y="55.0" font-size="12" fill="#57606a">Segment length: the number of that run’s bugs each reviewer caught.</text>
+<text x="16.0" y="39.0" font-size="12" fill="#57606a">Every qualifying run with 20 or more valid bugs (all 7 of them). Segment</text>
+<text x="16.0" y="55.0" font-size="12" fill="#57606a">length: the number of that run’s bugs each reviewer caught.</text>
 <text x="52.0" y="88.0" font-size="12" font-weight="700" text-anchor="end" fill="#1f2328">Run A</text>
 <rect x="58.0" y="72" width="84.8" height="23" fill="#2A78D6"/>
 <text x="100.4" y="87.0" font-size="12" font-weight="700" text-anchor="middle" fill="#ffffff">5</text>
@@ -61,7 +61,7 @@
 <text x="252.0" y="416.0" font-size="12" fill="#57606a">Copilot</text>
 <text x="16.0" y="441.0" font-size="12" fill="#8b949e">On Runs C, F, and G, Claude posted an explicit all-clear (“No issues</text>
 <text x="16.0" y="457.0" font-size="12" fill="#8b949e">found.”); the other reviewers subsequently identified 66 valid bugs. On</text>
-<text x="16.0" y="473.0" font-size="12" fill="#8b949e">Runs A and B, Claude left review comments rather than an all-clear,</text>
-<text x="16.0" y="489.0" font-size="12" fill="#8b949e">but none of those comments identified a valid bug. Each bug is</text>
-<text x="16.0" y="505.0" font-size="12" fill="#8b949e">credited to one catching reviewer. Ledger data, repo anonymized.</text>
+<text x="16.0" y="473.0" font-size="12" fill="#8b949e">Runs A and B, Claude left review comments rather than an all-clear, but</text>
+<text x="16.0" y="489.0" font-size="12" fill="#8b949e">none of those comments identified a valid bug. Each bug is credited to</text>
+<text x="16.0" y="505.0" font-size="12" fill="#8b949e">one catching reviewer. Ledger data, repo anonymized.</text>
 </svg>

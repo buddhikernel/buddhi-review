@@ -2,8 +2,8 @@
 <text x="16.0" y="20.0" font-size="16" font-weight="700" fill="#e6edf3">Share of bugs caught in round 2+, per review run</text>
 <text x="16.0" y="39.0" font-size="12" fill="#adbac7">Each bar is one qualifying run with 10 or more valid bugs (all 20 of</text>
 <text x="16.0" y="55.0" font-size="12" fill="#adbac7">them). Bar height: the share of that run’s bugs found after round 1. The</text>
-<text x="16.0" y="71.0" font-size="12" fill="#adbac7">bold line is the aggregate over all 88 qualifying runs (681 bugs).</text>
-<text x="16.0" y="87.0" font-size="12" fill="#adbac7">Ledger data, repo anonymized.</text>
+<text x="16.0" y="71.0" font-size="12" fill="#adbac7">bold line is the aggregate over all 88 qualifying runs (681 bugs). Ledger</text>
+<text x="16.0" y="87.0" font-size="12" fill="#adbac7">data, repo anonymized.</text>
 <line x1="46" y1="272.0" x2="414" y2="272.0" stroke="#2a3038" stroke-width="1"/>
 <text x="40.0" y="276.0" font-size="12" text-anchor="end" fill="#8b949e">0%</text>
 <line x1="46" y1="230.0" x2="414" y2="230.0" stroke="#2a3038" stroke-width="1"/>
@@ -36,11 +36,11 @@
 <rect x="399.6" y="238.4" width="14.4" height="33.6" fill="#E5484D" opacity="0.85"/>
 <line x1="46" y1="187.9" x2="414" y2="187.9" stroke="#e6edf3" stroke-width="2.2"/>
 <text x="414.0" y="182.9" font-size="12" font-weight="700" text-anchor="end" fill="#e6edf3">50.1% in round 2+</text>
-<text x="16.0" y="305.0" font-size="12" fill="#8b949e">Runs with more bugs tend to earn more review rounds, so most of</text>
-<text x="16.0" y="321.0" font-size="12" fill="#8b949e">these bars sit above the all-runs line.</text>
+<text x="16.0" y="305.0" font-size="12" fill="#8b949e">Runs with more bugs tend to earn more review rounds, so most of these</text>
+<text x="16.0" y="321.0" font-size="12" fill="#8b949e">bars sit above the all-runs line.</text>
 <text x="16.0" y="340.0" font-size="13" font-weight="700" fill="#ff7b72">Across all 88 qualifying runs, 50.1% of valid bugs, and 49.2%</text>
 <text x="16.0" y="357.0" font-size="13" font-weight="700" fill="#ff7b72">of the 189 high or critical ones, were caught only in round 2+.</text>
-<text x="16.0" y="375.0" font-size="12" fill="#8b949e">On the 20 runs shown as bars, the round 2+ share is 65.4%. A</text>
-<text x="16.0" y="391.0" font-size="12" fill="#8b949e">reviewer that stops after one round would have shipped every bug</text>
-<text x="16.0" y="407.0" font-size="12" fill="#8b949e">counted in these bars.</text>
+<text x="16.0" y="375.0" font-size="12" fill="#8b949e">On the 20 runs shown as bars, the round 2+ share is 65.4%. A reviewer</text>
+<text x="16.0" y="391.0" font-size="12" fill="#8b949e">that stops after one round would have shipped every bug counted in</text>
+<text x="16.0" y="407.0" font-size="12" fill="#8b949e">these bars.</text>
 </svg>

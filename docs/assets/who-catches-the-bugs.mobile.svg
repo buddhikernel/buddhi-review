@@ -2,8 +2,8 @@
 <text x="16.0" y="20.0" font-size="16" font-weight="700" fill="#1f2328">Claude’s share of the valid bugs, per review run</text>
 <text x="16.0" y="39.0" font-size="12" fill="#57606a">Each bar is one qualifying run with 10 or more valid bugs (all 20 of</text>
 <text x="16.0" y="55.0" font-size="12" fill="#57606a">them). Bar height: the share of that run’s bugs that Claude caught. The</text>
-<text x="16.0" y="71.0" font-size="12" fill="#57606a">bold line is the aggregate over all 88 qualifying runs (681 bugs).</text>
-<text x="16.0" y="87.0" font-size="12" fill="#57606a">Ledger data, repo anonymized.</text>
+<text x="16.0" y="71.0" font-size="12" fill="#57606a">bold line is the aggregate over all 88 qualifying runs (681 bugs). Ledger</text>
+<text x="16.0" y="87.0" font-size="12" fill="#57606a">data, repo anonymized.</text>
 <line x1="46" y1="272.0" x2="414" y2="272.0" stroke="#e6e8eb" stroke-width="1"/>
 <text x="40.0" y="276.0" font-size="12" text-anchor="end" fill="#8b949e">0%</text>
 <line x1="46" y1="230.0" x2="414" y2="230.0" stroke="#e6e8eb" stroke-width="1"/>
@@ -35,7 +35,7 @@
 <rect x="381.0" y="237.0" width="14.4" height="35.0" fill="#C2410C" opacity="0.9"/>
 <rect x="399.6" y="270.5" width="14.4" height="2.0" fill="#C2410C" opacity="0.35"/>
 <line x1="46" y1="256.0" x2="414" y2="256.0" stroke="#1f2328" stroke-width="2.2"/>
-<text x="414.0" y="251.0" font-size="12" font-weight="700" text-anchor="end" fill="#1f2328">Claude = 3.8%</text>
+<text x="368.0" y="251.0" font-size="12" font-weight="700" text-anchor="end" fill="#1f2328">Claude = 3.8%</text>
 <text x="16.0" y="305.0" font-size="12" fill="#8b949e">Flat stubs are zero. In 14 of these 20 runs Claude reviewed the code</text>
 <text x="16.0" y="321.0" font-size="12" fill="#8b949e">and caught nothing.</text>
 <text x="16.0" y="340.0" font-size="13" font-weight="700" fill="#B01722">Across all 88 qualifying runs, Claude caught 3.8% of the valid</text>
