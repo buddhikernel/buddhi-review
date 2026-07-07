@@ -157,6 +157,43 @@ def _assemble_pasted_secret(read_char, more_pending, echo=None) -> str:
             if more_pending():
                 continue                   # a newline INSIDE the paste (a wrap)
             break                          # the user's submit Enter
+        if ch == "\x1b":
+            # Discard escape sequences — valid tokens never contain ESC. Consume
+            # only the sequence itself so a paste burst after the sequence (e.g.
+            # arrow key ESC[A, color ESC[31m) is not accidentally drained along
+            # with the sequence when both arrive in the same buffered TTY burst.
+            if more_pending():
+                nxt = read_char()
+                if nxt == "[":
+                    # CSI: param bytes (0x30-0x3F) then a final byte (0x40-0x7E).
+                    # Covers bracketed-paste ESC[200~/ESC[201~ (final byte `~`=0x7E)
+                    # and any other CSI sequence (arrow keys, color codes, etc.).
+                    while more_pending():
+                        c = read_char()
+                        if c == "" or "\x40" <= c <= "\x7e":
+                            break
+                elif nxt == "]":
+                    # OSC: ends with BEL or a new ESC (String Terminator ESC \).
+                    while more_pending():
+                        c = read_char()
+                        if c in ("\x07", "\x1b", ""):
+                            if c == "\x1b" and more_pending():
+                                # ST is ESC \; consume the \ so it doesn't
+                                # land in the captured token.
+                                st_bslash = read_char()
+                                if st_bslash != "\\":
+                                    # Malformed — not a real ST; discard it
+                                    # anyway (tokens never contain ESC or \).
+                                    pass
+                            break
+                # Other two-byte sequences (ESC M, ESC O, etc.) — nxt consumed.
+            continue
+        if ch in ("\x7f", "\x08"):
+            if chars:
+                chars.pop()
+                if echo is not None:
+                    echo("\b \b")
+            continue
         chars.append(ch)
         if echo is not None:
             echo(ch)
@@ -169,10 +206,10 @@ def _read_hidden_tty(prompt: str) -> Optional[str]:
     first line AND its TCSAFLUSH restore DISCARDS the wrapped continuation before it can
     be read, so a token copied from a narrow window is silently truncated (confirmed via
     a pty). This reads the line + its wrapped continuation in ONE session and restores
-    WITHOUT flushing (TCSADRAIN). Bracketed paste is turned off so the paste arrives as
-    raw text (no ``ESC[200~`` framing to swallow); each captured char echoes a masked
-    '•' so the paste visibly registers. Returns the assembled token, or None when stdin
-    is not a usable TTY (the caller then falls back to getpass)."""
+    WITHOUT flushing (TCSADRAIN). Bracketed-paste framing sequences (ESC[200~/ESC[201~)
+    are stripped in the reader so the paste arrives as raw text; each captured char echoes
+    a masked '*' so the paste visibly registers. Returns the assembled token, or None when
+    stdin is not a usable TTY (the caller then falls back to getpass)."""
     if not _is_tty():
         return None
     try:
@@ -182,26 +219,39 @@ def _read_hidden_tty(prompt: str) -> Optional[str]:
         old = termios.tcgetattr(fd)
     except Exception:
         return None
-    # Tell the user what to do (they didn't know Enter submits); the value still masks
-    # to • as it pastes, so they also see the field register.
-    sys.stdout.write("  (paste the value, then press Enter)\n")
-    sys.stdout.write(prompt)
-    sys.stdout.write("\x1b[?2004l")        # disable bracketed paste → raw paste text
-    sys.stdout.flush()
-
-    def _mask(_ch):
-        sys.stdout.write("•")
+    def _mask(ch):
+        if ch == "\b \b":
+            sys.stdout.write("\b \b")
+        else:
+            sys.stdout.write("*")
         sys.stdout.flush()
 
     def _read_char():
         try:
-            return os.read(fd, 1).decode("utf-8", "replace")
+            first_byte = os.read(fd, 1)
+            if not first_byte:
+                return ""
+            b = first_byte[0]
+            if b & 0x80 == 0:
+                num_bytes = 1
+            elif b & 0xE0 == 0xC0:
+                num_bytes = 2
+            elif b & 0xF0 == 0xE0:
+                num_bytes = 3
+            elif b & 0xF8 == 0xF0:
+                num_bytes = 4
+            else:
+                num_bytes = 1
+            remaining = b""
+            if num_bytes > 1:
+                remaining = os.read(fd, num_bytes - 1)
+            return (first_byte + remaining).decode("utf-8", "replace")
         except OSError:
             return ""
 
     def _more_pending():
         try:
-            return bool(select.select([fd], [], [], 0.1)[0])
+            return bool(select.select([fd], [], [], 0)[0])
         except Exception:
             return False
 
@@ -211,6 +261,10 @@ def _read_hidden_tty(prompt: str) -> Optional[str]:
         new[6][termios.VMIN] = 1
         new[6][termios.VTIME] = 0
         termios.tcsetattr(fd, termios.TCSANOW, new)          # NOW — never TCSAFLUSH
+        # Prompt AFTER echo is off — no cleartext keystroke echo can leak to scrollback.
+        sys.stdout.write("  (paste the value, then press Enter)\n")
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
         return _assemble_pasted_secret(_read_char, _more_pending, echo=_mask)
     except Exception:
         return None
@@ -219,17 +273,17 @@ def _read_hidden_tty(prompt: str) -> Optional[str]:
             termios.tcsetattr(fd, termios.TCSADRAIN, old)     # restore, NO flush
         except Exception:
             pass
-        sys.stdout.write("\x1b[?2004h")   # re-enable bracketed paste (mirror the disable above)
         sys.stdout.write("\n")
         sys.stdout.flush()
 
 
 def _read_pasted_secret(prompt: str, getpass_fn: Callable) -> str:
     """Read a hidden secret that may arrive as a MULTI-LINE paste (a token copied from a
-    narrow console window wraps across lines). On a TTY, read via :func:`_read_hidden_tty`
-    — getpass CANNOT be used here: it truncates at the first line AND flushes the rest.
-    Off a TTY (tests, pipes), fall back to the injected ``getpass_fn`` (whitespace
-    stripped). Either way the result is the token's true single-line form."""
+    narrow console window wraps across lines). When a TTY is available, read via
+    :func:`_read_hidden_tty` (preferred: it preserves wrapped lines); when not available
+    (non-TTY stdin, missing termios/select, or reader failure), fall back to the injected
+    ``getpass_fn`` (whitespace stripped). Either way the result is the token's true
+    single-line form."""
     got = _read_hidden_tty(prompt)
     if got is not None:
         return got

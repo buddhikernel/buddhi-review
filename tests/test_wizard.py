@@ -288,6 +288,45 @@ def test_assemble_pasted_secret_masks_each_captured_char():
     assert out == "abc" and masked == ["a", "b", "c"]
 
 
+def test_assemble_pasted_secret_handles_backspace():
+    """Backspace characters (\x7f and \x08) delete the last captured character."""
+    read_char, more = _char_stream("ab\x7fcd\x08e\n")
+    assert wizard._assemble_pasted_secret(read_char, more) == "ace"
+
+
+def test_assemble_pasted_secret_strips_bracketed_paste_framing():
+    """ESC[200~ open and ESC[201~ close frames are discarded; the token content between
+    them is captured cleanly. Any other ESC sequence is also discarded."""
+    framed = "\x1b[200~sk-ant-oat01-framed\x1b[201~\n"
+    read_char, more = _char_stream(framed)
+    assert wizard._assemble_pasted_secret(read_char, more) == "sk-ant-oat01-framed"
+
+
+def test_assemble_pasted_secret_csi_non_tilde_does_not_drain_token():
+    """A CSI sequence that ends with a letter (not ~) — e.g. an arrow key ESC[A or a
+    color code ESC[31m — must consume ONLY the sequence itself and leave the token bytes
+    that follow in the same burst intact."""
+    arrow_then_token = "\x1b[Ask-ant-oat01-arrow\n"
+    read_char, more = _char_stream(arrow_then_token)
+    assert wizard._assemble_pasted_secret(read_char, more) == "sk-ant-oat01-arrow"
+
+    color_then_token = "\x1b[31msk-ant-oat01-color\n"
+    read_char, more = _char_stream(color_then_token)
+    assert wizard._assemble_pasted_secret(read_char, more) == "sk-ant-oat01-color"
+
+
+def test_assemble_pasted_secret_osc_st_does_not_corrupt_token():
+    """An OSC sequence ending with String Terminator ESC \\ must not leave the trailing
+    \\ in the stream where it would be appended to the captured token."""
+    osc_st_then_token = "\x1b]0;mytitle\x1b\\sk-ant-oat01-osc\n"
+    read_char, more = _char_stream(osc_st_then_token)
+    assert wizard._assemble_pasted_secret(read_char, more) == "sk-ant-oat01-osc"
+
+    osc_bel_then_token = "\x1b]0;mytitle\x07sk-ant-oat01-bel\n"
+    read_char, more = _char_stream(osc_bel_then_token)
+    assert wizard._assemble_pasted_secret(read_char, more) == "sk-ant-oat01-bel"
+
+
 def test_read_hidden_tty_returns_none_without_tty(monkeypatch):
     monkeypatch.setattr(wizard, "_is_tty", lambda: False)
     assert wizard._read_hidden_tty("p: ") is None
