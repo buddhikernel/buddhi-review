@@ -252,39 +252,73 @@ def test_claude_secret_checked_even_when_workflow_present(monkeypatch, tmp_path)
         "the secret check must run even when the Claude workflow is already present"
 
 
-# ── multi-line paste: a token wrapped by a narrow console is reconstructed ────────
+# ── the pasted-secret TTY reader (getpass truncates + FLUSHES a wrapped paste) ────
 
 
-def test_read_pasted_secret_rejoins_wrapped_token(monkeypatch):
-    """getpass returns only the first line of a wrapped token; the drained
-    continuation is appended and ALL whitespace stripped into the true token."""
-    monkeypatch.setattr(wizard, "_drain_buffered_stdin", lambda: "\n Y-second__part")
-    out = wizard._read_pasted_secret("p: ", lambda p: "sk-ant-oat01-first")
-    assert out == "sk-ant-oat01-firstY-second__part"
+def _char_stream(text):
+    """A (read_char, more_pending) pair over `text`. more_pending() is True while any
+    unread char remains — so a newline that ISN'T the last char is a WRAP and the final
+    newline SUBMITS, mirroring how a paste burst sits in the tty buffer."""
+    i = {"n": 0}
+
+    def read_char():
+        if i["n"] >= len(text):
+            return ""
+        ch = text[i["n"]]
+        i["n"] += 1
+        return ch
+
+    return read_char, (lambda: i["n"] < len(text))
 
 
-def test_read_pasted_secret_single_line_is_trimmed(monkeypatch):
-    """No continuation to drain → a single-line paste is returned trimmed of stray
-    surrounding whitespace, unchanged otherwise."""
-    monkeypatch.setattr(wizard, "_drain_buffered_stdin", lambda: "")
-    out = wizard._read_pasted_secret("p: ", lambda p: "  sk-ant-oat01-clean  ")
-    assert out == "sk-ant-oat01-clean"
+def test_assemble_pasted_secret_rejoins_wrapped_multiline():
+    read_char, more = _char_stream("sk-ant-oat01-A\n part-B\n")
+    assert wizard._assemble_pasted_secret(read_char, more) == "sk-ant-oat01-Apart-B"
 
 
-def test_drain_buffered_stdin_is_noop_without_tty(monkeypatch):
-    """Not a TTY (pytest / piped) → nothing to drain; returns '' and never blocks."""
+def test_assemble_pasted_secret_single_line_submits_on_enter():
+    read_char, more = _char_stream("sk-ant-oat01-solo\n")
+    assert wizard._assemble_pasted_secret(read_char, more) == "sk-ant-oat01-solo"
+
+
+def test_assemble_pasted_secret_masks_each_captured_char():
+    read_char, more = _char_stream("abc\n")
+    masked = []
+    out = wizard._assemble_pasted_secret(read_char, more, echo=masked.append)
+    assert out == "abc" and masked == ["a", "b", "c"]
+
+
+def test_read_hidden_tty_returns_none_without_tty(monkeypatch):
     monkeypatch.setattr(wizard, "_is_tty", lambda: False)
-    assert wizard._drain_buffered_stdin() == ""
+    assert wizard._read_hidden_tty("p: ") is None
+
+
+def test_read_pasted_secret_uses_tty_reader_when_present(monkeypatch):
+    """On a TTY the value comes from the self-managed reader — getpass is NEVER called
+    (it truncates at the first line AND flushes the wrapped rest)."""
+    monkeypatch.setattr(wizard, "_read_hidden_tty", lambda prompt: "sk-ant-oat01-full")
+
+    def _boom(_p):
+        raise AssertionError("getpass must not be called on a TTY")
+
+    assert wizard._read_pasted_secret("p: ", _boom) == "sk-ant-oat01-full"
+
+
+def test_read_pasted_secret_falls_back_to_getpass_off_tty(monkeypatch):
+    """Off a TTY the reader returns None → getpass_fn is used, whitespace stripped."""
+    monkeypatch.setattr(wizard, "_read_hidden_tty", lambda prompt: None)
+    assert wizard._read_pasted_secret("p: ", lambda p: "  sk-ant-oat01-clean  ") == \
+        "sk-ant-oat01-clean"
 
 
 def test_claude_multiline_paste_is_reconstructed_and_stored(monkeypatch):
-    """End-to-end: a token pasted wrapped across lines is drained, reconstructed,
-    validated, and stored as its true single-line form (the reported bug — a wrapped
-    paste used to be truncated at the newline and fail to authenticate)."""
+    """End-to-end: a token pasted wrapped across lines is read WHOLE by the TTY reader,
+    validated, and stored as its true single-line form (the reported bug)."""
+    clean = "sk-ant-oat01-AAAAccccDDDDeeeeFFFF__gggg-HHHH"
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     monkeypatch.setattr(wizard, "_gh_secret_exists", lambda *a, **k: None)  # not present
     monkeypatch.setattr(wizard, "_ask_yes_no", lambda *a, **k: True)        # consent granted
-    monkeypatch.setattr(wizard, "_drain_buffered_stdin", lambda: "\n eeeeFFFF__gggg-HHHH")
+    monkeypatch.setattr(wizard, "_read_hidden_tty", lambda prompt: clean)
     stored = {}
 
     def _store(repo, name, token, **k):
@@ -302,10 +336,9 @@ def test_claude_multiline_paste_is_reconstructed_and_stored(monkeypatch):
         "acme/widgets",
         run=lambda *a, **k: types.SimpleNamespace(returncode=0, stdout=""),
         spawn_command=lambda *a, **k: {"spawned": True},
-        getpass_fn=lambda *a, **k: "sk-ant-oat01-AAAAccccDDDD",
+        getpass_fn=lambda *a, **k: "SHOULD_NOT_BE_USED",
         pal=wizard._Palette(False), stream=io.StringIO(),
         owner_type="User", validate_fn=_validate)
-    clean = "sk-ant-oat01-AAAAccccDDDDeeeeFFFF__gggg-HHHH"
     assert status == "set"
     assert seen["validated"] == clean     # validated the reconstructed token
     assert stored["t"] == clean           # stored the reconstructed token

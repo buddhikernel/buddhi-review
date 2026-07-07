@@ -938,15 +938,15 @@ def test_offer_gh_token_stores_after_valid_probe(monkeypatch):
 
 
 def test_offer_gh_token_multiline_paste_is_reconstructed(monkeypatch):
-    # A GH token pasted wrapped across lines: getpass returns only line 1, the drained
-    # continuation is appended, and the whole is probed + stored as one token.
+    # A GH token pasted wrapped across lines is read WHOLE by the TTY reader, then
+    # probed + stored as one token (getpass would truncate it at the first newline).
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     monkeypatch.setattr(wizard, "single_select", _yn_bridge)
-    monkeypatch.setattr(wizard, "_drain_buffered_stdin", lambda: "\n PASTED2")
+    monkeypatch.setattr(wizard, "_read_hidden_tty", lambda prompt: "ghp_PASTED1PASTED2")
     run, calls = _gh_probe_run(_R(returncode=0, stdout="octocat\n"))
     seen = _capture_upsert(monkeypatch)
     pal, buf = wizard._Palette(False), io.StringIO()
-    wizard._offer_gh_token(run=run, getpass_fn=lambda *a: "ghp_PASTED1", pal=pal,
+    wizard._offer_gh_token(run=run, getpass_fn=lambda *a: "SHOULD_NOT_BE_USED", pal=pal,
                            stream=buf, input_fn=lambda *a: "y")
     assert seen["mapping"] == {"GH_TOKEN": "ghp_PASTED1PASTED2"}      # reconstructed
     assert calls[0]["env"]["GH_TOKEN"] == "ghp_PASTED1PASTED2"        # probed reconstructed
