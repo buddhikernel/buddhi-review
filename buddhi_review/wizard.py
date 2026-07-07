@@ -140,48 +140,100 @@ def _is_tty() -> bool:
         return False
 
 
-def _drain_buffered_stdin() -> str:
-    """Return any input ALREADY sitting in the TTY buffer right now, read hidden and
-    WITHOUT blocking. A multi-line paste — a token copied from a narrow terminal
-    wraps, so the clipboard carries newlines — dumps its whole content into the
-    buffer at once, but getpass returns only the first line; this recovers the
-    continuation the paste left behind. Returns '' when nothing is pending, stdin
-    isn't a TTY, or the platform lacks termios (so a single-line paste is untouched
-    and never blocks)."""
+def _assemble_pasted_secret(read_char, more_pending, echo=None) -> str:
+    """Assemble a possibly-multi-line pasted secret char-by-char. A token copied from a
+    narrow terminal window WRAPS across lines, so its clipboard carries newlines: each
+    such newline is a WRAP (detected because more input is still buffered) — it is
+    dropped and reading continues; a newline with nothing more pending is the user's
+    SUBMIT (Enter). Returns the joined chars with ALL whitespace stripped (a real token
+    has none). The `read_char` / `more_pending` seams keep this unit-testable without a
+    real TTY; `echo` (optional) masks each captured char so the field visibly fills."""
+    chars = []
+    while True:
+        ch = read_char()
+        if ch == "":                       # EOF / read error
+            break
+        if ch in ("\n", "\r"):
+            if more_pending():
+                continue                   # a newline INSIDE the paste (a wrap)
+            break                          # the user's submit Enter
+        chars.append(ch)
+        if echo is not None:
+            echo(ch)
+    return "".join("".join(chars).split())
+
+
+def _read_hidden_tty(prompt: str) -> Optional[str]:
+    """Read a hidden secret from the TTY in a SELF-MANAGED no-echo session, capturing a
+    wrapped MULTI-LINE paste intact. Deliberately NOT getpass: getpass returns only the
+    first line AND its TCSAFLUSH restore DISCARDS the wrapped continuation before it can
+    be read, so a token copied from a narrow window is silently truncated (confirmed via
+    a pty). This reads the line + its wrapped continuation in ONE session and restores
+    WITHOUT flushing (TCSADRAIN). Bracketed paste is turned off so the paste arrives as
+    raw text (no ``ESC[200~`` framing to swallow); each captured char echoes a masked
+    '•' so the paste visibly registers. Returns the assembled token, or None when stdin
+    is not a usable TTY (the caller then falls back to getpass)."""
     if not _is_tty():
-        return ""
+        return None
     try:
         import select
         import termios
-        import tty
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
-        chunks = []
-        try:
-            tty.setraw(fd)
-            while select.select([fd], [], [], 0)[0]:
-                b = os.read(fd, 4096)
-                if not b:
-                    break
-                if b'\x03' in b:  # Ctrl-C in raw mode — re-raise so cancellation works
-                    raise KeyboardInterrupt
-                chunks.append(b.decode(errors="ignore"))
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        return "".join(chunks)
     except Exception:
-        return ""
+        return None
+    # Tell the user what to do (they didn't know Enter submits); the value still masks
+    # to • as it pastes, so they also see the field register.
+    sys.stdout.write("  (paste the value, then press Enter)\n")
+    sys.stdout.write(prompt)
+    sys.stdout.write("\x1b[?2004l")        # disable bracketed paste → raw paste text
+    sys.stdout.flush()
+
+    def _mask(_ch):
+        sys.stdout.write("•")
+        sys.stdout.flush()
+
+    def _read_char():
+        try:
+            return os.read(fd, 1).decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def _more_pending():
+        try:
+            return bool(select.select([fd], [], [], 0.1)[0])
+        except Exception:
+            return False
+
+    try:
+        new = termios.tcgetattr(fd)
+        new[3] = new[3] & ~(termios.ECHO | termios.ICANON)   # lflags: no echo, char-at-a-time
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new)          # NOW — never TCSAFLUSH
+        return _assemble_pasted_secret(_read_char, _more_pending, echo=_mask)
+    except Exception:
+        return None
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)     # restore, NO flush
+        except Exception:
+            pass
+        sys.stdout.write("\x1b[?2004h")   # re-enable bracketed paste (mirror the disable above)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
 
 def _read_pasted_secret(prompt: str, getpass_fn: Callable) -> str:
-    """Read a hidden secret that may arrive as a MULTI-LINE paste. getpass returns
-    only the first line, so a token copied from a narrow console window (wrapped
-    across lines, sometimes with a leading indent) would be truncated. Drain the
-    buffered continuation the paste left behind, then strip ALL whitespace so the
-    wrapped pieces are rejoined into the token's true single-line form. A real
-    sk-ant-oat token carries no internal whitespace, so this is lossless."""
-    first = getpass_fn(prompt) or ""
-    return "".join((first + _drain_buffered_stdin()).split())
+    """Read a hidden secret that may arrive as a MULTI-LINE paste (a token copied from a
+    narrow console window wraps across lines). On a TTY, read via :func:`_read_hidden_tty`
+    — getpass CANNOT be used here: it truncates at the first line AND flushes the rest.
+    Off a TTY (tests, pipes), fall back to the injected ``getpass_fn`` (whitespace
+    stripped). Either way the result is the token's true single-line form."""
+    got = _read_hidden_tty(prompt)
+    if got is not None:
+        return got
+    return "".join((getpass_fn(prompt) or "").split())
 
 
 def _read_key() -> str:
