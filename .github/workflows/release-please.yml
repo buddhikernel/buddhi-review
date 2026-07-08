@@ -1,0 +1,46 @@
+# buddhi-review's own release automation — this is NOT a managed file that ships to user
+# repos; it releases buddhi-review itself.
+#
+# On every push to main, release-please maintains a rolling "release PR" (chore: release
+# X.Y.Z) carrying the version bump + changelog, computed from the commit history since the
+# last release. Merging that release PR tags the commit and creates a GitHub Release, which
+# fires .github/workflows/publish.yml (PyPI Trusted Publishing). Nothing publishes until you
+# merge the release PR — that merge is the human gate.
+#
+# Pre-1.0 / major gate: bump-minor-pre-major (in release-please-config.json) holds any
+# breaking change to a minor bump while the version is < 1.0.0, so a 1.0.0+ release happens
+# only when a maintainer explicitly asks for it (a "Release-As: 1.0.0" commit footer).
+#
+# TOKEN: the Release is created with a GitHub App token (minted below from the App id +
+# private key repo secrets), NOT the default GITHUB_TOKEN. A Release created by
+# GITHUB_TOKEN does not trigger other workflows (GitHub's recursion guard), so publish.yml
+# would silently never fire. Until the App secrets are set, the token step fails loudly
+# rather than half-working — that is intentional.
+name: release-please
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # Mint a short-lived installation token from the GitHub App so the Release it creates
+      # can trigger publish.yml. Pin these actions to a full commit SHA + Dependabot for
+      # stricter supply-chain hygiene; the major tags are used here for readability.
+      - uses: actions/create-github-app-token@v1
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_KEY }}
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json

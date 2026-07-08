@@ -16,7 +16,9 @@ from __future__ import annotations
 # which extracts it by AST WITHOUT importing the package — so it MUST stay a plain
 # top-level string literal (never computed). ``skill_provenance.package_version()``
 # returns it, and the version-stamp transform records it into installed skills.
-__version__ = "0.1.3"
+# The trailing ``# x-release-please-version`` marker lets release-please rewrite the
+# version in place on a release; it is a comment, so the AST literal is unaffected.
+__version__ = "0.1.3"  # x-release-please-version
 
 __all__ = [
     "Classification",
