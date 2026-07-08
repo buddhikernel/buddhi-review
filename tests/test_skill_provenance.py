@@ -39,8 +39,8 @@ def _restore_registry():
 def test_package_version_is_single_sourced():
     assert sp.package_version() == buddhi_review.__version__
     # Asserted by SemVer shape, not pinned to a literal, so an automated release bump
-    # (release-please) never turns this test red.
-    assert re.fullmatch(r"\d+\.\d+\.\d+", sp.package_version())
+    # (release-please) never turns this test red. Regex enforces SemVer: no leading zeros.
+    assert re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", sp.package_version())
 
 
 # ── version-stamp transform ─────────────────────────────────────────────────────

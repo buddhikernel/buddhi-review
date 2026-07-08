@@ -34,12 +34,12 @@ jobs:
       # Mint a short-lived installation token from the GitHub App so the Release it creates
       # can trigger publish.yml. Pin these actions to a full commit SHA + Dependabot for
       # stricter supply-chain hygiene; the major tags are used here for readability.
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
         id: app-token
         with:
           app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLEASE_APP_KEY }}
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@0b6b3fc0186a2f7118bfd88fab9ea481e1839504
         with:
           token: ${{ steps.app-token.outputs.token }}
           config-file: release-please-config.json

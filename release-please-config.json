@@ -5,6 +5,7 @@
       "release-type": "python",
       "package-name": "buddhi-review",
       "include-v-in-tag": true,
+      "include-component-in-tag": false,
       "bump-minor-pre-major": true,
       "bump-patch-for-minor-pre-major": false,
       "draft": false,
