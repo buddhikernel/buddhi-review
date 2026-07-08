@@ -116,7 +116,11 @@ Interactive-only and best-effort; if you cannot prompt, proceed with defaults.
 
 2. **Author the PR title + body** from the work on the branch, and pick a branch
    prefix (`feat` / `fix` / `refactor`) — used only when the work is sitting on the
-   base branch and a new branch must be created.
+   base branch and a new branch must be created. **Plan-ID prefix:** if the **branch
+   name encodes a plan id** (e.g. `feat/pro-9-…` → `PRO-9`), the title MUST carry that
+   id right after the conventional-commit prefix — `<type>(<scope>): <PLAN-ID> —
+   <summary>` (e.g. `feat(pro): PRO-9 — …`, cf. PR #498). A branch with no plan id
+   uses a normal conventional-commit title with no id.
 
 ### 1.1 Per-repo reviewer confirmation gate
 
