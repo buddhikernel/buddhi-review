@@ -5,6 +5,7 @@ version read, version-stamp idempotency, post-transform hash stability, registry
 ordering, and the "register a new transform WITHOUT editing the module" contract.
 """
 import hashlib
+import re
 
 import pytest
 
@@ -37,7 +38,9 @@ def _restore_registry():
 # ── package_version ─────────────────────────────────────────────────────────────
 def test_package_version_is_single_sourced():
     assert sp.package_version() == buddhi_review.__version__
-    assert sp.package_version() == "0.1.3"
+    # Asserted by SemVer shape, not pinned to a literal, so an automated release bump
+    # (release-please) never turns this test red. Regex enforces SemVer: no leading zeros.
+    assert re.fullmatch(r"(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", sp.package_version())
 
 
 # ── version-stamp transform ─────────────────────────────────────────────────────
