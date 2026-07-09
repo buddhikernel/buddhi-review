@@ -259,6 +259,39 @@ def reason_is_pending_checks(reason: str) -> bool:
     return bool(reason) and reason.startswith(_PENDING_REASON_PREFIX)
 
 
+def _branch_is_behind_base(
+    base_branch: str,
+    *,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> bool:
+    """True iff the checkout at ``cwd`` (the PR branch) is behind
+    ``origin/<base_branch>`` by >= 1 commit, decided by GIT independently of
+    GitHub's ``mergeStateStatus``.
+
+    ``mergeStateStatus`` is single-valued: when a PR is BOTH behind its base AND
+    has a failing check, GitHub reports UNSTABLE/BLOCKED (the red check), which
+    MASKS BEHIND. :func:`check_pr_mergeable` would then report "checks failing"
+    and the branch would never reach the exit-rebase path even though a rebase
+    onto the fixed base can clear the red. This git behind-count is the
+    CI-independent signal.
+
+    Fail-safe: ANY git error (fetch/rev-list non-zero, missing git, timeout,
+    non-int output) returns False — never claim a drift we could not verify, so a
+    transient failure never triggers a blind force-push."""
+    try:
+        fetched = run(["git", "fetch", "origin", base_branch], cwd=cwd)
+        if getattr(fetched, "returncode", 1) != 0:
+            return False
+        counted = run(
+            ["git", "rev-list", "--count", f"HEAD..origin/{base_branch}"], cwd=cwd)
+        if getattr(counted, "returncode", 1) != 0:
+            return False
+        return int((getattr(counted, "stdout", "") or "0").strip() or "0") > 0
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return False
+
+
 def check_pr_mergeable(
     pr: str,
     *,
@@ -278,7 +311,7 @@ def check_pr_mergeable(
     unparseable output returns ``(True, "")`` — a transient blip must never wedge
     a mergeable PR, and ``gh pr merge`` stays the authoritative final check."""
     cmd = ["gh", "pr", "view", str(pr), "--json",
-           "mergeable,mergeStateStatus,statusCheckRollup,isDraft"]
+           "mergeable,mergeStateStatus,statusCheckRollup,isDraft,baseRefName"]
     if repo:
         cmd += ["-R", repo]
     try:
@@ -295,16 +328,25 @@ def check_pr_mergeable(
         return True, ""
     mergeable = (data.get("mergeable") or "").upper()
     state = (data.get("mergeStateStatus") or "").upper()
+    base = (data.get("baseRefName") or "").strip()
     if data.get("isDraft"):
         return False, "the PR is still a draft"
     if mergeable == "CONFLICTING" or state == "DIRTY":
         return False, "merge conflicts"
     if state == "BEHIND":
-        return False, "the base branch is ahead — needs a rebase"
+        return False, "base branch ahead — needs rebase/update"
     failing, pending = _inspect_rollup(data.get("statusCheckRollup") or [])
     if failing:
         joined = " | ".join(failing[:3])
         tail = f" (+{len(failing) - 3} more)" if len(failing) > 3 else ""
+        # A failing check masks BEHIND in the single-valued mergeStateStatus, so a
+        # PR that is BOTH behind base AND red reports "checks failing" and never
+        # reaches the exit-rebase path — even though rebasing onto the fixed base
+        # may clear the red. Detect behind independently (git) and route it to the
+        # SAME drift reason as the BEHIND state above, so the branch is rebased
+        # first; a genuine failure survives the rebase and hands back next pass.
+        if base and _branch_is_behind_base(base, cwd=cwd, run=run):
+            return False, "base branch ahead — needs rebase/update"
         return False, f"checks failing: {joined}{tail}"
     if pending:
         return False, f"{_PENDING_REASON_PREFIX} ({pending})"
