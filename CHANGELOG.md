@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.1](https://github.com/buddhikernel/buddhi-review/compare/v0.2.0...v0.2.1) (2026-07-09)
+
+
+### Bug Fixes
+
+* rebase behind+red PRs — git behind-check independent of mergeStateStatus ([#62](https://github.com/buddhikernel/buddhi-review/issues/62)) ([3db5bee](https://github.com/buddhikernel/buddhi-review/commit/3db5beeb2c8c3a3572c126dd26f729af0da97d38))
+
 ## [0.2.0](https://github.com/buddhikernel/buddhi-review/compare/v0.1.3...v0.2.0) (2026-07-08)
 
 
