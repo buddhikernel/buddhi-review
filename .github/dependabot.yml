@@ -1,0 +1,15 @@
+# Keeps the SHA-pinned GitHub Actions current: Dependabot opens a PR to bump a pin (with the
+# new version) whenever a watched action publishes a release, so the pins stay immutable AND
+# up to date on security fixes. Grouped into one weekly PR to limit noise; chore-prefixed so
+# release-please treats the bump as non-releasing.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore"
