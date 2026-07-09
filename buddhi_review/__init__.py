@@ -18,7 +18,7 @@ from __future__ import annotations
 # returns it, and the version-stamp transform records it into installed skills.
 # The trailing ``# x-release-please-version`` marker lets release-please rewrite the
 # version in place on a release; it is a comment, so the AST literal is unaffected.
-__version__ = "0.1.3"  # x-release-please-version
+__version__ = "0.2.0"  # x-release-please-version
 
 __all__ = [
     "Classification",
