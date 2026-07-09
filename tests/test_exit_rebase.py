@@ -248,3 +248,105 @@ def test_branch_without_upstream_is_skipped(repo):
     assert status == "skipped"
     assert "push target" in detail
     assert rec.pushes() == [] and rec.rebases() == []
+
+
+# ── Fork alignment: the base remote must match the behind-drift check ────────────
+# In a fork checkout the push remote (origin/fork) and the remote that HOSTS the
+# PR base (upstream) differ. merge._branch_is_behind_base resolves the base remote
+# by matching the PR's base ``repo`` to a configured remote's URL, so it can find
+# a PR behind ``upstream/main``. exit_rebase MUST resolve the base remote the same
+# way (via the threaded ``repo``) — otherwise it falls back to the push remote,
+# rebases the fork's stale ``origin/main`` (or reports "current"), and a behind+red
+# PR never gets unstuck. These tests pin that alignment with real git.
+@pytest.fixture
+def fork_repo(tmp_path):
+    """A fork checkout: push remote ``origin`` (the fork) + a separate ``upstream``
+    that hosts the PR base. Both bare remotes live at ``<owner>/<repo>.git`` paths
+    so merge._remote_for_repo can match a passed ``repo`` to the right remote.
+    ``branch.main.remote`` is deliberately left UNSET (the fork norm), so the base
+    remote is resolvable ONLY via the repo→URL match, not branch config.
+
+    Returns ``(work, upstream_owner_repo)`` — the working clone on ``feat/x`` and
+    the ``owner/repo`` string the ``upstream`` remote URL normalises to."""
+    origin = tmp_path / "fork" / "widgets.git"       # _owner_repo → "fork/widgets"
+    upstream = tmp_path / "acme" / "widgets.git"      # _owner_repo → "acme/widgets"
+    origin.parent.mkdir(parents=True, exist_ok=True)
+    upstream.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", str(upstream)], check=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "t")
+    _git(work, "remote", "add", "upstream", str(upstream))
+    _git(work, "checkout", "-q", "-b", "main")
+    _write(work / "base.py", "x = 1\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "base")
+    _git(work, "push", "-q", "origin", "main")         # origin/main == base
+    _git(work, "push", "-q", "upstream", "main")        # upstream/main == base (for now)
+    _git(work, "checkout", "-q", "-b", "feat/x", "main")
+    _write(work / "feature.py", "y = 2\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "feature work")
+    _git(work, "push", "-q", "-u", "origin", "feat/x")  # push remote for feat/x = origin
+    return work, "acme/widgets"
+
+
+def _advance_upstream_only(work):
+    """Advance ``main`` on ``upstream`` ONLY (origin/main stays the stale base).
+    ``feat/x`` is now behind upstream/main but NOT behind origin/main. Returns the
+    new upstream/main SHA."""
+    _git(work, "checkout", "-q", "main")
+    _write(work / "up.py", "u = 9\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "upstream advances")
+    _git(work, "push", "-q", "upstream", "main")        # upstream only — origin/main untouched
+    up_sha = _sha(work, "HEAD")
+    _git(work, "checkout", "-q", "feat/x")
+    return up_sha
+
+
+def test_fork_repo_match_rebases_onto_upstream_not_origin(fork_repo):
+    """WITH ``repo`` threaded: the base remote resolves to ``upstream`` (repo→URL
+    match), so a PR behind upstream/main is actually rebased onto upstream/main —
+    the fix that keeps this path aligned with the behind-drift check."""
+    work, upstream_repo = fork_repo
+    up_sha = _advance_upstream_only(work)
+    # Sanity: feat/x is NOT behind origin/main (the stale fork copy) — so the OLD
+    # push-remote fallback would have no-op'd — but IS behind upstream/main.
+    assert _git(work, "merge-base", "--is-ancestor", _sha(work, "origin/main"),
+                "HEAD", check=False).returncode == 0
+    rec = Rec()
+
+    status, detail = commit_push.exit_rebase(
+        str(work), base="main", repo=upstream_repo, run=rec, notice=_silent_notice)
+
+    assert status == "rebased" and detail == ""
+    # Rebased onto UPSTREAM's tip, not origin's: the branch now contains up_sha.
+    assert _git(work, "merge-base", "--is-ancestor", up_sha, "HEAD",
+                check=False).returncode == 0
+    # The rebase target was upstream/main (proves the remote resolution).
+    assert ["git", "rebase", "upstream/main"] in rec.rebases()
+    assert not any(c == ["git", "rebase", "origin/main"] for c in rec.rebases())
+    # The rebased tip was force-with-lease pushed to the fork (origin/feat/x).
+    assert _sha(work, "origin/feat/x") == _sha(work, "HEAD")
+    pushes = rec.pushes()
+    assert len(pushes) == 1 and any(a.startswith("--force-with-lease") for a in pushes[0])
+
+
+def test_fork_without_repo_falls_back_to_push_remote_and_no_ops(fork_repo):
+    """WITHOUT ``repo`` (and no ``branch.main.remote``): the base remote falls back
+    to the push remote ``origin``, whose ``origin/main`` is the fork's stale base
+    copy — so the branch reports "current" and is NEVER rebased. This is exactly the
+    stuck behind+red symptom the ``repo`` threading fixes; pinned here so the fix
+    stays load-bearing."""
+    work, _upstream_repo = fork_repo
+    _advance_upstream_only(work)
+    rec = Rec()
+
+    status, detail = commit_push.exit_rebase(
+        str(work), base="main", run=rec, notice=_silent_notice)  # no repo → push-remote fallback
+
+    assert status == "current" and detail == ""
+    assert rec.rebases() == [] and rec.pushes() == []

@@ -2598,8 +2598,13 @@ class RoundDriver:
                         f"{current_branch!r} but the PR head is {pr_head!r}; "
                         f"resolve by hand", status="skip")
             return
+        # Pass self.repo so exit_rebase resolves the base remote the SAME way the
+        # behind-drift check (merge._branch_is_behind_base) did — matching the PR's
+        # base repo to a configured remote's URL. Without it, a fork PR found behind
+        # upstream/main could be rebased onto the fork's stale origin/main (or
+        # reported "current"), leaving a behind+red PR stuck on the next pass.
         status, detail = commit_push.exit_rebase(
-            self.cwd, base=base, run=self.gh_run, notice=self.notice)
+            self.cwd, base=base, repo=self.repo, run=self.gh_run, notice=self.notice)
         if status == "rebased":
             reason = self._handback_caution_reason(outcome)
             if reason is None:

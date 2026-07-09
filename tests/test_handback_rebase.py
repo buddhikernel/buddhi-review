@@ -64,8 +64,8 @@ def stub_rebase(monkeypatch):
     every call. Returns a setter the test uses to pick the return value."""
     box = {"ret": ("rebased", ""), "calls": []}
 
-    def fake(cwd, *, base, run, notice):
-        box["calls"].append({"cwd": cwd, "base": base})
+    def fake(cwd, *, base, repo=None, run, notice):
+        box["calls"].append({"cwd": cwd, "base": base, "repo": repo})
         return box["ret"]
 
     monkeypatch.setattr(round_driver.commit_push, "exit_rebase", fake)
@@ -150,6 +150,10 @@ def test_handback_calls_exit_rebase_with_resolved_base(stub_rebase):
     d._maybe_exit_rebase(RunOutcome("clean", 2, merged=False))
     assert len(stub_rebase["calls"]) == 1
     assert stub_rebase["calls"][0]["base"] == "develop"
+    # The PR's base repo is threaded so exit_rebase resolves the base remote the
+    # SAME way the behind-drift check did (repo→remote-URL match), keeping the two
+    # paths aligned for a fork PR.
+    assert stub_rebase["calls"][0]["repo"] == "o/r"
 
 
 # ── Honest post-rebase message: Bucket A (ready) vs Bucket B (discretion) ────────
