@@ -22,6 +22,7 @@ behind / branch-protection / failing or pending checks) before the merge, and
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import time
 from typing import Callable, List, Optional, Sequence
@@ -259,6 +260,148 @@ def reason_is_pending_checks(reason: str) -> bool:
     return bool(reason) and reason.startswith(_PENDING_REASON_PREFIX)
 
 
+_GIT_URL_OWNER_REPO_RE = re.compile(r"(?:^|[:/])([^/:]+/[^/:]+?)(?:\.git)?/?$")
+_GIT_URL_HOST_RE = re.compile(
+    r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*://)?(?:[^@/]+@)?([^/:]+)[:/][^/:]+/[^/:]+?(?:\.git)?/?$"
+)
+
+
+def _owner_repo(text: str) -> Optional[str]:
+    """Normalise a git remote URL (SSH or HTTPS, ``.git`` suffix optional) or a
+    ``gh``-style ``[HOST/]OWNER/REPO`` string down to a lowercase ``owner/repo``
+    for comparison, or ``None`` if it does not look like one. The host, if any,
+    is dropped here — use :func:`_host` alongside this when host disambiguation
+    matters (see :func:`_remote_for_repo`)."""
+    m = _GIT_URL_OWNER_REPO_RE.search(text.strip())
+    return m.group(1).lower() if m else None
+
+
+def _host(text: str) -> Optional[str]:
+    """Extract the lowercase host from a git remote URL (SSH or HTTPS) or a
+    ``gh``-style ``HOST/OWNER/REPO`` string, or ``None`` when the input has no
+    host component (e.g. a bare ``OWNER/REPO``, which ``gh``'s ``[HOST/]``
+    makes optional)."""
+    m = _GIT_URL_HOST_RE.match(text.strip())
+    return m.group(1).lower() if m else None
+
+
+def _remote_for_repo(
+    repo: str,
+    *,
+    cwd: Optional[str],
+    run: Callable[..., "subprocess.CompletedProcess[str]"],
+) -> Optional[str]:
+    """Find the local remote (if any) whose URL resolves to the same
+    ``owner/repo`` as ``repo`` (the ``-R``/``--repo`` target that
+    :func:`check_pr_mergeable` queried) by matching ``git remote -v`` output.
+    This is the AUTHORITATIVE base-remote signal: ``repo`` is the exact repo the
+    PR's base branch lives on, so a match here is correct regardless of what
+    ``branch.<base>.remote`` says (or whether it is even set). Returns ``None``
+    on any git error or no match, so the caller can fall back.
+
+    When ``repo`` carries an explicit host (``gh``'s ``[HOST/]OWNER/REPO``
+    form, e.g. from a GitHub Enterprise checkout), the matched remote's URL
+    must resolve to that SAME host — otherwise a checkout with remotes for the
+    same ``owner/repo`` on two different hosts (``github.com`` and an
+    Enterprise host) could match the wrong one. A host-less ``repo`` (the
+    common bare ``owner/repo`` case) keeps matching by ``owner/repo`` alone,
+    same as before."""
+    target = _owner_repo(repo)
+    if not target:
+        return None
+    target_host = _host(repo)
+    try:
+        r = run(["git", "remote", "-v"], cwd=cwd)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if getattr(r, "returncode", 1) != 0:
+        return None
+    for line in (getattr(r, "stdout", "") or "").splitlines():
+        parts = line.split()
+        if len(parts) < 3 or parts[2] != "(fetch)":
+            continue
+        name, url = parts[0], parts[1]
+        if _owner_repo(url) != target:
+            continue
+        if target_host and _host(url) != target_host:
+            continue
+        return name
+    return None
+
+
+def _base_remote(
+    base_branch: str,
+    *,
+    cwd: Optional[str],
+    run: Callable[..., "subprocess.CompletedProcess[str]"],
+    repo: Optional[str] = None,
+) -> str:
+    """Resolve the remote that hosts ``base_branch``.
+
+    ``repo`` (the exact ``owner/repo`` the PR's base lives on, passed through
+    from :func:`check_pr_mergeable`) is tried FIRST via :func:`_remote_for_repo`
+    — matching a configured remote's URL is authoritative, unlike guessing from
+    local branch config. When ``repo`` is absent or matches no configured
+    remote, this falls back to ``branch.<base>.remote`` (the same lookup
+    :func:`buddhi_review.commit_push.exit_rebase` uses), and finally to
+    ``origin``. The fallback chain still exists for callers that cannot supply
+    ``repo`` (e.g. a bare checkout with no PR context), but in a fork checkout
+    where the PR base is ``upstream/main``, the ``repo`` match now identifies
+    ``upstream`` directly instead of guessing ``origin`` and risking a compare
+    against the contributor's own stale fork copy of the base branch."""
+    if repo:
+        matched = _remote_for_repo(repo, cwd=cwd, run=run)
+        if matched:
+            return matched
+    try:
+        r = run(["git", "config", "--get", f"branch.{base_branch}.remote"], cwd=cwd)
+        val = (getattr(r, "stdout", "") or "").strip()
+        if getattr(r, "returncode", 1) == 0 and val:
+            return val
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return "origin"
+
+
+def _branch_is_behind_base(
+    base_branch: str,
+    *,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+    repo: Optional[str] = None,
+) -> bool:
+    """True iff the checkout at ``cwd`` (the PR branch) is behind the base
+    branch's remote tracking ref by >= 1 commit, decided by GIT independently of
+    GitHub's ``mergeStateStatus``. The remote is resolved by :func:`_base_remote`
+    — matched against ``repo`` (the exact base repo, when the caller has it)
+    first, then ``branch.<base_branch>.remote``, then ``origin`` — so a fork
+    worktree whose PR base is ``upstream/main`` is checked against ``upstream``
+    rather than the fork's ``origin``.
+
+    ``mergeStateStatus`` is single-valued: when a PR is BOTH behind its base AND
+    has a failing check, GitHub reports UNSTABLE/BLOCKED (the red check), which
+    MASKS BEHIND. :func:`check_pr_mergeable` would then report "checks failing"
+    and the branch would never reach the exit-rebase path even though a rebase
+    onto the fixed base can clear the red. This git behind-count is the
+    CI-independent signal.
+
+    Fail-safe: ANY git error (fetch/rev-list non-zero, missing git, timeout,
+    non-int output) returns False — never claim a drift we could not verify, so a
+    transient failure never triggers a blind force-push."""
+    try:
+        base_remote = _base_remote(base_branch, cwd=cwd, run=run, repo=repo)
+        fetched = run(["git", "fetch", base_remote, base_branch], cwd=cwd)
+        if getattr(fetched, "returncode", 1) != 0:
+            return False
+        counted = run(
+            ["git", "rev-list", "--count", f"HEAD..{base_remote}/{base_branch}"], cwd=cwd)
+        if getattr(counted, "returncode", 1) != 0:
+            return False
+        return int((getattr(counted, "stdout", "") or "0").strip() or "0") > 0
+    except (subprocess.SubprocessError, OSError, ValueError):
+        return False
+
+
 def check_pr_mergeable(
     pr: str,
     *,
@@ -278,7 +421,7 @@ def check_pr_mergeable(
     unparseable output returns ``(True, "")`` — a transient blip must never wedge
     a mergeable PR, and ``gh pr merge`` stays the authoritative final check."""
     cmd = ["gh", "pr", "view", str(pr), "--json",
-           "mergeable,mergeStateStatus,statusCheckRollup,isDraft"]
+           "mergeable,mergeStateStatus,statusCheckRollup,isDraft,baseRefName"]
     if repo:
         cmd += ["-R", repo]
     try:
@@ -295,16 +438,25 @@ def check_pr_mergeable(
         return True, ""
     mergeable = (data.get("mergeable") or "").upper()
     state = (data.get("mergeStateStatus") or "").upper()
+    base = (data.get("baseRefName") or "").strip()
     if data.get("isDraft"):
         return False, "the PR is still a draft"
     if mergeable == "CONFLICTING" or state == "DIRTY":
         return False, "merge conflicts"
     if state == "BEHIND":
-        return False, "the base branch is ahead — needs a rebase"
+        return False, "base branch ahead — needs rebase/update"
     failing, pending = _inspect_rollup(data.get("statusCheckRollup") or [])
     if failing:
         joined = " | ".join(failing[:3])
         tail = f" (+{len(failing) - 3} more)" if len(failing) > 3 else ""
+        # A failing check masks BEHIND in the single-valued mergeStateStatus, so a
+        # PR that is BOTH behind base AND red reports "checks failing" and never
+        # reaches the exit-rebase path — even though rebasing onto the fixed base
+        # may clear the red. Detect behind independently (git) and route it to the
+        # SAME drift reason as the BEHIND state above, so the branch is rebased
+        # first; a genuine failure survives the rebase and hands back next pass.
+        if base and _branch_is_behind_base(base, cwd=cwd, run=run, repo=repo):
+            return False, "base branch ahead — needs rebase/update"
         return False, f"checks failing: {joined}{tail}"
     if pending:
         return False, f"{_PENDING_REASON_PREFIX} ({pending})"

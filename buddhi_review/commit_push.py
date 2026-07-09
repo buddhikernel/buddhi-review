@@ -40,7 +40,7 @@ import subprocess
 import sys
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from buddhi_review import lang_syntax
+from buddhi_review import lang_syntax, merge
 from buddhi_review.notifier import Ask, ConsoleNotifier, Notifier
 from buddhi_review.transparency import automation_notice, _colour_enabled
 
@@ -588,6 +588,7 @@ def exit_rebase(
     cwd: str,
     *,
     base: str,
+    repo: Optional[str] = None,
     run: Run = _default_run,
     notice: Callable[..., str] = automation_notice,
 ) -> Tuple[str, str]:
@@ -616,7 +617,19 @@ def exit_rebase(
     :func:`_resolve_push_target`), and the force-push is always
     ``--force-with-lease`` against the remote tip we last fetched, so a remote
     that advanced under us is rejected rather than clobbered. ``run`` is the same
-    injectable git seam the rest of this module uses."""
+    injectable git seam the rest of this module uses.
+
+    ``repo`` (the PR's base ``owner/repo``, threaded from the round driver) is how
+    the base remote stays ALIGNED with the behind-drift check
+    (:func:`buddhi_review.merge._branch_is_behind_base`): both resolve the base
+    remote by matching ``repo`` to a configured remote's URL FIRST (via
+    :func:`buddhi_review.merge._remote_for_repo`), so a fork PR based on
+    ``upstream/main`` is rebased onto ``upstream`` — not the fork's stale
+    ``origin`` copy. Without it, the drift check could classify a PR as behind
+    ``upstream/main`` while this path rebased ``origin/main`` (or reported
+    "current"), leaving a behind+red PR stuck. When ``repo`` is absent or matches
+    no configured remote, the resolution falls back to ``branch.<base>.remote``
+    then the push remote, exactly as before."""
     # 1. Resolve THIS branch's own push remote + name. Detached HEAD / no
     #    upstream → skip (we will not synthesise a target for a force-push).
     remote, branch = _resolve_push_target(cwd, run=run)
@@ -651,11 +664,23 @@ def exit_rebase(
 
     # Derive the base remote separately from the push remote.  In a fork setup
     # (push → origin/fork, PR base → upstream/main) the push remote and the
-    # remote that hosts the base branch are different.  git config
-    # branch.<base>.remote tells us if there is an explicit tracking remote for
-    # the base branch; when unset (typical non-fork deployment) the push remote
-    # doubles as the base remote.
+    # remote that hosts the base branch are different.
+    #
+    # The resolution order MUST match the behind-drift check
+    # (merge._base_remote → _remote_for_repo), or the two paths disagree: the
+    # drift check can classify a fork PR as behind ``upstream/main`` (via the
+    # repo→remote-URL match) while this path, falling back to the push remote,
+    # rebases ``origin/main`` (the fork's stale base copy) or reports "current" —
+    # leaving a behind+red PR stuck. So resolve ``repo`` (the PR's base repo)
+    # against a configured remote's URL FIRST — authoritative regardless of
+    # branch.<base>.remote — then fall back to git config branch.<base>.remote,
+    # then to the push remote (the typical non-fork deployment, where the push
+    # remote doubles as the base remote).
     def _base_remote_cfg() -> str:
+        if repo:
+            matched = merge._remote_for_repo(repo, cwd=cwd, run=run)
+            if matched:
+                return matched
         try:
             r = run(["git", "config", "--get", f"branch.{base}.remote"], cwd=cwd)
             val = (getattr(r, "stdout", "") or "").strip()
