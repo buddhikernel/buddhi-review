@@ -295,7 +295,7 @@ def _remote_for_repo(
         return None
     for line in (getattr(r, "stdout", "") or "").splitlines():
         parts = line.split()
-        if len(parts) < 2:
+        if len(parts) < 3 or parts[2] != "(fetch)":
             continue
         name, url = parts[0], parts[1]
         if _owner_repo(url) == target:
