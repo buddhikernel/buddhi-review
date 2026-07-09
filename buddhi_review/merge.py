@@ -259,15 +259,40 @@ def reason_is_pending_checks(reason: str) -> bool:
     return bool(reason) and reason.startswith(_PENDING_REASON_PREFIX)
 
 
+def _base_remote(
+    base_branch: str,
+    *,
+    cwd: Optional[str],
+    run: Callable[..., "subprocess.CompletedProcess[str]"],
+) -> str:
+    """Resolve the remote that hosts ``base_branch`` via ``branch.<base>.remote``
+    (the same lookup :func:`buddhi_review.commit_push.exit_rebase` uses), falling
+    back to ``origin`` when unset — so a fork checkout whose PR base is
+    ``upstream/main`` is counted against ``upstream``, not the contributor's own
+    ``origin`` fork."""
+    try:
+        r = run(["git", "config", "--get", f"branch.{base_branch}.remote"], cwd=cwd)
+        val = (getattr(r, "stdout", "") or "").strip()
+        if getattr(r, "returncode", 1) == 0 and val:
+            return val
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return "origin"
+
+
 def _branch_is_behind_base(
     base_branch: str,
     *,
     cwd: Optional[str] = None,
     run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
 ) -> bool:
-    """True iff the checkout at ``cwd`` (the PR branch) is behind
-    ``origin/<base_branch>`` by >= 1 commit, decided by GIT independently of
-    GitHub's ``mergeStateStatus``.
+    """True iff the checkout at ``cwd`` (the PR branch) is behind the base
+    branch's remote tracking ref by >= 1 commit, decided by GIT independently of
+    GitHub's ``mergeStateStatus``. The remote is resolved via
+    ``branch.<base_branch>.remote`` (falling back to ``origin``), matching
+    :func:`buddhi_review.commit_push.exit_rebase`, so a fork worktree whose PR
+    base is ``upstream/main`` is checked against ``upstream`` rather than the
+    fork's ``origin``.
 
     ``mergeStateStatus`` is single-valued: when a PR is BOTH behind its base AND
     has a failing check, GitHub reports UNSTABLE/BLOCKED (the red check), which
@@ -280,11 +305,12 @@ def _branch_is_behind_base(
     non-int output) returns False — never claim a drift we could not verify, so a
     transient failure never triggers a blind force-push."""
     try:
-        fetched = run(["git", "fetch", "origin", base_branch], cwd=cwd)
+        base_remote = _base_remote(base_branch, cwd=cwd, run=run)
+        fetched = run(["git", "fetch", base_remote, base_branch], cwd=cwd)
         if getattr(fetched, "returncode", 1) != 0:
             return False
         counted = run(
-            ["git", "rev-list", "--count", f"HEAD..origin/{base_branch}"], cwd=cwd)
+            ["git", "rev-list", "--count", f"HEAD..{base_remote}/{base_branch}"], cwd=cwd)
         if getattr(counted, "returncode", 1) != 0:
             return False
         return int((getattr(counted, "stdout", "") or "0").strip() or "0") > 0

@@ -54,19 +54,26 @@ class _FakeRun:
     """Records calls and returns a queued CompletedProcess per git subcommand.
 
     ``raises`` (if set) is raised on the FIRST call, modelling a ``run`` seam
-    that blows up (timeout / missing binary) before returning.
+    that blows up (timeout / missing binary) before returning. The
+    ``branch.<base>.remote`` config lookup is unset by default (empty stdout),
+    so the remote resolution falls back to ``origin`` — these tests pin the
+    behind-count LOGIC, not the remote-resolution rule (that is covered
+    separately in ``TestBaseRemoteResolution`` below).
     """
 
-    def __init__(self, fetch=None, revlist=None, raises=None):
+    def __init__(self, fetch=None, revlist=None, raises=None, config=None):
         self.calls = []
         self._fetch = fetch if fetch is not None else _cp(0, "")
         self._revlist = revlist if revlist is not None else _cp(0, "0")
+        self._config = config if config is not None else _cp(1, "")
         self._raises = raises
 
     def __call__(self, argv, *, cwd=None, timeout=None):
         self.calls.append((list(argv), {"cwd": cwd}))
         if self._raises is not None:
             raise self._raises
+        if "config" in argv:
+            return self._config
         if "fetch" in argv:
             return self._fetch
         if "rev-list" in argv:
@@ -119,16 +126,28 @@ class TestBranchIsBehindBase:
         assert not any("rev-list" in argv for argv, _kw in fake.calls)
 
     def test_issues_expected_git_commands(self):
-        """The signal is git-only: fetch origin <base>, then behind-count. The
-        checkout is selected via the injected run seam's ``cwd`` (OSS pattern),
-        not a ``git -C`` prefix."""
+        """The signal is git-only: resolve the base remote (``branch.<base>.remote``,
+        falling back to ``origin``), fetch it, then behind-count. The checkout is
+        selected via the injected run seam's ``cwd`` (OSS pattern), not a
+        ``git -C`` prefix."""
         fake = _FakeRun(revlist=_cp(0, "2"))
         merge._branch_is_behind_base("main", cwd="/repo", run=fake)
         argvs = [argv for argv, _kw in fake.calls]
         cwds = [kw["cwd"] for _argv, kw in fake.calls]
-        assert argvs[0] == ["git", "fetch", "origin", "main"]
-        assert argvs[1] == ["git", "rev-list", "--count", "HEAD..origin/main"]
-        assert cwds == ["/repo", "/repo"]   # both git calls run in the worktree
+        assert argvs[0] == ["git", "config", "--get", "branch.main.remote"]
+        assert argvs[1] == ["git", "fetch", "origin", "main"]
+        assert argvs[2] == ["git", "rev-list", "--count", "HEAD..origin/main"]
+        assert cwds == ["/repo", "/repo", "/repo"]   # all git calls run in the worktree
+
+    def test_resolves_base_remote_from_branch_config(self):
+        """A fork worktree where ``branch.main.remote`` is ``upstream`` (PR base
+        lives on the upstream repo, not the contributor's ``origin`` fork) fetches
+        and counts against ``upstream``, not ``origin`` — the bug this fixes."""
+        fake = _FakeRun(config=_cp(0, "upstream\n"), revlist=_cp(0, "1"))
+        assert merge._branch_is_behind_base("main", cwd="/repo", run=fake) is True
+        argvs = [argv for argv, _kw in fake.calls]
+        assert argvs[1] == ["git", "fetch", "upstream", "main"]
+        assert argvs[2] == ["git", "rev-list", "--count", "HEAD..upstream/main"]
 
 
 # ---- 2. End-to-end: check_pr_mergeable routes behind+red to DRIFT -----------
