@@ -261,13 +261,27 @@ def reason_is_pending_checks(reason: str) -> bool:
 
 
 _GIT_URL_OWNER_REPO_RE = re.compile(r"(?:^|[:/])([^/:]+/[^/:]+?)(?:\.git)?/?$")
+_GIT_URL_HOST_RE = re.compile(
+    r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*://)?(?:[^@/]+@)?([^/:]+)[:/][^/:]+/[^/:]+?(?:\.git)?/?$"
+)
 
 
 def _owner_repo(text: str) -> Optional[str]:
     """Normalise a git remote URL (SSH or HTTPS, ``.git`` suffix optional) or a
     ``gh``-style ``[HOST/]OWNER/REPO`` string down to a lowercase ``owner/repo``
-    for comparison, or ``None`` if it does not look like one."""
+    for comparison, or ``None`` if it does not look like one. The host, if any,
+    is dropped here — use :func:`_host` alongside this when host disambiguation
+    matters (see :func:`_remote_for_repo`)."""
     m = _GIT_URL_OWNER_REPO_RE.search(text.strip())
+    return m.group(1).lower() if m else None
+
+
+def _host(text: str) -> Optional[str]:
+    """Extract the lowercase host from a git remote URL (SSH or HTTPS) or a
+    ``gh``-style ``HOST/OWNER/REPO`` string, or ``None`` when the input has no
+    host component (e.g. a bare ``OWNER/REPO``, which ``gh``'s ``[HOST/]``
+    makes optional)."""
+    m = _GIT_URL_HOST_RE.match(text.strip())
     return m.group(1).lower() if m else None
 
 
@@ -283,10 +297,19 @@ def _remote_for_repo(
     This is the AUTHORITATIVE base-remote signal: ``repo`` is the exact repo the
     PR's base branch lives on, so a match here is correct regardless of what
     ``branch.<base>.remote`` says (or whether it is even set). Returns ``None``
-    on any git error or no match, so the caller can fall back."""
+    on any git error or no match, so the caller can fall back.
+
+    When ``repo`` carries an explicit host (``gh``'s ``[HOST/]OWNER/REPO``
+    form, e.g. from a GitHub Enterprise checkout), the matched remote's URL
+    must resolve to that SAME host — otherwise a checkout with remotes for the
+    same ``owner/repo`` on two different hosts (``github.com`` and an
+    Enterprise host) could match the wrong one. A host-less ``repo`` (the
+    common bare ``owner/repo`` case) keeps matching by ``owner/repo`` alone,
+    same as before."""
     target = _owner_repo(repo)
     if not target:
         return None
+    target_host = _host(repo)
     try:
         r = run(["git", "remote", "-v"], cwd=cwd)
     except (subprocess.SubprocessError, OSError):
@@ -298,8 +321,11 @@ def _remote_for_repo(
         if len(parts) < 3 or parts[2] != "(fetch)":
             continue
         name, url = parts[0], parts[1]
-        if _owner_repo(url) == target:
-            return name
+        if _owner_repo(url) != target:
+            continue
+        if target_host and _host(url) != target_host:
+            continue
+        return name
     return None
 
 
