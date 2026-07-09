@@ -49,7 +49,7 @@
 * **setup:** preserve the installed CI command on gate updates + "reviewed — no findings" round card (R2) ([#31](https://github.com/buddhikernel/buddhi-review/issues/31)) ([b172979](https://github.com/buddhikernel/buddhi-review/commit/b1729796a59407b1ce84cff8d7d52cee51415ca2))
 * **setup:** read multi-line pasted tokens via a no-flush TTY reader ([#54](https://github.com/buddhikernel/buddhi-review/issues/54)) ([56794c4](https://github.com/buddhikernel/buddhi-review/commit/56794c4b9d0e227dc14b5901159e2c65b5dfe371))
 * **setup:** reconstruct a wrapped-paste token + idempotent update PR ([#24](https://github.com/buddhikernel/buddhi-review/issues/24)) ([da5f5f8](https://github.com/buddhikernel/buddhi-review/commit/da5f5f8b674f47a86c478f92eae7043346e5ace4))
-* **setup:** self-heal probe skips no-op runs; offer outdated-file update ([#17](https://github.com/buddhikernel/buddhi-review/issues/17)) ([64b6231](https://github.com/buddhikernel/buddhi-review/commit/64b623152fa25b10680b765b22bc45d3b34bc014))
+* **setup:** managed-file update probe skips no-op runs; offer outdated-file update ([#17](https://github.com/buddhikernel/buddhi-review/issues/17)) ([64b6231](https://github.com/buddhikernel/buddhi-review/commit/64b623152fa25b10680b765b22bc45d3b34bc014))
 * **types:** relax injectable run: annotations to keyword-aware Callable[...] ([#35](https://github.com/buddhikernel/buddhi-review/issues/35)) ([8717638](https://github.com/buddhikernel/buddhi-review/commit/8717638c332b47ef3de5df182cf594d610117871))
 * **wizard:** fail closed on a non-ubuntu CI gate runner ([#32](https://github.com/buddhikernel/buddhi-review/issues/32)) ([cb96172](https://github.com/buddhikernel/buddhi-review/commit/cb961725a38e366c4e0a7737a0d3ae428cce8791))
 
