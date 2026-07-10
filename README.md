@@ -1,5 +1,9 @@
 # buddhi-review
 
+[![PyPI version](https://img.shields.io/pypi/v/buddhi-review.svg)](https://pypi.org/project/buddhi-review/)
+[![Python versions](https://img.shields.io/pypi/pyversions/buddhi-review.svg)](https://pypi.org/project/buddhi-review/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://github.com/buddhikernel/buddhi-review/blob/main/LICENSE)
+
 `buddhi-review` is a **free, MIT-licensed PR review-and-fix loop for Claude Code**,
 built on the public [Buddhi kernel](https://github.com/buddhikernel/buddhi). It
 sends each PR to a cross-vendor panel of AI reviewers, classifies their findings,
