@@ -2383,6 +2383,60 @@ def step_repo_label_gated_ci(repo: str, current_default: bool, *, pal, stream,
     return confirm == 1
 
 
+def step_repo_test_command(repo: str, current: Optional[str], cwd: Optional[str] = None, *,
+                           pal, stream, input_fn=input) -> Optional[str]:
+    """Per-repo step — the local TEST-GATE command for THIS repo.
+
+    The loop runs this command as its pre-push gate (green → push, red → hold +
+    escalate). ``current`` is the repo's explicit persisted ``test_command``
+    string, or ``None`` (:func:`buddhi_review.config.repo_test_command`). UNSET =
+    auto-detect at gate time (a ``tests/`` dir → the pytest default ``python3 -m
+    pytest tests/ -q``; nothing detectable → a loud no-gate skip) — correct for a
+    Python repo, wrong for a JS / Go / … repo, which needs its own runner
+    (``npx vitest run``, ``go test ./...``). A best-effort command is
+    auto-detected from the checkout and offered as the default; a shell command
+    with ``&&`` / ``|`` / ``;`` runs via ``bash -lc`` automatically. Blank keeps
+    whatever is currently configured (an explicit command is preserved; an unset
+    repo stays on the auto-detect default) — it never silently wipes a set
+    command. Returns the chosen command STRING, or ``None`` to leave it unset
+    (inherit the auto-detect default). Non-TTY → returns the current persisted
+    value unchanged (never prompts). Mirrors the reference wizard's
+    ``step_repo_test_command``."""
+    _panel("Per-repo — Test command", [
+        f"Repo: {pal.BOLD}{repo}{pal.RESET}",
+        "The loop runs this command as its pre-push test gate. Leave it blank to",
+        "use the built-in pytest default (python3 -m pytest tests/ -q) — set it for",
+        "a non-Python repo that needs its own runner, e.g. `npx vitest run` or",
+        "`go test ./...`. A command with && / | / ; runs via `bash -lc`.",
+    ], pal, stream)
+    if not _is_tty():
+        # No TTY → never prompt; keep whatever is already persisted for this repo.
+        return current
+    detected = _detect_ci_command(cwd)
+    if current:
+        prompt = f"  Test-gate command for this repo [{current}]: "
+    elif detected:
+        prompt = (f"  Test-gate command for this repo — detected: {detected}\n"
+                   "  Type it (or paste it) to accept, or leave blank for the "
+                   "pytest default: ")
+    else:
+        prompt = "  Test-gate command for this repo (blank = pytest default): "
+    try:
+        entered = input_fn(prompt).strip()
+    except EOFError:
+        entered = ""
+    # Blank preserves whatever is currently configured: an explicit per-repo
+    # command is untouched, and an UNSET repo stays unset (the auto-detect
+    # default) even when a command was auto-detected and shown above — accepting
+    # a detected command requires typing/pasting it explicitly, so a persisted
+    # command is always one the user deliberately chose, never a silent adopt
+    # that would flip the gate away from its auto-detect posture. Typing "none"
+    # or "default" explicitly unsets/clears an existing custom command.
+    if entered.lower() in ("none", "default"):
+        return None
+    return entered or current
+
+
 def step_set_global_default(repo: str, has_existing_default: bool,
                             reviewers: Sequence[str], auto_on_open: Dict[str, bool], *,
                             pal, stream, single_select=single_select,
@@ -2581,13 +2635,24 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
     if lgc:
         _offer_install_ready_for_ci(repo, cwd, run=run, pal=pal, stream=stream,
                                     input_fn=input_fn)
+    tc = step_repo_test_command(repo, config.repo_test_command(existing, repo), cwd,
+                                pal=pal, stream=stream, input_fn=input_fn)
 
-    ok = config.set_repo_keys(repo, {
+    keys: Dict[str, Any] = {
         "active_reviewers": list(reviewers),
         "auto_on_open": {b: bool(v) for b, v in auto_on_open.items()},
         "auto_merge": bool(am),
         "label_gated_ci": bool(lgc),
-    }, cfg_path)
+    }
+    # `test_command` is three-way: a non-blank string persists; None with a
+    # previously-set command is the explicit "none"/"default" clear (the None
+    # overlay makes set_repo_keys DROP the key); None with nothing set writes
+    # nothing, so an unset repo's entry never grows a stale placeholder.
+    if tc is not None and str(tc).strip():
+        keys["test_command"] = str(tc).strip()
+    elif config.repo_test_command(existing, repo) is not None:
+        keys["test_command"] = None
+    ok = config.set_repo_keys(repo, keys, cfg_path)
     if ok and set_gd:
         ok = _write_global_default(reviewers, auto_on_open, cfg_path) and ok
     if not ok:
@@ -2607,6 +2672,8 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
          pal, stream)
     _row("ok", f"Label-gated CI for {repo}: "
                f"{'on' if config.label_gated_ci(cfg, repo) else 'off'}", pal, stream)
+    _row("ok", f"Test command for {repo}: "
+               f"{config.repo_test_command(cfg, repo) or 'pytest default'}", pal, stream)
     _row("info", f"Everyday usage: /review-pr {repo.split('/')[-1]} <pr-number>",
          pal, stream)
     return 0
@@ -2662,7 +2729,7 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
         existing = config.load_config(cfg_path) if cfg_path.exists() else {}
         # Per-repo confirmation for the bound repo: ask the auto-merge + label-gated
         # CI defaults so repos[<repo>] records a genuine per-repo opt-in.
-        repo_auto_merge = repo_label_gated_ci = None
+        repo_auto_merge = repo_label_gated_ci = repo_test_command = None
         if repo:
             repo_auto_merge = step_repo_auto_merge(
                 repo, _repo_auto_merge_default(existing, repo), pal=pal, stream=stream,
@@ -2675,6 +2742,13 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
             if repo_label_gated_ci:
                 _offer_install_ready_for_ci(repo, cwd, run=run, pal=pal, stream=stream,
                                             input_fn=input_fn)
+            # Per-repo local test-gate command, same as confirm_repo_interactive's
+            # lightweight path — otherwise a JS/Go repo bound via the full wizard is
+            # silently left on the auto-detect default with no chance to set its own
+            # runner.
+            repo_test_command = step_repo_test_command(
+                repo, config.repo_test_command(existing, repo), cwd,
+                pal=pal, stream=stream, input_fn=input_fn)
 
         new_cfg = build_config(plan, repo, cwd, reviewers, auto_on_open)
         merged = merge_preserving(existing, new_cfg)
@@ -2683,12 +2757,19 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
         # top-level fleet written above is ALSO the global default — non-disruptive;
         # the full wizard always establishes one.
         if ok and repo:
-            config.set_repo_keys(repo, {
+            repo_keys: Dict[str, Any] = {
                 "active_reviewers": list(reviewers),
                 "auto_on_open": {b: bool(v) for b, v in auto_on_open.items()},
                 "auto_merge": bool(repo_auto_merge),
                 "label_gated_ci": bool(repo_label_gated_ci),
-            }, cfg_path)
+            }
+            # Same three-way `test_command` handling as confirm_repo_interactive:
+            # non-blank string persists, None clears only a previously-set command.
+            if repo_test_command is not None and str(repo_test_command).strip():
+                repo_keys["test_command"] = str(repo_test_command).strip()
+            elif config.repo_test_command(existing, repo) is not None:
+                repo_keys["test_command"] = None
+            config.set_repo_keys(repo, repo_keys, cfg_path)
 
         step_summary(plan, repo, reviewers, auto_on_open, pal=pal, stream=stream,
                      auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)

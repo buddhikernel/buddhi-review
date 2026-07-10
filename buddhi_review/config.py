@@ -175,16 +175,57 @@ def label_gated_ci(cfg: Dict[str, Any], repo: Optional[str] = None) -> bool:
     return v if isinstance(v, bool) else DEFAULT_LABEL_GATED_CI
 
 
+def test_command(cfg: Dict[str, Any], repo: Optional[str] = None) -> Optional[str]:
+    """The configured test-gate command STRING for ``repo``: a CONFIRMED repo's
+    non-blank per-repo ``test_command`` (a ``repos[<repo>]`` entry carrying the
+    key) wins; otherwise the non-blank top-level global ``test_command``;
+    otherwise ``None`` (the gate then auto-detects). Unlike
+    :func:`label_gated_ci`, a blank / ``None`` per-repo value FALLS THROUGH to
+    the global rather than shadowing it — a config that predates this key is
+    byte-for-byte unchanged. ``repo=None`` reads the global value. The env
+    override (``BUDDHI_TEST_COMMAND``) is the caller's concern
+    (:func:`buddhi_review.commit_push.resolve_test_command`), not config's."""
+    entry = repo_entry(cfg, repo)
+    raw = entry.get("test_command") if entry is not None else None
+    if not (raw and str(raw).strip()):
+        raw = cfg.get("test_command")
+    if not (raw and str(raw).strip()):
+        return None
+    return str(raw)
+
+
+def repo_test_command(cfg: Dict[str, Any], repo: Optional[str]) -> Optional[str]:
+    """The EXPLICIT per-repo ``test_command`` STRING for ``repo`` (a
+    ``repos[<repo>]`` entry carrying a non-blank ``test_command``), else ``None``.
+    Unlike :func:`test_command` this reads ONLY the persisted per-repo value —
+    never the global — so the wizard can show and PRESERVE a repo's own
+    configured command without folding in the global default."""
+    entry = repo_entry(cfg, repo)
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get("test_command")
+    return str(raw) if raw is not None and str(raw).strip() else None
+
+
 # ── Per-repo writer (the ``repos:`` map) ────────────────────────────────────────
 
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
     """Return a copy of ``base`` with ``overlay`` recursively layered on: nested
-    dicts merge key-by-key, every other value (lists included) replaces wholesale.
+    dicts merge key-by-key, every other value (lists included) replaces wholesale,
+    and an overlay value of ``None`` REMOVES the key. ``None`` is the per-repo
+    TRISTATE — "no explicit value, inherit the default" — so removing the key is
+    what persists that intent (an absent key is exactly what
+    :func:`label_gated_ci` / :func:`test_command` read as *inherit*, and what the
+    reference wizard writes by simply omitting the key when its value is ``None``).
+    It is also the wizard's explicit-clear signal for a per-repo ``test_command``,
+    so a caller can drop a persisted key through the same writer that sets one.
     Keys present in ``base`` but absent from ``overlay`` are preserved."""
     out = dict(base)
     for k, v in overlay.items():
         cur = out.get(k)
-        if isinstance(v, dict) and isinstance(cur, dict):
+        if v is None:
+            out.pop(k, None)
+        elif isinstance(v, dict) and isinstance(cur, dict):
             out[k] = _deep_merge(cur, v)
         else:
             out[k] = v
@@ -217,15 +258,17 @@ def set_repo_keys(repo: str, keys: Dict[str, Any], path: Optional[Path] = None) 
     config atomically, leaving sibling repos and every unknown key intact.
 
     This is the per-repo CONFIRMATION writer: it records a repo's
-    ``active_reviewers`` / ``auto_on_open`` / ``label_gated_ci`` and, by creating
-    the ``repos[<repo>]`` entry, marks the repo confirmed (:func:`repo_entry`'s
-    presence marker). An existing entry is updated in place under a
-    case-insensitive match, so re-confirming a repo never spawns a duplicate
-    sibling key. After the merge, ``auto_on_open`` is pruned to the resulting
-    ``active_reviewers`` (see :func:`_prune_stale_auto_on_open`) so a re-run that
-    drops a reviewer cannot leave that bot's stale flag behind. Returns ``False``
-    (writing nothing) for an unusable repo / non-dict ``keys`` or when the atomic
-    write fails."""
+    ``active_reviewers`` / ``auto_on_open`` / ``label_gated_ci`` /
+    ``test_command`` and, by creating the ``repos[<repo>]`` entry, marks the repo
+    confirmed (:func:`repo_entry`'s presence marker). An existing entry is
+    updated in place under a case-insensitive match, so re-confirming a repo
+    never spawns a duplicate sibling key. A ``None`` value in ``keys`` REMOVES
+    that key from the entry (see :func:`_deep_merge` — the wizard's explicit
+    "none"/"default" clear), never persists a null. After the merge,
+    ``auto_on_open`` is pruned to the resulting ``active_reviewers`` (see
+    :func:`_prune_stale_auto_on_open`) so a re-run that drops a reviewer cannot
+    leave that bot's stale flag behind. Returns ``False`` (writing nothing) for
+    an unusable repo / non-dict ``keys`` or when the atomic write fails."""
     key = norm_repo(repo)
     if key is None or not isinstance(keys, dict):
         return False
