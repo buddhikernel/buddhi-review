@@ -42,6 +42,11 @@ _IDS = ["canonical", "template"]
 _STEP_NAME_FRAGMENT = "usage-limit silence"
 # The rev-guard's locked identity of the claude-code-review.yml master copy.
 _REV_LOCK = _ROOT / "tests" / "data" / "claude_code_review_rev.json"
+# Independent baseline for the rev-guard's version check: a literal hardcoded
+# here, NOT derived from the lock or TEMPLATE, so a half-update that bumps the
+# lock's sha256+version together (but skips a real version increment) still
+# reds this test. Bumping it is a separate, deliberate edit to this file.
+_REV_LOCKED_VERSION = 3
 
 
 def _step(path: Path):
@@ -81,12 +86,15 @@ def test_two_copies_are_byte_identical():
 
 
 def test_master_copy_matches_the_rev_lock():
-    """Rev-guard: the claude-code-review.yml master copy may not change bytes
-    without a version bump. Any content change — a Dependabot action bump or a
-    deliberate edit — shifts the file's sha256 away from the locked value and
-    reds this test, forcing the fix: bump ``# buddhi-managed-version`` in BOTH
-    copies (they stay byte-identical, see test_two_copies_are_byte_identical) and
-    update tests/data/claude_code_review_rev.json to the new version + sha256.
+    """Rev-guard: the buddhi_review/skills master copy (TEMPLATE) may not change
+    bytes without a version bump. A deliberate edit to TEMPLATE shifts its
+    sha256 away from the locked value and reds this test, forcing the fix:
+    bump ``# buddhi-managed-version`` in BOTH copies (they stay byte-identical,
+    see test_two_copies_are_byte_identical) and update
+    tests/data/claude_code_review_rev.json to the new version + sha256.
+    A Dependabot action bump instead lands only on CANONICAL
+    (.github/workflows/, the only path Dependabot's github-actions ecosystem
+    scans) and is caught by test_two_copies_are_byte_identical, not here.
     No memory, no judgment, no manual step to remember — the suite is the net.
     """
     lock = json.loads(_REV_LOCK.read_text(encoding="utf-8"))
@@ -94,10 +102,14 @@ def test_master_copy_matches_the_rev_lock():
     assert actual_sha == lock["sha256"], (
         "master copy changed: bump buddhi-managed-version in both copies and "
         "update the rev lock")
-    # Keep the lock self-describing: its `version` must match the marker the
-    # master copy actually carries, so a half-update (sha refreshed but the
-    # version — or a copy's marker — forgotten) is caught too.
-    assert f"# buddhi-managed-version: {lock['version']}" in TEMPLATE.read_text(encoding="utf-8"), (
+    # Validate against _REV_LOCKED_VERSION (hardcoded above, independent of the
+    # lock file) rather than lock["version"] itself: comparing the lock against
+    # its own field is circular and would let a sha+version bump that skips a
+    # real version increment sail through undetected.
+    assert lock["version"] == _REV_LOCKED_VERSION, (
+        "rev lock version drifted from the hardcoded baseline in this test: "
+        "bump _REV_LOCKED_VERSION here too")
+    assert f"# buddhi-managed-version: {_REV_LOCKED_VERSION}" in TEMPLATE.read_text(encoding="utf-8"), (
         "master copy changed: bump buddhi-managed-version in both copies and "
         "update the rev lock")
 
