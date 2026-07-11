@@ -53,5 +53,10 @@ def _hermetic_pr_intent(monkeypatch):
     # reactions fetch stays network-free; a reactions test either injects its own
     # fetch or sets this env in its own body.
     monkeypatch.setenv(gh_ingest.REACTIONS_JSON_ENV, "[]")
+    # The update-availability banner (update_banner) does a cached PyPI read at the
+    # /review-pr and /open-pr launch surfaces. Pin it OFF suite-wide so no test ever
+    # phones home; the dedicated tests/test_update_banner.py re-enables it and injects
+    # a fetcher, and any test that wants the banner sets the env in its own body.
+    monkeypatch.setenv("BUDDHI_NO_UPDATE_CHECK", "1")
     yield
     fix_apply.reset_pr_intent()

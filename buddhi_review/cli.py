@@ -26,7 +26,7 @@ import os
 import sys
 from typing import List, Optional
 
-from buddhi_review import __version__, gh_ingest, model_call, round_driver, upsell
+from buddhi_review import __version__, gh_ingest, model_call, round_driver, update_banner, upsell
 from buddhi_review.actuators import default_fix_dispatch
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.backends import launch_review_loop
@@ -97,6 +97,10 @@ def _review_pr(args: argparse.Namespace) -> int:
     installed, active backend would take over the same command. The backend prints
     its own "where to watch" line after the choice is made."""
     cwd = args.cwd or os.getcwd()
+    # A muted, non-blocking one-liner naming any available Buddhi / workflow update.
+    # Decoration → stderr (the front door's stdout carries the launch's own output);
+    # fully fail-open so it never blocks or delays the launch.
+    update_banner.maybe_emit_update_banner(cwd=cwd, stream=sys.stderr)
     return launch_review_loop(
         args.pr, args.repo, cwd,
         auto_merge=args.auto_merge,
@@ -202,6 +206,10 @@ def _run_loop(args: argparse.Namespace) -> int:
 
 def _open_pr(args: argparse.Namespace) -> int:
     from buddhi_review import open_pr
+    # A muted, non-blocking one-liner naming any available Buddhi / workflow update.
+    # Emitted to stderr so the actuator's stdout URL contract (PR URL is the last
+    # stdout line) is never touched; fully fail-open so the launch is unaffected.
+    update_banner.maybe_emit_update_banner(cwd=args.cwd or os.getcwd(), stream=sys.stderr)
     if not args.title:
         print("open-pr: --title is required.", file=sys.stderr)
         return 2
