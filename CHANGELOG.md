@@ -1,5 +1,25 @@
 # Changelog
 
+## [0.3.0](https://github.com/buddhikernel/buddhi-review/compare/v0.2.1...v0.3.0) (2026-07-11)
+
+
+### Features
+
+* guided verify-reject retry + per-test circuit-breaker ([#71](https://github.com/buddhikernel/buddhi-review/issues/71)) ([009f5df](https://github.com/buddhikernel/buddhi-review/commit/009f5dfe02bc26705717d1b742813a306671f43b))
+* muted update-available banner at the skill-call launch surface (F4) ([#70](https://github.com/buddhikernel/buddhi-review/issues/70)) ([31f36be](https://github.com/buddhikernel/buddhi-review/commit/31f36be6adf95b02cf8cf78faa4d092cad1db7a6))
+* **test-gate:** F1 — OSS command-seam reconcile + shell-operator executor fix ([#67](https://github.com/buddhikernel/buddhi-review/issues/67)) ([10e31a0](https://github.com/buddhikernel/buddhi-review/commit/10e31a0049e61369b44e11725b9216988fc2cc6c))
+
+
+### Bug Fixes
+
+* converge the behind-check to the reference tree's merged state ([#66](https://github.com/buddhikernel/buddhi-review/issues/66)) ([473b707](https://github.com/buddhikernel/buddhi-review/commit/473b70715520396f947d7e4612804d0805b012a4))
+
+
+### Documentation
+
+* add README badges (PyPI, Python versions, MIT license) ([#64](https://github.com/buddhikernel/buddhi-review/issues/64)) ([73ebba2](https://github.com/buddhikernel/buddhi-review/commit/73ebba279accbd31df79006ff72ca74e7a660cb4))
+* **readme:** fix clipped words in mobile chart wrapping ([#53](https://github.com/buddhikernel/buddhi-review/issues/53)) ([7ddcea7](https://github.com/buddhikernel/buddhi-review/commit/7ddcea794f4f64e7acdd237235c9c6a863a681c5))
+
 ## [0.2.1](https://github.com/buddhikernel/buddhi-review/compare/v0.2.0...v0.2.1) (2026-07-09)
 
 
