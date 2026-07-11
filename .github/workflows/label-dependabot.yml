@@ -1,0 +1,55 @@
+# buddhi-review's OWN CI infra — NOT a managed file that ships to user repos.
+# ──────────────────────────────────────────────────────────────────────────────
+# Auto-label Dependabot PRs so the full test suite runs BEFORE they merge.
+#
+# WHY THIS EXISTS
+#   The full pytest + publish-gate suite is label-gated: tests-ready-for-ci.yml
+#   runs its `ci` job ONLY when the `ready-for-ci` label is present, and that
+#   label is normally added at merge time by the review-loop merge automation.
+#   Dependabot PRs never pass through that automation, so they never get the
+#   label — which means the full suite NEVER runs on them. A Dependabot action
+#   bump that broke the tests (or drifted a bundled template) would merge
+#   completely unexercised. That is exactly how #61's template drift landed
+#   silently.
+#
+#   This workflow closes the gap: the instant Dependabot opens (or reopens) a PR,
+#   it stamps the `ready-for-ci` label, which fires tests-ready-for-ci.yml and
+#   makes the full suite gate the Dependabot merge just like every human PR.
+#
+# WHY THE JOB-LEVEL `permissions:` BLOCK IS REQUIRED (do NOT remove it)
+#   GitHub runs a `pull_request`-triggered workflow with a READ-ONLY GITHUB_TOKEN
+#   whenever the actor is Dependabot — it treats a Dependabot PR like a fork PR
+#   (a hardening GitHub applied in Feb/Mar 2021). A read-only token cannot add a
+#   label, so `gh pr edit --add-label` would fail. Since Oct 2021 these runs DO
+#   honor an explicit `permissions:` key, so declaring `pull-requests: write`
+#   restores exactly the one scope this job needs — and nothing more (least
+#   privilege).
+#   Refs: https://github.blog/changelog/2021-02-18-github-actions-workflows-triggered-by-dependabot-prs-will-run-with-read-only-permissions/
+#         https://github.blog/changelog/2021-10-06-github-actions-workflows-triggered-by-dependabot-prs-will-respect-permissions-key-in-workflows/
+#
+# No marketplace action is used (the built-in `gh` CLI does the labeling), so
+# there are deliberately NO pinned action versions anywhere in this file.
+# ──────────────────────────────────────────────────────────────────────────────
+name: Label Dependabot PRs
+
+on:
+  pull_request:
+    types: [opened, reopened]
+
+jobs:
+  label:
+    # Gate on the actor: only Dependabot's own PRs get auto-labeled here. Every
+    # other actor's PR goes through the review loop, which adds `ready-for-ci`
+    # at merge time.
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write   # add the label — the read-only default can't (see header)
+    steps:
+      - name: Add ready-for-ci label
+        env:
+          # The built-in token — present even on Dependabot runs. Passed via env
+          # (never interpolated into the run script) to avoid injection.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr edit "$PR_URL" --add-label ready-for-ci
