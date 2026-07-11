@@ -19,6 +19,9 @@ resolution at the caller: only ``applied`` resolves; ``rejected`` /
        contains the rejected patch); rollback_failed stays armed.
   R5 — a retry that SKIPs never resolves (no #31 laundering): terminal
        ``rejected``, and the SKIP's edits are rolled back defensively.
+  R5b— a retry that emits a bare BLOCKED: line (a real tooling failure) is
+       terminal ``rejected`` (NOT the first-dispatch ``transient-failed``): the
+       guided path falls back to the pre-feature verify-REJECT disposition.
   R6 — the retry's verify pass is FORCED even when the ``auto`` gate would not
        have selected the retry's (benign) diff.
   R7 — the retry-force is NOT a tripwire: the A5 alarm still fires on a genuine
@@ -204,6 +207,26 @@ def test_retry_skip_never_resolves_and_rolls_back(repo, monkeypatch):
     assert len(prompts) == 2                    # the retry did run
     assert len(verify_calls) == 1               # a SKIP has no diff to verify
     assert (repo / "tracked.py").read_text() == "original\n"  # SKIP edit rolled back
+
+
+# ── R5b — a retry that BLOCKs never resolves ────────────────────────────────
+
+def test_retry_blocked_is_terminal_rejected_not_escalated(repo, monkeypatch):
+    # A guided retry may only END in a CONFIRMed applied fix. A retry whose fixer
+    # prints a bare BLOCKED: line (a real tooling failure) falls back to the
+    # pre-feature verify-REJECT disposition — terminal 'rejected', thread OPEN —
+    # NOT the first-dispatch 'transient-failed'/escalated. This matches the guided
+    # SKIP (R5) and fail-open (R8) paths and the PR's documented semantics.
+    out, prompts, verify_calls, _ = _run(
+        repo, monkeypatch,
+        fixer_steps=[("bad\n", "done"),
+                     ("stray edit\n", "BLOCKED: git index.lock held by another process")],
+        verify_steps=[_REJECT])
+    assert out.status == "rejected"             # terminal rejection, NOT transient-failed
+    assert out.rollback_failed is False         # the BLOCKED retry's edits rolled back clean
+    assert len(prompts) == 2                    # the retry did run
+    assert len(verify_calls) == 1               # a BLOCKED has no diff to verify
+    assert (repo / "tracked.py").read_text() == "original\n"  # BLOCKED edit rolled back
 
 
 # ── R6 — the retry's verify is FORCED past the auto gate ────────────────────

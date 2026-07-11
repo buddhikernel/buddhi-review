@@ -47,17 +47,16 @@ def pytest_runtest_protocol(item, nextitem):
     # hang off the main thread.
     if not _HAS_ALARM:
         return (yield)
-    # signal.signal()/setitimer() raise ValueError off the main thread (e.g. a
-    # multithreaded test runner/plugin) -- _armed gates arming AND the finally
-    # restoration so a non-main-thread run falls through to the faulthandler
-    # backstop instead of crashing the whole suite.
+    # signal.signal() raises ValueError off the main thread (e.g. a
+    # multithreaded test runner/plugin); signal.setitimer() can raise OSError
+    # (signal.ItimerError, a OSError subclass) if the underlying setitimer()
+    # syscall fails. Either way, fall through to the faulthandler backstop
+    # instead of crashing the whole suite.
     _old = None
-    _armed = False
     try:
         _old = _signal.signal(_signal.SIGALRM, _on_alarm)
         _signal.setitimer(_signal.ITIMER_REAL, _PER_TEST_TIMEOUT)
-        _armed = True
-    except ValueError:
+    except (ValueError, OSError):
         pass
     _faulthandler.dump_traceback_later(_PER_TEST_TIMEOUT * 2, exit=True)
     try:
@@ -66,13 +65,14 @@ def pytest_runtest_protocol(item, nextitem):
         # Disarm the timer FIRST: if it stays armed while cancel_dump_traceback_later()
         # or signal.signal() run, a fired SIGALRM raises TimeoutError mid-finally and
         # aborts the rest of cleanup, leaking the timer + handler into later tests.
-        # Gate on _old (signal.signal succeeded), not _armed: if setitimer raised
-        # after signal.signal succeeded, _armed stays False but the handler was
-        # already swapped in and must still be restored.
+        # Gate on _old (signal.signal succeeded): if setitimer raised after
+        # signal.signal succeeded, the handler was already swapped in and must
+        # still be restored. Catch OSError too -- setitimer()/signal.signal() can
+        # raise it (e.g. signal.ItimerError, an OSError subclass) on some platforms.
         if _old is not None:
             try:
                 _signal.setitimer(_signal.ITIMER_REAL, 0)
                 _signal.signal(_signal.SIGALRM, _old)
-            except ValueError:
+            except (ValueError, OSError):
                 pass
         _faulthandler.cancel_dump_traceback_later()

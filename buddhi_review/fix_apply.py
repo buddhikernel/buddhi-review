@@ -1596,18 +1596,36 @@ def apply_fix(
             # so a rule-following refusal can't be laundered as "invalid". The reroute
             # errs toward BLOCKED — a kept-open finding is merely re-reviewed, a
             # wrongly-dismissed one ships unfixed. On a guided retry the SKIP branch
-            # above already caught a refusal-shaped SKIP; a bare BLOCKED: line still
-            # escalates here (transient-failed leaves the thread OPEN either way).
+            # above already caught a refusal-shaped SKIP; only a bare BLOCKED: line
+            # reaches here, and it keeps the terminal 'rejected' (see below) — never
+            # the pre-feature transient-failed — so the guided path stays consistent
+            # with the SKIP / fail-open retries and the PR's documented semantics.
             blocked_reason = _fixer_blocked_reason(stdout)
             if blocked_reason is None and skip_line and _is_refusal_skip(skip_line):
                 blocked_reason = skip_line.strip()
             if blocked_reason is not None:
                 # Restore first (a partial edit may sit in the worktree from before the
-                # failure), then escalate: the caller maps transient-failed to a
-                # per-comment Ask. rollback_failed arms the poisoned-worktree gate when
-                # the restore could not be proven clean (real-snapshot failure or no
+                # failure). rollback_failed arms the poisoned-worktree gate when the
+                # restore could not be proven clean (real-snapshot failure or no
                 # snapshot at all), matching the SKIP/REJECT paths.
                 trustworthy = _restore_or_degrade(cwd, snap, "after BLOCKED")
+                if guided_active:
+                    # A guided retry may only END in a CONFIRMed applied fix. A BLOCKED
+                    # on the retry (a real tooling/environment failure) falls back to
+                    # the pre-feature verify-REJECT disposition — terminal 'rejected',
+                    # thread stays OPEN for re-review — matching the guided SKIP (above)
+                    # and fail-open (below) paths and the PR's documented "a retry that
+                    # …is refusal-shaped/BLOCKED…never resolves → terminal rejected".
+                    return FixOutcome(
+                        status="rejected",
+                        detail=f"guided retry BLOCKED ({blocked_reason}) — "
+                               f"thread stays open for re-review",
+                        attempts=total_attempts + attempt,
+                        rollback_failed=not trustworthy or snap is None,
+                    )
+                # Non-guided (first-dispatch) BLOCKED: escalate — the caller maps
+                # transient-failed to a per-comment Ask. The finding was never
+                # evaluated, so there is no rejection to fall back to.
                 return FixOutcome(
                     status="transient-failed",
                     detail=f"BLOCKED: {blocked_reason}",
