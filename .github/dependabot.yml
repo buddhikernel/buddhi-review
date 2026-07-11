@@ -2,6 +2,9 @@
 # new version) whenever a watched action publishes a release, so the pins stay immutable AND
 # up to date on security fixes. Grouped into one weekly PR to limit noise; chore-prefixed so
 # release-please treats the bump as non-releasing.
+# NOTE: if a bump touches claude-code-review.yml, bump `# buddhi-managed-version` in BOTH copies
+# (.github/workflows + the buddhi_review/skills master copy) and update the rev lock
+# (tests/data/claude_code_review_rev.json) — else test_master_copy_matches_the_rev_lock reds the suite.
 version: 2
 updates:
   - package-ecosystem: "github-actions"
