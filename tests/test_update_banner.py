@@ -9,7 +9,6 @@ PyPI read); and the version compare fail-closes on dev / equal / newer-local edg
 import io
 import json
 import sys
-import types
 from pathlib import Path
 
 import pytest

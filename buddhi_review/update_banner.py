@@ -145,10 +145,11 @@ def _write_state(path: Path, state: Dict) -> None:
 # ── PRIMARY: newer buddhi-review release on PyPI ───────────────────────────────────
 
 def _fetch_latest_from_pypi(timeout: float) -> Optional[str]:
-    """One short HTTPS GET to PyPI's JSON API → the latest STABLE release string, or
+    """One short HTTPS GET to PyPI's JSON API → the latest release string, or
     ``None`` on ANY failure (offline, timeout, non-200, malformed JSON). ``info.version``
-    is PyPI's latest non-prerelease, so a project publishing a pre-release never leaks
-    an unstable version here. Never raises.
+    is PyPI's latest release (which may be a pre-release if no stable release exists).
+    Any pre-release or suffixed version is filtered by :func:`update_available`, so
+    a project publishing only pre-releases never triggers an update banner. Never raises.
 
     ``timeout`` is urllib's PER-SOCKET-OPERATION timeout — it bounds each connect/recv
     but NOT DNS resolution (``getaddrinfo`` runs before it) nor the total body-read
@@ -286,7 +287,18 @@ def workflow_out_of_date(cwd: Optional[str], *, spec: Optional[Dict[str, object]
     :func:`managed_files.needs_update`).
 
     An ABSENT file → False: nothing is installed to update (that is a setup concern,
-    not an update one). Scoped to ``claude-code-review.yml`` only. Never raises."""
+    not an update one). Scoped to ``claude-code-review.yml`` only. Never raises.
+
+    Deliberately reads the LOCAL worktree copy, not the default branch (unlike
+    :func:`wizard._installed_managed_file_text`, which needs the default-branch
+    truth for a write decision). This is a cheap, local, no-extra-network check
+    for a best-effort launch-time nudge — matching the module's fail-open, single
+    -network-call design (see the module docstring). A worktree/default-branch
+    version skew can make this nudge fire (or stay silent) a beat early/late; the
+    worst case is a harmless "re-run setup" suggestion that the wizard's own
+    default-branch check then confirms or no-ops. Adding a ``gh api`` round trip
+    here to chase default-branch truth would trade that harmlessness for a real,
+    uncached network dependency on every launch."""
     if not cwd:
         return False
     spec = spec if spec is not None else _claude_review_spec()
@@ -326,7 +338,7 @@ def format_banner(*, buddhi_latest: Optional[str] = None,
 
 def _emit(text: str, stream: TextIO) -> None:
     # Dim so the banner reads as a quiet, transient aside at launch — never as an
-    # error or a blocking prompt. (Colour auto-strips off a TTY / under NO_COLOR.)
+    # error or a blocking prompt. (Colour auto-strips off a non-TTY / under NO_COLOR.)
     line = f"\033[2m{text}\033[0m" if _colour_enabled(stream) else text
     print(line, file=stream)
 
