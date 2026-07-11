@@ -16,19 +16,33 @@
 #   it stamps the `ready-for-ci` label, which fires tests-ready-for-ci.yml and
 #   makes the full suite gate the Dependabot merge just like every human PR.
 #
-# WHY THE JOB-LEVEL `permissions:` BLOCK IS REQUIRED (do NOT remove it)
-#   GitHub runs a `pull_request`-triggered workflow with a READ-ONLY GITHUB_TOKEN
-#   whenever the actor is Dependabot — it treats a Dependabot PR like a fork PR
-#   (a hardening GitHub applied in Feb/Mar 2021). A read-only token cannot add a
-#   label, so `gh pr edit --add-label` would fail. Since Oct 2021 these runs DO
-#   honor an explicit `permissions:` key, so declaring `pull-requests: write`
-#   restores exactly the one scope this job needs — and nothing more (least
-#   privilege).
-#   Refs: https://github.blog/changelog/2021-02-18-github-actions-workflows-triggered-by-dependabot-prs-will-run-with-read-only-permissions/
-#         https://github.blog/changelog/2021-10-06-github-actions-workflows-triggered-by-dependabot-prs-will-respect-permissions-key-in-workflows/
+# WHY A GITHUB APP TOKEN — NOT THE DEFAULT GITHUB_TOKEN (do NOT switch it back)
+#   GitHub's recursion guard: a `pull_request: labeled` event created with the
+#   built-in GITHUB_TOKEN does NOT start a new workflow run (the only exceptions
+#   are workflow_dispatch/repository_dispatch). So if this job added the label
+#   with GITHUB_TOKEN, tests-ready-for-ci.yml (on: pull_request: [labeled,
+#   synchronize]) would never fire a fresh run — the label would land but the
+#   suite would silently never run, defeating the entire point of this workflow.
+#   Minting the label with a GitHub App installation token makes the `labeled`
+#   event come from the App instead of GITHUB_TOKEN, so the guard does not apply
+#   and the downstream run fires. This is the SAME pattern release-please.yml
+#   uses so its Release actually triggers publish.yml.
+#   Ref: https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow
 #
-# No marketplace action is used (the built-in `gh` CLI does the labeling), so
-# there are deliberately NO pinned action versions anywhere in this file.
+#   The App id + private key are the EXISTING RELEASE_PLEASE_APP_* repo secrets
+#   (that App already has `pull-requests: write`, which is all labeling needs, and
+#   already labels its own release PRs) — reused here rather than provisioning a
+#   second App. Until those secrets are set the token step fails loudly rather
+#   than half-working — that is intentional.
+#
+#   Because the App token does the labeling, the built-in GITHUB_TOKEN needs no
+#   scopes at all, so the job pins it to least privilege (`permissions: {}`). The
+#   old `pull-requests: write` grant is gone: it only mattered when GITHUB_TOKEN
+#   was the credential doing the write, which is no longer the case.
+#
+# The only marketplace action used is actions/create-github-app-token, pinned to
+# a full commit SHA (version in the trailing comment) for supply-chain integrity,
+# exactly as release-please.yml pins its actions; Dependabot bumps the SHA.
 # ──────────────────────────────────────────────────────────────────────────────
 name: Label Dependabot PRs
 
@@ -38,18 +52,32 @@ on:
 
 jobs:
   label:
-    # Gate on the actor: only Dependabot's own PRs get auto-labeled here. Every
-    # other actor's PR goes through the review loop, which adds `ready-for-ci`
-    # at merge time.
-    if: github.actor == 'dependabot[bot]'
+    # Gate on the PR author, not github.actor: only Dependabot's own PRs get
+    # auto-labeled here. Every other author's PR goes through the review loop,
+    # which adds `ready-for-ci` at merge time. github.actor is whoever triggered
+    # the event — on a `reopened` event that can be a human maintainer even when
+    # the PR itself is Dependabot's, so gating on it would skip the label on a
+    # human-reopened Dependabot PR. github.event.pull_request.user.login is the
+    # PR's actual author and stays `dependabot[bot]` no matter who reopens it.
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write   # add the label — the read-only default can't (see header)
+    permissions: {}   # least privilege: the App token labels, so GITHUB_TOKEN needs nothing
     steps:
+      # Mint a short-lived installation token from the GitHub App so the `labeled`
+      # event it creates actually triggers tests-ready-for-ci.yml — a GITHUB_TOKEN
+      # would be suppressed by the recursion guard (see header). Pinned to a full
+      # commit SHA for supply-chain integrity, exactly as release-please.yml does.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLEASE_APP_KEY }}
       - name: Add ready-for-ci label
         env:
-          # The built-in token — present even on Dependabot runs. Passed via env
-          # (never interpolated into the run script) to avoid injection.
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The GitHub App installation token — NOT GITHUB_TOKEN (see header):
+          # only a non-GITHUB_TOKEN credential lets the `labeled` event trigger
+          # the downstream suite. Passed via env (never interpolated into the run
+          # script) to avoid injection.
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: gh pr edit "$PR_URL" --add-label ready-for-ci

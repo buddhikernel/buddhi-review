@@ -9,16 +9,23 @@ unexercised (how #61's template drift landed silently).
 
 Every assertion below pins one load-bearing line whose loss would silently
 re-open that hole:
-  * the actor gate (`github.actor == 'dependabot[bot]'`) — without it the job
-    would try to label EVERY PR, or (if dropped) would never scope to Dependabot;
-  * the explicit `permissions: pull-requests: write` — a Dependabot-triggered
-    run gets a READ-ONLY token by default, so without this block `gh pr edit`
-    fails and the PR is never labeled;
+  * the PR-author gate (`github.event.pull_request.user.login ==
+    'dependabot[bot]'`) — without it the job would try to label EVERY PR, or
+    (if dropped) would never scope to Dependabot. It reads the PR's author
+    rather than `github.actor` (whoever triggered the event) so a human
+    reopening a Dependabot PR still gets it labeled;
+  * the label is added with a GitHub App installation token, NOT the built-in
+    `GITHUB_TOKEN` — GitHub's recursion guard suppresses workflow runs from
+    events a `GITHUB_TOKEN` creates, so a `GITHUB_TOKEN`-added label would land
+    but tests-ready-for-ci.yml would never fire (the suite would silently never
+    run). The App token is minted via `actions/create-github-app-token`, the
+    same pattern release-please.yml uses so its Release triggers publish.yml;
   * the `pull_request` trigger on `opened`/`reopened`;
   * the label added is exactly `ready-for-ci` (the gate label) — a typo would
     silently defeat the whole point;
-  * NO `@v<digit>` action-version literal — the job uses the built-in `gh` CLI,
-    not a marketplace action, so no pinned version should ever appear.
+  * the only marketplace action (`actions/create-github-app-token`) is pinned to
+    a full commit SHA, never a `@v<digit>` tag — SHA-pinning is the repo's
+    supply-chain posture (release-please.yml pins the same way).
 
 The workflow's own publish-cleanliness (no private paths/handles) is already
 covered by ``tests/test_oss_purity.py``, which scans every
@@ -78,23 +85,58 @@ def test_triggers_on_pull_request_opened_reopened() -> None:
     assert "opened" in types and "reopened" in types, types
 
 
-def test_job_gated_on_dependabot_actor() -> None:
-    """Only Dependabot's own PRs are auto-labeled here — every other actor's PR
-    is labeled by the review loop at merge time. Read from the PARSED `if:` so a
-    commented-out line can't satisfy it."""
+def test_job_gated_on_dependabot_pr_author() -> None:
+    """Only Dependabot's own PRs are auto-labeled here — every other author's PR
+    is labeled by the review loop at merge time. Gated on the PR author
+    (`github.event.pull_request.user.login`), not `github.actor`, so a human
+    reopening a Dependabot PR doesn't skip the label. Read from the PARSED `if:`
+    so a commented-out line can't satisfy it."""
     cond = str(_job(_doc()).get("if", "")).strip()
-    assert cond == "github.actor == 'dependabot[bot]'", cond
+    assert cond == "github.event.pull_request.user.login == 'dependabot[bot]'", cond
 
 
-def test_job_declares_pull_requests_write_permission() -> None:
-    """A Dependabot-triggered `pull_request` run gets a READ-ONLY GITHUB_TOKEN by
-    default (GitHub treats it like a fork PR). Without an explicit
-    `pull-requests: write`, `gh pr edit --add-label` fails and the PR is never
-    labeled — the exact hole this workflow exists to close. Least privilege: this
-    is the only scope granted."""
+def test_github_token_pinned_to_least_privilege() -> None:
+    """The App token (not GITHUB_TOKEN) performs the label write, so GITHUB_TOKEN
+    needs no scopes at all. The job pins it to least privilege with an empty
+    `permissions: {}` block. A stray write scope here would be unused privilege —
+    and a `pull-requests: write` grant in particular would signal a regression to
+    the old, broken GITHUB_TOKEN-labels-the-PR design."""
     perms = _job(_doc()).get("permissions")
-    assert isinstance(perms, dict), f"job has no permissions block: {perms!r}"
-    assert perms.get("pull-requests") == "write", perms
+    assert perms == {}, f"expected least-privilege `permissions: {{}}`, got {perms!r}"
+
+
+def test_mints_github_app_token() -> None:
+    """The label must be added with a GitHub App installation token, minted via
+    `actions/create-github-app-token`, so the `labeled` event is NOT attributed
+    to GITHUB_TOKEN (whose events the recursion guard suppresses). The action is
+    SHA-pinned and wired to the existing RELEASE_PLEASE_APP_* secrets."""
+    steps = _job(_doc())["steps"]
+    minters = [
+        s for s in steps
+        if str(s.get("uses", "")).startswith("actions/create-github-app-token@")
+    ]
+    assert len(minters) == 1, f"expected exactly one app-token minting step: {steps}"
+    minter = minters[0]
+    assert minter.get("id") == "app-token", minter
+    with_ = minter.get("with", {})
+    assert with_.get("app-id") == "${{ secrets.RELEASE_PLEASE_APP_ID }}", with_
+    assert with_.get("private-key") == "${{ secrets.RELEASE_PLEASE_APP_KEY }}", with_
+
+
+def test_label_added_with_app_token_not_github_token() -> None:
+    """The load-bearing invariant: the `gh pr edit` step authenticates with the
+    App token (`steps.app-token.outputs.token`), NOT `secrets.GITHUB_TOKEN`. A
+    GITHUB_TOKEN here would land the label but never trigger tests-ready-for-ci.yml
+    (recursion guard), silently re-opening the exact hole this workflow closes."""
+    steps = _job(_doc())["steps"]
+    label_steps = [s for s in steps if "gh pr edit" in str(s.get("run", ""))]
+    assert len(label_steps) == 1, f"expected exactly one labeling step: {steps}"
+    gh_token = str(label_steps[0].get("env", {}).get("GH_TOKEN", ""))
+    assert "steps.app-token.outputs.token" in gh_token, gh_token
+    assert "secrets.GITHUB_TOKEN" not in gh_token, (
+        "labeling must NOT use GITHUB_TOKEN — its `labeled` event is suppressed "
+        f"by GitHub's recursion guard: {gh_token!r}"
+    )
 
 
 def test_adds_exactly_the_ready_for_ci_gate_label() -> None:
@@ -107,17 +149,23 @@ def test_adds_exactly_the_ready_for_ci_gate_label() -> None:
     assert "--add-label ready-for-ci" in run, run
 
 
-def test_no_pinned_action_version_literal() -> None:
-    """The job uses the built-in `gh` CLI, not a marketplace action, so no
-    `uses: …@v<digit>` pin should ever appear (a version literal here would mean
-    someone reintroduced a marketplace action)."""
-    assert re.search(r"@v\d", _text()) is None, "unexpected @v<digit> action pin"
+def test_no_tag_pinned_action_version_literal() -> None:
+    """Any marketplace action must be pinned to a full commit SHA, never a
+    `@v<digit>` tag — a mutable tag is a supply-chain hazard. The `# vX.Y.Z`
+    version lives in a trailing comment (not preceded by `@`), so a real `@v<digit>`
+    literal would mean an action was tag-pinned and must be converted to a SHA."""
+    assert re.search(r"@v\d", _text()) is None, "action is tag-pinned; use a full SHA"
 
 
-def test_uses_no_marketplace_action() -> None:
-    """No `uses:` step at all — the labeling is done inline with `gh`, keeping the
-    workflow free of any third-party action (and thus of any version to pin)."""
+def test_only_action_is_the_sha_pinned_app_token() -> None:
+    """The workflow's ONLY third-party action is `actions/create-github-app-token`
+    (needed to mint the non-GITHUB_TOKEN credential), and it must be SHA-pinned.
+    The labeling itself is still done inline with the built-in `gh` CLI, so no
+    other `uses:` step should appear."""
     steps = _job(_doc())["steps"]
-    assert all("uses" not in s for s in steps), (
-        "a marketplace action crept in; label via the built-in gh CLI instead"
-    )
+    uses = [str(s["uses"]) for s in steps if "uses" in s]
+    assert len(uses) == 1, f"expected exactly one `uses:` step, found: {uses}"
+    action = uses[0]
+    assert action.startswith("actions/create-github-app-token@"), action
+    ref = action.split("@", 1)[1]
+    assert re.fullmatch(r"[0-9a-f]{40}", ref), f"app-token action must be SHA-pinned: {ref}"
