@@ -1,4 +1,4 @@
-# buddhi-managed-version: 1
+# buddhi-managed-version: 2
 # ^ Buddhi tracks this file's version so `review-pr setup` can offer to update an
 #   outdated installed copy (the old one stays in the update PR's git history).
 # ──────────────────────────────────────────────────────────────────────────────
@@ -59,7 +59,7 @@ jobs:
     if: contains(github.event.pull_request.labels.*.name, 'ready-for-ci')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # ── Your CI command ──────────────────────────────────────────────────────
       # The setup wizard substitutes your detected+confirmed CI command into the
       # `run:` step below at install time. By hand: replace that one line with your

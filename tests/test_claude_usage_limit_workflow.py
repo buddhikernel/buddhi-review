@@ -23,6 +23,7 @@ Load-bearing behaviors pinned here (each has a documented failure mode):
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -39,6 +40,8 @@ TEMPLATE = _ROOT / "buddhi_review" / "skills" / "review-pr" / "references" / "cl
 _COPIES = [CANONICAL, TEMPLATE]
 _IDS = ["canonical", "template"]
 _STEP_NAME_FRAGMENT = "usage-limit silence"
+# The rev-guard's locked identity of the claude-code-review.yml master copy.
+_REV_LOCK = _ROOT / "tests" / "data" / "claude_code_review_rev.json"
 
 
 def _step(path: Path):
@@ -64,7 +67,7 @@ def test_step_present_runs_always_self_contained(path):
 @pytest.mark.parametrize("path", _COPIES, ids=_IDS)
 def test_marker_contract_and_version(path):
     text = path.read_text(encoding="utf-8")
-    assert "# buddhi-managed-version: 2" in text
+    assert "# buddhi-managed-version: 3" in text
     assert "claude-review-unavailable-v1" in text
     assert "type=rate_limited resets_at=" in text
     assert "type=credits_exhausted" in text
@@ -75,6 +78,28 @@ def test_marker_contract_and_version(path):
 def test_two_copies_are_byte_identical():
     assert CANONICAL.read_text(encoding="utf-8") == TEMPLATE.read_text(encoding="utf-8"), (
         "the .github/workflows canonical and the shipped template have drifted")
+
+
+def test_master_copy_matches_the_rev_lock():
+    """Rev-guard: the claude-code-review.yml master copy may not change bytes
+    without a version bump. Any content change — a Dependabot action bump or a
+    deliberate edit — shifts the file's sha256 away from the locked value and
+    reds this test, forcing the fix: bump ``# buddhi-managed-version`` in BOTH
+    copies (they stay byte-identical, see test_two_copies_are_byte_identical) and
+    update tests/data/claude_code_review_rev.json to the new version + sha256.
+    No memory, no judgment, no manual step to remember — the suite is the net.
+    """
+    lock = json.loads(_REV_LOCK.read_text(encoding="utf-8"))
+    actual_sha = hashlib.sha256(TEMPLATE.read_bytes()).hexdigest()
+    assert actual_sha == lock["sha256"], (
+        "master copy changed: bump buddhi-managed-version in both copies and "
+        "update the rev lock")
+    # Keep the lock self-describing: its `version` must match the marker the
+    # master copy actually carries, so a half-update (sha refreshed but the
+    # version — or a copy's marker — forgotten) is caught too.
+    assert f"# buddhi-managed-version: {lock['version']}" in TEMPLATE.read_text(encoding="utf-8"), (
+        "master copy changed: bump buddhi-managed-version in both copies and "
+        "update the rev lock")
 
 
 # ── Behavior ─────────────────────────────────────────────────────────────────
