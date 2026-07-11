@@ -43,9 +43,6 @@ jobs:
     if: ${{ contains(github.event.comment.body, '@claude') && (github.event.issue.pull_request || github.event_name == 'pull_request_review_comment') }}
     runs-on: ubuntu-latest
     steps:
-      # v7 is the current actions/checkout major (verify via GitHub API before
-      # "fixing" this to an older pin — a reviewer bot flagged v7 as
-      # nonexistent, but /repos/actions/checkout/releases/latest confirms v7.0.0).
       - uses: actions/checkout@v7
         with:
           # For issue_comment events, checkout defaults to the default branch,
