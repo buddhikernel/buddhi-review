@@ -43,7 +43,7 @@ jobs:
     if: ${{ contains(github.event.comment.body, '@claude') && (github.event.issue.pull_request || github.event_name == 'pull_request_review_comment') }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # For issue_comment events, checkout defaults to the default branch,
           # not the PR head. Fetch the PR head so Read/Glob/Grep see the actual

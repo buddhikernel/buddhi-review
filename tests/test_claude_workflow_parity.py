@@ -101,16 +101,19 @@ def test_template_is_valid_yaml() -> None:
     assert isinstance(doc, dict) and "jobs" in doc
 
 
-def test_checkout_is_v4_with_pr_head_ref() -> None:
-    """checkout@v4 with the PR-head ``ref:`` override, so issue_comment runs see
-    the actual changed files rather than stale base-branch contents. Read from
-    the PARSED step so a commented-out ``@v4`` line can't satisfy it."""
+def test_checkout_uses_the_pr_head_ref() -> None:
+    """checkout with the PR-head ``ref:`` override, so issue_comment runs see the
+    actual changed files rather than stale base-branch contents.
+
+    NO version is asserted, anywhere: the ``ref:`` input (the only thing that
+    matters here) works on every actions/checkout major, so pinning — or
+    forbidding — any specific version would be a freeze with no technical reason.
+    Read from the PARSED step so a commented-out ``uses:`` line can't satisfy
+    the ref check."""
     step = _checkout_step()
-    assert step["uses"] == "actions/checkout@v4", step["uses"]
+    assert step["uses"].startswith("actions/checkout@"), step["uses"]
     ref = (step.get("with") or {}).get("ref", "")
     assert ref.startswith("refs/pull/"), f"checkout ref is not the PR head: {ref!r}"
-    # Belt-and-suspenders: no stale @v3 lingers anywhere (live step or comment).
-    assert "actions/checkout@v3" not in _workflow_text(), "stale checkout@v3 present"
 
 
 def test_model_is_the_opus_alias_not_a_pinned_literal() -> None:
