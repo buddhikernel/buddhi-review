@@ -380,8 +380,14 @@ class TestCliGateWiring:
 # ── per-repo round-1 summon ──────────────────────────────────────────────────
 def _driver(cfg, *, repo=REPO, gh=None):
     rec = gh or GhRec()
+    # Inject a no-op sleep: a summon posts the re-request then waits
+    # ``register_delay`` (60s real) for the bot to react — a wall-clock burn with
+    # nothing to assert on, which also trips the per-test circuit-breaker
+    # (BUDDHI_TEST_TIMEOUT default 60s). ``sleep`` is RoundDriver's injection seam
+    # for exactly this; no test here asserts on the delay.
     d = RoundDriver("7", repo=repo, cwd="/x", cfg=cfg, gh_run=rec,
-                    classify_runner=lambda p: "{}", clean_llm=None)
+                    classify_runner=lambda p: "{}", clean_llm=None,
+                    sleep=lambda *_a: None)
     return d, rec
 
 

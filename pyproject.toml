@@ -50,7 +50,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-test = ["pytest>=7"]
+test = ["pytest>=7", "pluggy>=1.2"]
 
 [project.scripts]
 buddhi-review = "buddhi_review.cli:main"
