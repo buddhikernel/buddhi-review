@@ -115,6 +115,19 @@ def test_rejected_then_corrected_fix_applies(repo, monkeypatch, capsys):
     assert "guided retry" in capsys.readouterr().out
 
 
+def test_attempts_accumulates_across_a_guided_retry_dispatch(repo, monkeypatch):
+    # ``attempt`` resets to 0 on each while-loop re-entry (one per guided-retry
+    # dispatch) — ``FixOutcome.attempts`` must still report the TOTAL fixer runs
+    # across every dispatch, not just the final one's local count.
+    out, prompts, _, _ = _run(
+        repo, monkeypatch,
+        fixer_steps=[("bad\n", "done"), ("corrected\n", "done")],
+        verify_steps=[_REJECT, _CONFIRM])
+    assert out.status == "applied"
+    assert len(prompts) == 2
+    assert out.attempts == 2
+
+
 def test_retry_prompt_contains_the_rejection_reason(repo, monkeypatch):
     _, prompts, _, _ = _run(
         repo, monkeypatch,

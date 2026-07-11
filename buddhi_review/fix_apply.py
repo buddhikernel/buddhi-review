@@ -1509,6 +1509,11 @@ def apply_fix(
     # the snapshot precondition the terminal REJECT path already enforces.
     guided_attempts_left = VERIFY_REJECT_RETRIES if snap is not None else 0
     verify_reject_feedback: Optional[str] = None
+    # Attempts consumed by prior guided-retry dispatches — ``attempt`` below resets
+    # to 0 on each re-entry into the while loop, so every returned ``attempts``
+    # value adds this offset to report the TOTAL fixer runs across all dispatches,
+    # not just the final (or first) one.
+    total_attempts = 0
 
     while True:  # bounded: re-enters ONLY on a trustworthy REJECT with budget left
         guided_active = verify_reject_feedback is not None
@@ -1545,14 +1550,14 @@ def apply_fix(
                         return FixOutcome(
                             status="transient-failed",
                             detail="rollback failed after timeout — aborting to avoid corrupt state",
-                            attempts=attempt,
+                            attempts=total_attempts + attempt,
                             rollback_failed=True,
                         )
                 continue
             except OSError as exc:
                 trustworthy = _restore_or_degrade(cwd, snap, "after fixer spawn failure")
                 return FixOutcome(
-                    status="transient-failed", detail=f"fixer spawn failed: {exc}", attempts=attempt,
+                    status="transient-failed", detail=f"fixer spawn failed: {exc}", attempts=total_attempts + attempt,
                     rollback_failed=not trustworthy,
                 )
             if rc != 0:  # restore, then retry the SAME model/effort/timeout within the bound
@@ -1561,7 +1566,7 @@ def apply_fix(
                         return FixOutcome(
                             status="transient-failed",
                             detail="rollback failed after non-zero exit — aborting to avoid corrupt state",
-                            attempts=attempt,
+                            attempts=total_attempts + attempt,
                             rollback_failed=True,
                         )
                 continue
@@ -1581,7 +1586,7 @@ def apply_fix(
                     status="rejected",
                     detail=f"guided retry returned SKIP ({skip_line.strip()}) — "
                            f"thread stays open for re-review",
-                    attempts=attempt,
+                    attempts=total_attempts + attempt,
                     rollback_failed=not trustworthy or snap is None,
                 )
             # BLOCKED (a real environment / policy / tooling failure) OR a refusal-
@@ -1606,7 +1611,7 @@ def apply_fix(
                 return FixOutcome(
                     status="transient-failed",
                     detail=f"BLOCKED: {blocked_reason}",
-                    attempts=attempt,
+                    attempts=total_attempts + attempt,
                     rollback_failed=not trustworthy or snap is None,
                 )
             if skip_line:  # terminal: the fixer's own verification said don't apply
@@ -1620,7 +1625,7 @@ def apply_fix(
                     return FixOutcome(
                         status="transient-failed",
                         detail="rollback failed after SKIP — stray edits may remain",
-                        attempts=attempt,
+                        attempts=total_attempts + attempt,
                         rollback_failed=True,
                     )
                 # No snapshot: degrade returned trustworthy=True but no actual rollback
@@ -1632,10 +1637,10 @@ def apply_fix(
                     return FixOutcome(
                         status="transient-failed",
                         detail="SKIP received without snapshot — cannot verify worktree is clean",
-                        attempts=attempt,
+                        attempts=total_attempts + attempt,
                         rollback_failed=True,
                     )
-                return FixOutcome(status="skipped", detail=skip_line.strip(), attempts=attempt)
+                return FixOutcome(status="skipped", detail=skip_line.strip(), attempts=total_attempts + attempt)
             # Clean success → deterministic pre-commit Unicode cleanup, then tripwire +
             # verify over this attempt's diff (the FULL scan text — the 60KB cap is
             # applied only to the verify-prompt artifact by _compose_verify_diff).
@@ -1726,7 +1731,7 @@ def apply_fix(
                            else (" — no snapshot; rejected edits may remain" if snap is None
                                  else " — rollback FAILED, stray edits may ride the next push")),
                         diff=prompt_diff,
-                        attempts=attempt,
+                        attempts=total_attempts + attempt,
                         rollback_failed=rollback_failed,
                     )
                 if verdict.get("fail_open"):  # fail-open must never read as "verified"
@@ -1743,7 +1748,7 @@ def apply_fix(
                             detail="guided retry unverifiable (fix-verify unavailable) — "
                                    "keeping the REJECTED outcome; an unverifiable corrected "
                                    f"fix never ships: {str(verify_reject_feedback)[:200]}",
-                            attempts=attempt,
+                            attempts=total_attempts + attempt,
                             rollback_failed=not trustworthy or snap is None,
                         )
                     _status_line(
@@ -1755,11 +1760,13 @@ def apply_fix(
                 else:
                     _status_line("✓", "fix verified (CONFIRM)", colour=_DIM)
             return FixOutcome(status="applied", detail=trip or "",
-                              diff=prompt_diff, attempts=attempt)
+                              diff=prompt_diff, attempts=total_attempts + attempt)
 
         if guided_retry_reason is not None:
             # A trustworthy REJECT with budget left broke out of the attempt loop:
             # spend one guided retry and re-dispatch with the verifier's feedback.
+            # Bank this dispatch's attempts before ``attempt`` resets to 0 on re-entry.
+            total_attempts += attempt
             guided_attempts_left -= 1
             verify_reject_feedback = guided_retry_reason
             _status_line(
@@ -1777,13 +1784,13 @@ def apply_fix(
             return FixOutcome(
                 status="transient-failed",
                 detail=f"fixer failed after {max_attempts} attempt(s) and final rollback failed — worktree may be corrupt",
-                attempts=attempt,
+                attempts=total_attempts + attempt,
                 rollback_failed=True,
             )
         return FixOutcome(
             status="transient-failed",
             detail=f"fixer failed after {max_attempts} attempt(s); escalating rather than retrying on another model",
-            attempts=attempt,
+            attempts=total_attempts + attempt,
         )
 
 

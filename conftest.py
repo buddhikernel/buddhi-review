@@ -35,7 +35,7 @@ def _on_alarm(signum, frame):
         % _PER_TEST_TIMEOUT)
 
 
-@_pytest.hookimpl(wrapper=True)   # NEVER add trylast=True — it disables the abort
+@_pytest.hookimpl(wrapper=True)   # new-style wrapper (pluggy>=1.2); NEVER add trylast=True — it disables the abort
 def pytest_runtest_protocol(item, nextitem):
     # Brackets setup + call + teardown. SIGALRM turns a pure-Python
     # main-thread hang into a reported failure/error and lets the suite
