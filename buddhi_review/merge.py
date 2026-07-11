@@ -404,7 +404,12 @@ def _branch_is_behind_base(
         # (e.g. a shallow/single-branch clone tracking only the PR head), the
         # fetch above can succeed while the remote-tracking ref stays
         # absent/stale. FETCH_HEAD is exactly what that fetch just wrote,
-        # independent of refspec config (the same ref the exit-rebase targets).
+        # independent of refspec config. Detection is deliberately NOT tied to
+        # the ref exit-rebase resolves: `exit_rebase` (commit_push.py) rebases
+        # onto `<base_remote>/<base>`, so in that rare missing-refspec case it
+        # cleanly reports "skipped" with a manual-rebase hint rather than
+        # force-pushing onto a stale/absent ref — detection here is the strictly
+        # more sensitive signal, and a hand-back is the safe degradation.
         counted = run(
             ["git", "rev-list", "--count", "HEAD..FETCH_HEAD"], cwd=cwd)
         if getattr(counted, "returncode", 1) != 0:
