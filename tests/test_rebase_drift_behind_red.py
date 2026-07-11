@@ -125,29 +125,48 @@ class TestBranchIsBehindBase:
         merge._branch_is_behind_base("main", cwd="/x", run=fake)
         assert not any("rev-list" in argv for argv, _kw in fake.calls)
 
+    def test_none_cwd_returns_false(self):
+        """A missing ``cwd`` fails safe (no counting in whatever directory the
+        process happens to be in) — production callers always thread the path."""
+        fake = _FakeRun()
+        assert merge._branch_is_behind_base("main", cwd=None, run=fake) is False
+        assert fake.calls == []
+
+    def test_typeerror_from_run_returns_false(self):
+        """A run stub raising TypeError is still an unverifiable git error -> fail safe."""
+        fake = _FakeRun(raises=TypeError("unexpected"))
+        assert merge._branch_is_behind_base("main", cwd="/x", run=fake) is False
+
     def test_issues_expected_git_commands(self):
         """The signal is git-only: resolve the base remote (``branch.<base>.remote``,
         falling back to ``origin``), fetch it, then behind-count. The checkout is
         selected via the injected run seam's ``cwd`` (OSS pattern), not a
-        ``git -C`` prefix."""
+        ``git -C`` prefix.
+
+        Counts against FETCH_HEAD, not ``origin/main`` — a checkout whose
+        ``remote.origin.fetch`` doesn't map the base branch (shallow/
+        single-branch clone) can fetch successfully while leaving the
+        remote-tracking ref absent/stale; FETCH_HEAD is immune to that.
+        """
         fake = _FakeRun(revlist=_cp(0, "2"))
         merge._branch_is_behind_base("main", cwd="/repo", run=fake)
         argvs = [argv for argv, _kw in fake.calls]
         cwds = [kw["cwd"] for _argv, kw in fake.calls]
         assert argvs[0] == ["git", "config", "--get", "branch.main.remote"]
         assert argvs[1] == ["git", "fetch", "origin", "main"]
-        assert argvs[2] == ["git", "rev-list", "--count", "HEAD..origin/main"]
+        assert argvs[2] == ["git", "rev-list", "--count", "HEAD..FETCH_HEAD"]
         assert cwds == ["/repo", "/repo", "/repo"]   # all git calls run in the worktree
 
     def test_resolves_base_remote_from_branch_config(self):
         """A fork worktree where ``branch.main.remote`` is ``upstream`` (PR base
         lives on the upstream repo, not the contributor's ``origin`` fork) fetches
-        and counts against ``upstream``, not ``origin`` — the bug this fixes."""
+        ``upstream`` — and the count reads FETCH_HEAD, i.e. exactly what that
+        upstream fetch wrote — not the fork's ``origin`` — the bug this fixes."""
         fake = _FakeRun(config=_cp(0, "upstream\n"), revlist=_cp(0, "1"))
         assert merge._branch_is_behind_base("main", cwd="/repo", run=fake) is True
         argvs = [argv for argv, _kw in fake.calls]
         assert argvs[1] == ["git", "fetch", "upstream", "main"]
-        assert argvs[2] == ["git", "rev-list", "--count", "HEAD..upstream/main"]
+        assert argvs[2] == ["git", "rev-list", "--count", "HEAD..FETCH_HEAD"]
 
 
 # ---- 2. End-to-end: check_pr_mergeable routes behind+red to DRIFT -----------

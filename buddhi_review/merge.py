@@ -262,7 +262,8 @@ def reason_is_pending_checks(reason: str) -> bool:
 
 _GIT_URL_OWNER_REPO_RE = re.compile(r"(?:^|[:/])([^/:]+/[^/:]+?)(?:\.git)?/?$")
 _GIT_URL_HOST_RE = re.compile(
-    r"^(?:[a-zA-Z][a-zA-Z0-9+.-]*://)?(?:[^@/]+@)?([^/:]+)[:/][^/:]+/[^/:]+?(?:\.git)?/?$"
+    r"^(?P<scheme>[a-zA-Z][a-zA-Z0-9+.-]*://)?(?:[^@/]+@)?(?P<host>[^/:]+)"
+    r"(?(scheme)(?::\d+)?/|[:/])[^/:]+/[^/:]+?(?:\.git)?/?$"
 )
 
 
@@ -277,12 +278,13 @@ def _owner_repo(text: str) -> Optional[str]:
 
 
 def _host(text: str) -> Optional[str]:
-    """Extract the lowercase host from a git remote URL (SSH or HTTPS) or a
-    ``gh``-style ``HOST/OWNER/REPO`` string, or ``None`` when the input has no
-    host component (e.g. a bare ``OWNER/REPO``, which ``gh``'s ``[HOST/]``
+    """Extract the lowercase host from a git remote URL (SSH or HTTPS,
+    optionally with an explicit ``:port``) or a ``gh``-style
+    ``HOST/OWNER/REPO`` string, or ``None`` when the input has no host
+    component (e.g. a bare ``OWNER/REPO``, which ``gh``'s ``[HOST/]``
     makes optional)."""
     m = _GIT_URL_HOST_RE.match(text.strip())
-    return m.group(1).lower() if m else None
+    return m.group("host").lower() if m else None
 
 
 def _remote_for_repo(
@@ -371,8 +373,8 @@ def _branch_is_behind_base(
     repo: Optional[str] = None,
 ) -> bool:
     """True iff the checkout at ``cwd`` (the PR branch) is behind the base
-    branch's remote tracking ref by >= 1 commit, decided by GIT independently of
-    GitHub's ``mergeStateStatus``. The remote is resolved by :func:`_base_remote`
+    branch by >= 1 commit, decided by GIT independently of GitHub's
+    ``mergeStateStatus``. The remote is resolved by :func:`_base_remote`
     — matched against ``repo`` (the exact base repo, when the caller has it)
     first, then ``branch.<base_branch>.remote``, then ``origin`` — so a fork
     worktree whose PR base is ``upstream/main`` is checked against ``upstream``
@@ -387,18 +389,28 @@ def _branch_is_behind_base(
 
     Fail-safe: ANY git error (fetch/rev-list non-zero, missing git, timeout,
     non-int output) returns False — never claim a drift we could not verify, so a
-    transient failure never triggers a blind force-push."""
+    transient failure never triggers a blind force-push. A missing ``cwd`` also
+    returns False rather than counting in whatever directory the process happens
+    to be in (production callers always thread the checkout's path)."""
+    if not cwd:
+        return False
     try:
         base_remote = _base_remote(base_branch, cwd=cwd, run=run, repo=repo)
         fetched = run(["git", "fetch", base_remote, base_branch], cwd=cwd)
         if getattr(fetched, "returncode", 1) != 0:
             return False
+        # Count against FETCH_HEAD, not `<base_remote>/<base_branch>`: in a
+        # checkout whose `remote.<name>.fetch` does not map the base branch
+        # (e.g. a shallow/single-branch clone tracking only the PR head), the
+        # fetch above can succeed while the remote-tracking ref stays
+        # absent/stale. FETCH_HEAD is exactly what that fetch just wrote,
+        # independent of refspec config (the same ref the exit-rebase targets).
         counted = run(
-            ["git", "rev-list", "--count", f"HEAD..{base_remote}/{base_branch}"], cwd=cwd)
+            ["git", "rev-list", "--count", "HEAD..FETCH_HEAD"], cwd=cwd)
         if getattr(counted, "returncode", 1) != 0:
             return False
         return int((getattr(counted, "stdout", "") or "0").strip() or "0") > 0
-    except (subprocess.SubprocessError, OSError, ValueError):
+    except (subprocess.SubprocessError, OSError, TypeError, ValueError):
         return False
 
 
