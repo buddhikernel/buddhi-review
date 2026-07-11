@@ -13,10 +13,13 @@ red-gate console ask offers three operator answers:
      it stays red. The gate is the sole arbiter — the operator's claim is
      re-verified, never trusted. It never auto-edits or reverts a test.
 
-Test command resolution: env ``BUDDHI_TEST_COMMAND`` → auto-detect (a ``tests/``
-dir → ``python3 -m pytest tests/ -q``) → no gate (emits a ``⊘ [auto]`` notice so
-the skip is never silent). ``--test-failure-mode off`` skips the gate the same
-loud way.
+Test command resolution: env ``BUDDHI_TEST_COMMAND`` → the per-repo
+``repos[<repo>].test_command`` → the global ``test_command`` → auto-detect (a
+``tests/`` dir → ``python3 -m pytest tests/ -q``) → no gate (emits a ``⊘ [auto]``
+notice so the skip is never silent). A configured command STRING carrying shell
+syntax runs via ``bash -lc``; a bare command runs as a plain argv
+(:func:`_split_test_command`). ``--test-failure-mode off`` skips the gate the
+same loud way.
 
 The red-gate panel is a self-contained escalation: it shows the MEANINGFUL slice
 of the captured pytest output (the ``short test summary info`` / ``FAILURES``
@@ -40,7 +43,7 @@ import subprocess
 import sys
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from buddhi_review import lang_syntax, merge
+from buddhi_review import config, lang_syntax, merge
 from buddhi_review.notifier import Ask, ConsoleNotifier, Notifier
 from buddhi_review.transparency import automation_notice, _colour_enabled
 
@@ -108,10 +111,84 @@ def _test_gate_timeout() -> int:
     return value if value > 0 else _TEST_TIMEOUT_DEFAULT
 
 
-def resolve_test_command(cwd: str) -> Optional[List[str]]:
-    env = os.environ.get("BUDDHI_TEST_COMMAND", "").strip()
-    if env:
-        return shlex.split(env)
+# Shell metacharacters that force a command to run via `bash -lc` instead of a bare
+# `shlex.split` argv. `shlex.split("npm ci && npm test")` yields a literal `"&&"`
+# token and execvp would hand it to npm as an argument, so a command carrying ANY
+# shell syntax must go to a shell: control operators (``&`` ``|`` ``;`` — covers
+# ``&&`` / ``||`` / ``|`` / ``;`` / background ``&``), redirection (``<`` ``>`` —
+# covers ``2>`` / ``>>`` / heredoc ``<<``), expansion (``$`` and backticks — ``$VAR``
+# / ``$(…)`` / ``${…}`` / ``` `…` ```), subshell grouping (``(`` ``)``), and a
+# newline. Quotes are NOT here (shlex handles quoting), and glob chars
+# (``*`` ``?`` ``[`` ``]`` ``{`` ``}``) are deliberately NOT here: JS/Go/pytest
+# runners expand their own path globs, so passing the literal pattern via execvp is
+# what they expect. See `_command_needs_shell`.
+_SHELL_METACHARS = frozenset("&|;<>()$`\n")
+
+
+def _command_needs_shell(cmd: str) -> bool:
+    """True when the test-command STRING `cmd` needs a shell (``bash -lc "<cmd>"``)
+    rather than a bare `shlex.split` argv, because it uses shell syntax execvp
+    cannot honour: a control operator (``&&`` / ``||`` / ``|`` / ``;`` / background
+    ``&``), redirection (``>`` / ``<`` / ``2>`` / heredoc), expansion (``$VAR`` /
+    ``$(…)`` / backticks), a subshell, a newline, a leading ``VAR=val`` environment
+    prefix, or a ``cd <dir>`` step. A bare command (``npx vitest run``,
+    ``go test ./...``) has none of these and runs directly — glob patterns are left
+    literal because test runners expand their own. Over-matching a quoted operator
+    (e.g. ``go test -run 'A|B'``) is harmless: ``bash -lc`` re-parses the quotes to
+    the same argv `shlex` would produce."""
+    s = (cmd or "").strip()
+    if not s:
+        return False
+    if any(ch in _SHELL_METACHARS for ch in s):
+        return True
+    if re.match(r"[A-Za-z_][A-Za-z0-9_]*=", s):            # leading VAR=val prefix
+        return True
+    if re.search(r"(?:^|\s)cd\s", s):                     # a `cd <dir>` step
+        return True
+    return False
+
+
+def _split_test_command(cmd: str) -> list:
+    """Turn a test-command STRING into the argv the gate executes. A command with
+    shell syntax (`_command_needs_shell`) is wrapped as ``["bash", "-lc", cmd]`` so
+    the shell interprets the operators / env-prefix / ``cd``; a bare command splits
+    to argv with `shlex` and runs directly (execvp, never ``shell=True``). A
+    malformed bare command (an unbalanced quote → `shlex.split` ``ValueError``) also
+    falls back to ``bash -lc`` so this NEVER raises — the malformed command then
+    surfaces as a clean RED gate (a captured nonzero bash exit) instead of an
+    uncaught traceback that would crash the loop (`run_test_gate`'s never-raises
+    contract). Centralised here so the reference implementation and (via the same
+    shape) this package agree on the rule that turns a configured command into an
+    argv."""
+    s = (cmd or "").strip()
+    if _command_needs_shell(s):
+        return ["bash", "-lc", s]
+    try:
+        return shlex.split(s)
+    except ValueError:
+        return ["bash", "-lc", s]
+
+
+def resolve_test_command(cwd: str, repo: Optional[str] = None) -> Optional[List[str]]:
+    """The command the pre-push test gate runs, as an argv list — or ``None`` for
+    no gate (the caller's loud skip).
+
+    Resolution (first non-blank source wins): env ``BUDDHI_TEST_COMMAND`` (the
+    whole command); else the per-repo ``repos[<repo>].test_command``; else the
+    top-level global ``test_command`` (both via
+    :func:`buddhi_review.config.test_command`); else auto-detect — a ``tests/``
+    dir means the pytest default ``python3 -m pytest tests/ -q``, nothing
+    detectable means ``None``. A configured command STRING is turned into argv by
+    `_split_test_command` (shell-operator commands → ``bash -lc``, bare commands →
+    ``shlex.split``). A blank/whitespace value at any source falls through, so a
+    config that predates the ``test_command`` key is byte-for-byte unchanged.
+    ``repo=None`` reads env → global → auto-detect."""
+    raw: Optional[str] = os.environ.get("BUDDHI_TEST_COMMAND")
+    if not (raw and str(raw).strip()):
+        cfg = config.load_config() if config.config_path().exists() else {}
+        raw = config.test_command(cfg, repo)
+    if raw and str(raw).strip():
+        return _split_test_command(str(raw))
     if os.path.isdir(os.path.join(cwd, "tests")):
         return ["python3", "-m", "pytest", "tests/", "-q"]
     return None
@@ -267,14 +344,16 @@ def _print_red_gate_panel(
 
 
 def run_test_gate(
-    cwd: str, *, run: Run = _default_run,
+    cwd: str, *, repo: Optional[str] = None, run: Run = _default_run,
     notice: Callable[..., str] = automation_notice,
 ) -> Tuple[str, str]:
     """Returns ``(status, output_tail)`` with status ``green`` / ``red`` /
     ``skipped`` (no detectable suite — loud, never silent). ``output_tail`` is
-    the full combined stdout+stderr (the caller caps + formats it for display)."""
+    the full combined stdout+stderr (the caller caps + formats it for display).
+    ``repo`` (``owner/repo``) scopes the per-repo ``test_command`` resolution;
+    ``None`` reads env → global → auto-detect."""
     try:
-        cmd = resolve_test_command(cwd)
+        cmd = resolve_test_command(cwd, repo)
         if cmd is None:
             notice("test-gate", "no test suite detected — pushing unverified",
                    status="skip", hint="set BUDDHI_TEST_COMMAND to enable the gate")
@@ -413,6 +492,7 @@ def commit_and_push(
     cwd: str,
     *,
     message: str,
+    repo: Optional[str] = None,
     run: Run = _default_run,
     notifier: Optional[Notifier] = None,
     answer_wait: Optional[Callable[[Notifier, Ask], Optional[str]]] = None,
@@ -428,7 +508,8 @@ def commit_and_push(
     pending worktree edits, re-runs the FULL gate, and pushes + continues ONLY
     when green (asking again, never pushing, while red); the gate is the sole
     arbiter. ``answer_wait`` is the
-    :func:`buddhi_review.escalation_wait.wait_for_answer` seam."""
+    :func:`buddhi_review.escalation_wait.wait_for_answer` seam. ``repo``
+    (``owner/repo``) scopes the gate's per-repo ``test_command`` resolution."""
     status = run(["git", "status", "--porcelain"], cwd=cwd)
     if status.returncode != 0:
         return "error"
@@ -445,7 +526,7 @@ def commit_and_push(
         reruns = 0
         while True:
             print(flush=True)  # phase break — the test gate is its own block
-            gate, tail = run_test_gate(cwd, run=run, notice=notice)
+            gate, tail = run_test_gate(cwd, repo=repo, run=run, notice=notice)
             if gate != "red":
                 break  # green / skipped → fall through to commit + push
             notifier = notifier or ConsoleNotifier()

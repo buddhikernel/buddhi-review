@@ -391,13 +391,110 @@ def test_confirm_leaves_sibling_repo_and_unknown_keys_intact(tmp_path):
     assert cfg["a_hand_added_key"] == {"keep": "me"}
 
 
+# ── The per-repo test command ──────────────────────────────────────────────────────
+
+def test_typed_test_command_persists_and_reads_back(tmp_path):
+    """A typed command lands in repos[<repo>].test_command and is what the gate's
+    resolver would run."""
+    cfg_path = tmp_path / "config.yaml"
+    rc, out = _confirm(
+        cfg_path, reviewers={COPILOT},
+        ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
+                    "Label-gated CI default for": 0},
+        yn_answers={"Test-gate command": "npx vitest run"})
+    assert rc == 0
+    cfg = _read(cfg_path)
+    assert config.repo_test_command(cfg, REPO) == "npx vitest run"
+    assert config.test_command(cfg, REPO) == "npx vitest run"
+    assert "Test command for octocat/Hello-World: npx vitest run" in out
+
+
+def test_shell_operator_test_command_persists_verbatim(tmp_path):
+    """A `&&` command is stored as the STRING; the bash -lc wrap happens at the gate
+    (never baked into the config), so the persisted value stays human-editable."""
+    cfg_path = tmp_path / "config.yaml"
+    rc, _ = _confirm(
+        cfg_path, reviewers={COPILOT},
+        ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
+                    "Label-gated CI default for": 0},
+        yn_answers={"Test-gate command": "npm ci && npm test"})
+    assert rc == 0
+    assert config.repo_test_command(_read(cfg_path), REPO) == "npm ci && npm test"
+
+
+def test_blank_answer_leaves_an_unset_repo_unset(tmp_path):
+    """No command typed → the entry carries NO test_command key at all (never a
+    null / empty placeholder), so the gate keeps its auto-detect posture."""
+    cfg_path = tmp_path / "config.yaml"
+    rc, out = _confirm(
+        cfg_path, reviewers={COPILOT},
+        ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
+                    "Label-gated CI default for": 0})
+    assert rc == 0
+    cfg = _read(cfg_path)
+    assert "test_command" not in config.repo_entry(cfg, REPO)
+    assert config.repo_test_command(cfg, REPO) is None
+    assert "Test command for octocat/Hello-World: pytest default" in out
+
+
+def test_blank_answer_preserves_a_previously_set_command(tmp_path):
+    """A re-run that accepts the default (bare Enter) must not wipe the command."""
+    cfg_path = tmp_path / "config.yaml"
+    config.set_repo_keys(REPO, {"test_command": "go test ./..."}, cfg_path)
+    rc, _ = _confirm(
+        cfg_path, reviewers={COPILOT},
+        ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
+                    "Label-gated CI default for": 0})
+    assert rc == 0
+    assert config.repo_test_command(_read(cfg_path), REPO) == "go test ./..."
+
+
+def test_explicit_none_clears_a_previously_set_command(tmp_path):
+    """Typing `none` drops the key entirely (the None overlay → _deep_merge removes
+    it), returning the repo to the auto-detect default rather than persisting a null.
+
+    MUTATION: make _deep_merge write None instead of popping, and this fails —
+    `test_command: null` would round-trip and repo_test_command would still be None
+    but the key would linger in the file.
+    """
+    cfg_path = tmp_path / "config.yaml"
+    config.set_repo_keys(REPO, {"test_command": "go test ./..."}, cfg_path)
+    rc, out = _confirm(
+        cfg_path, reviewers={COPILOT},
+        ss_answers={"GLOBAL default": 1, "Auto-merge default for": 0,
+                    "Label-gated CI default for": 0},
+        yn_answers={"Test-gate command": "none"})
+    assert rc == 0
+    cfg = _read(cfg_path)
+    assert "test_command" not in config.repo_entry(cfg, REPO)
+    assert config.repo_test_command(cfg, REPO) is None
+    assert "Test command for octocat/Hello-World: pytest default" in out
+
+
+def test_set_repo_keys_none_removes_the_key_and_spares_siblings(tmp_path):
+    """The writer-level contract the clear path rides on: a None value REMOVES that
+    key from the entry, leaving every other key (and sibling repos) intact."""
+    cfg_path = tmp_path / "config.yaml"
+    config.set_repo_keys(REPO, {"test_command": "go test ./...",
+                                "auto_merge": True}, cfg_path)
+    config.set_repo_keys("acme/widgets", {"test_command": "cargo test"}, cfg_path)
+
+    config.set_repo_keys(REPO, {"test_command": None}, cfg_path)
+
+    cfg = _read(cfg_path)
+    entry = config.repo_entry(cfg, REPO)
+    assert "test_command" not in entry
+    assert entry["auto_merge"] is True                       # sibling key untouched
+    assert config.repo_test_command(cfg, "acme/widgets") == "cargo test"  # sibling repo
+
+
 # ── Parity with the reference wizard's confirm_repo_interactive ─────────────────────
 
 def test_confirm_repo_interactive_full_parity(tmp_path):
     """One end-to-end pass mirroring the reference wizard: reviewer multiSelect +
     per-bot auto_on_open + global-default promotion + per-repo auto_merge + label-gated
-    CI, all persisted under repos[<repo>] and read back through the F1 readers, plus
-    the read-back rows the operator sees."""
+    CI + the per-repo test command, all persisted under repos[<repo>] and read back
+    through the F1 readers, plus the read-back rows the operator sees."""
     cfg_path = tmp_path / "config.yaml"
     rc, out = _confirm(
         cfg_path, reviewers={COPILOT, CODEX},
@@ -406,7 +503,8 @@ def test_confirm_repo_interactive_full_parity(tmp_path):
                     "Label-gated CI default for": 1,     # label-gated CI on …
                     "Confirm: enable label-gated CI": 1,  # … confirmed
                     # per-bot auto_on_open via the G3 labeled select (0=Yes, 1=No)
-                    "Does Copilot auto-review": 0, "Does Codex auto-review": 1})
+                    "Does Copilot auto-review": 0, "Does Codex auto-review": 1},
+        yn_answers={"Test-gate command": "npx vitest run"})
     assert rc == 0
     cfg = _read(cfg_path)
     # Per-repo persistence (every key via an F1 reader).
@@ -415,10 +513,12 @@ def test_confirm_repo_interactive_full_parity(tmp_path):
     assert config.auto_on_open(cfg, "codex", REPO) is False
     assert config.repo_entry(cfg, REPO)["auto_merge"] is True
     assert config.label_gated_ci(cfg, REPO) is True
+    assert config.repo_test_command(cfg, REPO) == "npx vitest run"
     # Promotion established the global default too.
     assert config.has_global_default(cfg) is True
     # The operator-facing read-back rows.
     assert "Confirmed reviewers for octocat/Hello-World: copilot, codex" in out
     assert "Auto-merge for octocat/Hello-World: on" in out
     assert "Label-gated CI for octocat/Hello-World: on" in out
+    assert "Test command for octocat/Hello-World: npx vitest run" in out
     assert "/review-pr Hello-World <pr-number>" in out

@@ -2088,6 +2088,7 @@ class RoundDriver:
                 pushed = commit_push.commit_and_push(
                     self.cwd,
                     message=f"fix: address review comments (round {round_no})",
+                    repo=self.repo,
                     run=self.gh_run,
                     notifier=self.adapter.escalation.notifier,
                     answer_wait=lambda n, ask: escalation_wait.wait_for_answer(
