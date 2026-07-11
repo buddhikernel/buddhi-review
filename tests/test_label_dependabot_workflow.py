@@ -20,7 +20,13 @@ re-open that hole:
     but tests-ready-for-ci.yml would never fire (the suite would silently never
     run). The App token is minted via `actions/create-github-app-token`, the
     same pattern release-please.yml uses so its Release triggers publish.yml;
-  * the `pull_request` trigger on `opened`/`reopened`;
+  * the `pull_request_target` trigger on `opened`/`reopened` — NOT plain
+    `pull_request`: a Dependabot-triggered `pull_request` run is sandboxed to
+    Dependabot secrets only (no Actions secrets), so `secrets.RELEASE_PLEASE_APP_*`
+    would be empty and the App-token step would fail on the exact
+    `opened`-by-Dependabot case this workflow targets. `pull_request_target` runs
+    in the base-repo context where those Actions secrets are visible (safe here
+    because the job checks out no PR code and only runs `gh pr edit`);
   * the label added is exactly `ready-for-ci` (the gate label) — a typo would
     silently defeat the whole point;
   * the only marketplace action (`actions/create-github-app-token`) is pinned to
@@ -75,13 +81,25 @@ def test_parses_as_yaml() -> None:
     assert isinstance(doc, dict) and "jobs" in doc
 
 
-def test_triggers_on_pull_request_opened_reopened() -> None:
+def test_triggers_on_pull_request_target_opened_reopened() -> None:
     """The label has to land the moment the PR appears, so the full suite gates
     the merge. `opened` covers the first push; `reopened` covers a Dependabot
-    recreate/rebase that reopens the PR."""
+    recreate/rebase that reopens the PR.
+
+    The trigger is `pull_request_target`, NOT plain `pull_request`: a
+    Dependabot-triggered `pull_request` run only sees Dependabot secrets, so the
+    RELEASE_PLEASE_APP_* Actions secrets used to mint the App token would be empty
+    and the step would fail on the very case this workflow exists for.
+    `pull_request_target` runs in the base-repo context where those Actions
+    secrets are available. Assert plain `pull_request` is NOT the trigger so a
+    regression back to it (which silently re-opens the hole) is caught."""
     on = _on_block(_doc())
-    assert isinstance(on, dict) and "pull_request" in on, on
-    types = on["pull_request"]["types"]
+    assert isinstance(on, dict) and "pull_request_target" in on, on
+    assert "pull_request" not in on, (
+        "trigger regressed to plain `pull_request` — Dependabot runs can't see the "
+        f"RELEASE_PLEASE_APP_* Actions secrets, so the App-token step fails: {on}"
+    )
+    types = on["pull_request_target"]["types"]
     assert "opened" in types and "reopened" in types, types
 
 
