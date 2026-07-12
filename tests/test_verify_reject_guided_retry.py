@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import re
 import subprocess
 
@@ -393,6 +394,7 @@ def test_env_var_reload_wires_the_module_constant(monkeypatch):
     # the WIRING — that the module constant VERIFY_REJECT_RETRIES is actually
     # promoted from BUDDHI_VERIFY_REJECT_RETRIES at import, not a hardcoded value or
     # a wrong env name. Reload the module under each env and read the constant back.
+    original = os.environ.get("BUDDHI_VERIFY_REJECT_RETRIES")
     try:
         for raw, expected in [("4", 4), ("0", 0), ("-3", 0), ("garbage", 1)]:
             monkeypatch.setenv("BUDDHI_VERIFY_REJECT_RETRIES", raw)
@@ -400,5 +402,11 @@ def test_env_var_reload_wires_the_module_constant(monkeypatch):
         monkeypatch.delenv("BUDDHI_VERIFY_REJECT_RETRIES", raising=False)
         assert importlib.reload(fix_apply).VERIFY_REJECT_RETRIES == 1  # default
     finally:
-        monkeypatch.delenv("BUDDHI_VERIFY_REJECT_RETRIES", raising=False)
-        importlib.reload(fix_apply)  # restore clean module state for later tests
+        # Restore the module constant to match the ORIGINAL ambient env (not just
+        # the default) before monkeypatch's own teardown restores that env value —
+        # otherwise a later reload-free test could read a stale constant.
+        if original is None:
+            monkeypatch.delenv("BUDDHI_VERIFY_REJECT_RETRIES", raising=False)
+        else:
+            monkeypatch.setenv("BUDDHI_VERIFY_REJECT_RETRIES", original)
+        importlib.reload(fix_apply)
