@@ -29,7 +29,7 @@
 #   uses so its Release actually triggers publish.yml.
 #   Ref: https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow
 #
-#   The App id + private key are the EXISTING RELEASE_PLEASE_APP_* repo secrets
+#   The App id + private key are the EXISTING BUDDHI_AUTOMATION_APP_* Actions secrets
 #   (that App already has `pull-requests: write`, which is all labeling needs, and
 #   already labels its own release PRs) — reused here rather than provisioning a
 #   second App. Until those secrets are set the token step fails loudly rather
@@ -41,13 +41,13 @@
 #   was the credential doing the write, which is no longer the case.
 #
 # WHY pull_request_target — NOT pull_request (do NOT switch it back)
-#   That App token is minted from the RELEASE_PLEASE_APP_* Actions secrets, and a
+#   That App token is minted from the BUDDHI_AUTOMATION_APP_* Actions secrets, and a
 #   Dependabot-authored PR cannot see Actions secrets on a plain `pull_request`
 #   run: GitHub runs Dependabot-triggered push/pull_request/pull_request_review/
 #   pull_request_review_comment events under a hardened sandbox that exposes ONLY
 #   *Dependabot* secrets (Settings → Secrets and variables → Dependabot), never
 #   Actions secrets, and gives the built-in GITHUB_TOKEN read-only scope. So on a
-#   plain `pull_request` trigger the `secrets.RELEASE_PLEASE_APP_*` expressions
+#   plain `pull_request` trigger the `secrets.BUDDHI_AUTOMATION_APP_*` expressions
 #   resolve to empty strings and the token step fails on the exact
 #   `opened`-by-Dependabot case this workflow exists for — the primary trigger
 #   would never label, so the suite would never run: the very gap this closes.
@@ -68,7 +68,7 @@
 name: Label Dependabot PRs
 
 on:
-  # pull_request_target (not pull_request) so the RELEASE_PLEASE_APP_* Actions
+  # pull_request_target (not pull_request) so the BUDDHI_AUTOMATION_APP_* Actions
   # secrets are visible on Dependabot PRs — see "WHY pull_request_target" header.
   # Safe: this job checks out no PR code and runs only `gh pr edit`.
   pull_request_target:
@@ -94,8 +94,8 @@ jobs:
       - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         id: app-token
         with:
-          app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
-          private-key: ${{ secrets.RELEASE_PLEASE_APP_KEY }}
+          app-id: ${{ secrets.BUDDHI_AUTOMATION_APP_ID }}
+          private-key: ${{ secrets.BUDDHI_AUTOMATION_APP_KEY }}
       - name: Add ready-for-ci label
         env:
           # The GitHub App installation token — NOT GITHUB_TOKEN (see header):
