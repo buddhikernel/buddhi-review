@@ -22,7 +22,7 @@ re-open that hole:
     same pattern release-please.yml uses so its Release triggers publish.yml;
   * the `pull_request_target` trigger on `opened`/`reopened` — NOT plain
     `pull_request`: a Dependabot-triggered `pull_request` run is sandboxed to
-    Dependabot secrets only (no Actions secrets), so `secrets.RELEASE_PLEASE_APP_*`
+    Dependabot secrets only (no Actions secrets), so `secrets.BUDDHI_AUTOMATION_APP_*`
     would be empty and the App-token step would fail on the exact
     `opened`-by-Dependabot case this workflow targets. `pull_request_target` runs
     in the base-repo context where those Actions secrets are visible (safe here
@@ -88,7 +88,7 @@ def test_triggers_on_pull_request_target_opened_reopened() -> None:
 
     The trigger is `pull_request_target`, NOT plain `pull_request`: a
     Dependabot-triggered `pull_request` run only sees Dependabot secrets, so the
-    RELEASE_PLEASE_APP_* Actions secrets used to mint the App token would be empty
+    BUDDHI_AUTOMATION_APP_* Actions secrets used to mint the App token would be empty
     and the step would fail on the very case this workflow exists for.
     `pull_request_target` runs in the base-repo context where those Actions
     secrets are available. Assert plain `pull_request` is NOT the trigger so a
@@ -97,7 +97,7 @@ def test_triggers_on_pull_request_target_opened_reopened() -> None:
     assert isinstance(on, dict) and "pull_request_target" in on, on
     assert "pull_request" not in on, (
         "trigger regressed to plain `pull_request` — Dependabot runs can't see the "
-        f"RELEASE_PLEASE_APP_* Actions secrets, so the App-token step fails: {on}"
+        f"BUDDHI_AUTOMATION_APP_* Actions secrets, so the App-token step fails: {on}"
     )
     types = on["pull_request_target"]["types"]
     assert "opened" in types and "reopened" in types, types
@@ -127,7 +127,7 @@ def test_mints_github_app_token() -> None:
     """The label must be added with a GitHub App installation token, minted via
     `actions/create-github-app-token`, so the `labeled` event is NOT attributed
     to GITHUB_TOKEN (whose events the recursion guard suppresses). The action is
-    SHA-pinned and wired to the existing RELEASE_PLEASE_APP_* secrets."""
+    SHA-pinned and wired to the existing BUDDHI_AUTOMATION_APP_* secrets."""
     steps = _job(_doc())["steps"]
     minters = [
         s for s in steps
@@ -137,8 +137,8 @@ def test_mints_github_app_token() -> None:
     minter = minters[0]
     assert minter.get("id") == "app-token", minter
     with_ = minter.get("with", {})
-    assert with_.get("app-id") == "${{ secrets.RELEASE_PLEASE_APP_ID }}", with_
-    assert with_.get("private-key") == "${{ secrets.RELEASE_PLEASE_APP_KEY }}", with_
+    assert with_.get("app-id") == "${{ secrets.BUDDHI_AUTOMATION_APP_ID }}", with_
+    assert with_.get("private-key") == "${{ secrets.BUDDHI_AUTOMATION_APP_KEY }}", with_
 
 
 def test_label_added_with_app_token_not_github_token() -> None:
