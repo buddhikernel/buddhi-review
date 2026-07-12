@@ -56,7 +56,7 @@ except ImportError:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
 from buddhi_review import (config, detectors, managed_files, plan_profile,
-                           setup_launcher, shell_env, upsell)
+                           pro_trial, setup_launcher, shell_env, upsell)
 from buddhi_review.transparency import _colour_enabled
 
 _GH_MIN = (2, 87)
@@ -70,9 +70,12 @@ _MODEL_TIERS = ("opus", "sonnet", "haiku")
 # work-tracking surface is deliberately NOT named or advertised here (it may be cut).
 _BUDGETS_TEASER = "Budget controls — paid tier"
 _MONITORING_TEASER = "Live run monitoring — paid tier"
-# A single-line, suppressible benefit-only nudge (exec-plan §E: benefit only,
-# no paid product name or mechanism details).
-_PRO_SOON_TEASER = "More automation is coming soon — stay tuned."
+# The first-run Pro trial offer (PRO-6, §E.9(a)) — a single benefit-led line +
+# a default-YES prompt shown at the end of a successful setup. It replaces the
+# earlier "coming soon" teaser now that the trial is live; the acquisition itself
+# lives in the scoped pro_trial module. Suppressible via BUDDHI_NO_UPSELL.
+_PRO_TRIAL_OFFER = ("Try Buddhi Pro free for 14 days — automation that carries a run "
+                    "like this to the finish on its own.")
 
 # A one-line static note (NOT a live usage read) about the Claude review workflow's
 # GitHub Actions cost.
@@ -2497,14 +2500,65 @@ def step_summary(plan: str, repo: Optional[str], reviewers: Sequence[str],
 
 
 def step_done(path: Path, *, pal, stream) -> None:
-    """Step 7b — done + launch hint."""
+    """Step 7b — done + launch hint. The Pro trial offer is a SEPARATE interactive
+    step (:func:`step_pro_trial`) run after this by :func:`run`, so the done panel
+    stays non-interactive and prints identically on a TTY or a pipe."""
     _panel("Step 7 — Done", [
         f"Config written : {path}",
         "Re-run setup   : /review-pr setup",
         "Review a PR    : /review-pr <pr-number>   (omit to auto-select)",
         "Create a PR    : /open-pr",
     ], pal, stream)
-    _teaser(_PRO_SOON_TEASER, pal, stream)
+
+
+def _prompt_email(*, input_fn, stream, pal) -> Optional[str]:
+    """Ask for the trial email and validate its shape, at most three tries. Returns
+    a valid address, or None if the user gives up / enters nothing (a soft cancel —
+    NOT a durable decline)."""
+    for _ in range(3):
+        try:
+            raw = input_fn("  Email to set up your trial: ")
+        except (EOFError, KeyboardInterrupt):
+            return None
+        email = (raw or "").strip()
+        if not email:
+            return None
+        if pro_trial.valid_email(email):
+            return email
+        _row("warn", "That doesn't look like an email address — try again.", pal, stream)
+    return None
+
+
+def step_pro_trial(repo: Optional[str], *, pal, stream, input_fn=input) -> None:
+    """Step 7c — the first-run Pro trial offer (PRO-6, §E.9(a): the one sanctioned
+    conversion moment). A single benefit-led line + a default-YES prompt, shown only
+    on an interactive first run where Pro is not already active and the upsell
+    suppression / durable-dismiss / frequency conventions permit it. Decline is one
+    keypress and leaves the locked teaser rows exactly as they are. All trial
+    acquisition + install is delegated to the scoped :mod:`pro_trial` module; this
+    function only asks and prints."""
+    if not _is_tty():
+        return
+    if not pro_trial.offer_allowed(now=None):
+        return
+    pro_trial.record_offer_shown()
+    _row("step", _PRO_TRIAL_OFFER, pal, stream)
+    if not _ask_yes_no("Start your free 14-day Pro trial?", default=True,
+                       input_fn=input_fn, stream=stream, pal=pal):
+        pro_trial.record_declined()
+        return
+    email = _prompt_email(input_fn=input_fn, stream=stream, pal=pal)
+    if not email:
+        return  # soft cancel — not a durable decline, so a later setup may re-offer
+    outcome = pro_trial.start_trial(email)
+    _row("ok" if outcome.ok else "info", outcome.message, pal, stream)
+    # An already-registered email means the buyer likely has (or wants) a paid key —
+    # route them to the concierge-paste convert path rather than dead-ending.
+    if outcome.status == "email_registered" and _ask_yes_no(
+            "Already have a Pro key to paste?", default=False,
+            input_fn=input_fn, stream=stream, pal=pal):
+        conv = pro_trial.convert(paste_input=input_fn, stream=stream)
+        _row("ok" if conv.ok else "info", conv.message, pal, stream)
 
 
 def _offer_first_review(repo: Optional[str], *, pal, stream, input_fn=input) -> None:
@@ -2775,6 +2829,7 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
                      auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
         if ok:
             step_done(cfg_path, pal=pal, stream=stream)
+            step_pro_trial(repo, pal=pal, stream=stream, input_fn=input_fn)
             _offer_first_review(repo, pal=pal, stream=stream, input_fn=input_fn)
             return 0
         _row("bad", f"Could not write {cfg_path} — check the path's permissions", pal, stream)

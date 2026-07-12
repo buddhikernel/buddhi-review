@@ -54,9 +54,18 @@ def _shipped_files():
     return files
 
 
+def _acquisition_allowlisted(path: Path) -> bool:
+    """True for the ONE sanctioned license-acquisition module (PRO-6 §E.9(a)),
+    which may name the pro package it installs + the Keygen acquisition vocabulary
+    the rest of the tree may not."""
+    return path.relative_to(_PKG.parent).as_posix() in g._ACQUISITION_ALLOWLIST
+
+
 @pytest.mark.parametrize("path", _shipped_files(), ids=lambda p: str(p.name))
 def test_no_paid_or_private_surface(path):
-    hits = g.scan_paid_and_publish(path.read_text(encoding="utf-8"))
+    hits = g.scan_paid_and_publish(
+        path.read_text(encoding="utf-8"),
+        allow_acquisition=_acquisition_allowlisted(path))
     assert hits == [], f"{path.name}: {hits}"
 
 
@@ -97,6 +106,7 @@ _VOCAB_SCAFFOLDING = frozenset({
     "tests/test_notifier_transparency.py",   # asserts a paid channel value coerces to console
     "tests/test_shell_env.py",               # asserts paid env keys never reach the env
     "tests/test_wizard.py",                  # asserts wizard output ships no paid name
+    "tests/test_pro_trial.py",               # the acquisition module's test names the pro package it installs
 })
 
 
@@ -208,5 +218,39 @@ _CODE_FILES = [p for p in _shipped_files() if p.suffix in (".py", ".sh")]
 
 @pytest.mark.parametrize("path", _CODE_FILES, ids=lambda p: str(p.name))
 def test_no_entitlement_logic_symbols(path):
+    if _acquisition_allowlisted(path):
+        pytest.skip("pro_trial.py is the sanctioned acquisition module — it may name "
+                    "the Keygen acquisition vocabulary; the creation-only guard below "
+                    "asserts it holds ZERO enforcement logic")
     hits = g.scan_entitlement(path.read_text(encoding="utf-8"))
     assert hits == [], f"{path.name}: {hits}"
+
+
+# ── The acquisition allowlist is scoped, not a hole: acquisition ONLY, never
+#    enforcement ──────────────────────────────────────────────────────────────────
+# pro_trial.py is allowed the Keygen acquisition vocabulary so the wizard can mint a
+# trial + install the wheel — but it must contain creation / registration /
+# validation calls ONLY, and ZERO entitlement-ENFORCEMENT logic (no signed-machine-
+# file verify, no runtime lease check, no signature math). The compiled wheel checks
+# itself (§E.1/§E.3); a lease check in the readable free tree is both trivially
+# patched AND a blueprint of the paid architecture. These greppable markers pin that.
+_ENFORCEMENT_MARKERS = (
+    "verify_lease", "require_lease", "ed25519", "machine_file", "machine-file",
+    "machine file", "parse_and_verify", "heartbeat", "anti_rollback",
+    "last_seen_online", "signed machine",
+)
+_ACQUISITION_MARKERS = ("register_user", "create_trial_license", "validate_key")
+
+
+def test_acquisition_module_is_creation_only():
+    """The allowlisted acquisition module holds creation/registration/validation
+    calls only, and NO entitlement-enforcement logic."""
+    allowlisted = [p for p in _CODE_FILES if _acquisition_allowlisted(p)]
+    assert allowlisted, "the acquisition allowlist names a module that is not shipped"
+    for path in allowlisted:
+        text = path.read_text(encoding="utf-8").lower()
+        present = [m for m in _ENFORCEMENT_MARKERS if m in text]
+        assert present == [], f"{path.name}: enforcement logic leaked in: {present}"
+        assert any(m in text for m in _ACQUISITION_MARKERS), (
+            f"{path.name}: no acquisition markers found — is this still the "
+            f"acquisition module?")

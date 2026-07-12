@@ -182,17 +182,67 @@ def test_locked_teasers_suppressed_by_env(monkeypatch, tmp_path):
     assert wizard._MONITORING_TEASER not in out
 
 
-def test_pro_soon_teaser_at_done(monkeypatch):
-    """The 'Pro coming soon' nudge renders at the done step and is suppressible."""
-    monkeypatch.delenv("BUDDHI_NO_UPSELL", raising=False)
+def test_step_done_has_no_coming_soon_teaser():
+    """The 'coming soon' teaser is retired now that the trial is live (PRO-6): the
+    done panel is non-interactive and carries no upgrade line — the live offer is a
+    separate, gated step (step_pro_trial)."""
     pal = wizard._Palette(False)
     buf = io.StringIO()
     wizard.step_done(Path("/tmp/x.yaml"), pal=pal, stream=buf)
-    assert wizard._PRO_SOON_TEASER in buf.getvalue()
-    monkeypatch.setenv("BUDDHI_NO_UPSELL", "1")
-    buf2 = io.StringIO()
-    wizard.step_done(Path("/tmp/x.yaml"), pal=pal, stream=buf2)
-    assert wizard._PRO_SOON_TEASER not in buf2.getvalue()
+    out = buf.getvalue().lower()
+    assert "coming soon" not in out and "stay tuned" not in out
+    assert "config written" in out
+
+
+def _pro_trial_stub(monkeypatch, *, allowed=True, active=False):
+    """Neuter pro_trial's side effects for step_pro_trial UI tests."""
+    calls = {"shown": 0, "declined": 0, "start": [], "convert": 0}
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard.pro_trial, "offer_allowed", lambda **k: allowed)
+    monkeypatch.setattr(wizard.pro_trial, "record_offer_shown",
+                        lambda **k: calls.__setitem__("shown", calls["shown"] + 1))
+    monkeypatch.setattr(wizard.pro_trial, "record_declined",
+                        lambda **k: calls.__setitem__("declined", calls["declined"] + 1))
+
+    def _start(email, **k):
+        calls["start"].append(email)
+        return wizard.pro_trial.TrialOutcome(True, "active", "✓ Buddhi Pro is active")
+    monkeypatch.setattr(wizard.pro_trial, "start_trial", _start)
+    monkeypatch.setattr(wizard.pro_trial, "convert",
+                        lambda **k: (calls.__setitem__("convert", calls["convert"] + 1)
+                                     or wizard.pro_trial.TrialOutcome(True, "active", "ok")))
+    return calls
+
+
+def test_step_pro_trial_yes_starts_trial(monkeypatch):
+    calls = _pro_trial_stub(monkeypatch, allowed=True)
+    buf = io.StringIO()
+    # Radio selectors read via single_select; bridge Yes → default. Provide the email.
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
+    answers = iter(["y", "me@example.com"])   # 1) yes to the offer  2) the email
+    wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
+                          input_fn=lambda *a: next(answers))
+    assert calls["shown"] == 1
+    assert calls["start"] == ["me@example.com"]
+    assert "14 days" in buf.getvalue()
+
+
+def test_step_pro_trial_skips_when_not_allowed(monkeypatch):
+    calls = _pro_trial_stub(monkeypatch, allowed=False)
+    buf = io.StringIO()
+    wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
+                          input_fn=lambda *a: "y")
+    assert calls["shown"] == 0
+    assert buf.getvalue() == ""       # nothing shown when the offer is not allowed
+
+
+def test_step_pro_trial_skips_off_tty(monkeypatch):
+    _pro_trial_stub(monkeypatch, allowed=True)
+    monkeypatch.setattr(wizard, "_is_tty", lambda: False)
+    buf = io.StringIO()
+    wizard.step_pro_trial(None, pal=wizard._Palette(False), stream=buf,
+                          input_fn=lambda *a: "y")
+    assert buf.getvalue() == ""
 
 
 def test_claude_workflow_written_when_absent(monkeypatch, tmp_path):
