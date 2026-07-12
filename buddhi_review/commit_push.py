@@ -43,7 +43,7 @@ import subprocess
 import sys
 from typing import Callable, List, Optional, Sequence, Tuple
 
-from buddhi_review import config, lang_syntax, merge
+from buddhi_review import config, lang_syntax, merge, test_runner
 from buddhi_review.notifier import Ask, ConsoleNotifier, Notifier
 from buddhi_review.transparency import automation_notice, _colour_enabled
 
@@ -343,15 +343,56 @@ def _print_red_gate_panel(
         print(rule, flush=True)
 
 
+def _emit_no_tests_skip(runner_label: str) -> None:
+    """Print the unmistakable no-tests SKIP notice: the resolved gate command RAN
+    but the classifier (:func:`test_runner.classify`) found ZERO tests, so the gate
+    is NOT red — it verified nothing, the same "no gate" posture as an undetectable
+    suite. Loud on purpose ('zero coverage, not green') so a green push is never
+    mistaken for a real pass. Never blocks the push (the caller returns
+    ``skipped``)."""
+    print(f"[local-tests] no tests detected for {runner_label} — gate SKIPPED "
+          f"(zero coverage, not green)")
+
+
+def _gate_class_headline(klass: str, runner_label: str) -> str:
+    """A one-line RED-gate headline naming a ``compile_error`` / ``env_error`` class
+    so the operator sees WHY the gate is red (the build / collection step failed, or
+    the runner / a dependency is missing) rather than a bare nonzero exit. Returns
+    ``""`` for ``passed`` / ``no_tests`` / ``failed`` / ``timeout`` — their tail is
+    unchanged, so a plain failed-gate display stays byte-identical to before F2."""
+    if klass == test_runner.COMPILE_ERROR:
+        return (f"[local-tests] ✗ gate RED — compile_error ({runner_label}): the "
+                f"build / collection step failed BEFORE any test ran. No "
+                f"failing-test ids are extracted from a compile error.")
+    if klass == test_runner.ENV_ERROR:
+        return (f"[local-tests] ✗ gate RED — env_error ({runner_label}): the test "
+                f"runner or a dependency is missing / the command could not run. No "
+                f"failing-test ids are extracted from an env error.")
+    return ""
+
+
 def run_test_gate(
     cwd: str, *, repo: Optional[str] = None, run: Run = _default_run,
     notice: Callable[..., str] = automation_notice,
 ) -> Tuple[str, str]:
     """Returns ``(status, output_tail)`` with status ``green`` / ``red`` /
-    ``skipped`` (no detectable suite — loud, never silent). ``output_tail`` is
-    the full combined stdout+stderr (the caller caps + formats it for display).
-    ``repo`` (``owner/repo``) scopes the per-repo ``test_command`` resolution;
-    ``None`` reads env → global → auto-detect."""
+    ``skipped``. The resolved command's runner is detected (:mod:`test_runner`) and
+    its exit CLASSIFIED into one of the six outcome classes, so a silent-exit-0
+    runner (jasmine / Karma / go / VSTest / gtest / swift / cargo) that ran ZERO
+    tests never false-greens AND pytest's exit 5 never false-reds (F2):
+
+      * ``passed``                     → ``green``.
+      * ``no_tests``                   → ``skipped``: the command ran but found no
+        tests, so it verified nothing — the same loud "no gate" posture as an
+        undetectable suite (:func:`_emit_no_tests_skip`), NEVER red.
+      * ``compile_error`` / ``env_error`` → ``red`` with the CLASS named in a
+        one-line tail headline (:func:`_gate_class_headline`).
+      * ``failed`` / ``timeout``       → ``red`` (tail byte-identical to before F2).
+
+    ``output_tail`` is the full combined stdout+stderr (the caller caps + formats
+    it for display). ``repo`` (``owner/repo``) scopes the per-repo ``test_command``
+    resolution; ``None`` reads env → global → auto-detect. A ``skipped`` on no
+    detectable suite stays loud, never silent."""
     try:
         cmd = resolve_test_command(cwd, repo)
         if cmd is None:
@@ -363,7 +404,20 @@ def run_test_gate(
     except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
         return "red", f"test command failed to run: {exc}"
     tail = (proc.stdout or "") + "\n" + (proc.stderr or "")
-    return ("green" if proc.returncode == 0 else "red"), tail
+    # Detect the runner behind the resolved command and classify its outcome (F2):
+    # a zero-test run of a silent-exit-0 runner classifies `no_tests` (SKIP, not a
+    # false-green) and pytest exit 5 classifies `no_tests` (SKIP, not a false-red);
+    # a compile / env failure is named apart from a genuine test failure. No triage
+    # (failing-id extraction / scoped re-run) — this free skill's gate has none.
+    info = test_runner.detect_runner(cwd, cmd)
+    klass = test_runner.classify(info.runner, proc.returncode, tail, "", False)
+    if klass == test_runner.NO_TESTS:
+        _emit_no_tests_skip(info.runner)
+        return "skipped", ""
+    if klass == test_runner.PASSED:
+        return "green", tail
+    headline = _gate_class_headline(klass, info.runner)
+    return "red", (f"{headline}\n{tail}" if headline else tail)
 
 
 def _assert_clean_after_commit(
