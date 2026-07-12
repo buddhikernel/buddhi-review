@@ -305,6 +305,12 @@ def test_read_clipboard_swallows_all_exceptions():
     assert pro_trial._read_clipboard(boom) == ""       # falls through, never raises
 
 
+def test_request_non_numeric_status_is_fail_open():
+    def weird(method, url, auth, body):
+        return "not-an-int", None                       # a misbehaving transport
+    assert pro_trial._request("POST", "/users", transport=weird) == (0, None)
+
+
 # ── offer gating ────────────────────────────────────────────────────────────────
 
 def test_offer_allowed_default(tmp_path):

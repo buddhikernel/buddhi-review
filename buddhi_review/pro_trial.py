@@ -116,9 +116,10 @@ def _request(method, path, *, auth=None, body=None, transport=None) -> Tuple[int
     fn = transport or _default_transport
     try:
         status, data = fn(method, url, auth, body)
-    except Exception:
-        return 0, None
-    return int(status or 0), data if isinstance(data, dict) else None
+        status = int(status or 0)          # inside the guard: a non-numeric status
+    except Exception:                      # from a misbehaving transport is fail-open,
+        return 0, None                     # never a raise
+    return status, data if isinstance(data, dict) else None
 
 
 def _ok(status: int) -> bool:
