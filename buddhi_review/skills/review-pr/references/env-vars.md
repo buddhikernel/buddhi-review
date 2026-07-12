@@ -17,6 +17,7 @@ are sane; the skill works with no env vars at all.
 | `BUDDHI_CLASSIFY_RETRIES` | Retries on a failed comment classification (`0` disables the retry) | 1 | clamped ≥ 0; garbage/blank → default |
 | `BUDDHI_FIX_RETRIES` | Retries on a transient per-comment fix failure (timeout / non-zero rc; `0` disables; SKIP/success are never retried) | 1 | clamped ≥ 0; garbage/blank → default |
 | `BUDDHI_VERIFY_REJECT_RETRIES` | Bounded guided retries after a fix-verify REJECT — re-dispatches with the rejection reason (`0` disables; the retry's verify is forced; a retry that SKIPs or can't be verified never resolves) | 1 | clamped ≥ 0; garbage/blank → default |
+| `BUDDHI_TEST_TIMEOUT` | Per-test wall-clock budget (seconds) for the test-suite's circuit-breaker — a test exceeding it is aborted as a failure (an unbounded-loop backstop). Test-suite-only; nothing in the shipped skill reads it at runtime. | 60 | positive int wins; `0`/negative/garbage/blank → default |
 | `BUDDHI_TRIGGER_COPILOT` | Override the Copilot reviewer slug — lets a vendor slug rename be config, not a source edit | `copilot-pull-request-reviewer[bot]` | blank/unset → default |
 | `BUDDHI_TRIGGER_GEMINI` | Override the Gemini re-trigger PR comment | `/gemini review` | blank/unset → default |
 | `BUDDHI_TRIGGER_CODEX` | Override the Codex re-trigger PR comment | `@codex review` | blank/unset → default |

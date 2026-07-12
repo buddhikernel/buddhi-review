@@ -1569,6 +1569,11 @@ def apply_fix(
                             attempts=total_attempts + attempt,
                             rollback_failed=True,
                         )
+                # `continue` is UNCONDITIONAL here (outside the `attempt < max_attempts`
+                # restore branch) — even on the FINAL attempt this exhausts the `for`
+                # range instead of falling through to the diff/verify logic below, so
+                # rc!=0 always lands in the give-up tail's `transient-failed`, never
+                # `rejected`. Do not move this inside the `if attempt < max_attempts:`.
                 continue
             skip_line = next(
                 (ln for ln in (stdout or "").splitlines() if ln.strip().startswith("SKIP:")), None
