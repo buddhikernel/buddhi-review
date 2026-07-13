@@ -123,16 +123,18 @@ with defaults. It must NEVER block the loop.
 Resolve `OWNER/REPO` and `CWD` in this order:
 
 1. **If the user passed an explicit `owner/repo` (or repo-name) argument, honor it
-   first**; set `CWD` to the cwd or a given path. Running `/open-pr owner/target` from
-   an unrelated checkout must target `owner/target`, never silently fall back to
-   whatever repo the cwd happens to sit in.
-2. **Else, infer from the current directory's git remote first** (the cwd's `origin`
-   remote → `OWNER/REPO`, its toplevel → `CWD`; the same resolution the actuator does).
+   first**: set `OWNER_REPO` to that literal argument value and `CWD` to the cwd or a
+   given path. Running `/open-pr owner/target` from an unrelated checkout must target
+   `owner/target`, never silently fall back to whatever repo the cwd happens to sit in —
+   do NOT run the `gh repo view` fallback below when an explicit argument was given.
+2. **Else, infer from the current directory's git remote first.** If the cwd is inside a
+   git repo, derive `OWNER/REPO` from its `origin` remote and set `CWD` to its toplevel
+   (the same resolution the actuator does):
 
-```bash
-CWD=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
-OWNER_REPO=${OWNER_REPO:-$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)}
-```
+   ```bash
+   CWD=$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")
+   OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
+   ```
 
 **Auto-target the worktree this session worked in.** When the work was done in a NEW
 worktree off `main` (the standing rule), the session's `$PWD` can still point at the
