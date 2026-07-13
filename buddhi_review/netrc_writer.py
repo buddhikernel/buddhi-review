@@ -82,22 +82,36 @@ def _replace_or_append(content: str, host: str, login: str, password: str) -> Tu
         sep = "" if content.endswith("\n") else "\n"
         return content + sep + stanza, "appended-unparsed"
 
-    # Locate the target host's (untangled) stanza start.
-    start = None
-    for i, line in enumerate(lines):
-        if _line_is_our_machine(line, host):
+    # Locate EVERY (untangled) stanza for this host. netrc resolves duplicate
+    # `machine` entries to the LAST one in the file, so replacing only the first
+    # match would leave a later stale duplicate as the one that actually wins —
+    # collapse all matching stanzas into a single upserted one at the first
+    # occurrence's position instead.
+    spans = []
+    i = 0
+    while i < len(lines):
+        if _line_is_our_machine(lines[i], host):
             start = i
-            break
+            end = start + 1
+            while end < len(lines) and _line_starts_stanza(lines[end]) is None:
+                end += 1
+            spans.append((start, end))
+            i = end
+        else:
+            i += 1
 
-    if start is None:
+    if not spans:
         sep = "" if content.endswith("\n") else "\n"
         return content + sep + stanza, "created"
 
-    # Our stanza runs from `start` until the next top-level keyword line or EOF.
-    end = start + 1
-    while end < len(lines) and _line_starts_stanza(lines[end]) is None:
-        end += 1
-    new_content = "".join(lines[:start]) + stanza + "".join(lines[end:])
+    first_start = spans[0][0]
+    pieces = ["".join(lines[:first_start]), stanza]
+    prev_end = spans[0][1]
+    for s, e in spans[1:]:
+        pieces.append("".join(lines[prev_end:s]))
+        prev_end = e
+    pieces.append("".join(lines[prev_end:]))
+    new_content = "".join(pieces)
     return new_content, "updated"
 
 

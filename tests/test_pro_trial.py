@@ -399,16 +399,16 @@ def test_convert_falls_back_to_manual_paste_when_clipboard_invalid(tmp_path):
     # consented clipboard that the SERVER rejects → prompt for manual paste.
     def validate(body):
         key = body["meta"]["key"]
-        return (200, {"meta": {"valid": key == "GOODKEY", "code": "VALID" if key == "GOODKEY" else "NOT_FOUND"}})
+        return (200, {"meta": {"valid": key == "GOODKEY-PASTE", "code": "VALID" if key == "GOODKEY-PASTE" else "NOT_FOUND"}})
     t = _full(validate=validate)
     out = pro_trial.convert(
         transport=t, clipboard_reader=lambda: "junk-not-a-key",
         confirm_input=lambda *a: "y",
-        paste_input=lambda *a: "GOODKEY", backends=[FakeProBackend(True)],
+        paste_input=lambda *a: "GOODKEY-PASTE", backends=[FakeProBackend(True)],
         runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
         netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
         attempts=2, stream=io.StringIO())
-    assert out.ok and "GOODKEY" in (tmp_path / ".netrc").read_text()
+    assert out.ok and "GOODKEY-PASTE" in (tmp_path / ".netrc").read_text()
 
 
 # ── the clipboard never leaves the machine unbidden (P1: no arbitrary exfiltration) ──
@@ -432,14 +432,14 @@ def test_declined_clipboard_falls_through_to_manual_paste(tmp_path):
     t = _full()
     out = pro_trial.convert(
         transport=t, clipboard_reader=lambda: "SOME-OTHER-SECRET-VALUE",
-        confirm_input=lambda *a: "", paste_input=lambda *a: "GOODKEY",
+        confirm_input=lambda *a: "", paste_input=lambda *a: "GOODKEY-PASTE",
         backends=[FakeProBackend(True)],
         runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
         netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
         attempts=2, stream=io.StringIO())
     assert out.ok
     sent = [c["body"]["meta"]["key"] for c in t.calls if "validate-key" in c["url"]]
-    assert sent == ["GOODKEY"]                            # the clipboard value was NOT sent
+    assert sent == ["GOODKEY-PASTE"]                      # the clipboard value was NOT sent
 
 
 def test_non_key_shaped_clipboard_is_not_even_offered():
@@ -452,6 +452,20 @@ def test_non_key_shaped_clipboard_is_not_even_offered():
         confirm_input=lambda p: asked.append(p) or "y", paste_input=lambda *a: "")
     assert got is None
     assert t.calls == [] and asked == []
+
+
+def test_manual_paste_is_shape_gated_before_validation():
+    """A manually pasted value must clear the SAME narrow key-shape gate as the
+    clipboard candidate before it is POSTed to validate-key — prose, a passphrase,
+    or another secret accidentally pasted into the hidden prompt must never reach
+    the network."""
+    t = _full()
+    got = pro_trial.detect_pasted_key(
+        transport=t, clipboard_reader=lambda: "",
+        confirm_input=lambda *a: "y",
+        paste_input=lambda *a: "correct horse battery staple")
+    assert got is None
+    assert t.calls == []                                  # never even validated
 
 
 def test_looks_like_license_key_shape_gate():

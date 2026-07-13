@@ -153,10 +153,11 @@ def _gen_password() -> str:
     """A throwaway password used ONLY to mint the user token; never shown to the
     user. The unprotected account requires a credential pair to issue a user token,
     so we generate a strong random one. If registration succeeds but a later step
-    (token or license) fails, it is kept as a short-lived local retry-state
-    credential (0600, see ``_save_pending_credential``) — cleared as soon as the
-    trial license is minted — so a same-email retry is not permanently locked out
-    of the account it just opened."""
+    (token, license, or the netrc/pip/activation install tail) fails, it is kept as
+    a short-lived local retry-state credential (0600, see
+    ``_save_pending_credential``) — cleared only once the install actually succeeds
+    (see ``start_trial``) — so a same-email retry is not permanently locked out of
+    the account it just opened."""
     return secrets.token_urlsafe(24)
 
 
@@ -372,8 +373,8 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
                                 "active yet — wait a moment and re-run setup.")
         return TrialOutcome(False, "pip_failed",
                             f"Install did not complete — your license is set up and {resolved_netrc} "
-                            f"is intact, so just re-run: pip install {_PACKAGE} "
-                            f"--index-url {_index_url()}")
+                            f"is intact, so just re-run: {sys.executable} -m pip install --upgrade "
+                            f"{_PACKAGE} --index-url {_index_url()} --no-input")
 
     start_daemon(backends=backends)
     if _await_active(backends=backends, is_active=is_active, sleep=sleep, attempts=attempts):
@@ -541,7 +542,7 @@ def detect_pasted_key(*, transport=None, clipboard_reader=None,
         raw = (paste_input("Paste your Pro key (input hidden): ") or "").strip()
     except (EOFError, KeyboardInterrupt):
         return None
-    if not raw:
+    if not raw or not _looks_like_license_key(raw):
         return None
     valid, _code = validate_key(raw, transport=transport)
     return raw if valid else None

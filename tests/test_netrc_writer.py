@@ -56,6 +56,25 @@ def test_idempotent_no_duplicate(tmp_path):
     assert "password K2" in out and "K1" not in out
 
 
+def test_all_duplicate_stanzas_updated(tmp_path):
+    p = tmp_path / ".netrc"
+    p.write_text(
+        "machine github.com login ghuser password ghtok\n"
+        "machine index.example\n  login old1\n  password OLDKEY1\n"
+        "machine gitlab.com login gl password gltok\n"
+        "machine index.example\n  login old2\n  password OLDKEY2\n", encoding="utf-8")
+    ok, action = nw.upsert("index.example", "license", "NEWKEY", path=p)
+    assert ok and action == "updated"
+    out = _read(p)
+    # only a single, fresh stanza for our host remains
+    assert out.count("machine index.example") == 1
+    assert "password NEWKEY" in out
+    assert "OLDKEY1" not in out and "OLDKEY2" not in out
+    # every OTHER entry preserved byte-for-byte
+    assert "machine github.com login ghuser password ghtok\n" in out
+    assert "machine gitlab.com login gl password gltok\n" in out
+
+
 def test_single_line_form_replaced(tmp_path):
     p = tmp_path / ".netrc"
     p.write_text("machine index.example login old password OLDKEY\n"
