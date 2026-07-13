@@ -409,7 +409,7 @@ def _dispatch_unclaimed_command(command: str, trailing: List[str], *,
             return backend.run_command(command, trailing)
         except Exception as exc:  # an installed backend must never crash the free front door
             print(f"⚠ backend {getattr(backend, 'name', repr(backend))!r} failed "
-                  f"running {command!r} ({exc})", file=out)
+                  f"running {command!r} ({exc!r})", file=out)
             return 1
     print(_UNCLAIMED_COMMAND_NOTICE.format(command=_display_command(command)), file=out)
     return 2
