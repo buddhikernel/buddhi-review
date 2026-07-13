@@ -882,11 +882,16 @@ def _classify_vitest(rc: int, out: str) -> str:
 
 def _classify_mocha(rc: int, out: str) -> str:
     # mocha's exit code == the number of failing tests; 0 = all pass. "No test files
-    # found" (exit >0) = no tests.
+    # found" (exit >0) = no tests. Gated on the absence of a real "N passing"/"N
+    # failing" summary — same run-evidence guard shape as the jest/vitest/jasmine
+    # classifiers above — so a suite that actually ran (e.g. a CLI/error-path test
+    # whose own captured output happens to echo the no-test marker text) isn't
+    # masked as an empty run.
     if rc != 0 and _js_env(out):
         return ENV_ERROR
     if _has(out, r"No test files found", r"Error: No test files found",
-            r"cannot resolve path.*spec"):
+            r"cannot resolve path.*spec") and not _has(
+            out, r"\b[1-9]\d* passing\b", r"\b[1-9]\d* failing\b"):
         return NO_TESTS
     if rc == 0:
         return PASSED
@@ -1197,11 +1202,21 @@ def _classify_gradle(rc: int, out: str) -> str:
         # NO-SOURCE is a generic Gradle task-outcome marker, not test-specific — it
         # also prints for e.g. `> Task :processResources NO-SOURCE` on any project
         # with no src/main/resources, even when the test task ran and passed. Anchor
-        # to the TEST task's own NO-SOURCE line so an unrelated task's NO-SOURCE
-        # can't false the gate into NO_TESTS on a green run.
-        if _has(out, r"(?m)^> Task :\S*[Tt]est\S* NO-SOURCE",
-                r"No tests found for given includes") and not _has(
-                out, r"\bBUILD SUCCESSFUL\b.*\d+ test"):
+        # to test-NAMED tasks' own status lines, and require EVERY matched test task
+        # to be NO-SOURCE: a multi-task invocation (`gradle check`, `gradle test
+        # integrationTest`) can have one empty test task print NO-SOURCE beside a
+        # sibling that actually ran — normal Gradle console output never prints a
+        # "BUILD SUCCESSFUL ... N test" count to use as counter-evidence, so keying
+        # off a single NO-SOURCE line would false the gate into NO_TESTS despite real
+        # tests executing.
+        test_task_statuses = re.findall(
+            r"(?m)^> Task :\S*[Tt]est\S*(?:[ \t]+(\S[^\n]*))?[ \t]*$", out)
+        if test_task_statuses:
+            if all((status or "").strip().upper() == "NO-SOURCE"
+                    for status in test_task_statuses):
+                return NO_TESTS
+            return PASSED
+        if _has(out, r"No tests found for given includes"):
             return NO_TESTS
         return PASSED
     # Gradle `--tests <pattern>` with no match FAILS exit 1 ("No tests found for

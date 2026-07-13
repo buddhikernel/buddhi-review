@@ -226,6 +226,14 @@ _CLASSIFY_CASES = [
      "> Task :processResources NO-SOURCE\n> Task :test\nBUILD SUCCESSFUL in 4s", tr.PASSED),
     ("gradle-test-task-nonsource-is-no-tests", tr.GRADLE, 0,
      "> Task :test NO-SOURCE\nBUILD SUCCESSFUL in 1s", tr.NO_TESTS),
+    # `gradle test integrationTest` (or `gradle check`) runs MULTIPLE test-named
+    # tasks — one can be NO-SOURCE (e.g. no unit tests) while a sibling actually
+    # executes. Normal Gradle console output never prints a "BUILD SUCCESSFUL ... N
+    # test" count, so this must NOT be masked as an empty run just because one of
+    # the test tasks was NO-SOURCE.
+    ("gradle-multi-test-task-sibling-ran-not-no-tests", tr.GRADLE, 0,
+     "> Task :test NO-SOURCE\n> Task :integrationTest\nBUILD SUCCESSFUL in 5s\n"
+     "3 actionable tasks: 3 executed", tr.PASSED),
 
     # ---- dotnet (VSTest SILENT EXIT 0 + MTP) ----
     ("dotnet-pass", tr.DOTNET, 0, "Passed!  - Failed: 0, Passed: 12, Total: 12", tr.PASSED),
