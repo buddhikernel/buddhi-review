@@ -1353,9 +1353,15 @@ def _classify_catch2(rc: int, out: str) -> str:
 
 def _classify_gtest(rc: int, out: str) -> str:
     # GoogleTest EXITS 0 when zero tests match a filter unless
-    # --gtest_fail_if_no_test_selected is set — parse the "0 tests" banner.
+    # --gtest_fail_if_no_test_selected is set — parse the "0 tests" banner. Gated on
+    # the absence of a real "[  PASSED/FAILED  ] N tests" summary (nonzero N) so a
+    # suite that actually ran and failed — but whose OWN output happens to echo a
+    # zero-tests marker (e.g. a wrapper/snapshot test quoting another empty run) —
+    # can't be masked as an empty run. Same run-evidence guard shape as the
+    # jest/vitest/mocha/jasmine classifiers above.
     if _has(out, r"No tests were found", r"0 tests from 0 test (?:suites|cases)",
-            r"\[  PASSED  \] 0 tests", r"Running 0 tests"):
+            r"\[  PASSED  \] 0 tests", r"Running 0 tests") and not _has(
+            out, r"\[  (?:PASSED|FAILED)  \] [1-9]"):
         return NO_TESTS
     if _has(out, r"\[  FAILED  \]") and rc == 0:
         # defensive: a FAILED banner with rc 0 shouldn't happen, but never green it.
@@ -1419,8 +1425,15 @@ def _classify_swift(rc: int, out: str) -> str:
 
 def _classify_dart(rc: int, out: str) -> str:
     # dart/flutter test exit 1 for BOTH a test failure AND "No tests ran" — parse
-    # the marker.
-    if _has(out, r"No tests ran", r"No tests match", r"Found no tests"):
+    # the marker. Gated on the absence of a real pass/fail summary ("All tests
+    # passed"/"Some tests failed"/a nonzero "+N"/"-N" run counter) so a suite that
+    # actually ran and failed — but whose OWN output happens to echo a no-tests
+    # marker (e.g. a test asserting on captured subprocess text) — can't be masked
+    # as an empty run. Same run-evidence guard shape as the jest/vitest/mocha/
+    # jasmine classifiers above.
+    if _has(out, r"No tests ran", r"No tests match", r"Found no tests") and not _has(
+            out, r"All tests passed", r"Some tests failed",
+            r"\+[1-9]\d*(?:\s+-\d+)?:"):
         return NO_TESTS
     if rc == 0:
         return PASSED

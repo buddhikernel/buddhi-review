@@ -292,6 +292,11 @@ _CLASSIFY_CASES = [
     ("gtest-pass", tr.GTEST, 0, "[==========] 10 tests from 2 test suites ran.\n[  PASSED  ] 10 tests.", tr.PASSED),
     ("gtest-fail", tr.GTEST, 1, "[  FAILED  ] 1 test, listed below:", tr.FAILED),
     ("gtest-no-tests-exit0", tr.GTEST, 0, "[==========] 0 tests from 0 test suites ran.", tr.NO_TESTS),
+    # A real failure whose captured output merely QUOTES a zero-tests marker (a
+    # wrapper/snapshot test invoking another empty test command) must not
+    # short-circuit to a green no_tests SKIP — the "[  FAILED  ] N tests" summary
+    # gates the zero-tests branch, same as the swift-fail-quoting case below.
+    ("gtest-fail-quoting-no-tests-marker", tr.GTEST, 1, "stdout was: 'Running 0 tests'\n[  FAILED  ] 2 tests, listed below:", tr.FAILED),
     ("catch2-pass", tr.CATCH2, 0, "All tests passed (12 assertions in 3 test cases)", tr.PASSED),
     ("catch2-fail-42", tr.CATCH2, 42, "test cases: 3 | 2 passed | 1 failed", tr.FAILED),
     ("catch2-no-tests-2", tr.CATCH2, 2, "No test cases matched", tr.NO_TESTS),
@@ -321,6 +326,10 @@ _CLASSIFY_CASES = [
     ("dart-fail", tr.DART, 1, "Some tests failed.", tr.FAILED),
     ("dart-no-tests", tr.DART, 1, "No tests ran.", tr.NO_TESTS),
     ("flutter-no-tests", tr.FLUTTER, 1, "No tests ran.", tr.NO_TESTS),
+    # A real failure whose captured output merely QUOTES a no-tests marker (e.g. a
+    # test asserting on captured subprocess text) must not short-circuit to a green
+    # no_tests SKIP — the "Some tests failed" summary gates the zero-tests branch.
+    ("dart-fail-quoting-no-tests-marker", tr.DART, 1, "expected: 'No tests ran.'\nSome tests failed.", tr.FAILED),
 
     # ---- universal env / timeout ----
     ("cmd-not-found-127", tr.VITEST, 127, "vitest: command not found", tr.ENV_ERROR),
