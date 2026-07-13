@@ -301,7 +301,7 @@ def failure_excerpt(tail: Optional[str], max_lines: int = _FAILURE_EXCERPT_LINES
     lines = raw.splitlines()
     meaningful = [ln for ln in lines if not _PYTEST_PROGRESS_RE.match(ln)]
     if not meaningful:
-        body = "(no failure detail in the captured pytest output)"
+        body = "(no failure detail captured)"
         return f"{headline}\n{body}" if headline else body
 
     def _find(pred: Callable[[str], bool]) -> Optional[int]:
@@ -422,7 +422,28 @@ def run_test_gate(
             return "skipped", ""
         print(f"[local-tests] running {' '.join(cmd)} before push …", flush=True)
         proc = run(cmd, cwd=cwd, timeout=_test_gate_timeout())
-    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+    except subprocess.TimeoutExpired as exc:
+        # A real timeout kills the process before `run()` returns, so it never
+        # reaches the `classify()` call below. Route it through the SAME
+        # classifier for consistency with the six-outcome contract; the tail
+        # stays byte-identical either way since `_gate_class_headline` adds no
+        # headline for TIMEOUT (matching a plain `failed`, both "before F2").
+        info = test_runner.detect_runner(cwd, cmd)
+        klass = test_runner.classify(info.runner, None, "", "", timed_out=True)
+        headline = _gate_class_headline(klass, info.runner)
+        tail = f"test command failed to run: {exc}"
+        return "red", (f"{headline}\n{tail}" if headline else tail)
+    except OSError as exc:
+        # The command never spawned at all (missing runner binary, permission
+        # denied, …) — that IS env_error by definition, so classify it directly
+        # rather than feeding the exception text through `classify()`'s
+        # stdout/stderr marker scan (built for a completed process's captured
+        # output, not a Python exception string).
+        info = test_runner.detect_runner(cwd, cmd)
+        headline = _gate_class_headline(test_runner.ENV_ERROR, info.runner)
+        tail = f"test command failed to run: {exc}"
+        return "red", (f"{headline}\n{tail}" if headline else tail)
+    except ValueError as exc:
         return "red", f"test command failed to run: {exc}"
     tail = (proc.stdout or "") + "\n" + (proc.stderr or "")
     # Detect the runner behind the resolved command and classify its outcome (F2):

@@ -11,8 +11,11 @@ gate command, and what did its exit mean?" These tests pin:
      never `passed`, because that false-green is the whole reason the classifier
      exists. Plus pytest exit 5, the unittest ≤3.11-vs-≥3.12 split, and env markers.
   2. Detection — argv shapes + marker-file fixtures per runner (tmp dirs, no real
-     toolchains), including the tox.ini/noxfile force-guard and the bash-lc / opaque
-     wrapper → UNKNOWN.
+     toolchains), including the tox.ini/noxfile force-guard, the runner read back out
+     of a `bash -lc` STRING (the gate wraps every `cd …` / `VAR=… ` / `&&` command
+     that way, so argv[0] alone would call them all opaque), and the genuinely opaque
+     wrapper (`npm test`, `make`) → UNKNOWN — which the generic classifier still
+     refuses to false-green on a zero-test run.
   3. Gate wiring in ``commit_push.run_test_gate`` — `no_tests` SKIPs (never red) with
      the loud notice; `env_error` / `compile_error` RED with the class named in the
      tail; pytest exit 5 is a SKIP, not a red gate; and the free skill's
@@ -134,6 +137,34 @@ _CLASSIFY_CASES = [
     # The toolchain markers are rc!=0-gated: a GREEN snapshot test that echoes a captured
     # "[setup failed]" string must not false-RED.
     ("go-pass-prints-setup-failed-string", tr.GO, 0, "=== RUN   TestSnap\n    snap_test.go:9: FAIL\tpkg [setup failed]\n--- PASS: TestSnap\nPASS\nok  \texample.com/a", tr.PASSED),
+    # `go test -run <no-match>` FILTERS every test out, yet still EXITS 0 printing a
+    # column-0 `ok  pkg 0.5s [no tests to run]` per package (real go1.26.5 output). An
+    # `ok`-line check that ignored the annotation read that as "tests ran" and reported
+    # a verified GREEN for a run that executed NOTHING — the exact silent-exit-0
+    # false-green this classifier exists to catch.
+    ("go-run-filter-no-match-exit0", tr.GO, 0,
+     "ok  \texample.com/a\t0.521s [no tests to run]\nok  \texample.com/b\t0.879s [no tests to run]", tr.NO_TESTS),
+    # …and under `-v` the same zero-test run ALSO prints a bare column-0 `PASS` (the test
+    # binary saying "I did not fail"), which is likewise NOT proof that anything ran.
+    ("go-run-filter-no-match-verbose", tr.GO, 0,
+     "testing: warning: no tests to run\nPASS\nok  \texample.com/a\t0.369s [no tests to run]\n?   \texample.com/c\t[no test files]", tr.NO_TESTS),
+    # But an UNANNOTATED `ok` line IS run evidence: one package really ran while a
+    # sibling was filtered to zero → the run verified something → stays GREEN.
+    ("go-mixed-one-ran-one-filtered", tr.GO, 0,
+     "ok  \texample.com/a\t0.1s\nok  \texample.com/b\t0.2s [no tests to run]", tr.PASSED),
+    # `go test -v` echoes a PASSING test's stdout VERBATIM at column 0, so a tooling /
+    # snapshot test asserting on captured `go build` output prints BOTH halves of the
+    # compile predicate (`# <pkg>` header AND a column-0 `file.go:N:N:`) on an all-green
+    # rc==0 run. Those lines are the TEST's, not the go tool's — scoping the predicate to
+    # the tool's own lines keeps this green while `go-64286-exit0-build-fail` above (whose
+    # header the TOOL printed, outside any `=== RUN` region) still REDs at the SAME rc 0.
+    ("go-pass-prints-captured-build-failure", tr.GO, 0,
+     "=== RUN   TestParsesBuildFailure\n# example.com/other/broken\n./main.go:5:9: undefined: undefinedSymbol\n--- PASS: TestParsesBuildFailure (0.00s)\nPASS\nok  \texample.com/tooling\t0.4s", tr.PASSED),
+    # A REAL build failure under -v still REDs: the go tool builds every package BEFORE
+    # running any test binary, so its `# <pkg>` header lands OUTSIDE the `=== RUN` region
+    # even when a sibling package's tests run and pass right after it.
+    ("go-real-build-fail-v-with-passing-sibling", tr.GO, 1,
+     "# example.com/broken\nbroken/b.go:3:23: undefined: undefinedSymbol\nFAIL\texample.com/broken [build failed]\n=== RUN   TestAdd\n--- PASS: TestAdd (0.00s)\nPASS\nok  \texample.com/a\t0.354s\nFAIL", tr.COMPILE_ERROR),
 
     # ---- cargo (stable — 101 is BOTH fail and compile) ----
     ("cargo-pass", tr.CARGO, 0, "test result: ok. 5 passed; 0 failed", tr.PASSED),
@@ -420,6 +451,20 @@ class TestDotnetNoTestsIsExitGated:
         out = "Passed!  - Failed: 0, Passed: 3, Total: 3\n  log: 'Test Run Aborted' handled"
         assert tr.classify(tr.DOTNET, 0, out) == tr.PASSED
 
+    def test_empty_project_beside_a_passing_project_is_passed_not_skipped(self):
+        # `dotnet test` on a multi-project solution prints one summary line PER
+        # project, so an empty project's "Total: 0" / "Passed: 0" trailer can appear
+        # beside a sibling project's real "Total: 3" at rc==0 — must not mask green.
+        out = (
+            "Passed!  - Failed: 0, Passed: 0, Skipped: 0, Total: 0, Duration: 1 ms - Empty.Tests.dll\n"
+            "Passed!  - Failed: 0, Passed: 3, Skipped: 0, Total: 3, Duration: 9 ms - App.Tests.dll"
+        )
+        assert tr.classify(tr.DOTNET, 0, out) == tr.PASSED
+
+    def test_all_projects_empty_is_still_no_tests(self):
+        out = "Passed!  - Failed: 0, Passed: 0, Skipped: 0, Total: 0, Duration: 1 ms - Empty.Tests.dll"
+        assert tr.classify(tr.DOTNET, 0, out) == tr.NO_TESTS
+
 
 class TestSwiftRunBannerGate:
     """swift: the run banner (`Test Suite`, `Executed N test(s)`, `Test run with N
@@ -504,11 +549,19 @@ def test_detect_from_argv(argv, want):
 
 class TestWrapperDetection:
     @pytest.mark.parametrize("argv", [
+        # A shell string whose commands name NO runner we recognize stays opaque:
+        # `npm test` is a package SCRIPT, `make` a build tool — neither is a runner.
         ["bash", "-lc", "npm ci && npm test"],
-        ["bash", "-c", "pytest"],
         ["sh", "-c", "make test"],
+        ["bash", "-lc", "./run-tests.sh --all"],
+        # TWO distinct runners: the wrapper's exit code + output are a MIX of two
+        # runners' conventions, which no single per-runner classifier can read — so
+        # it stays Tier-B opaque rather than guessing one of them.
+        ["bash", "-lc", "pytest && npx jest"],
+        # An unbalanced quote cannot be tokenized → stay opaque, never raise.
+        ["bash", "-lc", "pytest 'unbalanced"],
     ])
-    def test_shell_wrapper_is_unknown(self, argv):
+    def test_opaque_shell_wrapper_is_unknown(self, argv):
         info = tr.detect_runner(".", argv)
         assert info.runner == tr.UNKNOWN
         assert info.source == "wrapper:shell"
@@ -530,6 +583,93 @@ class TestWrapperDetection:
         # it is NOT the vitest/jest binary, so from argv alone it stays opaque.
         info = tr.detect_runner(".", ["npm", "test"])
         assert info.runner == tr.UNKNOWN
+
+
+class TestShellStringDetection:
+    """`commit_push._split_test_command` wraps EVERY command carrying shell syntax
+    (a `cd` step, a `VAR=val` prefix, an `&&` chain, a pipe) into `bash -lc "<cmd>"`,
+    so reading argv[0] alone would call the most ordinary gate commands there are
+    opaque — and hand them to the generic rc==0→passed classifier, false-greening a
+    zero-test run of a silent-exit-0 runner. The runner is read back OUT of the string."""
+
+    @pytest.mark.parametrize("cmd,want", [
+        ("cd frontend && npx jasmine", tr.JASMINE),      # behind a `cd` step
+        ("CI=1 go test ./...", tr.GO),                   # behind a VAR=val prefix
+        ("CI=1 NODE_ENV=test npx jest --ci", tr.JEST),   # …several of them
+        ("npm ci && npx vitest run", tr.VITEST),         # after an install step
+        ("pytest -q | tee out.log", tr.PYTEST),          # mid-pipeline
+        ("cd api && python3 -m pytest tests/ -q", tr.PYTEST),
+        ("cd rs && cargo nextest run", tr.NEXTEST),
+        ("(cd sub && bundle exec rspec)", tr.RSPEC),     # in a subshell, behind a launcher
+        # A QUOTED operator needs no shell at all — `_command_needs_shell` over-matches
+        # it (documented there as harmless). The tokenizer is quote-aware, so `A|B`
+        # stays one token and the command is NOT split in half at the `|`.
+        ("cd sub && go test -run 'A|B' ./...", tr.GO),
+    ])
+    def test_runner_read_out_of_the_shell_string(self, cmd, want):
+        info = tr.detect_runner(".", commit_push._split_test_command(cmd))
+        assert info.runner == want
+        assert info.source == "shell"
+
+    def test_shell_wrapped_runner_is_never_scopable(self):
+        # P1's rule is "scopable iff argv AND recognized": a shell STRING is not an
+        # argv we can append an exact-subset filter to (the runner may sit behind a
+        # `cd`, mid-pipeline, or after an `&&` step), so a runner found inside one is
+        # never scopable — even though the SAME runner as a bare argv is.
+        assert tr.detect_runner(".", ["pytest", "-q"]).scopable is True
+        assert tr.detect_runner(".", commit_push._split_test_command("cd api && pytest -q")).scopable is False
+
+    def test_zero_test_run_behind_a_cd_is_not_a_false_green(self):
+        # The defect this fix exists for: `cd frontend && npx jasmine` is wrapped in
+        # `bash -lc`, jasmine EXITS 0 on zero specs, and an opaque wrapper's rc==0
+        # meant `passed` — the gate reported a verified GREEN for a run that executed
+        # NOTHING. It must classify no_tests (a loud "zero coverage" SKIP).
+        out = "Randomized with seed 1\nNo specs found\nIncomplete: No specs found"
+        info = tr.detect_runner(".", commit_push._split_test_command("cd frontend && npx jasmine"))
+        assert tr.classify(info.runner, 0, out) == tr.NO_TESTS
+
+
+class TestOpaqueWrapperNoFalseGreen:
+    """The residual opaque wrappers (`npm test`, `make test`, `./run-tests.sh`) never
+    name their runner ANYWHERE — not in argv, not in a shell string. `npm test` is the
+    single most common gate command there is, and the jasmine / Karma / go / VSTest /
+    gtest behind it all EXIT 0 on an empty run, so the generic classifier must not read
+    a bare rc==0 as a verified pass."""
+
+    @pytest.mark.parametrize("out", [
+        "No specs found\nIncomplete: No specs found",            # jasmine
+        "Executed 0 of 0 SUCCESS",                               # karma
+        "ok  \tpkg\t0.5s [no tests to run]",                     # go, filtered to zero
+        "No test is available in /app/bin/Tests.dll",            # dotnet / VSTest
+        "[  PASSED  ] 0 tests",                                  # gtest
+        "running 0 tests\ntest result: ok. 0 passed",            # cargo
+        "Test run with 0 tests",                                 # swift
+        "No tests found",                                        # jest
+    ])
+    def test_zero_test_markers_are_not_green(self, out):
+        assert tr.classify(tr.UNKNOWN, 0, out) == tr.NO_TESTS
+
+    @pytest.mark.parametrize("out", [
+        "12 specs, 0 failures",                                  # jasmine
+        "Executed 8 of 8 SUCCESS",                               # karma
+        "ok  \tpkg\t0.5s",                                       # go
+        "Tests:       3 passed, 3 total",                        # jest
+        "459 passed in 4.20s",                                   # pytest
+        "running 7 tests\ntest result: ok. 7 passed",            # cargo
+        # A run that really executed must stay GREEN even when a SIBLING suite in the
+        # same wrapper was empty — the go `[no test files]`-beside-a-passing-package
+        # shape, which an unguarded marker scan would have masked as no_tests.
+        "ok  \tpkga\t0.2s\n?   \tpkgc\t[no test files]",
+        "",                                                      # no output at all
+    ])
+    def test_real_run_evidence_stays_green(self, out):
+        assert tr.classify(tr.UNKNOWN, 0, out) == tr.PASSED
+
+    def test_nonzero_exit_is_still_failed(self):
+        # The nonzero path is untouched: through an opaque wrapper we cannot tell a
+        # zero-test run from a broken step of the wrapper itself, and RED is the safe
+        # answer either way.
+        assert tr.classify(tr.UNKNOWN, 1, "No specs found") == tr.FAILED
 
 
 # ── Detection — repo markers ─────────────────────────────────────────────────────

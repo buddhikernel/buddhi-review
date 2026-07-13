@@ -7,11 +7,16 @@ no scoped re-run — this free skill's gate escalates on red, nothing more):
 
   detect_runner(cwd, resolved_cmd) -> RunnerInfo
       Identify the runner behind the gate command, from (in priority order) the
-      resolved command's argv[0]/shape, then repo markers. A `bash -lc` wrapper or
-      an unrecognized argv (`./run-tests.sh`, `make`) is an opaque wrapper ->
-      runner=UNKNOWN; a `tox.ini [tox]` / `noxfile.py` forces tox/nox (a Tier-B
-      wrapper) over the tox.ini->pytest signal. Pure / read-only (no network, no
-      installs); the ONLY subprocess it runs is a bounded `cargo nextest --version`
+      resolved command's argv[0]/shape, the STRING inside a `bash -lc` wrapper, then
+      repo markers. The gate wraps every command carrying shell syntax in `bash -lc`
+      (`commit_push._split_test_command`: a `cd <dir>` step, a `VAR=val` prefix, an
+      `&&` chain), so the runner is read back OUT of that string — else the most
+      ordinary gate commands there are would all be opaque. An unrecognized argv
+      (`npm test`, `./run-tests.sh`, `make`) or a shell string naming no runner we
+      know stays an opaque wrapper -> runner=UNKNOWN (and `classify` still holds the
+      no-false-green line there); a `tox.ini [tox]` / `noxfile.py` forces tox/nox (a
+      Tier-B wrapper) over the tox.ini->pytest signal. Pure / read-only (no network,
+      no installs); the ONLY subprocess it runs is a bounded `cargo nextest --version`
       probe to tell nextest from stable cargo, which the design explicitly permits.
 
   classify(runner, exit_code, stdout, stderr, timed_out) -> str
@@ -35,6 +40,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from functools import lru_cache
 from pathlib import Path
@@ -104,12 +110,14 @@ class RunnerInfo(NamedTuple):
     """The identified runner behind a gate command.
 
     runner   — one of the runner-id constants above, or UNKNOWN for an opaque
-               wrapper (`bash -lc`, `./run-tests.sh`, `make`) we cannot see through.
+               wrapper (`npm test`, `./run-tests.sh`, `make`, a `bash -lc` string
+               naming no runner we recognize) we cannot see through.
     scopable — best-effort hint: is this a recognized, scoped-rerun-capable runner?
-               (P1's rule; consumed by P3, not P2.) UNKNOWN and the Tier-B wrappers
-               are never scopable.
-    source   — how it was identified ("argv", "wrapper:shell",
-               "wrapper:unrecognized", "marker:<file>", "none") — for logging/tests.
+               (P1's rule; consumed by P3, not P2.) UNKNOWN, the Tier-B wrappers and
+               ANY shell-wrapped runner (source "shell") are never scopable.
+    source   — how it was identified ("argv", "shell" — read out of a `bash -lc`
+               string, "wrapper:shell", "wrapper:unrecognized", "marker:<file>",
+               "none") — for logging/tests.
     """
     runner: str
     scopable: bool
@@ -289,14 +297,93 @@ def _runner_from_argv(argv: list) -> Optional[str]:
 
 def _is_shell_wrapper(argv: list) -> bool:
     """True when argv is a `bash -lc "<cmd>"` / `sh -c "<cmd>"` form (P1's
-    `_command_needs_shell` commands are executed this way): the runner is hidden
-    inside the shell string, so it is an opaque wrapper."""
+    `_command_needs_shell` commands are executed this way): the runner is not argv[0]
+    — it is hidden inside the shell STRING (`_shell_string` reads it back out)."""
     if len(argv) >= 2:
         head = _basename_token(argv[0])
         if head in ("bash", "sh", "zsh", "dash", "ksh") and any(
                 str(a) in ("-c", "-lc", "-lic", "-ic") for a in argv[1:2]):
             return True
     return False
+
+
+def _shell_string(argv: list) -> str:
+    """The COMMAND STRING a shell wrapper carries: `bash -lc "<cmd>"` → `<cmd>`.
+    `_is_shell_wrapper` pins the `-c` flag at argv[1], so the string is argv[2]."""
+    return str(argv[2]) if len(argv) >= 3 else ""
+
+
+#: shlex's `punctuation_chars` set — the shell control operators it tokenizes apart
+#: from words (`&&` `||` `;` `|` `(` `)` `<` `>` and combinations like `>&`).
+_SHELL_PUNCT = frozenset("();<>|&")
+
+#: A leading `VAR=val` environment prefix on a command (`CI=1 npx jest`). Mirrors
+#: `commit_push._command_needs_shell`'s own env-prefix rule — which is one of the
+#: reasons a command gets wrapped in `bash -lc` in the first place.
+_ENV_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _shell_segments(cmd: str) -> list:
+    """A wrapped shell string split into the individual COMMANDS it runs, each as an
+    argv-style token list: `cd sub && npx jest` → `[["cd","sub"], ["npx","jest"]]`.
+
+    Tokenized with `shlex` in punctuation mode, which is quote-AWARE: a quoted
+    operator (`go test -run 'A|B'` — the over-match `_command_needs_shell` documents,
+    which needs no shell at all) keeps `A|B` as ONE token instead of splitting the
+    command in half, while an unspaced real operator (`pytest|tee log`) still splits.
+    An unbalanced quote raises `ValueError` → no segments → the caller stays opaque."""
+    lex = shlex.shlex(cmd or "", posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    try:
+        toks = list(lex)
+    except ValueError:                  # unbalanced quote — untokenizable; stay opaque
+        return []
+    segments, cur = [], []
+    for tok in toks:
+        if tok and all(ch in _SHELL_PUNCT for ch in tok):   # an operator ends a command
+            if cur:
+                segments.append(cur)
+                cur = []
+            continue
+        cur.append(tok)
+    if cur:
+        segments.append(cur)
+    return segments
+
+
+def _strip_env_prefix(toks: list) -> list:
+    """Drop a leading `VAR=val` env prefix (`CI=1 NODE_ENV=test npx jest`) so the
+    runner token comes first. Returns a possibly-shorter copy; never mutates."""
+    i = 0
+    while i < len(toks) and _ENV_PREFIX_RE.match(str(toks[i])):
+        i += 1
+    return toks[i:]
+
+
+def _runner_from_shell_string(cmd: str) -> Optional[str]:
+    """Best-effort: the runner behind a `bash -lc "<cmd>"` wrapper, read out of the
+    shell STRING. None when the string names no runner we recognize, or names more
+    than one.
+
+    This exists because `commit_push._split_test_command` wraps a LOT of ordinary gate
+    commands into `bash -lc` — everything carrying a shell operator, a `cd <dir>` step
+    or a `VAR=val` prefix (`cd frontend && npx jasmine`, `CI=1 go test ./...`,
+    `npm ci && npx jest`). Reading argv[0] alone calls all of those UNKNOWN, which
+    hands them to `_classify_generic` (rc==0 → passed) and hence false-GREENS a
+    zero-test run of a silent-exit-0 runner — the exact guarantee this module exists
+    to keep. Each command in the string is checked, so the runner is found behind a
+    `cd`, an env prefix, or a preceding `npm ci` step.
+
+    Two or more DISTINCT runners (`pytest && npx jest`) → None: the wrapper's exit
+    code and output are then a MIX of two runners' conventions, which no single
+    per-runner classifier can read soundly, so it stays an opaque wrapper (Tier-B),
+    exactly as before. `_classify_generic` still holds the no-false-green line there."""
+    found = []
+    for seg in _shell_segments(cmd):
+        r = _runner_from_argv(_strip_env_prefix(seg))
+        if r is not None and r not in found:
+            found.append(r)
+    return found[0] if len(found) == 1 else None
 
 
 # ── Detection: repo markers ──────────────────────────────────────────────────────
@@ -500,6 +587,16 @@ def detect_runner(cwd: Optional[str], resolved_cmd: Optional[list[str] | str]) -
         resolved_cmd = [resolved_cmd]
     argv = [str(a) for a in (resolved_cmd or []) if a is not None]
     if _is_shell_wrapper(argv):
+        # The runner is inside the shell string, not at argv[0] — read it back out
+        # (`_runner_from_shell_string`). NEVER scopable, even when found: a shell
+        # string is not an argv we can append an exact-subset filter to (the runner
+        # may sit behind a `cd`, mid-pipeline, or after a `&&` step), which is P1's
+        # "scopable iff argv AND recognized" rule. A string naming no recognized
+        # runner (`npm test`, `make test`) or two of them stays a Tier-B opaque
+        # wrapper, exactly as before.
+        r = _runner_from_shell_string(_shell_string(argv))
+        if r is not None:
+            return RunnerInfo(runner=r, scopable=False, source="shell")
         return _mk(UNKNOWN, "wrapper:shell")
     r = _runner_from_argv(argv)
     if r is not None:
@@ -583,11 +680,90 @@ def _has(out: str, *patterns) -> bool:
     return any(re.search(p, out, re.I) for p in patterns)
 
 
+#: The go per-package RESULT line that proves tests ACTUALLY RAN: a column-0 `ok`
+#: WITHOUT a zero-test annotation. A bare `^ok\s` is NOT run evidence — `go test -run
+#: Nomatch ./...` (every test filtered out) and a package with no `_test.go` file BOTH
+#: exit 0 and print a column-0 `ok  pkg 0.5s [no tests to run]` / `[no test files]`
+#: line (verified on go1.26.5), so reading those as "tests ran" false-GREENS a run
+#: that executed nothing. Shared by `_RAN_TESTS_MARKERS_ANY` and `_classify_go` — one
+#: source of truth, because the two MUST agree on what counts as evidence.
+_GO_OK_RAN = r"^ok\s+(?![^\n]*\[no tests? (?:to run|files)\])"
+
+#: Zero-test markers UNIONED across every per-runner classifier below — the only
+#: signal `_classify_generic` has when the runner is opaque. Not every runner is
+#: string-detectable (pytest signals an empty run by exit code 5 ALONE, so a wrapper
+#: hiding pytest keeps the pre-F2 posture), but every silent-exit-0 runner is: those
+#: are precisely the ones that would otherwise false-green.
+_NO_TESTS_MARKERS_ANY = re.compile(
+    r"\[no tests? (?:to run|files)\]|testing: warning: no tests to run"  # go
+    r"|^Ran 0 tests\b"                                                   # unittest/django
+    r"|No tests? (?:found|ran|executed|to run)\b"                        # jest/phpunit/dart/maven…
+    r"|No test (?:files|suite) found|Couldn't find any files to test"    # vitest/mocha/ava
+    r"|No specs found|\b0 specs,\s*0 failures"                           # jasmine
+    r"|Executed 0 of \d+|TOTAL:\s*0\s+SUCCESS"                           # karma
+    r"|^#\s*tests\s+0\b|^1\.\.0\b"                                       # node:test (TAP)
+    r"|running 0 tests"                                                  # cargo
+    r"|Tests run:\s*0\b"                                                 # maven/surefire
+    r"|No tests found for given includes"                                # gradle
+    r"|No test is available|no test matches the specified selection criteria"  # dotnet/VSTest
+    r"|\b0 tests,\s*0 failures|There are no tests to run"                # mix
+    r"|\b0 examples,\s*0 failures"                                       # rspec
+    r"|\b0 runs,\s*0 assertions"                                         # minitest
+    r"|No tests were found|0 tests from 0 test (?:suites|cases)"         # gtest/ctest
+    r"|\[  PASSED  \] 0 tests|Running 0 tests"                           # gtest banners
+    r"|Executed 0 tests|Test run with 0 tests|No matching test cases were run"  # swift
+    r"|Found no tests",                                                  # dart
+    re.I | re.M,
+)
+
+#: RUN-EVIDENCE markers: proof that tests ACTUALLY EXECUTED — a nonzero count, or a
+#: per-test verdict. The counterweight to `_NO_TESTS_MARKERS_ANY`: an opaque wrapper
+#: often drives SEVERAL suites (`npm test` → lint + unit), so one empty suite's marker
+#: must never mask a sibling suite that really ran. Same guard shape the go / dotnet /
+#: swift / cargo classifiers already use against their own zero-count trailers.
+_RAN_TESTS_MARKERS_ANY = re.compile(
+    _GO_OK_RAN + r"|^---\s+(?:PASS|FAIL)"                        # go / TAP
+    r"|\b[1-9]\d* (?:passed|failed|passing|failing|error)"       # pytest/vitest/mocha…
+    r"|\bRan [1-9]\d* tests?\b"                                  # unittest/django
+    r"|Tests:\s*[1-9]"                                           # jest / phpunit summary
+    r"|\b[1-9]\d* specs?,|Executed [1-9]\d* of"                  # jasmine / karma
+    r"|^#\s*(?:pass|fail)\s+[1-9]"                               # node:test (TAP)
+    r"|running [1-9]\d* tests?"                                  # cargo
+    r"|Tests run:\s*[1-9]"                                       # maven/surefire
+    r"|(?:Total|Passed|Failed):\s*[1-9]"                         # dotnet/VSTest
+    r"|\b[1-9]\d* tests?,\s*\d+ failures?"                       # mix
+    r"|\b[1-9]\d* examples?,|\b[1-9]\d* runs?,"                  # rspec / minitest
+    r"|\[  (?:PASSED|FAILED)  \] [1-9]"                          # gtest
+    r"|Executed [1-9]\d* tests?|Test run with [1-9]\d* tests?"   # swift
+    r"|All tests passed|OK \([1-9]",                             # dart / phpunit
+    re.I | re.M,
+)
+
+
 def _classify_generic(rc: int, out: str) -> str:
-    """Opaque-wrapper / unknown-runner fallback: we cannot reliably tell no-tests
-    from pass (that is exactly why a wrapper degrades to Tier-B). rc 0 → passed,
-    nonzero → failed. env/timeout already handled by `classify`."""
-    return PASSED if rc == 0 else FAILED
+    """Opaque-wrapper / unknown-runner fallback (`npm test`, `make check`,
+    `./run-tests.sh`, a `bash -lc` string naming no runner we recognize).
+
+    rc nonzero → failed. rc 0 → passed, UNLESS the output carries a zero-test marker
+    from SOME known runner and NO evidence that anything ran — then no_tests. That
+    last branch is what stops the wrapper path from re-opening the false-green this
+    module exists to close: `npm test` is the single most common gate command there
+    is, argv[0] alone can never see the jasmine / Karma / go / VSTest / gtest behind
+    it, and every one of those EXITS 0 on an empty run. Both halves are required —
+    the marker alone would mislabel a multi-suite wrapper whose FIRST suite is empty
+    and whose second really ran (the go `[no test files]`-beside-a-passing-package
+    shape), so a nonzero count anywhere keeps the run `passed`.
+
+    Erring toward no_tests here is deliberate and fail-SAFE: the gate maps no_tests to
+    a loud "zero coverage, not green" SKIP that never blocks the push
+    (`commit_push._emit_no_tests_skip`), whereas the error it replaces — reporting a
+    zero-test run as a verified GREEN — is the one this module must never make.
+    env/timeout are already handled by `classify`."""
+    if rc != 0:
+        return FAILED
+    if _NO_TESTS_MARKERS_ANY.search(out) and not _RAN_TESTS_MARKERS_ANY.search(out):
+        return NO_TESTS
+    return PASSED
 
 
 # ---- Python ---------------------------------------------------------------------
@@ -778,6 +954,49 @@ def _go_json_stream(out: str) -> bool:
                          r"|ok\s|FAIL\b|PASS\r?$)")
 
 
+#: A `go test -v` per-test REGION: `=== RUN/PAUSE/CONT/NAME <test>` opens it, and the
+#: test's OWN stdout — which go echoes VERBATIM, at column 0 — runs until the test's
+#: column-0 verdict (a SUBTEST verdict is indented, so a column-0 `--- PASS/FAIL/SKIP:`
+#: is the top-level test's own). The package RESULT lines (`ok`/`FAIL`/`PASS`/`?`) also
+#: close a region, defensively: a panicking test never prints a verdict, and leaving the
+#: region open would swallow the REST of a `./...` run — hiding a real build failure (a
+#: false NEGATIVE, the worse direction).
+_GO_V_OPEN_RE = re.compile(r"^=== (?:RUN|PAUSE|CONT|NAME)\b")
+_GO_V_CLOSE_RE = re.compile(r"^(?:---\s+(?:PASS|FAIL|SKIP|BENCH):|ok\s|FAIL\b|PASS\b|\?\s)")
+
+
+def _go_tool_lines(out: str) -> str:
+    """`out` with every `go test -v` TEST-BODY region stripped — the lines the go TOOL
+    itself printed, not the ones a TEST printed.
+
+    `go test -v` echoes a passing test's stdout verbatim at column 0 (verified on
+    go1.26.5), so a tooling/snapshot test that prints CAPTURED build-failure text — a
+    `# <pkg>` header AND a `file.go:line:col:` diagnostic, exactly what a `go build`
+    transcript looks like — otherwise trips the compile_error predicate below and REDs
+    a suite that PASSED (rc 0, every test green).
+
+    Stripping the regions is what makes that predicate safe WITHOUT gating it on the
+    exit code or on run-evidence absence — both of which would cost real coverage: go
+    builds every package BEFORE running any test binary, so a genuine build failure's
+    `# <pkg>` header is printed OUTSIDE any test region (verified go1.26.5: it is line
+    1 of a `go test -v ./...` whose sibling package passes), and it therefore survives
+    this strip. The predicate stays EXIT-CODE-INDEPENDENT — an exit-0 build failure
+    (golang/go#64286) beside a PASSING sibling package still REDs, which an `rc != 0`
+    or "no run evidence anywhere" gate would each have silently let through."""
+    kept, in_test = [], False
+    for line in (out or "").splitlines():
+        if _GO_V_OPEN_RE.match(line):
+            in_test = True
+            kept.append(line)
+            continue
+        if in_test:
+            if not _GO_V_CLOSE_RE.match(line):
+                continue                    # a TEST's own stdout — not the go tool's
+            in_test = False
+        kept.append(line)
+    return "\n".join(kept)
+
+
 def _classify_go(rc: int, out: str) -> str:
     # A build failure and a test failure BOTH exit nonzero (the exact numeric code is
     # version/context-dependent — sources disagree 1 vs 2), so distinguish WHICH red a
@@ -846,14 +1065,36 @@ def _classify_go(rc: int, out: str) -> str:
     # doc/lint run) AND misroute a failing test whose captured build path contained a
     # space (`/home/ci/My Project/broken/main.go:5:9:`) into compile_error. Keep it space-
     # excluding; do NOT re-widen.
-    if _has(out, r"(?m)^#\s+\S") and _has(out, r"(?m)^(?:[a-zA-Z]:)?[^\s:]+\.go:\d+:\d+:"):
+    # Both halves are matched against the go TOOL's own lines (`_go_tool_lines`), NOT the
+    # raw output: under `-v` go echoes a PASSING test's stdout verbatim at column 0, so a
+    # tooling/snapshot test printing a captured `go build` transcript emits BOTH halves at
+    # column 0 on an rc==0 all-green run and false-RED the gate. Scoping the SAME two
+    # regexes to the tool's lines fixes that while keeping the predicate exit-code-
+    # independent (see `_go_tool_lines`) — do NOT instead gate it on `rc != 0` or on
+    # run-evidence absence: either would drop the exit-0 build failure beside a passing
+    # sibling that this predicate exists to catch.
+    tool_out = _go_tool_lines(out)
+    if _has(tool_out, r"(?m)^#\s+\S") and _has(
+            tool_out, r"(?m)^(?:[a-zA-Z]:)?[^\s:]+\.go:\d+:\d+:"):
         return COMPILE_ERROR
-    # go test exits 0 for BOTH all-pass AND "[no test files]" — parse the marker,
-    # and only call it no_tests when NOTHING actually ran (no `ok`/`PASS`/`--- FAIL`).
+    # go test exits 0 for BOTH all-pass AND a zero-test run — parse the marker, and
+    # call it no_tests only when NOTHING actually ran. RUN EVIDENCE is an UNANNOTATED
+    # column-0 `ok` line (`_GO_OK_RAN`) or a `--- PASS`, and deliberately NOT:
+    #   * a bare `^ok\s` — `go test -run Nomatch ./...` filters every test out yet
+    #     still exits 0 printing `ok  pkg 0.5s [no tests to run]` at column 0 (and a
+    #     `_test.go`-less package prints `[no test files]`), so a blind `^ok` read
+    #     those zero-test runs as evidence and false-GREENED them (verified go1.26.5);
+    #   * a bare `^PASS\b` — the test binary prints a column-0 `PASS` under `-v` even
+    #     when zero tests ran (`testing: warning: no tests to run` / `PASS` / `ok pkg
+    #     [no tests to run]`, verified go1.26.5), so `PASS` proves only that the binary
+    #     did not fail, NOT that anything executed.
+    # The evidence check stays a WHOLE-OUTPUT scan so a package that genuinely ran
+    # keeps a `go test ./...` run GREEN when a SIBLING package is empty (the common
+    # `?  pkg [no test files]` beside `ok  pkg 0.2s` shape).
     if rc == 0:
         if _has(out, r"\[no test files\]", r"no test files", r"\[no tests to run\]",
                 r"testing: warning: no tests to run") and not _has(
-                out, r"(?m)^ok\s", r"(?m)^---\s+PASS", r"(?m)^PASS\b"):
+                out, "(?m)" + _GO_OK_RAN, r"(?m)^---\s+PASS"):
             return NO_TESTS
         return PASSED
     return FAILED
@@ -980,13 +1221,20 @@ def _classify_dotnet(rc: int, out: str) -> str:
     # be masked green (round-1 1bd706113d dropped this rc==0 gate → red→green masking).
     # The reliable markers are "No test is available in <assembly>" (nothing discovered)
     # and "no test matches the specified selection criteria" (a filter matched
-    # nothing) — NOT a "Total: 0" line, which VSTest does not reliably print (kept
-    # only as a harmless extra, since a real pass shows "Total: [1-9]"). Per-test
-    # failure evidence and the abort branch above already RED any rc!=0 run, so no
-    # separate failure-evidence guard is needed once the markers are rc==0-gated.
+    # nothing) — always safe regardless of project count. The "Total: 0" / "Passed: 0"
+    # summary markers are per-PROJECT lines: `dotnet test` on a multi-project solution
+    # prints one summary line per project, so a solution with one empty project and one
+    # passing project emits BOTH "Total: 0" (the empty project) and "Total: 3" (the
+    # project with real tests) at rc==0. Gate those two markers on the absence of a
+    # nonzero count ANYWHERE in the output — same guard shape as _classify_swift below —
+    # so a passing multi-project run can never be masked NO_TESTS by a sibling empty
+    # project's zero-count trailer.
     if rc == 0 and _has(out, r"No test is available",
-                        r"no test matches the specified selection criteria",
-                        r"Total:\s*0\b", r"Passed!\s*-\s*Failed:\s*0,\s*Passed:\s*0"):
+                        r"no test matches the specified selection criteria"):
+        return NO_TESTS
+    if rc == 0 and _has(out, r"Total:\s*0\b",
+                        r"Passed!\s*-\s*Failed:\s*0,\s*Passed:\s*0") and not _has(
+            out, r"Total:\s*[1-9]\d*\b", r"Passed!\s*-\s*Failed:\s*\d+,\s*Passed:\s*[1-9]"):
         return NO_TESTS
     if rc == 0:
         return PASSED
