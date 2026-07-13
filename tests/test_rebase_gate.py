@@ -453,3 +453,156 @@ def test_rebase_check_reports_error_status_when_run_raises(repo):
 
     result = rebase_gate.rebase_check(str(repo), "main", run=raising_run)
     assert result["status"] == "error"
+
+
+# ── 12. Fork checkout — the base remote is upstream, not origin ───────────────
+
+@pytest.fixture
+def fork(tmp_path):
+    """A fork checkout: ``origin`` is the contributor's fork, the PR base lives
+    on ``upstream``.
+
+    Built exactly as a contributor's clone is: ``upstream.git`` (bare, hosts
+    ``main``) → ``fork.git`` (a bare clone of it) → ``work`` (a plain clone of
+    the FORK, so ``origin`` = fork), with ``upstream`` added as a second remote
+    afterwards. Crucially ``branch.main.remote`` stays ``origin`` — that is
+    what a plain ``git clone <fork>`` leaves behind, which is why the
+    ``branch.<base>.remote`` lookup alone cannot save this shape.
+
+    Returns ``(work, upstream_path, seed)``; ``seed`` is a clone of upstream
+    used to push commits onto the real base."""
+    upstream = tmp_path / "upstream.git"
+    _g(tmp_path, "init", "-q", "--bare", str(upstream))
+
+    seed = tmp_path / "seed"
+    _g(tmp_path, "clone", "-q", str(upstream), str(seed))
+    _g(seed, "config", "user.email", "t@example.com")
+    _g(seed, "config", "user.name", "Tester")
+    _g(seed, "checkout", "-q", "-b", "main")
+    _write(seed / "base.py", "x = 1\n")
+    _g(seed, "add", "-A")
+    _g(seed, "commit", "-qm", "base commit")
+    _g(seed, "push", "-q", "-u", "origin", "main")
+    # `git init --bare` sets HEAD from init.defaultBranch, which may not be
+    # `main`; point it at the branch that actually exists so clones of this
+    # repo (and of the fork below) check out `main`.
+    _g(upstream, "symbolic-ref", "HEAD", "refs/heads/main")
+
+    fork_bare = tmp_path / "fork.git"
+    _g(tmp_path, "clone", "-q", "--bare", str(upstream), str(fork_bare))
+
+    work = tmp_path / "work"
+    _g(tmp_path, "clone", "-q", str(fork_bare), str(work))
+    _g(work, "config", "user.email", "c@example.com")
+    _g(work, "config", "user.name", "Contributor")
+    _g(work, "remote", "add", "upstream", str(upstream))
+    _g(work, "fetch", "-q", "upstream")
+    _g(work, "checkout", "-q", "-b", "feat/x", "main")
+    _write(work / "feature.py", "y = 2\n")
+    _g(work, "add", "-A")
+    _g(work, "commit", "-qm", "feature work")
+    _g(work, "push", "-q", "-u", "origin", "feat/x")
+
+    # The base advances on UPSTREAM only; the fork's own `main` stays stale.
+    _write(seed / "other.py", "z = 3\n")
+    _g(seed, "add", "-A")
+    _g(seed, "commit", "-qm", "upstream base advances")
+    _g(seed, "push", "-q", "origin", "main")
+
+    return work, upstream, seed
+
+
+def test_fork_branch_config_still_points_at_origin(fork):
+    """Pins the premise: in a fork clone `branch.main.remote` IS `origin`, so
+    that lookup alone cannot find the upstream base."""
+    work, _upstream, _seed = fork
+    assert _g(work, "config", "--get", "branch.main.remote").stdout.strip() == "origin"
+
+
+def test_fork_explicit_remote_sees_upstream_is_ahead(fork):
+    """With `--remote upstream`, the gate compares against the REAL base and
+    reports the branch as behind (a rebase is required)."""
+    work, _upstream, _seed = fork
+    result = rebase_gate.rebase_check(str(work), "main", remote="upstream")
+    assert result["remote"] == "upstream"
+    assert result["status"] == "clean"
+    assert result["behind"] == 1
+
+
+def test_fork_repo_hint_resolves_the_upstream_remote(fork, tmp_path):
+    """`repo` (the owner/repo the PR base lives on) is matched against the
+    configured remotes' URLs — the authoritative signal, per
+    merge._remote_for_repo — and selects `upstream` over `origin`."""
+    work, _upstream, _seed = fork
+    result = rebase_gate.rebase_check(str(work), "main",
+                                      repo=f"{tmp_path.name}/upstream")
+    assert result["remote"] == "upstream"
+    assert result["status"] == "clean"
+    assert result["behind"] == 1
+
+
+def test_fork_without_a_hint_compares_against_the_stale_fork(fork):
+    """Documents WHY --repo/--remote exist: with no hint the chain falls back to
+    branch.main.remote → `origin` (the fork), whose `main` is stale, so the
+    branch reads up-to-date even though upstream/main is ahead."""
+    work, _upstream, _seed = fork
+    result = rebase_gate.rebase_check(str(work), "main")
+    assert result["remote"] == "origin"
+    assert result["status"] == "up-to-date"
+
+
+def test_explicit_remote_overrides_repo_hint(fork, tmp_path):
+    """`remote` is the explicit operator override and wins over `repo`."""
+    work, _upstream, _seed = fork
+    assert rebase_gate._resolve_base_remote(
+        str(work), "main", rebase_gate._default_run,
+        repo=f"{tmp_path.name}/upstream", remote="origin") == "origin"
+
+
+def test_unmatched_repo_hint_falls_back_to_branch_config(fork):
+    """A `repo` that matches no configured remote must not break the check — it
+    falls through to branch.<base>.remote, then origin."""
+    work, _upstream, _seed = fork
+    assert rebase_gate._resolve_base_remote(
+        str(work), "main", rebase_gate._default_run,
+        repo="someone/not-a-configured-remote") == "origin"
+
+
+def test_repo_and_remote_flags_reach_the_verb(fork, tmp_path):
+    """The CLI plumbs --repo/--remote through to the engine (both verbs)."""
+    work, _upstream, _seed = fork
+    seen = {}
+    original = rebase_gate.run_check_verb
+
+    def fake_verb(cwd, base, **kwargs):
+        seen.update(kwargs)
+        return 0
+
+    rebase_gate.run_check_verb = fake_verb
+    try:
+        rc = cli.main(["rebase-check", "--cwd", str(work), "--base", "main",
+                       "--repo", f"{tmp_path.name}/upstream",
+                       "--remote", "upstream", "--json-only"])
+    finally:
+        rebase_gate.run_check_verb = original
+
+    assert rc == 0
+    assert seen["repo"] == f"{tmp_path.name}/upstream"
+    assert seen["remote"] == "upstream"
+
+    args = cli.build_parser().parse_args(
+        ["rebase", "--repo", "o/r", "--remote", "upstream"])
+    assert (args.repo, args.remote) == ("o/r", "upstream")
+
+
+def test_cli_rebase_check_end_to_end_with_remote_flag(fork, capsys):
+    """End-to-end through cli.main: the fork checkout with --remote upstream
+    reports `clean` (behind), not a false `up-to-date`."""
+    work, _upstream, _seed = fork
+    rc = cli.main(["rebase-check", "--cwd", str(work), "--base", "main",
+                   "--remote", "upstream", "--json-only"])
+    data = json.loads(capsys.readouterr().out.strip())
+    assert rc == 0
+    assert data["remote"] == "upstream"
+    assert data["status"] == "clean"
+    assert data["behind"] == 1

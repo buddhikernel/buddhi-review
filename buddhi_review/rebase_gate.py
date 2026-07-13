@@ -103,6 +103,45 @@ def _resolve_baseref(cwd: str, base: str, remote: str, run: Any,
     return None
 
 
+def _resolve_base_remote(cwd: str, base: str, run: Any, *,
+                         repo: Optional[str] = None,
+                         remote: Optional[str] = None) -> str:
+    """Resolve the remote that hosts the BASE branch, NOT the feature branch's.
+
+    Order (the same chain as ``buddhi_review.merge._base_remote``): an explicit
+    ``remote`` → the configured remote whose URL resolves to ``repo`` (the
+    ``owner/repo`` the PR's base actually lives on — authoritative) →
+    ``branch.<base>.remote`` → ``origin``.
+
+    ``branch.<base>.remote`` alone is NOT enough for a fork checkout: a plain
+    ``git clone <fork>`` leaves ``branch.<base>.remote`` = ``origin`` (the
+    fork) even after the contributor adds an ``upstream`` remote, so the base
+    would be compared against the fork's own stale copy of ``main`` and a
+    needed rebase would be reported ``up-to-date``. Callers with PR context
+    supply ``repo`` (``--repo``) or ``--remote``; callers without it keep the
+    historical config→``origin`` chain.
+
+    The ``repo`` match REUSES :func:`buddhi_review.merge._remote_for_repo` (one
+    authoritative implementation of remote-URL matching, host disambiguation
+    included) via an adapter that routes its ``git`` call back through this
+    module's injected ``run`` seam."""
+    if remote:
+        return remote
+    if repo:
+        from buddhi_review.merge import _remote_for_repo
+
+        def _adapter(argv: Sequence[str], cwd: Optional[str] = None, **_kw: Any) -> Any:
+            return _git(cwd or "", *list(argv)[1:], run=run)
+
+        matched = _remote_for_repo(repo, cwd=cwd, run=_adapter)
+        if matched:
+            return matched
+    cfg_r = _git(cwd, "config", "--get", f"branch.{base}.remote", run=run)
+    if _rc(cfg_r) == 0 and _stdout(cfg_r):
+        return _stdout(cfg_r)
+    return "origin"
+
+
 def _merge_tree_clean(cwd: str, baseref: str,
                       run: Any) -> Tuple[str, List[str]]:
     """Best-effort conflict prediction WITHOUT touching the working tree.
@@ -139,10 +178,16 @@ def _merge_tree_clean(cwd: str, baseref: str,
 # ── The free rebase-check ──────────────────────────────────────────────────────
 
 def rebase_check(cwd: str, base: str, *, fetch: bool = True,
-                 run: Any = _default_run) -> Dict[str, Any]:
-    """Read-only: report whether <cwd>'s HEAD is based on the latest remote/<base>.
+                 run: Any = _default_run, repo: Optional[str] = None,
+                 remote: Optional[str] = None) -> Dict[str, Any]:
+    """Read-only: report whether <cwd>'s HEAD is based on the latest <remote>/<base>.
 
     status ∈ up-to-date | clean | conflicts | dirty | error.
+
+    ``repo`` (the ``owner/repo`` hosting the PR's base) and ``remote`` (an
+    explicit remote name) select the remote the base is compared against — see
+    :func:`_resolve_base_remote`. Without either, the chain falls back to
+    ``branch.<base>.remote`` then ``origin``.
 
     A dirty working tree is reported as ``dirty`` (a rebase would fail); the
     behind/ahead counts are still populated when determinable. A failed fetch
@@ -150,42 +195,46 @@ def rebase_check(cwd: str, base: str, *, fetch: bool = True,
     guarantee cannot be met against a possibly-stale local ref, so the skill
     should ask rather than trust it."""
     if not os.path.isdir(cwd):
-        return {"status": "error", "detail": f"cwd does not exist: {cwd}"}
-    if _rc(_git(cwd, "rev-parse", "--is-inside-work-tree", run=run)) != 0:
-        return {"status": "error", "detail": "not a git work tree"}
+        return {"status": "error", "base": base, "base_resolved": None,
+                "remote": None, "behind": None, "ahead": None,
+                "conflict_files": [], "detail": f"cwd does not exist: {cwd}"}
+    wt_r = _git(cwd, "rev-parse", "--is-inside-work-tree", run=run)
+    # A bare repo exits 0 with stdout "false" (no working tree to rebase in),
+    # so the exit code alone is not sufficient — stdout must be checked too.
+    if _rc(wt_r) != 0 or _stdout(wt_r) != "true":
+        return {"status": "error", "base": base, "base_resolved": None,
+                "remote": None, "behind": None, "ahead": None,
+                "conflict_files": [], "detail": "not a git work tree"}
 
     # Dirty-tree probe (porcelain: non-empty → uncommitted changes present).
     dirty_r = _git(cwd, "status", "--porcelain", run=run)
     dirty = _rc(dirty_r) == 0 and bool(_stdout(dirty_r))
 
-    # Resolve the remote that hosts the BASE branch (branch.<base>.remote),
-    # not the feature branch's remote: in a fork checkout the feature branch
-    # tracks origin (the fork) while the PR base lives on upstream, so
-    # comparing against origin/<base> would silently miss commits merged
-    # straight to upstream. Mirrors ``buddhi_review.merge._base_remote``'s
-    # ``branch.<base>.remote`` lookup.
-    remote = "origin"
-    cfg_r = _git(cwd, "config", f"branch.{base}.remote", run=run)
-    if _rc(cfg_r) == 0 and _stdout(cfg_r):
-        remote = _stdout(cfg_r)
+    # The remote that hosts the BASE branch, not the feature branch's remote:
+    # in a fork checkout the feature branch tracks origin (the fork) while the
+    # PR base lives on upstream, so comparing against origin/<base> would
+    # silently miss commits merged straight to upstream.
+    base_remote = _resolve_base_remote(cwd, base, run, repo=repo, remote=remote)
 
     if fetch:
-        fr = _git(cwd, "fetch", remote, base, run=run)
+        fr = _git(cwd, "fetch", base_remote, base, run=run)
         if _rc(fr) != 0:
             out: Dict[str, Any] = {
                 "status": "error", "base": base, "base_resolved": None,
-                "behind": None, "ahead": None, "conflict_files": [],
-                "fetch_failed": True,
-                "detail": (f"git fetch {remote} {base} failed; cannot verify "
+                "remote": base_remote, "behind": None, "ahead": None,
+                "conflict_files": [], "fetch_failed": True,
+                "detail": (f"git fetch {base_remote} {base} failed; cannot verify "
                            f"base freshness: {_stderr(fr)[:200]}"),
             }
             if dirty:
                 out["dirty"] = True
             return out
 
-    baseref = _resolve_baseref(cwd, base, remote, run, try_fetch_head=fetch)
+    baseref = _resolve_baseref(cwd, base, base_remote, run, try_fetch_head=fetch)
     if not baseref:
         return {"status": "error", "base": base, "base_resolved": None,
+                "remote": base_remote, "behind": None, "ahead": None,
+                "conflict_files": [],
                 "detail": f"could not resolve base ref for {base!r}"}
 
     behind = _count_commits(cwd, f"HEAD..{baseref}", run)
@@ -194,7 +243,8 @@ def rebase_check(cwd: str, base: str, *, fetch: bool = True,
     if behind is None:
         result: Dict[str, Any] = {
             "status": "error", "base": base, "base_resolved": baseref,
-            "behind": None, "ahead": ahead, "conflict_files": [],
+            "remote": base_remote, "behind": None, "ahead": ahead,
+            "conflict_files": [],
             "detail": f"could not count commits vs {baseref}",
         }
         if dirty:
@@ -202,7 +252,7 @@ def rebase_check(cwd: str, base: str, *, fetch: bool = True,
         return result
 
     out2: Dict[str, Any] = {
-        "base": base, "base_resolved": baseref,
+        "base": base, "base_resolved": baseref, "remote": base_remote,
         "behind": behind, "ahead": ahead, "conflict_files": [],
     }
 
@@ -316,6 +366,8 @@ def run_check_verb(
     run: Any = _default_run,
     out: Any = None,
     json_only: bool = False,
+    repo: Optional[str] = None,
+    remote: Optional[str] = None,
 ) -> int:
     """The ``rebase-check`` subcommand body: check + guidance only, NEVER
     mutates. Run :func:`rebase_check`, print JSON, then print guidance.
@@ -326,7 +378,8 @@ def run_check_verb(
     surprise the caller by mutating the repo."""
     out = out or sys.stdout
 
-    result = rebase_check(cwd, base, fetch=fetch, run=run)
+    result = rebase_check(cwd, base, fetch=fetch, run=run, repo=repo,
+                          remote=remote)
     print(json.dumps(result), file=out)
 
     if not json_only:
@@ -349,6 +402,8 @@ def run_rebase_verb(
     backend: Any = None,
     out: Any = None,
     json_only: bool = False,
+    repo: Optional[str] = None,
+    remote: Optional[str] = None,
 ) -> int:
     """The ``rebase`` subcommand body — the paid-capability ACTION verb.
 
@@ -370,7 +425,8 @@ def run_rebase_verb(
 
     # Free path: no paid capability — check + guidance only, decline to
     # mutate (same read-only contract as rebase-check).
-    result = rebase_check(cwd, base, fetch=fetch, run=run)
+    result = rebase_check(cwd, base, fetch=fetch, run=run, repo=repo,
+                          remote=remote)
     print(json.dumps(result), file=out)
 
     if not json_only:

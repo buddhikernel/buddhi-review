@@ -291,6 +291,20 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                         "accidentally-silent fleet)")
 
 
+def _add_base_remote_args(sp: argparse.ArgumentParser) -> None:
+    """Base-remote selection, shared by ``rebase-check`` and ``rebase``.
+
+    Without these, a fork checkout (origin = the contributor's fork, PR base on
+    upstream) resolves the base to the fork's own stale copy of the branch and
+    the gate reports ``up-to-date`` when ``upstream/<base>`` is ahead."""
+    sp.add_argument("--repo", default=None,
+                    help="owner/repo hosting the base branch; its matching git "
+                         "remote is used (fork checkouts: pass the upstream repo)")
+    sp.add_argument("--remote", default=None,
+                    help="git remote hosting the base branch; overrides --repo "
+                         "(default: branch.<base>.remote, else origin)")
+
+
 def _detect_rebase_base(args: argparse.Namespace) -> str:
     cwd = args.cwd or os.getcwd()
     if args.base:
@@ -317,6 +331,8 @@ def _rebase_check(args: argparse.Namespace) -> int:
         cwd, base,
         fetch=not args.no_fetch,
         json_only=args.json_only,
+        repo=getattr(args, "repo", None),
+        remote=getattr(args, "remote", None),
     )
 
 
@@ -345,6 +361,8 @@ def _rebase(args: argparse.Namespace) -> int:
         fetch=not args.no_fetch,
         backend=backend,
         json_only=args.json_only,
+        repo=getattr(args, "repo", None),
+        remote=getattr(args, "remote", None),
     )
 
 
@@ -385,6 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     rc.add_argument("--cwd", help="repo directory (default: cwd)")
     rc.add_argument("--base", default=None,
                     help="base branch to check against (default: auto-detect origin/HEAD)")
+    _add_base_remote_args(rc)
     rc.add_argument("--no-fetch", action="store_true",
                     help="skip git fetch (use local tracking refs; may be stale)")
     rc.add_argument("--json-only", action="store_true",
@@ -398,6 +417,7 @@ def build_parser() -> argparse.ArgumentParser:
     rb.add_argument("--cwd", help="repo directory (default: cwd)")
     rb.add_argument("--base", default=None,
                     help="base branch to rebase onto (default: auto-detect origin/HEAD)")
+    _add_base_remote_args(rb)
     rb.add_argument("--no-fetch", action="store_true",
                     help="skip git fetch (use local tracking refs; may be stale)")
     rb.add_argument("--json-only", action="store_true",
