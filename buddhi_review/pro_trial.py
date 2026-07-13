@@ -20,8 +20,8 @@ zero-paste way and then hands off to the installed Pro wheel:
      only the discovered backend object (§E.2).
 
 It also carries the **convert / re-subscribe** path: print the checkout, then
-concierge-paste the emailed paid key (clipboard-detect → manual paste), validate it
-with the public tokenless ``validate-key`` action, and install.
+concierge-paste the emailed paid key (consent-gated clipboard-detect → hidden manual
+paste), validate it with the public tokenless ``validate-key`` action, and install.
 
 ⛔ **ACQUISITION ONLY — zero entitlement ENFORCEMENT.** Nothing here does runtime
 entitlement checking — no cryptographic verification, no runtime entitlement gate,
@@ -234,9 +234,15 @@ def pip_install(*, runner: Optional[Callable] = None) -> Tuple[bool, int, str]:
     """``pip install buddhi-review-pro`` from the license-gated index. Returns
     ``(ok, returncode, output)``. The index credential is NOT on the command line —
     pip reads it from the ``~/.netrc`` written just before this call — so the key is
-    never exposed in argv. The ``runner`` seam keeps this network-free under test."""
+    never exposed in argv. The ``runner`` seam keeps this network-free under test.
+
+    ``--no-input`` (pip ≥ 21.1) is what keeps a credential failure FAST: setup runs on an
+    inherited TTY, so an ignored / malformed ~/.netrc or a 401 from the index would
+    otherwise leave pip blocking on its interactive user/password prompt — the wizard
+    would simply look hung until the 600 s timeout instead of falling into the
+    ``pip_failed`` / ``index_403`` paths below."""
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", _PACKAGE,
-           "--index-url", _index_url()]
+           "--index-url", _index_url(), "--no-input"]
     run = runner or (lambda c: subprocess.run(c, capture_output=True, text=True,
                                               timeout=600))
     try:
@@ -334,16 +340,23 @@ def _expiry_phrase(attrs: Optional[dict]) -> str:
 
 # ═══════════════════════════════ Orchestration ═════════════════════════════════
 
-def _finish_install(key: str, *, attrs=None, backends=None, runner=None,
+def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runner=None,
                     netrc_path=None, is_active=None, sleep=None, attempts=20) -> TrialOutcome:
     """Shared tail for both the trial and the convert paths: write the index
     credential → pip install → start the daemon → confirm activation → message.
     Every failure leaves ``~/.netrc`` intact (the key is valid; the user can retry
-    the install later)."""
-    ok, _action = write_index_credential(key, path=netrc_path)
+    the install later). ``is_trial`` selects trial-vs-paid wording for the success
+    and not-activated messages — ``convert()`` passes a paid key with no ``attrs``,
+    so the messaging must not default to trial language."""
+    ok, action = write_index_credential(key, path=netrc_path)
     if not ok:
         return TrialOutcome(False, "netrc_failed",
                             "Could not write ~/.netrc — check the file's permissions and re-run.")
+    if action == "appended-unparsed":
+        return TrialOutcome(False, "netrc_unparsed",
+                            "~/.netrc has an entry that could not be safely updated (it shares a "
+                            "line with another entry) — your new credential was appended instead. "
+                            "Please clean up ~/.netrc by hand, then re-run setup.")
 
     installed, rc, output = pip_install(runner=runner)
     if not installed:
@@ -357,15 +370,21 @@ def _finish_install(key: str, *, attrs=None, backends=None, runner=None,
 
     start_daemon(backends=backends)
     if _await_active(backends=backends, is_active=is_active, sleep=sleep, attempts=attempts):
+        status_phrase = _expiry_phrase(attrs) if is_trial else "your subscription is active"
         return TrialOutcome(True, "active",
-                            f"✓ Buddhi Pro is active — {_expiry_phrase(attrs)}. "
+                            f"✓ Buddhi Pro is active — {status_phrase}. "
                             "The live view is starting in the background.")
-    # Installed but the machine did not activate — most often this machine already
-    # used its one trial (the policy allows one per machine). One calm line + the
-    # convert pointer; no error spam.
+    # Installed but the machine did not activate. On the trial path this is most
+    # often this machine already used its one trial (the policy allows one per
+    # machine); on the convert path the paid key may simply be active on another
+    # machine already. One calm line + the appropriate pointer; no error spam.
+    if is_trial:
+        return TrialOutcome(False, "not_activated",
+                            "Pro installed, but it did not activate on this machine — it may have "
+                            f"already been used for a trial. {_convert_pointer()}")
     return TrialOutcome(False, "not_activated",
-                        "Pro installed, but it did not activate on this machine — it may have "
-                        f"already been used for a trial. {_convert_pointer()}")
+                        "Pro installed, but it did not activate on this machine — your key may "
+                        f"already be active elsewhere. Contact support via {CHECKOUT_URL}.")
 
 
 def start_trial(email: str, *, transport=None, backends=None, runner=None,
@@ -425,19 +444,73 @@ def _read_clipboard(reader: Optional[Callable] = None) -> str:
     return ""
 
 
+# A key is ONE opaque whitespace-free token: every Keygen key format — hyphen-grouped
+# hex, a UUID, or a signed ``key/<payload>.<signature>`` — is a single run of these
+# characters. Prose, a URL, a wrapped paragraph or a passphrase with spaces is
+# definitively NOT a key, and must never leave the machine to find that out.
+_KEY_SHAPE_RE = re.compile(r"^[A-Za-z0-9._/+=-]{12,4096}$")
+
+
+def _looks_like_license_key(candidate: str) -> bool:
+    """A NARROW *shape* gate on clipboard content — never a semantic one (the server
+    stays the only authority on whether a key is real). A false negative is harmless:
+    the caller falls straight through to the manual-paste prompt."""
+    return bool(_KEY_SHAPE_RE.match(candidate or ""))
+
+
+def _mask_key(candidate: str) -> str:
+    """A recognisable but non-disclosing preview for the consent prompt: enough for the
+    owner to recognise their own key, never enough to spill a mis-copied secret into
+    the scrollback."""
+    if len(candidate) <= 8:
+        return "*" * len(candidate)
+    return f"{candidate[:4]}{'*' * 6}{candidate[-4:]}"
+
+
+def _clipboard_consented(candidate: str, confirm_input: Callable) -> bool:
+    """Ask BEFORE the clipboard leaves the machine. Defaults to NO: a non-interactive
+    host (EOF / no usable stdin) or any answer other than an explicit yes declines, and
+    the caller falls back to the manual paste."""
+    try:
+        answer = (confirm_input(
+            f"Use the Pro key in your clipboard ({_mask_key(candidate)})? [y/N]: ") or "")
+    except (EOFError, KeyboardInterrupt, OSError):
+        return False
+    return answer.strip().lower() in ("y", "yes")
+
+
+def _hidden_paste_input(prompt: str) -> str:
+    """Read the pasted key WITHOUT echoing it. The key IS the private-index password
+    (it goes straight into ~/.netrc), so a plain ``input`` would leave a live credential
+    in the terminal scrollback of every SSH / headless / manual-paste session. The
+    wizard injects its own wrapped-paste-safe hidden reader over this default."""
+    import getpass
+    try:
+        return getpass.getpass(prompt)
+    except Exception:
+        return ""
+
+
 def detect_pasted_key(*, transport=None, clipboard_reader=None,
-                      paste_input: Callable = input) -> Optional[str]:
-    """Concierge-paste: if the clipboard already holds a VALID key, use it; else
-    prompt for a manual paste and validate that. Returns the validated key or None.
-    Validation uses the public tokenless validate-key action (allowed at acquisition
-    — it is proof-of-possession, not lease enforcement)."""
+                      paste_input: Callable = _hidden_paste_input,
+                      confirm_input: Callable = input) -> Optional[str]:
+    """Concierge-paste: OFFER a key-shaped clipboard candidate and, only with the user's
+    explicit consent, validate it; else prompt for a hidden manual paste and validate
+    that. Returns the validated key or None.
+
+    The clipboard is NEVER transmitted unprompted. A stale clipboard routinely holds an
+    unrelated password / API token — itself key-shaped — so a candidate must BOTH match
+    the narrow key shape AND be explicitly confirmed before it is POSTed to validate-key.
+    Everything else falls through to the manual paste, so declining costs one paste and
+    leaks nothing. Validation uses the public tokenless validate-key action (allowed at
+    acquisition — it is proof-of-possession, not lease enforcement)."""
     clip = _read_clipboard(clipboard_reader)
-    if clip:
+    if clip and _looks_like_license_key(clip) and _clipboard_consented(clip, confirm_input):
         valid, _code = validate_key(clip, transport=transport)
         if valid:
             return clip
     try:
-        raw = (paste_input("Paste your Pro key: ") or "").strip()
+        raw = (paste_input("Paste your Pro key (input hidden): ") or "").strip()
     except (EOFError, KeyboardInterrupt):
         return None
     if not raw:
@@ -446,23 +519,26 @@ def detect_pasted_key(*, transport=None, clipboard_reader=None,
     return raw if valid else None
 
 
-def convert(*, transport=None, clipboard_reader=None, paste_input: Callable = input,
+def convert(*, transport=None, clipboard_reader=None,
+            paste_input: Callable = _hidden_paste_input, confirm_input: Callable = input,
             backends=None, runner=None, netrc_path=None, is_active=None, sleep=None,
             attempts=20, stream=None) -> TrialOutcome:
     """The convert / re-subscribe path: point at the checkout, concierge-paste the
-    emailed paid key (validated tokenlessly), then write ~/.netrc + install +
-    daemon. Never mints a paid license itself and never holds a privileged token —
-    open registration + validate-key only."""
+    emailed paid key (consent-gated clipboard detect, then a HIDDEN manual paste;
+    validated tokenlessly), then write ~/.netrc + install + daemon. Never mints a paid
+    license itself and never holds a privileged token — open registration +
+    validate-key only."""
     out = stream or sys.stdout
     print(f"Subscribe or re-subscribe at {CHECKOUT_URL} — Keygen emails your Pro key.",
           file=out)
     key = detect_pasted_key(transport=transport, clipboard_reader=clipboard_reader,
-                            paste_input=paste_input)
+                            paste_input=paste_input, confirm_input=confirm_input)
     if not key:
         return TrialOutcome(False, "no_key",
                             "No valid key entered — re-run setup once you have your Pro key.")
-    return _finish_install(key, backends=backends, runner=runner, netrc_path=netrc_path,
-                           is_active=is_active, sleep=sleep, attempts=attempts)
+    return _finish_install(key, is_trial=False, backends=backends, runner=runner,
+                           netrc_path=netrc_path, is_active=is_active, sleep=sleep,
+                           attempts=attempts)
 
 
 # ═══════════════════ First-run offer gating (durable dismiss) ═══════════════════

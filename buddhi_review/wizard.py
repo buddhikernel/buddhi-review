@@ -2529,14 +2529,19 @@ def _prompt_email(*, input_fn, stream, pal) -> Optional[str]:
     return None
 
 
-def step_pro_trial(repo: Optional[str], *, pal, stream, input_fn=input) -> None:
+def step_pro_trial(repo: Optional[str], *, pal, stream, input_fn=input,
+                   paste_input: Optional[Callable] = None) -> None:
     """Step 7c — the first-run Pro trial offer (PRO-6, §E.9(a): the one sanctioned
     conversion moment). A single benefit-led line + a default-YES prompt, shown only
     on an interactive first run where Pro is not already active and the upsell
     suppression / durable-dismiss / frequency conventions permit it. Decline is one
     keypress and leaves the locked teaser rows exactly as they are. All trial
     acquisition + install is delegated to the scoped :mod:`pro_trial` module; this
-    function only asks and prints."""
+    function only asks and prints.
+
+    The Pro key is a live credential (it becomes the private-index password), so the
+    convert path reads it through the same HIDDEN, wrapped-paste-safe reader the wizard
+    uses for every other secret — never ``input_fn``, which echoes into the scrollback."""
     if not _is_tty():
         return
     if not pro_trial.offer_allowed(now=None):
@@ -2557,7 +2562,8 @@ def step_pro_trial(repo: Optional[str], *, pal, stream, input_fn=input) -> None:
     if outcome.status == "email_registered" and _ask_yes_no(
             "Already have a Pro key to paste?", default=False,
             input_fn=input_fn, stream=stream, pal=pal):
-        conv = pro_trial.convert(paste_input=input_fn, stream=stream)
+        paste = paste_input or (lambda prompt: _read_pasted_secret(prompt, _default_getpass))
+        conv = pro_trial.convert(paste_input=paste, confirm_input=input_fn, stream=stream)
         _row("ok" if conv.ok else "info", conv.message, pal, stream)
 
 

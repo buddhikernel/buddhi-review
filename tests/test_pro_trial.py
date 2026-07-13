@@ -182,6 +182,19 @@ def test_pip_install_command_targets_package_and_plain_index_no_key():
     assert "@" not in idx and idx.endswith("/simple")
 
 
+def test_pip_install_disables_interactive_prompts():
+    """Setup runs on an inherited TTY: without --no-input a rejected/missing netrc makes
+    pip block on its user/password prompt and the wizard just looks hung until the 600 s
+    timeout, instead of failing fast into pip_failed / index_403."""
+    captured = {}
+
+    def runner(cmd):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+    pro_trial.pip_install(runner=runner)
+    assert "--no-input" in captured["cmd"]
+
+
 def test_pip_install_403_detected():
     def runner(cmd):
         return types.SimpleNamespace(returncode=1, stdout="", stderr="HTTP error 403 Forbidden")
@@ -266,10 +279,11 @@ def test_start_trial_not_activated_unique_per_policy(tmp_path):
 # ── convert / concierge-paste ───────────────────────────────────────────────────
 
 def test_convert_uses_valid_clipboard_key(tmp_path):
+    # A key-shaped clipboard is used ONLY once the user explicitly consents to it.
     t = _full()
     out = pro_trial.convert(
         transport=t, clipboard_reader=lambda: "PAIDKEY-FROM-CLIP",
-        backends=[FakeProBackend(True)],
+        confirm_input=lambda *a: "y", backends=[FakeProBackend(True)],
         runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
         netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
         attempts=2, stream=io.StringIO())
@@ -278,18 +292,122 @@ def test_convert_uses_valid_clipboard_key(tmp_path):
 
 
 def test_convert_falls_back_to_manual_paste_when_clipboard_invalid(tmp_path):
-    # clipboard holds junk that does NOT validate → prompt for manual paste.
+    # consented clipboard that the SERVER rejects → prompt for manual paste.
     def validate(body):
         key = body["meta"]["key"]
         return (200, {"meta": {"valid": key == "GOODKEY", "code": "VALID" if key == "GOODKEY" else "NOT_FOUND"}})
     t = _full(validate=validate)
     out = pro_trial.convert(
         transport=t, clipboard_reader=lambda: "junk-not-a-key",
+        confirm_input=lambda *a: "y",
         paste_input=lambda *a: "GOODKEY", backends=[FakeProBackend(True)],
         runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
         netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
         attempts=2, stream=io.StringIO())
     assert out.ok and "GOODKEY" in (tmp_path / ".netrc").read_text()
+
+
+# ── the clipboard never leaves the machine unbidden (P1: no arbitrary exfiltration) ──
+
+def test_clipboard_is_never_posted_without_explicit_consent(tmp_path):
+    """A stale clipboard holding an unrelated secret must NOT be POSTed just because the
+    user chose the key-paste path: without a yes, validate-key is never called on it."""
+    t = _full()
+    out = pro_trial.convert(
+        transport=t, clipboard_reader=lambda: "ghp_STALE_GITHUB_TOKEN_abcdef123456",
+        confirm_input=lambda *a: "n", paste_input=lambda *a: "", stream=io.StringIO(),
+        netrc_path=tmp_path / ".netrc")
+    assert not out.ok and out.status == "no_key"
+    assert t.calls == []                                  # nothing left the machine at all
+    assert not (tmp_path / ".netrc").exists()
+
+
+def test_declined_clipboard_falls_through_to_manual_paste(tmp_path):
+    """Declining the clipboard costs one paste and leaks nothing — the manual key still
+    installs, and the clipboard value is never sent."""
+    t = _full()
+    out = pro_trial.convert(
+        transport=t, clipboard_reader=lambda: "SOME-OTHER-SECRET-VALUE",
+        confirm_input=lambda *a: "", paste_input=lambda *a: "GOODKEY",
+        backends=[FakeProBackend(True)],
+        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+        netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
+        attempts=2, stream=io.StringIO())
+    assert out.ok
+    sent = [c["body"]["meta"]["key"] for c in t.calls if "validate-key" in c["url"]]
+    assert sent == ["GOODKEY"]                            # the clipboard value was NOT sent
+
+
+def test_non_key_shaped_clipboard_is_not_even_offered():
+    """Clipboard content that cannot be a key (prose / a passphrase with spaces) is
+    dropped locally — no network call AND no consent prompt."""
+    t = _full()
+    asked = []
+    got = pro_trial.detect_pasted_key(
+        transport=t, clipboard_reader=lambda: "the quick brown fox jumps",
+        confirm_input=lambda p: asked.append(p) or "y", paste_input=lambda *a: "")
+    assert got is None
+    assert t.calls == [] and asked == []
+
+
+def test_looks_like_license_key_shape_gate():
+    ok = ["2A26D5-D74C39-D5CDCA-38DA05-4F70E5-V3",          # Keygen hyphen-grouped hex
+          "40680ca7-99c5-4569-8c1d-611713612d3d",           # a UUID key
+          "key/eyJhY2NvdW50IjoiYnVkZGhpIn0=.c2lnbmF0dXJl"]  # a signed key/<payload>.<sig>
+    for k in ok:
+        assert pro_trial._looks_like_license_key(k) is True
+    bad = ["", "short", "correct horse battery staple",     # empty / too short / spaces
+           "my password is hunter2", "line one\nline two"]  # prose / multi-line
+    for k in bad:
+        assert pro_trial._looks_like_license_key(k) is False
+
+
+def test_consent_prompt_masks_the_candidate():
+    """The prompt must let the OWNER recognise their key without spilling a mis-copied
+    secret into the scrollback."""
+    masked = pro_trial._mask_key("ghp_STALE_GITHUB_TOKEN_abcdef123456")
+    assert "STALE_GITHUB_TOKEN" not in masked and masked.startswith("ghp_")
+    assert pro_trial._mask_key("shortkey") == "*" * 8       # short values disclose nothing
+
+
+def test_consent_declines_on_non_interactive_stdin():
+    """A headless / captured-stdin host cannot consent, so it must DECLINE (fail closed)
+    rather than raise or default to sending the clipboard."""
+    def boom(_prompt):
+        raise OSError("reading from stdin while output is captured")
+    assert pro_trial._clipboard_consented("KEY-1234-5678", boom) is False
+    assert pro_trial._clipboard_consented("KEY-1234-5678", lambda p: (_ for _ in ()).throw(EOFError())) is False
+    assert pro_trial._clipboard_consented("KEY-1234-5678", lambda p: "yes") is True
+
+
+# ── the manually pasted key is hidden (P2: no credential in the scrollback) ──────
+
+def test_manual_paste_default_is_hidden_not_echoing_input():
+    """The pasted key becomes the private-index password, so the DEFAULT reader must be
+    the hidden one — never the echoing builtin ``input``."""
+    import inspect
+    default = inspect.signature(pro_trial.detect_pasted_key).parameters["paste_input"].default
+    assert default is pro_trial._hidden_paste_input and default is not input
+    assert inspect.signature(pro_trial.convert).parameters["paste_input"].default is not input
+
+
+def test_hidden_paste_input_reads_via_getpass(monkeypatch):
+    seen = {}
+
+    def fake_getpass(prompt):
+        seen["p"] = prompt
+        return "K-1"
+    monkeypatch.setattr("getpass.getpass", fake_getpass)
+    assert pro_trial._hidden_paste_input("Paste your Pro key: ") == "K-1"
+    assert "Pro key" in seen["p"]
+
+
+def test_hidden_paste_input_never_falls_back_to_an_echoing_read(monkeypatch):
+    """If the hidden read fails outright, return "" (→ no key) rather than echoing."""
+    def boom(prompt):
+        raise RuntimeError("no terminal")
+    monkeypatch.setattr("getpass.getpass", boom)
+    assert pro_trial._hidden_paste_input("Paste your Pro key: ") == ""
 
 
 def test_convert_no_key_entered(tmp_path):

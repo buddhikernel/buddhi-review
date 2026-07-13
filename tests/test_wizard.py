@@ -227,6 +227,28 @@ def test_step_pro_trial_yes_starts_trial(monkeypatch):
     assert "14 days" in buf.getvalue()
 
 
+def test_step_pro_trial_convert_gets_a_hidden_paste_reader(monkeypatch):
+    """The Pro key becomes the private-index password (it lands in ~/.netrc), so the
+    convert path must read it through the wizard's HIDDEN reader — never ``input_fn``,
+    which echoes the credential into the terminal scrollback."""
+    _pro_trial_stub(monkeypatch, allowed=True)
+    seen = {}
+    monkeypatch.setattr(wizard.pro_trial, "start_trial", lambda email, **k:
+                        wizard.pro_trial.TrialOutcome(False, "email_registered", "taken"))
+    monkeypatch.setattr(wizard.pro_trial, "convert", lambda **k: seen.update(k)
+                        or wizard.pro_trial.TrialOutcome(True, "active", "ok"))
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
+    buf = io.StringIO()
+    answers = iter(["y", "me@example.com", "y"])   # offer → email → "have a key to paste"
+    input_fn = lambda *a: next(answers)
+    wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
+                          input_fn=input_fn)
+    assert seen["paste_input"] is not input_fn and seen["paste_input"] is not input
+    # the y/N consent for a clipboard candidate is a plain visible prompt — that one is
+    # the wizard's own input_fn (it must never carry the key itself).
+    assert seen["confirm_input"] is input_fn
+
+
 def test_step_pro_trial_skips_when_not_allowed(monkeypatch):
     calls = _pro_trial_stub(monkeypatch, allowed=False)
     buf = io.StringIO()
