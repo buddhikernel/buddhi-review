@@ -290,8 +290,8 @@ Parse the JSON object on stdout and act on `status`:
   ```
 
   Read the JSON result:
-  - `status` is `rebased` (with `pushed == true` when the branch is already on the remote)
-    or `up-to-date` → the engine handled it. Proceed to Step 3.
+  - `status` is `rebased` (with `pushed == true` when the branch is already on the remote),
+    `up-to-date`, or `current` → the engine handled it. Proceed to Step 3.
   - anything else — the engine did NOT rebase (it printed the manual steps instead, or the
     rebase could not complete) → ask with **AskUserQuestion** (a sanctioned gate). Offer
     "rebase manually yourself" ONLY if resolution is genuinely beyond you:

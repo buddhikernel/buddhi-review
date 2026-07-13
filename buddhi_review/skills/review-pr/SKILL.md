@@ -285,8 +285,8 @@ Parse the JSON object on stdout and act on `status`:
   ```
 
   Read the JSON result: `status` is `rebased` (with `pushed == true` when the branch is already
-  on the remote) or `up-to-date` → the engine handled it; launch (Step 3). Anything else — the
-  engine did NOT rebase (it printed the manual steps instead, or the rebase could not complete)
+  on the remote), `up-to-date`, or `current` → the engine handled it; launch (Step 3). Anything
+  else — the engine did NOT rebase (it printed the manual steps instead, or the rebase could not complete)
   → ask with **AskUserQuestion**, the same three options as `/open-pr` Step 2:
 
   1. **Rebase — I resolve the conflicts** *(recommended)*: run
