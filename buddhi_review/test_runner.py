@@ -44,7 +44,7 @@ import shlex
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-from typing import NamedTuple, Optional
+from typing import NamedTuple, Optional, Union
 
 
 # ── Outcome classes — the six-class contract P2 owns ─────────────────────────────
@@ -572,7 +572,7 @@ def _runner_from_js(base: str) -> Optional[RunnerInfo]:
     return None
 
 
-def detect_runner(cwd: Optional[str], resolved_cmd: Optional[list[str] | str]) -> RunnerInfo:
+def detect_runner(cwd: Optional[str], resolved_cmd: Optional[Union[list[str], str]]) -> RunnerInfo:
     """Identify the runner behind the resolved gate command.
 
     Priority: the command's argv[0]/shape first, then repo markers. A `bash -lc`
@@ -789,10 +789,16 @@ def _classify_pytest(rc: int, out: str) -> str:
 
 def _classify_unittest(rc: int, out: str) -> str:
     # Python >= 3.12: `python -m unittest` exits 5 on zero tests. Python <= 3.11:
-    # exits 0 but prints "Ran 0 tests" — parse it or it false-greens.
+    # exits 0 but prints "Ran 0 tests" — parse it or it false-greens. Gated on the
+    # absence of a real "Ran N tests" (nonzero) summary anywhere in the output so a
+    # suite that actually ran and failed — but whose OWN output happens to contain
+    # the "Ran 0 tests" string (e.g. a test asserting on captured subprocess text)
+    # — can't be masked as an empty run. Same run-evidence guard shape as the
+    # go/cargo/maven/dotnet classifiers above.
     if rc == 5:
         return NO_TESTS
-    if _has(out, r"(?m)^Ran 0 tests\b", r"\bRan 0 tests in\b"):
+    if _has(out, r"(?m)^Ran 0 tests\b", r"\bRan 0 tests in\b") and not _has(
+            out, r"\bRan [1-9]\d* tests?\b"):
         return NO_TESTS
     if rc == 0:
         return PASSED
@@ -835,9 +841,13 @@ def _classify_jest(rc: int, out: str) -> str:
     if rc != 0 and _js_env(out):
         return ENV_ERROR
     # jest exits 1 on "No tests found" (conflated with a failure) — parse it. With
-    # --json the signal is numTotalTests==0.
+    # --json the signal is numTotalTests==0. Gated on the absence of a real "Tests: N
+    # …" summary (nonzero) so a genuinely-run suite whose OWN output happens to
+    # contain the marker text (a snapshot/assertion string, e.g.) can't be masked as
+    # an empty run — same run-evidence guard shape as the go/cargo/maven/dotnet
+    # classifiers above.
     if _has(out, r"No tests found", r'"numTotalTests"\s*:\s*0\b',
-            r"No tests found, exiting with code"):
+            r"No tests found, exiting with code") and not _has(out, r"Tests:\s*[1-9]"):
         return NO_TESTS
     if rc == 0:
         return PASSED

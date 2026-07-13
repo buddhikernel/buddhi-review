@@ -54,6 +54,12 @@ _CLASSIFY_CASES = [
     ("unittest-no-tests-312", tr.UNITTEST, 5, "\n----\nNO TESTS RAN", tr.NO_TESTS),
     ("unittest-no-tests-311", tr.UNITTEST, 0, "\n----\nRan 0 tests in 0.000s\n\nOK", tr.NO_TESTS),
     ("unittest-load-error", tr.UNITTEST, 1, "ImportError: cannot import name 'foo'", tr.COMPILE_ERROR),
+    # A real, failing run whose OWN output happens to echo "Ran 0 tests in ..." (e.g.
+    # a test asserting on captured subprocess text) must NOT be masked as an empty
+    # run — the genuine "Ran 1 test" summary is real-run evidence.
+    ("unittest-fail-with-embedded-zero-marker", tr.UNITTEST, 1,
+     "test_subprocess_output (t.T) ... FAIL\nAssertionError: expected 'Ran 0 tests in 0.000s'\n\nRan 1 test in 0.01s\n\nFAILED (failures=1)",
+     tr.FAILED),
 
     # ---- django (unittest runner) ----
     ("django-pass", tr.DJANGO, 0, "Ran 8 tests in 1.0s\nOK", tr.PASSED),
@@ -66,6 +72,12 @@ _CLASSIFY_CASES = [
     ("jest-no-tests", tr.JEST, 1, "No tests found, exiting with code 1", tr.NO_TESTS),
     ("jest-no-tests-json", tr.JEST, 1, '{"numTotalTests":0,"numPassedTests":0}', tr.NO_TESTS),
     ("jest-missing-deps", tr.JEST, 1, "Cannot find module 'react' from 'src/App.test.js'", tr.ENV_ERROR),
+    # A real, failing suite whose OWN assertion/snapshot text happens to contain "No
+    # tests found" must NOT be masked as an empty run — the genuine "Tests: 1 failed,
+    # 1 total" summary is real-run evidence.
+    ("jest-fail-with-embedded-no-tests-string", tr.JEST, 1,
+     "FAIL src/empty.test.js\n  ✕ renders empty state\n    Expected: \"No tests found\"\n\nTests: 1 failed, 1 total",
+     tr.FAILED),
 
     # ---- vitest ----
     ("vitest-pass", tr.VITEST, 0, "Test Files  3 passed (3)", tr.PASSED),
