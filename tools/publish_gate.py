@@ -170,11 +170,17 @@ _KERNEL_SEAM_ALLOWLIST = (
 _ENTITLEMENT_SUBSTR = ("verify_lease", "keygen", "entitlement", "entitle", "ed25519")
 _ENTITLEMENT_WORD = ("license", "licence", "lease")
 # Benign references scrubbed before the entitlement-word scan: the project's own
-# MIT licence naming, and the git ``--force-with-lease`` force-push flag that the
-# git-guardrail hook (FREE-2) documents as a thing it BLOCKS.
+# MIT licence naming, the git ``--force-with-lease`` force-push flag that the
+# git-guardrail hook (FREE-2) documents as a thing it BLOCKS, and the two "licence"
+# tokens in the sanctioned unclaimed-command upgrade notice (``cli.py``; approved
+# verbatim 2026-07-12, exec-plan §B2a / §E item 9c). Those tokens are product COPY,
+# not a lease/entitlement CHECK — scrubbing them here lets the notice ship while every
+# real check symbol (``verify_lease`` / ``keygen`` / ``ed25519`` / …) stays caught by
+# the un-scrubbed substring scan above.
 _BENIGN_LICENSE = (
     "mit-licensed", "mit license", "licensed under", "license file",
     "license ::", "license = ", "force-with-lease",
+    "buddhi licence", "get a licence",
 )
 
 # Subtrees that are the gate's own scaffolding — excluded from the paid-name

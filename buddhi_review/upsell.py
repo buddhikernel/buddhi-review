@@ -1,13 +1,19 @@
-"""In-run contextual upgrade nudge — the ONE permitted paid reference in the OSS skill.
+"""In-run contextual upgrade nudge — one of the sanctioned paid-reference surfaces in OSS.
 
 When the free skill finishes a review run and the run ended at a point it handed
 work BACK to a human (it could not carry it through on its own), this module emits
 a single transient, non-blocking line: a benefit-named upgrade nudge tied to what
 just happened, a Cmd-clickable domain, and a plain ``/review-pr setup`` suggestion
 the reader can type to open the free setup wizard themselves (never auto-launched).
-It is the only place in the OSS tree
-that may reference a paid upgrade (execution-plan §E item 9 / §D4), and it does so
-under hard limits:
+
+This nudge is ONE of the sanctioned upgrade-reference surfaces in the OSS tree, not
+the only one: its sibling is the unclaimed-command upgrade notice in ``cli.py`` (the
+one-shot answer a non-free command prints when no installed backend claims it —
+execution-plan §B2a / §E item 9c). Both name no paid mechanism and pass the publish
+gate; the two differ only in gating — this nudge is frequency-capped and honours
+``BUDDHI_NO_UPSELL``, whereas that notice is a functional answer and so is exempt
+from both. This module's own paid reference (execution-plan §E item 9 / §D4) still
+operates under hard limits:
 
   * **Benefit-named only.** The line cites ONE concrete benefit and names NO paid
     product, mechanism, or feature; it ships no feature list and no free-vs-paid

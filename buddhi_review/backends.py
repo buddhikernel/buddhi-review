@@ -50,6 +50,18 @@ class Backend(Protocol):
 
       * ``name``     — a short identifier, used only for de-duplication / logging;
       * ``priority`` — higher wins when several backends are active (default ``0``).
+
+    A backend MAY additionally CLAIM commands this skill does not define itself, via
+    two OPTIONAL hooks read by :func:`select_command_backend` through ``getattr`` —
+    deliberately kept OUT of this Protocol so ``runtime_checkable`` never requires
+    them and a backend without them is simply skipped:
+
+      * ``claimed_commands()`` — return an iterable of command names it handles;
+      * ``run_command(name, argv)`` — run one such command with the verbatim,
+        unparsed trailing argv, returning an exit code.
+
+    The free backend claims nothing, so an unclaimed command falls through to the
+    front door's own answer (see :func:`select_command_backend`).
     """
 
     def is_active(self) -> bool: ...
@@ -220,6 +232,15 @@ def _is_active(backend: Backend) -> bool:
         return False
 
 
+def _safe_priority(backend: Backend) -> int:
+    """A backend's ``priority`` as an int, defaulting to ``0`` when absent or when
+    reading/int-casting it raises (a third-party backend must never break ordering)."""
+    try:
+        return int(getattr(backend, "priority", 0))
+    except Exception:
+        return 0
+
+
 def select_backend(backends: List[Backend]) -> Backend:
     """Return the highest-priority backend whose :meth:`Backend.is_active` is True.
     The free backend is always active (lowest priority), so this never fails; the
@@ -227,14 +248,42 @@ def select_backend(backends: List[Backend]) -> Backend:
     active = [b for b in backends if _is_active(b)]
     if not active:
         return FreeBackend()
-    def safe_priority(b: Backend) -> int:
-        try:
-            return int(getattr(b, "priority", 0))
-        except Exception:
-            return 0
-
-    active.sort(key=safe_priority, reverse=True)
+    active.sort(key=_safe_priority, reverse=True)
     return active[0]
+
+
+def select_command_backend(command: str, *,
+                           backends: Optional[List[Backend]] = None) -> Optional[Backend]:
+    """Return the highest-priority ACTIVE backend that CLAIMS ``command`` and can run
+    it, or ``None`` when no installed backend does.
+
+    A backend claims commands through the OPTIONAL ``claimed_commands()`` hook —
+    deliberately NOT part of the :class:`Backend` Protocol, read via ``getattr`` so a
+    backend that lacks it (the free backend, which claims nothing) is simply skipped.
+    A claimant must ALSO be active AND expose a callable ``run_command``; a backend
+    that claims a command it cannot run is treated as not claiming it, so the front
+    door falls through to its own answer rather than calling a missing method. A
+    backend that raises while answering is skipped (an installed package must never
+    break the free skill). ``backends`` is injectable for tests.
+    """
+    candidates = backends if backends is not None else discover_backends()
+    claimants: List[Backend] = []
+    for backend in candidates:
+        claimed = getattr(backend, "claimed_commands", None)
+        if not callable(claimed):
+            continue
+        try:
+            names = list(claimed() or ())
+        except Exception:
+            continue
+        if command not in names:
+            continue
+        if _is_active(backend) and callable(getattr(backend, "run_command", None)):
+            claimants.append(backend)
+    if not claimants:
+        return None
+    claimants.sort(key=_safe_priority, reverse=True)
+    return claimants[0]
 
 
 def launch_review_loop(pr: str, repo: Optional[str], cwd: Optional[str], *,
