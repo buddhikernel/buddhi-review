@@ -352,15 +352,17 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
     the install later). ``is_trial`` selects trial-vs-paid wording for the success
     and not-activated messages — ``convert()`` passes a paid key with no ``attrs``,
     so the messaging must not default to trial language."""
+    resolved_netrc = netrc_path or netrc_writer.default_path()
     ok, action = write_index_credential(key, path=netrc_path)
     if not ok:
         return TrialOutcome(False, "netrc_failed",
-                            "Could not write ~/.netrc — check the file's permissions and re-run.")
+                            f"Could not write {resolved_netrc} — check the file's permissions "
+                            "and re-run.")
     if action == "appended-unparsed":
         return TrialOutcome(False, "netrc_unparsed",
-                            "~/.netrc has an entry that could not be safely updated (it shares a "
-                            "line with another entry) — your new credential was appended instead. "
-                            "Please clean up ~/.netrc by hand, then re-run setup.")
+                            f"{resolved_netrc} has an entry that could not be safely updated (it "
+                            "shares a line with another entry) — your new credential was appended "
+                            f"instead. Please clean up {resolved_netrc} by hand, then re-run setup.")
 
     installed, rc, output = pip_install(runner=runner)
     if not installed:
@@ -369,8 +371,8 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
                                 "The license index refused the install (403). Your key may not be "
                                 "active yet — wait a moment and re-run setup.")
         return TrialOutcome(False, "pip_failed",
-                            "Install did not complete — your license is set up and ~/.netrc is "
-                            f"intact, so just re-run: pip install {_PACKAGE} "
+                            f"Install did not complete — your license is set up and {resolved_netrc} "
+                            f"is intact, so just re-run: pip install {_PACKAGE} "
                             f"--index-url {_index_url()}")
 
     start_daemon(backends=backends)
@@ -435,10 +437,17 @@ def start_trial(email: str, *, transport=None, backends=None, runner=None,
         return TrialOutcome(False, "license_failed",
                             "Could not create the trial license — try again later.")
 
-    _clear_pending_credential(state_path=state_path)
-    return _finish_install(attrs["key"], attrs=attrs, backends=backends, runner=runner,
-                           netrc_path=netrc_path, is_active=is_active, sleep=sleep,
-                           attempts=attempts)
+    # Cleared only once the install actually succeeds — a netrc/pip/activation
+    # failure here still leaves the license minted, and the pending credential is
+    # what lets a same-email retry mint a fresh token+license directly instead of
+    # re-registering (which the server would now refuse as already-taken, with no
+    # emailed key to fall back on since this is a trial, not a paid subscription).
+    outcome = _finish_install(attrs["key"], attrs=attrs, backends=backends, runner=runner,
+                              netrc_path=netrc_path, is_active=is_active, sleep=sleep,
+                              attempts=attempts)
+    if outcome.ok:
+        _clear_pending_credential(state_path=state_path)
+    return outcome
 
 
 # ── Convert / re-subscribe (concierge-paste) ─────────────────────────────────────
@@ -589,12 +598,19 @@ def _read_state(path: Optional[Path]) -> dict:
 def _write_state(path: Optional[Path], state: dict) -> None:
     """Atomic write. Locked to 0600 because this file may hold the pending-
     credential's throwaway password (see ``_save_pending_credential``), not just
-    non-secret offer counters."""
+    non-secret offer counters. The temp file is created via ``os.open`` with mode
+    0600 from its first byte — unlike ``Path.write_text``, which creates at the
+    umask-derived default (often 0644) and would briefly expose the password
+    before the post-replace chmod below catches up."""
     p = path or _state_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps(state), encoding="utf-8")
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(json.dumps(state))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, p)
         os.chmod(p, 0o600)
     except OSError:

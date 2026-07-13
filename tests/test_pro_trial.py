@@ -304,6 +304,25 @@ def test_start_trial_retries_after_token_failure_reuse_same_password(tmp_path):
     assert token_calls[0]["auth"] == token_calls[1]["auth"]   # same password both times
 
 
+def test_start_trial_retries_after_install_failure_reuse_same_password(tmp_path):
+    """A license that mints successfully but whose local install then fails (netrc
+    write / pip install / activation) must not burn the pending credential: the key
+    never made it to disk, so a same-email retry must still mint a token directly
+    instead of re-registering (which the server would now refuse as already-taken,
+    dead-ending into email_registered with no emailed key to fall back on)."""
+    runner_fail = lambda c: types.SimpleNamespace(returncode=1, stdout="", stderr="network down")
+    t = _full()
+    out1 = _start(transport=t, runner=runner_fail, tmp=tmp_path)
+    assert not out1.ok and out1.status == "pip_failed"
+    state = json.loads((tmp_path / "trial.json").read_text(encoding="utf-8"))
+    assert state.get("pending_email") == "me@x.io"   # kept for retry, not cleared
+
+    out2 = _start(transport=t, tmp=tmp_path)
+    assert out2.ok and out2.status == "active"
+    # no second registration attempt on retry
+    assert len([c for c in t.calls if c["url"].endswith("/users")]) == 1
+
+
 def test_start_trial_retries_after_license_failure_reuse_same_password(tmp_path):
     attempt = {"n": 0}
 
