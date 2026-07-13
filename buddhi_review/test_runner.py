@@ -809,8 +809,12 @@ def _classify_unittest(rc: int, out: str) -> str:
 
 
 def _classify_django(rc: int, out: str) -> str:
-    # `manage.py test` drives unittest; zero tests → "Ran 0 tests".
-    if _has(out, r"\bRan 0 tests\b"):
+    # `manage.py test` drives unittest; zero tests → "Ran 0 tests". Gated on the
+    # absence of a real "Ran N tests" (nonzero) summary — same run-evidence guard
+    # the unittest classifier above uses — so a suite that actually ran and failed,
+    # but whose own output happens to echo "Ran 0 tests" (e.g. a test asserting on
+    # captured subprocess/management-command text), isn't masked as an empty run.
+    if _has(out, r"\bRan 0 tests\b") and not _has(out, r"\bRan [1-9]\d* tests?\b"):
         return NO_TESTS
     if rc == 0:
         return PASSED
@@ -860,8 +864,14 @@ def _classify_jest(rc: int, out: str) -> str:
 def _classify_vitest(rc: int, out: str) -> str:
     if rc != 0 and _js_env(out):
         return ENV_ERROR
+    # Gated on the absence of a real nonzero "Test Files"/"Tests" summary — same
+    # run-evidence guard shape the jest classifier above uses — so a suite that
+    # actually ran and failed, but whose own output happens to echo a
+    # "No test files found"-style string, isn't masked as an empty run.
     if _has(out, r"No test files found", r"No test suite found",
-            r"include:.*no test files", r'"numTotalTests"\s*:\s*0\b'):
+            r"include:.*no test files", r'"numTotalTests"\s*:\s*0\b') and not _has(
+            out, r"Test Files\s+[1-9]\d*\s*(?:passed|failed)",
+            r"Tests\s+[1-9]\d*\s*(?:passed|failed)"):
         return NO_TESTS
     if rc == 0:
         return PASSED

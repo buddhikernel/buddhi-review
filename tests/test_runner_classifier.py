@@ -65,6 +65,12 @@ _CLASSIFY_CASES = [
     ("django-pass", tr.DJANGO, 0, "Ran 8 tests in 1.0s\nOK", tr.PASSED),
     ("django-no-tests", tr.DJANGO, 0, "Ran 0 tests in 0.000s\nOK", tr.NO_TESTS),
     ("django-fail", tr.DJANGO, 1, "Ran 2 tests\nFAILED (failures=1)", tr.FAILED),
+    # A real, failing run whose OWN output happens to echo "Ran 0 tests" (e.g. a
+    # test asserting on captured subprocess/management-command text) must NOT be
+    # masked as an empty run — the genuine "Ran 1 test" summary is real-run evidence.
+    ("django-fail-with-embedded-zero-marker", tr.DJANGO, 1,
+     "test_subcommand_output (t.T) ... FAIL\nAssertionError: expected 'Ran 0 tests in 0.000s'\n\nRan 1 test in 0.01s\n\nFAILED (failures=1)",
+     tr.FAILED),
 
     # ---- jest ----
     ("jest-pass", tr.JEST, 0, "Tests: 5 passed, 5 total", tr.PASSED),
@@ -85,6 +91,13 @@ _CLASSIFY_CASES = [
     ("vitest-no-tests", tr.VITEST, 1, "No test files found, exiting with code 1", tr.NO_TESTS),
     ("vitest-missing-deps", tr.VITEST, 1, "Failed to resolve import 'vite'", tr.ENV_ERROR),
     ("vitest-esbuild-missing-dep", tr.VITEST, 1, "X [ERROR] Could not resolve 'react'\n\n    src/App.tsx:1:18:", tr.ENV_ERROR),
+    # A real, failing suite whose OWN assertion text happens to contain "No test
+    # files found" must NOT be masked as an empty run — the genuine "Test Files  1
+    # failed" / "Tests  1 failed" summary is real-run evidence.
+    ("vitest-fail-with-embedded-no-tests-string", tr.VITEST, 1,
+     "FAIL src/empty.test.ts\n  ✕ renders empty state\n    Expected: \"No test files found\"\n\n"
+     " Test Files  1 failed (1)\n      Tests  1 failed (1)",
+     tr.FAILED),
 
     # ---- mocha ----
     ("mocha-pass", tr.MOCHA, 0, "  5 passing (20ms)", tr.PASSED),
