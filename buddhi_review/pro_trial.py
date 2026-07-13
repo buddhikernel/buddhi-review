@@ -41,6 +41,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import ssl
 import subprocess
 import sys
@@ -418,7 +419,7 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
     and not-activated messages — ``convert()`` passes a paid key with no ``attrs``,
     so the messaging must not default to trial language."""
     resolved_netrc = netrc_path or netrc_writer.default_path()
-    ok, action = write_index_credential(key, path=netrc_path)
+    ok, action = write_index_credential(key, path=resolved_netrc)
     if not ok:
         return TrialOutcome(False, "netrc_failed",
                             f"Could not write {resolved_netrc} — check the file's permissions "
@@ -437,8 +438,9 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
                                 "active yet — wait a moment and re-run setup.")
         return TrialOutcome(False, "pip_failed",
                             f"Install did not complete — your license is set up and {resolved_netrc} "
-                            f"is intact, so just re-run: NETRC={resolved_netrc} {sys.executable} -m "
-                            f"pip install --upgrade {_PACKAGE} --index-url {_index_url()} --no-input")
+                            f"is intact, so just re-run: NETRC={shlex.quote(str(resolved_netrc))} "
+                            f"{shlex.quote(sys.executable)} -m pip install --upgrade {_PACKAGE} "
+                            f"--index-url {shlex.quote(_index_url())} --no-input")
 
     start_daemon(backends=backends)
     if _await_active(backends=backends, is_active=is_active, sleep=sleep, attempts=attempts):
