@@ -119,6 +119,46 @@ def test_failure_excerpt_empty_tail_is_placeholder():
     assert "no failure detail" in commit_push.failure_excerpt(None)
 
 
+# ── failure_excerpt: a gate class headline always survives truncation (F2) ──
+_HEADLINE = ("[local-tests] ✗ gate RED — compile_error (pytest): the build / "
+             "collection step failed BEFORE any test ran. No failing-test ids "
+             "are extracted from a compile error.")
+
+
+def test_failure_excerpt_keeps_headline_when_failures_section_overflows():
+    # The FAILURES-section branch keeps the FRONT of the section and drops the
+    # END — a headline merely prepended to `tail` would be sliced away before
+    # `start`. It must survive as its own line regardless.
+    body = "\n".join(["=== FAILURES ==="] + [f"E line {i}" for i in range(30)])
+    tail = f"{_HEADLINE}\n{body}"
+    ex = commit_push.failure_excerpt(tail, max_lines=24)
+    assert ex.startswith(_HEADLINE)
+    assert "E line 0" in ex
+
+
+def test_failure_excerpt_keeps_headline_when_no_marker_and_tail_overflows():
+    # The no-marker branch keeps the END of the output and drops the START — the
+    # headline (prepended, so at the very start) must still survive.
+    body = "\n".join(f"err{i}" for i in range(40))
+    tail = f"{_HEADLINE}\n{body}"
+    ex = commit_push.failure_excerpt(tail, max_lines=10)
+    assert ex.startswith(_HEADLINE)
+    assert "err39" in ex
+
+
+def test_failure_excerpt_keeps_headline_with_no_other_output():
+    ex = commit_push.failure_excerpt(f"{_HEADLINE}\n")
+    assert ex.startswith(_HEADLINE)
+
+
+def test_failure_excerpt_no_headline_unaffected():
+    # A tail that merely starts with similar-looking text (not the exact gate
+    # sentinel) is treated as ordinary content, not pulled out.
+    tail = "gate RED — not the real sentinel\nFAILED tests/test_x.py::test_a"
+    ex = commit_push.failure_excerpt(tail)
+    assert ex.startswith("gate RED — not the real sentinel")
+
+
 # ── _print_red_gate_panel: clearly-labelled action options ───────────────────
 def test_red_gate_panel_renders_labelled_options(capsys, monkeypatch):
     monkeypatch.setenv("NO_COLOR", "1")
