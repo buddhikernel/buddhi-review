@@ -357,6 +357,15 @@ _UNCLAIMED_COMMAND_NOTICE = (
 )
 
 
+def _display_command(command: str) -> str:
+    """Escape non-printable characters in ``command`` before it goes into a
+    printed notice — a raw control character (e.g. an ANSI/OSC escape) would
+    otherwise be interpreted by the terminal, mangling output or forging a
+    clickable link. The unescaped ``command`` is still what gets passed to a
+    claiming backend; only the displayed copy is sanitized."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in command)
+
+
 def _known_commands(parser: argparse.ArgumentParser) -> frozenset:
     """The free subcommand names this parser defines — read straight off the
     subparsers action, so a newly-added free command is covered with no second list
@@ -402,7 +411,7 @@ def _dispatch_unclaimed_command(command: str, trailing: List[str], *,
             print(f"⚠ backend {getattr(backend, 'name', repr(backend))!r} failed "
                   f"running {command!r} ({exc})", file=out)
             return 1
-    print(_UNCLAIMED_COMMAND_NOTICE.format(command=command), file=out)
+    print(_UNCLAIMED_COMMAND_NOTICE.format(command=_display_command(command)), file=out)
     return 2
 
 
