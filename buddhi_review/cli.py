@@ -16,6 +16,11 @@ Subcommands:
   ``status``     — print per-repo setup status as JSON (``repo_confirmed`` /
                    ``has_global_default``) for the SKILL.md gate to shell out to.
 
+Any other command word is not one of ours: it is routed to a separately-installed
+backend that CLAIMS it (which runs it), or — the normal free-only state, and equally
+a plain typo — answered with a one-shot upgrade notice and exit 2 (never a half-run).
+See :func:`_dispatch_unclaimed_command`.
+
 Answers come from the terminal.
 """
 from __future__ import annotations
@@ -24,12 +29,12 @@ import argparse
 import json
 import os
 import sys
-from typing import List, Optional
+from typing import List, Optional, TextIO
 
 from buddhi_review import __version__, gh_ingest, model_call, round_driver, update_banner, upsell
 from buddhi_review.actuators import default_fix_dispatch
 from buddhi_review.adapter import ReviewAdapter
-from buddhi_review.backends import launch_review_loop
+from buddhi_review.backends import launch_review_loop, select_command_backend
 from buddhi_review.config import (
     active_reviewers,
     has_global_default,
@@ -330,8 +335,100 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+# ── Unclaimed-command fallback seam ───────────────────────────────────────────────
+# argparse's subparsers raise SystemExit(2) on an unknown subcommand BEFORE any
+# dispatch runs, so a command word that is not one of our own free subcommands has to
+# be intercepted in main() ahead of parse_args. Such a command may be claimed by a
+# separately-installed, active backend (which runs it), or answered with the notice
+# below — the normal free-only outcome, and equally what a plain typo gets.
+
+# The upgrade notice (approved verbatim 2026-07-12, gate H1) printed when no installed
+# backend claims the command. The free tree ships NO list of non-free command names,
+# so a command whose paid access has lapsed and one that never existed are
+# indistinguishable here; the wording is deliberately true for BOTH and asserts
+# nothing about whether the command is real. ``{command}`` is echoed from the runtime
+# invocation — no command name is ever hard-coded. This is a functional "why did
+# nothing happen?" answer, so it is exempt from BUDDHI_NO_UPSELL and any nudge
+# frequency cap (execution-plan §B2a / §E item 9c).
+_UNCLAIMED_COMMAND_NOTICE = (
+    "The '{command}' command is not included in this free installation.\n"
+    "If you have a Buddhi licence, renew or reactivate it and run the command again.\n"
+    "To get a licence: https://buddhikernel.com"
+)
+
+
+def _display_command(command: str) -> str:
+    """Escape non-printable characters in ``command`` before it goes into a
+    printed notice — a raw control character (e.g. an ANSI/OSC escape) would
+    otherwise be interpreted by the terminal, mangling output or forging a
+    clickable link. The unescaped ``command`` is still what gets passed to a
+    claiming backend; only the displayed copy is sanitized."""
+    return "".join(c if c.isprintable() else repr(c)[1:-1] for c in command)
+
+
+def _known_commands(parser: argparse.ArgumentParser) -> frozenset:
+    """The free subcommand names this parser defines — read straight off the
+    subparsers action, so a newly-added free command is covered with no second list
+    to keep in sync."""
+    for action in parser._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            return frozenset(action.choices)
+    return frozenset()
+
+
+def _split_command(argv: List[str]) -> tuple[Optional[str], List[str]]:
+    """Split ``argv`` into ``(command, trailing)`` for the pre-parse fallback seam:
+    ``command`` is ``argv[0]`` (the subcommand word) and ``trailing`` is everything
+    after it, forwarded verbatim to a claiming backend. Returns ``(None, [])`` when
+    there is no candidate to dispatch — an empty argv, a leading ``-h`` / ``--help``
+    / ``--version`` that argparse itself answers, or any other leading option (this
+    parser has no global options that take a value, so a leading ``-`` token is
+    always argparse's to reject, never a command word)."""
+    if not argv:
+        return None, []
+    tok = argv[0]
+    if tok in ("-h", "--help", "--version"):
+        return None, []
+    if not tok.startswith("-"):
+        return tok, list(argv[1:])
+    return None, []
+
+
+def _dispatch_unclaimed_command(command: str, trailing: List[str], *,
+                                backends: Optional[List] = None,
+                                stream: Optional[TextIO] = None) -> int:
+    """Route a non-free command through the front door.
+
+    A separately-installed backend may CLAIM the command via the optional
+    ``claimed_commands`` hook (never part of the Backend Protocol); the highest-
+    priority active claimant runs it, receiving the command name and the trailing
+    argv verbatim and unparsed. With no active claimant the front door prints the
+    upgrade notice and exits 2 — it never half-runs a command it does not own.
+    ``backends`` / ``stream`` are injectable for tests.
+    """
+    backend = select_command_backend(command, backends=backends)
+    out = stream if stream is not None else sys.stderr
+    if backend is not None:
+        try:
+            return backend.run_command(command, trailing)
+        except Exception as exc:  # an installed backend must never crash the free front door
+            print(f"⚠ backend {getattr(backend, 'name', repr(backend))!r} failed "
+                  f"running {command!r} ({exc!r})", file=out)
+            return 1
+    print(_UNCLAIMED_COMMAND_NOTICE.format(command=_display_command(command)), file=out)
+    return 2
+
+
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    parser = build_parser()
+    # Intercept a non-free command BEFORE argparse (which would SystemExit(2) on it):
+    # a claiming backend runs it, else it gets the upgrade notice.
+    command, trailing = _split_command(raw_argv)
+    if command is not None and command not in _known_commands(parser):
+        return _dispatch_unclaimed_command(command, trailing)
+
+    args = parser.parse_args(raw_argv)
     if args.command == "self-check":
         return _self_check()
     if args.command == "review-pr":
@@ -344,7 +441,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _setup(args)
     if args.command == "status":
         return _status(args)
-    build_parser().print_help()
+    parser.print_help()
     return 0
 
 
