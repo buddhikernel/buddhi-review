@@ -296,6 +296,81 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                         "accidentally-silent fleet)")
 
 
+def _add_base_remote_args(sp: argparse.ArgumentParser) -> None:
+    """Base-remote selection, shared by ``rebase-check`` and ``rebase``.
+
+    Without these, a fork checkout (origin = the contributor's fork, PR base on
+    upstream) resolves the base to the fork's own stale copy of the branch and
+    the gate reports ``up-to-date`` when ``upstream/<base>`` is ahead."""
+    sp.add_argument("--repo", default=None,
+                    help="owner/repo hosting the base branch; its matching git "
+                         "remote is used (fork checkouts: pass the upstream repo)")
+    sp.add_argument("--remote", default=None,
+                    help="git remote hosting the base branch; overrides --repo "
+                         "(default: branch.<base>.remote, else origin)")
+
+
+def _detect_rebase_base(args: argparse.Namespace) -> str:
+    cwd = args.cwd or os.getcwd()
+    if args.base:
+        return args.base
+    # Auto-detect base if not supplied (mirrors open_pr.detect_base).
+    from buddhi_review.open_pr import detect_base, _default_run as _opr_run
+    try:
+        return detect_base(cwd, _opr_run)
+    except Exception:
+        return "main"
+
+
+def _rebase_check(args: argparse.Namespace) -> int:
+    """The ``rebase-check`` verb: report rebase state as JSON + guidance.
+
+    Strictly check-only, on every tier — never mutates. The paid-capability
+    action verb is the separate ``rebase`` subcommand (see ``_rebase``)."""
+    from buddhi_review import rebase_gate
+
+    cwd = args.cwd or os.getcwd()
+    base = _detect_rebase_base(args)
+
+    return rebase_gate.run_check_verb(
+        cwd, base,
+        fetch=not args.no_fetch,
+        json_only=args.json_only,
+        repo=getattr(args, "repo", None),
+        remote=getattr(args, "remote", None),
+    )
+
+
+def _rebase(args: argparse.Namespace) -> int:
+    """The ``rebase`` verb: the paid-capability ACTION verb.
+
+    On free tier (no active backend exposing ``run_rebase``), this prints
+    the same manual guidance as ``rebase-check`` and declines to mutate the
+    repo itself. On paid tier, it delegates the actual rebase to the backend."""
+    from buddhi_review import rebase_gate
+    from buddhi_review.backends import discover_backends, select_backend
+
+    cwd = args.cwd or os.getcwd()
+    base = _detect_rebase_base(args)
+
+    # Capability hook: resolve the active backend so a paid ``run_rebase`` can
+    # take over the action. The free FreeBackend has no ``run_rebase``, so it
+    # is silently treated as free-tier inside ``run_rebase_verb``.
+    try:
+        backend = select_backend(discover_backends())
+    except Exception:
+        backend = None
+
+    return rebase_gate.run_rebase_verb(
+        cwd, base,
+        fetch=not args.no_fetch,
+        backend=backend,
+        json_only=args.json_only,
+        repo=getattr(args, "repo", None),
+        remote=getattr(args, "remote", None),
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="buddhi-review", description="Buddhi PR-review skill.")
     p.add_argument("--version", action="version", version=f"buddhi_review {__version__}")
@@ -326,6 +401,32 @@ def build_parser() -> argparse.ArgumentParser:
                     help="branch prefix when deriving a name (feat/fix/refactor; default feat)")
     cp.add_argument("--no-loop", action="store_true",
                     help="create the PR but skip launching the review loop")
+
+    # S2 — the free rebase-gate verb (check-only, never mutates).
+    rc = sub.add_parser("rebase-check",
+                        help="report whether the branch needs a rebase (JSON + guidance)")
+    rc.add_argument("--cwd", help="repo directory (default: cwd)")
+    rc.add_argument("--base", default=None,
+                    help="base branch to check against (default: auto-detect origin/HEAD)")
+    _add_base_remote_args(rc)
+    rc.add_argument("--no-fetch", action="store_true",
+                    help="skip git fetch (use local tracking refs; may be stale)")
+    rc.add_argument("--json-only", action="store_true",
+                    help="print only the JSON result, no guidance text")
+
+    # S2 — the rebase action verb (paid-capability hook; free tier declines
+    # to mutate and prints the same manual guidance as rebase-check).
+    rb = sub.add_parser("rebase",
+                        help="rebase onto the base branch (paid tier); free "
+                             "tier prints manual guidance and does not mutate")
+    rb.add_argument("--cwd", help="repo directory (default: cwd)")
+    rb.add_argument("--base", default=None,
+                    help="base branch to rebase onto (default: auto-detect origin/HEAD)")
+    _add_base_remote_args(rb)
+    rb.add_argument("--no-fetch", action="store_true",
+                    help="skip git fetch (use local tracking refs; may be stale)")
+    rb.add_argument("--json-only", action="store_true",
+                    help="print only the JSON result, no guidance text")
 
     sp = sub.add_parser("setup", help="interactive onboarding wizard")
     sp.add_argument("--repo", help="pre-bind this owner/repo (per-repo confirm mode)")
@@ -437,6 +538,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run_loop(args)
     if args.command == "open-pr":
         return _open_pr(args)
+    if args.command == "rebase-check":
+        return _rebase_check(args)
+    if args.command == "rebase":
+        return _rebase(args)
     if args.command == "setup":
         return _setup(args)
     if args.command == "status":
