@@ -305,7 +305,11 @@ Parse the JSON object on stdout and act on `status`:
      conflicts surface on the PR.
   3. (Other / free-text) a different approach, or "I'll rebase manually" — accept manual only
      when truly impossible for you; if so print the exact commands and **EXIT**.
-- **`dirty`** with `behind == 0` — nothing to rebase onto; launch (Step 3).
+- **`dirty`** with `behind == 0` — nothing to rebase onto, but the worktree has uncommitted or
+  untracked changes. Do NOT launch: once the loop applies its first fix, `commit_and_push` stages
+  with `git add -A`, which would sweep this pre-existing WIP into the PR. Print the `detail` field
+  (names the dirty state) and ask the user to commit, stash, or clean the tree in `$TARGET_CWD`,
+  then STOP — re-run `/review-pr` once the tree is clean.
 - **`error`** — the check itself failed, so the rebase state is unknown (never read that as
   healthy). Log the `detail` and STOP.
 
@@ -316,7 +320,7 @@ Run this EXACT command — substitute the angle-bracket placeholders, AND replac
 between Bash calls; an empty `--repo` / `--cwd` would silently fall back to the tool's own cwd):
 
 ```bash
-python3 -m buddhi_review review-pr <PR_NUMBER> --repo <OWNER_REPO> --cwd <TARGET_CWD> [--rr or --rr-active or --rr-none if the user passed it]
+python3 -m buddhi_review review-pr <PR_NUMBER> --repo <OWNER_REPO> --cwd "<TARGET_CWD>" [--rr or --rr-active or --rr-none if the user passed it]
 ```
 
 This is the front door: it selects the review engine, **detaches the process and returns

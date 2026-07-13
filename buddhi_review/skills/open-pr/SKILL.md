@@ -340,7 +340,7 @@ the loop uses its own default:
 ```bash
 python3 -m buddhi_review open-pr \
   --title "<title>" --body "<body>" \
-  --repo <OWNER_REPO> --cwd <TARGET_CWD> \
+  --repo <OWNER_REPO> --cwd "<TARGET_CWD>" \
   [--branch-prefix <feat|fix|refactor>] [--branch "<explicit-branch-name>"] \
   [--max-rounds <N>]
 ```
