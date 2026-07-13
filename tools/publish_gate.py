@@ -183,6 +183,22 @@ _BENIGN_LICENSE = (
     "buddhi licence", "get a licence",
 )
 
+# ── The ONE sanctioned license-ACQUISITION module (PRO-6 / §E.9(a)) ─────────────
+# The setup wizard's first-run trial offer must ACQUIRE a license (Keygen open
+# registration + trial creation + the private-index credential + the pip install of
+# the pro wheel). That is acquisition, NOT enforcement, and it is confined to this
+# ONE module — which is why it may name the acquisition vocabulary the rest of the
+# tree may not. It is allowlisted from the entitlement scan AND from the two
+# pro-package-name paid terms it must reference to install the wheel; it is STILL
+# scanned for every OTHER paid surface (Cockpit/Telegram/dashboard/…), and
+# tests/test_oss_purity.py additionally asserts it holds creation/registration/
+# validation calls only — zero verification logic. Its test lives under tests/,
+# already excluded by _is_scaffolding, so only the module itself is named here.
+_ACQUISITION_ALLOWLIST = ("buddhi_review/pro_trial.py",)
+# The ONLY paid-name terms the acquisition module may use — the pro package it pip-
+# installs. Every OTHER paid name stays forbidden even here.
+_ACQUISITION_PAID_TERMS = ("buddhi_review_pro", "buddhi-review-pro")
+
 # Subtrees that are the gate's own scaffolding — excluded from the paid-name
 # artifact scan. They enumerate the forbidden vocabulary as test/definition
 # literals and never reach the installed wheel (only ``buddhi_review/`` does).
@@ -230,13 +246,21 @@ def _normalize(text: str) -> str:
     return "".join(ch for ch in folded if unicodedata.category(ch) not in ("Cf", "Mn"))
 
 
-def scan_paid_and_publish(text: str) -> list[str]:
+def scan_paid_and_publish(text: str, *, allow_acquisition: bool = False) -> list[str]:
     """Return the paid-name / publish-gate violations in ``text`` (one per hit kind).
 
     Applies the kernel-seam allowlist scrub first so the legitimate Apache-2.0
     signaled-OOB and pass-through-Stage-0 references are not false positives.
+
+    ``allow_acquisition`` is set ONLY for the sanctioned acquisition module
+    (:data:`_ACQUISITION_ALLOWLIST`): it scrubs the two pro-package-name terms that
+    module must reference to pip-install the wheel, so every OTHER paid surface is
+    still scanned there. Nothing else is relaxed.
     """
     lower = _normalize(text).lower()
+    if allow_acquisition:
+        for term in _ACQUISITION_PAID_TERMS:
+            lower = lower.replace(term.lower(), " ")
     scrubbed = lower
     for benign in _KERNEL_SEAM_ALLOWLIST:
         scrubbed = scrubbed.replace(benign, " ")
@@ -343,9 +367,14 @@ def scan_tree(root: Path) -> list[str]:
             if not _is_allowed_binary(rel):
                 problems.append(f"{rel}: binary/undecodable file shipped (cannot scan for leaks)")
             continue
-        for hit in scan_paid_and_publish(text):
+        # The sanctioned acquisition module may name the pro package it installs +
+        # the Keygen acquisition vocabulary; it is scanned for every OTHER paid
+        # surface and its entitlement scan is skipped (it does acquisition, never
+        # enforcement — asserted separately by test_oss_purity).
+        acquisition = rel.as_posix() in _ACQUISITION_ALLOWLIST
+        for hit in scan_paid_and_publish(text, allow_acquisition=acquisition):
             problems.append(f"{rel}: {hit}")
-        if _is_package_code(rel):
+        if _is_package_code(rel) and not acquisition:
             for hit in scan_entitlement(text):
                 problems.append(f"{rel}: {hit}")
     return problems
