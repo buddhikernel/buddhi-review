@@ -291,34 +291,56 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                         "accidentally-silent fleet)")
 
 
+def _detect_rebase_base(args: argparse.Namespace) -> str:
+    cwd = args.cwd or os.getcwd()
+    if args.base:
+        return args.base
+    # Auto-detect base if not supplied (mirrors open_pr.detect_base).
+    from buddhi_review.open_pr import detect_base, _default_run as _opr_run
+    try:
+        return detect_base(cwd, _opr_run)
+    except Exception:
+        return "main"
+
+
 def _rebase_check(args: argparse.Namespace) -> int:
     """The ``rebase-check`` verb: report rebase state as JSON + guidance.
 
-    Free default is check-only (never mutates). When the active backend
-    exposes ``run_rebase``, it delegates the actual rebase to it instead."""
+    Strictly check-only, on every tier — never mutates. The paid-capability
+    action verb is the separate ``rebase`` subcommand (see ``_rebase``)."""
+    from buddhi_review import rebase_gate
+
+    cwd = args.cwd or os.getcwd()
+    base = _detect_rebase_base(args)
+
+    return rebase_gate.run_check_verb(
+        cwd, base,
+        fetch=not args.no_fetch,
+        json_only=args.json_only,
+    )
+
+
+def _rebase(args: argparse.Namespace) -> int:
+    """The ``rebase`` verb: the paid-capability ACTION verb.
+
+    On free tier (no active backend exposing ``run_rebase``), this prints
+    the same manual guidance as ``rebase-check`` and declines to mutate the
+    repo itself. On paid tier, it delegates the actual rebase to the backend."""
     from buddhi_review import rebase_gate
     from buddhi_review.backends import discover_backends, select_backend
 
     cwd = args.cwd or os.getcwd()
-    base = args.base or "main"
-
-    # Auto-detect base if not supplied (mirrors open_pr.detect_base).
-    if not args.base:
-        from buddhi_review.open_pr import detect_base, _default_run as _opr_run
-        try:
-            base = detect_base(cwd, _opr_run)
-        except Exception:
-            base = "main"
+    base = _detect_rebase_base(args)
 
     # Capability hook: resolve the active backend so a paid ``run_rebase`` can
     # take over the action. The free FreeBackend has no ``run_rebase``, so it
-    # is silently treated as free-tier inside ``run_check_verb``.
+    # is silently treated as free-tier inside ``run_rebase_verb``.
     try:
         backend = select_backend(discover_backends())
     except Exception:
         backend = None
 
-    return rebase_gate.run_check_verb(
+    return rebase_gate.run_rebase_verb(
         cwd, base,
         fetch=not args.no_fetch,
         backend=backend,
@@ -368,6 +390,19 @@ def build_parser() -> argparse.ArgumentParser:
     rc.add_argument("--json-only", action="store_true",
                     help="print only the JSON result, no guidance text")
 
+    # S2 — the rebase action verb (paid-capability hook; free tier declines
+    # to mutate and prints the same manual guidance as rebase-check).
+    rb = sub.add_parser("rebase",
+                        help="rebase onto the base branch (paid tier); free "
+                             "tier prints manual guidance and does not mutate")
+    rb.add_argument("--cwd", help="repo directory (default: cwd)")
+    rb.add_argument("--base", default=None,
+                    help="base branch to rebase onto (default: auto-detect origin/HEAD)")
+    rb.add_argument("--no-fetch", action="store_true",
+                    help="skip git fetch (use local tracking refs; may be stale)")
+    rb.add_argument("--json-only", action="store_true",
+                    help="print only the JSON result, no guidance text")
+
     sp = sub.add_parser("setup", help="interactive onboarding wizard")
     sp.add_argument("--repo", help="pre-bind this owner/repo (per-repo confirm mode)")
 
@@ -388,6 +423,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _open_pr(args)
     if args.command == "rebase-check":
         return _rebase_check(args)
+    if args.command == "rebase":
+        return _rebase(args)
     if args.command == "setup":
         return _setup(args)
     if args.command == "status":

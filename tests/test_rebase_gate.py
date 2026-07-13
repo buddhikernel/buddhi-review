@@ -10,7 +10,6 @@ from __future__ import annotations
 import io
 import json
 import subprocess
-import types
 
 import pytest
 
@@ -252,14 +251,29 @@ class _FreeBackendNoRebase:
         return 0
 
 
+def test_check_verb_never_delegates_even_with_paid_backend(repo):
+    """rebase-check has no capability hook: it stays read-only-check even when
+    a paid backend with run_rebase is active. (The hook lives on the
+    separate ``rebase`` action verb, run_rebase_verb, not on the check verb.)"""
+    assert "backend" not in rebase_gate.run_check_verb.__code__.co_varnames[
+        :rebase_gate.run_check_verb.__code__.co_argcount]
+
+    out = io.StringIO()
+    rc = rebase_gate.run_check_verb(str(repo), "main", fetch=True, out=out,
+                                    json_only=True)
+    data = json.loads(out.getvalue().strip())
+    assert data["status"] in ("up-to-date", "clean", "conflicts", "dirty", "error")
+    assert rc == (1 if data["status"] == "error" else 0)
+
+
 def test_capability_hook_delegates_when_backend_has_run_rebase(repo):
-    """When the active backend exposes run_rebase, run_check_verb delegates to it."""
+    """When the active backend exposes run_rebase, run_rebase_verb delegates to it."""
     _advance_base(repo)
     backend = _FakePaidBackend(status="rebased")
     out = io.StringIO()
 
-    rc = rebase_gate.run_check_verb(str(repo), "main", backend=backend,
-                                    fetch=True, out=out, json_only=True)
+    rc = rebase_gate.run_rebase_verb(str(repo), "main", backend=backend,
+                                     fetch=True, out=out, json_only=True)
 
     assert len(backend.calls) == 1, "backend.run_rebase must be called exactly once"
     assert backend.calls[0] == (str(repo), "main")
@@ -270,27 +284,28 @@ def test_capability_hook_delegates_when_backend_has_run_rebase(repo):
 
 
 def test_capability_hook_free_path_when_backend_has_no_run_rebase(repo):
-    """When the backend has no run_rebase, the free check path runs instead."""
+    """When the backend has no run_rebase, the free check path runs instead
+    (declines to mutate, same read-only contract as rebase-check)."""
     backend = _FreeBackendNoRebase()
     out = io.StringIO()
 
-    rc = rebase_gate.run_check_verb(str(repo), "main", backend=backend,
-                                    fetch=True, out=out, json_only=True)
+    rc = rebase_gate.run_rebase_verb(str(repo), "main", backend=backend,
+                                     fetch=True, out=out, json_only=True)
 
     data = json.loads(out.getvalue().strip())
     assert data["status"] in ("up-to-date", "clean", "conflicts", "dirty", "error")
-    # exit 0 for any valid check result (non-error)
-    assert rc == 0
+    # rc is 0 for any valid check result, 1 only when the check itself errored
+    assert rc == (1 if data["status"] == "error" else 0)
 
 
 def test_capability_hook_no_backend(repo):
     """With backend=None, the free path runs (no delegation attempted)."""
     out = io.StringIO()
-    rc = rebase_gate.run_check_verb(str(repo), "main", backend=None,
-                                    fetch=True, out=out, json_only=True)
+    rc = rebase_gate.run_rebase_verb(str(repo), "main", backend=None,
+                                     fetch=True, out=out, json_only=True)
     data = json.loads(out.getvalue().strip())
     assert data["status"] in ("up-to-date", "clean", "conflicts", "dirty", "error")
-    assert rc == 0
+    assert rc == (1 if data["status"] == "error" else 0)
 
 
 def test_capability_hook_backend_run_rebase_exception_falls_through(repo):
@@ -302,12 +317,12 @@ def test_capability_hook_backend_run_rebase_exception_falls_through(repo):
             raise RuntimeError("backend exploded")
 
     out = io.StringIO()
-    rc = rebase_gate.run_check_verb(str(repo), "main", backend=_BrokenBackend(),
-                                    fetch=True, out=out, json_only=True)
+    rc = rebase_gate.run_rebase_verb(str(repo), "main", backend=_BrokenBackend(),
+                                     fetch=True, out=out, json_only=True)
     data = json.loads(out.getvalue().strip())
     # Free path ran → valid status
     assert data["status"] in ("up-to-date", "clean", "conflicts", "dirty", "error")
-    assert rc == 0
+    assert rc == (1 if data["status"] == "error" else 0)
 
 
 # ── 8. CLI subcommand smoke tests ─────────────────────────────────────────────
@@ -341,3 +356,100 @@ def test_cli_rebase_check_help():
     with pytest.raises(SystemExit) as exc:
         cli.main(["rebase-check", "--help"])
     assert exc.value.code == 0
+
+
+# ── 9. _resolve_baseref: FETCH_HEAD vs. a stale tracking ref ─────────────────
+
+class _FakeGitRun:
+    """Answers ``git -C <cwd> rev-parse --verify --quiet <ref>`` per a table of
+    ref -> (returncode, stdout), so a stale-but-resolvable tracking ref can be
+    modelled without needing a real narrow/single-branch clone."""
+
+    def __init__(self, answers):
+        self._answers = answers
+        self.calls = []
+
+    def __call__(self, argv, *, cwd=None, timeout=None):
+        self.calls.append(list(argv))
+        ref = argv[-1]
+        rc, out = self._answers.get(ref, (1, ""))
+        return subprocess.CompletedProcess(argv, rc, stdout=out, stderr="")
+
+
+def test_resolve_baseref_prefers_fetch_head_over_stale_tracking_ref():
+    """The bug: a narrow/single-branch checkout's ``origin/main`` tracking ref
+    can still resolve (stale) after an explicit ``git fetch origin main`` that
+    only updated FETCH_HEAD. With ``try_fetch_head=True`` FETCH_HEAD must win
+    even though the stale tracking ref also resolves successfully."""
+    fake = _FakeGitRun({
+        "origin/main": (0, "stale-sha"),
+        "refs/remotes/origin/main": (0, "stale-sha"),
+        "FETCH_HEAD": (0, "fresh-sha"),
+    })
+    baseref = rebase_gate._resolve_baseref(
+        "/repo", "main", "origin", fake, try_fetch_head=True)
+    assert baseref == "FETCH_HEAD"
+    assert fake.calls[0][-1] == "FETCH_HEAD", "FETCH_HEAD must be tried first"
+
+
+def test_resolve_baseref_falls_back_to_tracking_ref_when_no_fetch_head():
+    """When FETCH_HEAD doesn't resolve (no fetch just ran), the tracking ref
+    is still used."""
+    fake = _FakeGitRun({"origin/main": (0, "sha")})
+    baseref = rebase_gate._resolve_baseref(
+        "/repo", "main", "origin", fake, try_fetch_head=True)
+    assert baseref == "origin/main"
+
+
+def test_resolve_baseref_uses_tracking_ref_without_try_fetch_head():
+    """Without ``try_fetch_head`` (no explicit fetch just ran for this base),
+    the remote-tracking ref is tried directly; FETCH_HEAD is never consulted."""
+    fake = _FakeGitRun({"origin/main": (0, "sha"), "FETCH_HEAD": (0, "other-sha")})
+    baseref = rebase_gate._resolve_baseref(
+        "/repo", "main", "origin", fake, try_fetch_head=False)
+    assert baseref == "origin/main"
+    assert "FETCH_HEAD" not in [c[-1] for c in fake.calls]
+
+
+# ── 10. _default_run: non-interactive stdin ───────────────────────────────────
+
+def test_default_run_sets_stdin_devnull(monkeypatch):
+    """git must never block on a credential/input prompt: stdin is DEVNULL."""
+    captured = {}
+    real_run = subprocess.run
+
+    def spy(*args, **kwargs):
+        captured.update(kwargs)
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", spy)
+    rebase_gate._default_run(["git", "--version"])
+    assert captured.get("stdin") is subprocess.DEVNULL
+
+
+# ── 11. _git: injected run() exceptions never escape ─────────────────────────
+
+def test_git_converts_timeout_to_structured_failure():
+    def raising_run(argv, *, cwd=None, timeout=None):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    r = rebase_gate._git("/repo", "fetch", "origin", "main", run=raising_run)
+    assert rebase_gate._rc(r) != 0
+
+
+def test_git_converts_missing_binary_to_structured_failure():
+    def raising_run(argv, *, cwd=None, timeout=None):
+        raise FileNotFoundError("git")
+
+    r = rebase_gate._git("/repo", "status", "--porcelain", run=raising_run)
+    assert rebase_gate._rc(r) != 0
+
+
+def test_rebase_check_reports_error_status_when_run_raises(repo):
+    """End-to-end: an injected run() that raises must surface as a structured
+    error result, not propagate the exception out of rebase_check()."""
+    def raising_run(argv, *, cwd=None, timeout=None):
+        raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+
+    result = rebase_gate.rebase_check(str(repo), "main", run=raising_run)
+    assert result["status"] == "error"

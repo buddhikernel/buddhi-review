@@ -1,7 +1,9 @@
-"""Free rebase-gate engine verb: ``python -m buddhi_review rebase-check``.
+"""Rebase-gate engine verbs: ``python -m buddhi_review rebase-check`` and
+``rebase``.
 
-Reports whether the current branch is behind its base and (if so) whether a
-rebase would be clean — check-only, NEVER mutates the working tree.
+``rebase-check`` reports whether the current branch is behind its base and
+(if so) whether a rebase would be clean — check-only, NEVER mutates the
+working tree, on free tier or paid tier alike.
 
 status ∈ ``up-to-date`` | ``clean`` | ``conflicts`` | ``dirty`` | ``error``
 
@@ -9,10 +11,12 @@ The free-path guidance text tells the operator the manual rebase steps (the
 prose that used to live in ``open-pr/SKILL.md`` §2 now comes from the engine
 so the skill text can be tier-neutral).
 
-When an active backend exposes ``run_rebase(cwd, base)`` the verb MAY
-delegate the actual rebase action to it (paid capability hook — resolved via
+Mutation lives in the separate ``rebase`` verb (:func:`run_rebase_verb`).
+When an active backend exposes ``run_rebase(cwd, base)`` that verb delegates
+the actual rebase action to it (paid capability hook — resolved via
 ``getattr``, never a Protocol change, so a backend without the method is
-silently treated as free-tier).
+silently treated as free-tier). On free tier, ``rebase`` prints the same
+manual guidance as ``rebase-check`` and declines to mutate the repo itself.
 """
 from __future__ import annotations
 
@@ -28,7 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 def _default_run(argv: Sequence[str], *, cwd: Optional[str] = None,
                  timeout: int = 60):
     return subprocess.run(list(argv), cwd=cwd, capture_output=True,
-                          text=True, timeout=timeout)
+                          text=True, timeout=timeout, stdin=subprocess.DEVNULL)
 
 
 def _rc(r: Any) -> int:
@@ -44,7 +48,15 @@ def _stderr(r: Any) -> str:
 
 
 def _git(cwd: str, *args: str, run=_default_run, timeout: int = 60) -> Any:
-    return run(["git", "-C", cwd, *args], cwd=None, timeout=timeout)
+    """Run ``run(["git", "-C", cwd, *args], ...)``, never letting the injected
+    seam's own exceptions (``TimeoutExpired``, missing-binary ``OSError``, ...)
+    escape: they are converted to a synthetic non-zero result so callers stay
+    on the structured ``{"status": "error", ...}`` path instead of crashing."""
+    argv = ["git", "-C", cwd, *args]
+    try:
+        return run(argv, cwd=None, timeout=timeout)
+    except (subprocess.SubprocessError, OSError) as exc:
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr=str(exc))
 
 
 # ── git helpers ────────────────────────────────────────────────────────────────
@@ -64,23 +76,27 @@ def _resolve_baseref(cwd: str, base: str, remote: str, run: Any,
                      *, try_fetch_head: bool = False) -> Optional[str]:
     """Resolve ``origin/<base>`` to the ref the commit-counting can use.
 
-    Prefers the remote-tracking ref (refreshed by fetch). When
-    ``try_fetch_head`` is set (an explicit ``git fetch <remote> <base>`` for
-    this base just ran), FETCH_HEAD is tried next: in a narrow/single-branch
-    checkout the fetch can succeed while leaving ``refs/remotes/<remote>/<base>``
-    absent or stale, because that refspec never mapped the base branch.
-    FETCH_HEAD is exactly what the fetch just wrote, independent of refspec
-    config — mirrors ``buddhi_review.merge._branch_is_behind_base``'s
-    ``HEAD..FETCH_HEAD`` fallback for this same checkout shape. Falls back
+    When ``try_fetch_head`` is set (an explicit ``git fetch <remote> <base>``
+    for this base just ran), FETCH_HEAD is tried FIRST: in a narrow/
+    single-branch checkout the fetch can succeed while leaving
+    ``refs/remotes/<remote>/<base>`` absent OR STALE, because that refspec
+    never mapped the base branch — a stale tracking ref still resolves via
+    rev-parse, so checking it before FETCH_HEAD would silently report the
+    freshly-fetched branch as up-to-date against old data. FETCH_HEAD is
+    exactly what the fetch just wrote, independent of refspec config —
+    mirrors ``buddhi_review.merge._branch_is_behind_base``'s
+    ``HEAD..FETCH_HEAD`` fallback for this same checkout shape. Without a
+    just-completed fetch (``try_fetch_head`` unset), the remote-tracking ref
+    is the freshest signal available and is tried first instead. Falls back
     last to a plain local ref of the same name."""
-    for ref in (f"{remote}/{base}", f"refs/remotes/{remote}/{base}"):
-        r = _git(cwd, "rev-parse", "--verify", "--quiet", ref, run=run)
-        if _rc(r) == 0 and _stdout(r):
-            return ref
     if try_fetch_head:
         r = _git(cwd, "rev-parse", "--verify", "--quiet", "FETCH_HEAD", run=run)
         if _rc(r) == 0 and _stdout(r):
             return "FETCH_HEAD"
+    for ref in (f"{remote}/{base}", f"refs/remotes/{remote}/{base}"):
+        r = _git(cwd, "rev-parse", "--verify", "--quiet", ref, run=run)
+        if _rc(r) == 0 and _stdout(r):
+            return ref
     r = _git(cwd, "rev-parse", "--verify", "--quiet", base, run=run)
     if _rc(r) == 0 and _stdout(r):
         return base
@@ -298,27 +314,18 @@ def run_check_verb(
     *,
     fetch: bool = True,
     run: Any = _default_run,
-    backend: Any = None,
     out: Any = None,
     json_only: bool = False,
 ) -> int:
-    """The ``rebase-check`` subcommand body.
+    """The ``rebase-check`` subcommand body: check + guidance only, NEVER
+    mutates. Run :func:`rebase_check`, print JSON, then print guidance.
 
-    Free default: run :func:`rebase_check`, print JSON, then print guidance.
-    When an active backend exposes ``run_rebase(cwd, base)``, the verb
-    delegates the actual rebase action to it instead."""
+    Strictly read-only on every tier — there is no capability hook here. The
+    paid ``run_rebase`` delegation lives in :func:`run_rebase_verb` (the
+    separate ``rebase`` action verb) so a check-only invocation can never
+    surprise the caller by mutating the repo."""
     out = out or sys.stdout
 
-    # Capability hook: if the active backend can rebase, delegate to it.
-    if backend is not None:
-        backend_result = _delegate_to_backend(backend, cwd, base)
-        if backend_result is not None:
-            print(json.dumps(backend_result), file=out)
-            # Backend-driven results: 0 on success, 1 on any failure state.
-            return 0 if backend_result.get("status") in (
-                "rebased", "up-to-date", "current") else 1
-
-    # Free path: check + guidance only (never mutates).
     result = rebase_check(cwd, base, fetch=fetch, run=run)
     print(json.dumps(result), file=out)
 
@@ -330,4 +337,45 @@ def run_check_verb(
     # 0 for any valid check result (up-to-date/clean/conflicts/dirty); the
     # caller reads the JSON to decide whether action is needed. 1 only for
     # "error" (check itself failed — we do not know the rebase state).
+    return 0 if status != "error" else 1
+
+
+def run_rebase_verb(
+    cwd: str,
+    base: str,
+    *,
+    fetch: bool = True,
+    run: Any = _default_run,
+    backend: Any = None,
+    out: Any = None,
+    json_only: bool = False,
+) -> int:
+    """The ``rebase`` subcommand body — the paid-capability ACTION verb.
+
+    When an active backend exposes ``run_rebase(cwd, base)``, delegates the
+    actual rebase to it (paid tier — this call MAY mutate the working tree).
+    On free tier (no backend, or the backend has no ``run_rebase``), this
+    performs the same read-only check as ``rebase-check`` and prints the
+    manual guidance instead — mutation lives where mutation is expected
+    (here), and this verb never auto-applies it without the paid capability."""
+    out = out or sys.stdout
+
+    if backend is not None:
+        backend_result = _delegate_to_backend(backend, cwd, base)
+        if backend_result is not None:
+            print(json.dumps(backend_result), file=out)
+            # Backend-driven results: 0 on success, 1 on any failure state.
+            return 0 if backend_result.get("status") in (
+                "rebased", "up-to-date", "current") else 1
+
+    # Free path: no paid capability — check + guidance only, decline to
+    # mutate (same read-only contract as rebase-check).
+    result = rebase_check(cwd, base, fetch=fetch, run=run)
+    print(json.dumps(result), file=out)
+
+    if not json_only:
+        print("", file=out)
+        print(guidance_text(result), file=out)
+
+    status = result.get("status", "error")
     return 0 if status != "error" else 1
