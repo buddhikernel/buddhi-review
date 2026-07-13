@@ -202,10 +202,46 @@ def test_pip_install_403_detected():
     assert not ok and pro_trial._looks_like_403(rc, out)
 
 
+def test_pip_install_passes_netrc_env_to_a_runner_that_accepts_it(tmp_path):
+    """A production wrapper runner that declares ``env`` must receive the computed
+    NETRC env — the docstring's export guarantee must hold for injected runners,
+    not just the default subprocess.run lambda."""
+    captured = {}
+
+    def runner(cmd, env=None):
+        captured["env"] = env
+        return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+    netrc_path = tmp_path / "custom.netrc"
+    pro_trial.pip_install(runner=runner, netrc_path=netrc_path)
+    assert captured["env"]["NETRC"] == str(netrc_path)
+
+
+def test_pip_install_legacy_single_arg_runner_is_still_called_with_just_cmd(tmp_path):
+    """A legacy runner that only accepts ``cmd`` (no ``env`` keyword) must keep
+    working unchanged — it must NOT be called with an unexpected ``env=`` kwarg."""
+    captured = {}
+
+    def runner(cmd):
+        captured["cmd"] = cmd
+        return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
+    ok, rc, _out = pro_trial.pip_install(runner=runner, netrc_path=tmp_path / "custom.netrc")
+    assert ok and rc == 0
+    assert captured["cmd"][0:2] == [pro_trial.sys.executable, "-m"]
+
+
 # ── daemon start via discovery ──────────────────────────────────────────────────
 
 def test_start_daemon_via_discovered_backend():
     fake = FakeProBackend(active=True)
+    assert pro_trial.start_daemon(backends=[fake]) is True
+    assert fake.started == 1
+
+
+def test_start_daemon_targets_a_freshly_installed_backend_that_is_not_yet_active():
+    """A backend fresh off ``pip install`` legitimately reports inactive until its
+    OWN start_daemon performs first activation — select_backend's active-only
+    filter would exclude it, so start_daemon must select it directly instead."""
+    fake = FakeProBackend(active=False)
     assert pro_trial.start_daemon(backends=[fake]) is True
     assert fake.started == 1
 
@@ -275,6 +311,19 @@ def test_start_trial_pip_failed_message_includes_index_url(tmp_path):
     out = _start(runner=runner, tmp=tmp_path)
     assert not out.ok and out.status == "pip_failed"
     assert f"--index-url {pro_trial._index_url()}" in out.message
+
+
+def test_start_trial_pip_failed_message_sets_netrc_for_a_custom_path(tmp_path):
+    """When ``netrc_path`` is not the default ``~/.netrc`` (e.g. BUDDHI_NETRC), the
+    printed manual retry command must itself set NETRC= to that same path — a bare
+    ``pip install`` would otherwise fall back to ~/.netrc and repeat the failure."""
+    runner = lambda c: types.SimpleNamespace(returncode=1, stdout="", stderr="network down")
+    custom_netrc = tmp_path / "custom.netrc"
+    out = pro_trial.start_trial(
+        "me@x.io", transport=_full(), backends=[FakeProBackend(True)], runner=runner,
+        netrc_path=custom_netrc, is_active=lambda: True, sleep=lambda s: None, attempts=3)
+    assert not out.ok and out.status == "pip_failed"
+    assert f"NETRC={custom_netrc}" in out.message
 
 
 # ── start_trial: pending-credential retry (token/license failure must not burn the email) ──

@@ -36,6 +36,7 @@ licenses/actions/validate-key · engines/pypi · authentication) 2026-07-12.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -277,15 +278,28 @@ def pip_install(*, runner: Optional[Callable] = None,
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", _PACKAGE,
            "--index-url", _index_url(), "--no-input"]
     env = {**os.environ, "NETRC": str(netrc_path)} if netrc_path is not None else None
-    run = runner or (lambda c: subprocess.run(c, capture_output=True, text=True,
-                                              timeout=600, env=env))
+    run = runner or (lambda c, env=None: subprocess.run(c, capture_output=True, text=True,
+                                                         timeout=600, env=env))
     try:
-        proc = run(cmd)
+        proc = run(cmd, env=env) if _runner_accepts_env(run) else run(cmd)
     except Exception as exc:
         return False, 1, f"{type(exc).__name__}: {exc}"
     rc = getattr(proc, "returncode", 1)
     output = f"{getattr(proc, 'stdout', '') or ''}\n{getattr(proc, 'stderr', '') or ''}"
     return rc == 0, rc, output
+
+
+def _runner_accepts_env(run: Callable) -> bool:
+    """Whether ``run`` will take an ``env=`` keyword — the default subprocess runner
+    and any production wrapper that wants the computed ``NETRC`` env do; the legacy
+    single-arg fakes in the test suite (``lambda cmd: ...``) do not, and must keep
+    receiving just ``cmd`` unchanged."""
+    try:
+        params = inspect.signature(run).parameters
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "env" or p.kind == inspect.Parameter.VAR_KEYWORD
+              for p in params.values())
 
 
 def _looks_like_403(returncode: int, output: str) -> bool:
@@ -304,14 +318,34 @@ def pro_backend_active(*, backends=None) -> bool:
     return upsell.paid_backend_active(backends)
 
 
+def _select_installed_backend(candidates, *, free_name: str):
+    """The freshly-installed non-free backend to kick, regardless of whether it
+    already reports itself active. Unlike :func:`backends.select_backend` (which
+    filters to already-active candidates — the right call for routing a review
+    loop), a backend fresh off ``pip install`` legitimately reports inactive until
+    its OWN ``start_daemon`` performs first activation; requiring active-already
+    here would mean it is never selected, so its daemon never starts and it can
+    never become active in the first place."""
+    from buddhi_review import backends as _b
+    non_free = [b for b in candidates if getattr(b, "name", None) != free_name]
+    if not non_free:
+        return None
+    non_free.sort(key=_b._safe_priority, reverse=True)
+    return non_free[0]
+
+
 def start_daemon(*, backends=None) -> bool:
     """Start the Pro live-view daemon THROUGH the discovered backend (never importing
-    the Pro package). Selects the active backend and duck-types its ``start_daemon``;
-    a backend without one, or any error, is a best-effort no-op. Returns True iff a
-    daemon was reported ready."""
+    the Pro package). Selects the freshly-installed non-free backend — NOT through
+    :func:`backends.select_backend`, whose active-only filter would exclude a
+    backend that has not yet run its own first-activation daemon start — and
+    duck-types its ``start_daemon``; a backend without one, or any error, is a
+    best-effort no-op. Returns True iff a daemon was reported ready."""
     from buddhi_review import backends as _b
     candidates = backends if backends is not None else _b.discover_backends()
-    backend = _b.select_backend(candidates)
+    backend = _select_installed_backend(candidates, free_name=_b.FreeBackend.name)
+    if backend is None:
+        return False
     starter = getattr(backend, "start_daemon", None)
     if not callable(starter):
         return False
@@ -402,8 +436,8 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
                                 "active yet — wait a moment and re-run setup.")
         return TrialOutcome(False, "pip_failed",
                             f"Install did not complete — your license is set up and {resolved_netrc} "
-                            f"is intact, so just re-run: {sys.executable} -m pip install --upgrade "
-                            f"{_PACKAGE} --index-url {_index_url()} --no-input")
+                            f"is intact, so just re-run: NETRC={resolved_netrc} {sys.executable} -m "
+                            f"pip install --upgrade {_PACKAGE} --index-url {_index_url()} --no-input")
 
     start_daemon(backends=backends)
     if _await_active(backends=backends, is_active=is_active, sleep=sleep, attempts=attempts):
