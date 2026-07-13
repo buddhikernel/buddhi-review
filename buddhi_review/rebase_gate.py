@@ -12,10 +12,13 @@ prose that used to live in ``open-pr/SKILL.md`` §2 now comes from the engine
 so the skill text can be tier-neutral).
 
 Mutation lives in the separate ``rebase`` verb (:func:`run_rebase_verb`).
-When an active backend exposes ``run_rebase(cwd, base)`` that verb delegates
-the actual rebase action to it (paid capability hook — resolved via
-``getattr``, never a Protocol change, so a backend without the method is
-silently treated as free-tier). On free tier, ``rebase`` prints the same
+When an active backend exposes ``run_rebase(cwd, base, repo=None,
+remote=None)`` that verb delegates the actual rebase action to it (paid
+capability hook — resolved via ``getattr``, never a Protocol change, so a
+backend without the method is silently treated as free-tier). The
+``repo``/``remote`` keywords forward the same base-remote override
+``rebase-check`` honors, so a fork checkout's explicit ``--remote upstream``
+is not dropped on the paid path. On free tier, ``rebase`` prints the same
 manual guidance as ``rebase-check`` and declines to mutate the repo itself.
 """
 from __future__ import annotations
@@ -207,8 +210,17 @@ def rebase_check(cwd: str, base: str, *, fetch: bool = True,
                 "conflict_files": [], "detail": "not a git work tree"}
 
     # Dirty-tree probe (porcelain: non-empty → uncommitted changes present).
+    # A failed probe fails CLOSED (status "error") rather than defaulting to
+    # dirty=False, which could otherwise let a later up-to-date/clean result
+    # through when the working-tree state was never actually determined.
     dirty_r = _git(cwd, "status", "--porcelain", run=run)
-    dirty = _rc(dirty_r) == 0 and bool(_stdout(dirty_r))
+    if _rc(dirty_r) != 0:
+        return {"status": "error", "base": base, "base_resolved": None,
+                "remote": None, "behind": None, "ahead": None,
+                "conflict_files": [],
+                "detail": (f"git status --porcelain failed; cannot determine "
+                           f"working-tree state: {_stderr(dirty_r)[:200]}")}
+    dirty = bool(_stdout(dirty_r))
 
     # The remote that hosts the BASE branch, not the feature branch's remote:
     # in a fork checkout the feature branch tracks origin (the fork) while the
@@ -270,16 +282,24 @@ def rebase_check(cwd: str, base: str, *, fetch: bool = True,
         return out2
 
     tree_status, files = _merge_tree_clean(cwd, baseref, run)
-    # Normalise unknown → clean (conservative: offer the user the manual rebase
-    # steps, and let the real rebase be the truth source about conflicts).
+    conflict_prediction = tree_status
+    # Normalise unknown → clean STATUS (conservative: still offer the user the
+    # manual rebase steps, and let the real rebase be the truth source about
+    # conflicts) but record the raw prediction separately in
+    # ``conflict_prediction`` so a caller — and the detail text below — can
+    # tell "predicted clean" apart from "prediction unavailable" instead of
+    # asserting cleanliness that was never actually verified.
     if tree_status == "unknown":
         tree_status = "clean"
     out2["status"] = tree_status
     out2["conflict_files"] = files
-    out2["detail"] = (
-        f"{behind} commit(s) behind {baseref}; "
-        + {"clean": "rebase looks clean.",
-           "conflicts": "rebase would conflict."}[tree_status])
+    out2["conflict_prediction"] = conflict_prediction
+    if conflict_prediction == "unknown":
+        detail_suffix = "conflict prediction unavailable; rebase outcome unverified."
+    else:
+        detail_suffix = {"clean": "rebase looks clean.",
+                         "conflicts": "rebase would conflict."}[tree_status]
+    out2["detail"] = f"{behind} commit(s) behind {baseref}; " + detail_suffix
     return out2
 
 
@@ -319,8 +339,12 @@ def guidance_text(result: Dict[str, Any]) -> str:
                 f"  git stash --include-untracked\n{rebase_msg}")
 
     if status == "clean":
+        headline_suffix = (
+            "conflict prediction unavailable; rebase outcome unverified."
+            if result.get("conflict_prediction") == "unknown"
+            else "rebase looks clean.")
         return (f"Branch is {behind} commit(s) behind {baseref}; "
-                "rebase looks clean.\nTo rebase manually:\n"
+                f"{headline_suffix}\nTo rebase manually:\n"
                 + _MANUAL_STEPS.format(baseref=baseref))
 
     if status == "conflicts":
@@ -340,18 +364,29 @@ def guidance_text(result: Dict[str, Any]) -> str:
 
 # ── Paid capability hook ───────────────────────────────────────────────────────
 
-def _delegate_to_backend(backend: Any, cwd: str,
-                         base: str) -> Optional[Dict[str, Any]]:
+def _delegate_to_backend(backend: Any, cwd: str, base: str, *,
+                         repo: Optional[str] = None,
+                         remote: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Delegate to the active backend's ``run_rebase`` if it exposes one.
 
+    ``repo``/``remote`` forward the same base-remote override ``rebase_check``
+    honors (see :func:`_resolve_base_remote`) so a fork checkout's explicit
+    ``--remote upstream``/``--repo`` is not silently dropped on the paid path —
+    without it the backend would fall back to its own default remote
+    resolution and could rebase against the stale fork copy of the base.
+
     Never a Protocol change — a backend without ``run_rebase`` is silently
-    treated as free-tier. Returns the backend's result dict, or None when the
-    backend does not offer the capability or the call fails."""
+    treated as free-tier, and a backend whose ``run_rebase`` does not accept
+    the ``repo``/``remote`` keywords raises ``TypeError`` here, which is
+    likewise swallowed and treated as free-tier (the hook stays best-effort
+    duck typing, not an enforced interface). Returns the backend's result
+    dict, or None when the backend does not offer the capability or the call
+    fails."""
     fn = getattr(backend, "run_rebase", None)
     if fn is None or not callable(fn):
         return None
     try:
-        return dict(fn(cwd, base))
+        return dict(fn(cwd, base, repo=repo, remote=remote))
     except Exception:
         return None
 
@@ -407,16 +442,21 @@ def run_rebase_verb(
 ) -> int:
     """The ``rebase`` subcommand body — the paid-capability ACTION verb.
 
-    When an active backend exposes ``run_rebase(cwd, base)``, delegates the
-    actual rebase to it (paid tier — this call MAY mutate the working tree).
-    On free tier (no backend, or the backend has no ``run_rebase``), this
-    performs the same read-only check as ``rebase-check`` and prints the
-    manual guidance instead — mutation lives where mutation is expected
-    (here), and this verb never auto-applies it without the paid capability."""
+    When an active backend exposes ``run_rebase(cwd, base, repo=None,
+    remote=None)``, delegates the actual rebase to it (paid tier — this call
+    MAY mutate the working tree), forwarding the same base-remote override
+    ``repo``/``remote`` that the free check path resolves against (see
+    :func:`_resolve_base_remote`) so a fork checkout's explicit remote is not
+    dropped on the paid path. On free tier (no backend, or the backend has no
+    ``run_rebase``), this performs the same read-only check as
+    ``rebase-check`` and prints the manual guidance instead — mutation lives
+    where mutation is expected (here), and this verb never auto-applies it
+    without the paid capability."""
     out = out or sys.stdout
 
     if backend is not None:
-        backend_result = _delegate_to_backend(backend, cwd, base)
+        backend_result = _delegate_to_backend(backend, cwd, base,
+                                              repo=repo, remote=remote)
         if backend_result is not None:
             print(json.dumps(backend_result), file=out)
             # Backend-driven results: 0 on success, 1 on any failure state.

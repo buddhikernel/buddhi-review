@@ -234,8 +234,8 @@ class _FakePaidBackend:
     def run_review_loop(self, pr, repo, cwd, **opts):
         return 0
 
-    def run_rebase(self, cwd, base):
-        self.calls.append((cwd, base))
+    def run_rebase(self, cwd, base, repo=None, remote=None):
+        self.calls.append((cwd, base, repo, remote))
         return {"status": self._status, "base": base, "detail": "backend did it"}
 
 
@@ -276,11 +276,29 @@ def test_capability_hook_delegates_when_backend_has_run_rebase(repo):
                                      fetch=True, out=out, json_only=True)
 
     assert len(backend.calls) == 1, "backend.run_rebase must be called exactly once"
-    assert backend.calls[0] == (str(repo), "main")
+    assert backend.calls[0] == (str(repo), "main", None, None)
     assert rc == 0
 
     data = json.loads(out.getvalue().strip())
     assert data["status"] == "rebased"
+
+
+def test_capability_hook_forwards_base_remote_override(repo):
+    """A fork checkout's explicit --repo/--remote override must reach the
+    paid backend's run_rebase, not just the free-fallback rebase_check path —
+    otherwise a paid rebase could target the stale fork remote/base."""
+    backend = _FakePaidBackend(status="rebased")
+    out = io.StringIO()
+
+    rc = rebase_gate.run_rebase_verb(str(repo), "main", backend=backend,
+                                     fetch=False, out=out, json_only=True,
+                                     repo="owner/upstream-repo",
+                                     remote="upstream")
+
+    assert len(backend.calls) == 1
+    assert backend.calls[0] == (str(repo), "main", "owner/upstream-repo",
+                                "upstream")
+    assert rc == 0
 
 
 def test_capability_hook_free_path_when_backend_has_no_run_rebase(repo):
@@ -313,7 +331,7 @@ def test_capability_hook_backend_run_rebase_exception_falls_through(repo):
     class _BrokenBackend:
         def is_active(self): return True
         def run_review_loop(self, *a, **k): return 0
-        def run_rebase(self, cwd, base):
+        def run_rebase(self, cwd, base, repo=None, remote=None):
             raise RuntimeError("backend exploded")
 
     out = io.StringIO()
