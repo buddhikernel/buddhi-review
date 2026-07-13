@@ -7,6 +7,7 @@ rebase_check).
 """
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import subprocess
@@ -255,8 +256,8 @@ def test_check_verb_never_delegates_even_with_paid_backend(repo):
     """rebase-check has no capability hook: it stays read-only-check even when
     a paid backend with run_rebase is active. (The hook lives on the
     separate ``rebase`` action verb, run_rebase_verb, not on the check verb.)"""
-    assert "backend" not in rebase_gate.run_check_verb.__code__.co_varnames[
-        :rebase_gate.run_check_verb.__code__.co_argcount]
+    sig = inspect.signature(rebase_gate.run_check_verb)
+    assert "backend" not in sig.parameters
 
     out = io.StringIO()
     rc = rebase_gate.run_check_verb(str(repo), "main", fetch=True, out=out,

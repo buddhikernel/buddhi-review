@@ -192,11 +192,12 @@ def rebase_check(cwd: str, base: str, *, fetch: bool = True,
     :func:`_resolve_base_remote`. Without either, the chain falls back to
     ``branch.<base>.remote`` then ``origin``.
 
-    A dirty working tree is reported as ``dirty`` (a rebase would fail); the
-    behind/ahead counts are still populated when determinable. A failed fetch
-    or rev-list yields ``error`` (never a false ``up-to-date``): the freshness
-    guarantee cannot be met against a possibly-stale local ref, so the skill
-    should ask rather than trust it."""
+    A dirty working tree is reported as ``dirty``; note that this includes
+    untracked files, which do not block a rebase, so some dirty trees may still
+    rebase cleanly. The behind/ahead counts are still populated when
+    determinable. A failed fetch or rev-list yields ``error`` (never a false
+    ``up-to-date``): the freshness guarantee cannot be met against a
+    possibly-stale local ref, so the skill should ask rather than trust it."""
     if not os.path.isdir(cwd):
         return {"status": "error", "base": base, "base_resolved": None,
                 "remote": None, "behind": None, "ahead": None,
