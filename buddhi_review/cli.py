@@ -378,15 +378,19 @@ def _known_commands(parser: argparse.ArgumentParser) -> frozenset:
 
 def _split_command(argv: List[str]) -> tuple[Optional[str], List[str]]:
     """Split ``argv`` into ``(command, trailing)`` for the pre-parse fallback seam:
-    ``command`` is the first positional token (the subcommand word) and ``trailing``
-    is everything after it, forwarded verbatim to a claiming backend. Returns
-    ``(None, [])`` when there is no positional to dispatch — an empty argv, or a
-    leading ``-h`` / ``--help`` / ``--version`` that argparse itself answers."""
-    for i, tok in enumerate(argv):
-        if tok in ("-h", "--help", "--version"):
-            return None, []
-        if not tok.startswith("-"):
-            return tok, list(argv[i + 1:])
+    ``command`` is ``argv[0]`` (the subcommand word) and ``trailing`` is everything
+    after it, forwarded verbatim to a claiming backend. Returns ``(None, [])`` when
+    there is no candidate to dispatch — an empty argv, a leading ``-h`` / ``--help``
+    / ``--version`` that argparse itself answers, or any other leading option (this
+    parser has no global options that take a value, so a leading ``-`` token is
+    always argparse's to reject, never a command word)."""
+    if not argv:
+        return None, []
+    tok = argv[0]
+    if tok in ("-h", "--help", "--version"):
+        return None, []
+    if not tok.startswith("-"):
+        return tok, list(argv[1:])
     return None, []
 
 

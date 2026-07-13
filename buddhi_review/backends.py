@@ -273,10 +273,12 @@ def select_command_backend(command: str, *,
         if not callable(claimed):
             continue
         try:
-            names = list(claimed() or ())
+            # Stream the membership test (``in`` short-circuits on a match) instead
+            # of materializing the full iterable first — a third-party backend's
+            # claimed_commands() may be large or expensive to fully enumerate.
+            if command not in (claimed() or ()):
+                continue
         except Exception:
-            continue
-        if command not in names:
             continue
         if _is_active(backend) and callable(getattr(backend, "run_command", None)):
             claimants.append(backend)
