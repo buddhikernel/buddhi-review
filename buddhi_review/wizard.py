@@ -2529,7 +2529,7 @@ def _prompt_email(*, input_fn, stream, pal) -> Optional[str]:
     return None
 
 
-def step_pro_trial(repo: Optional[str], *, pal, stream, input_fn=input,
+def step_pro_trial(_repo: Optional[str], *, pal, stream, input_fn=input,
                    paste_input: Optional[Callable] = None) -> None:
     """Step 7c — the first-run Pro trial offer (PRO-6, §E.9(a): the one sanctioned
     conversion moment). A single benefit-led line + a default-YES prompt, shown only
@@ -2562,6 +2562,7 @@ def step_pro_trial(repo: Optional[str], *, pal, stream, input_fn=input,
     if outcome.status == "email_registered" and _ask_yes_no(
             "Already have a Pro key to paste?", default=False,
             input_fn=input_fn, stream=stream, pal=pal):
+        _row("step", pro_trial.convert_checkout_prompt(), pal, stream)
         paste = paste_input or (lambda prompt: _read_pasted_secret(prompt, _default_getpass))
         conv = pro_trial.convert(paste_input=paste, confirm_input=input_fn, stream=stream)
         _row("ok" if conv.ok else "info", conv.message, pal, stream)

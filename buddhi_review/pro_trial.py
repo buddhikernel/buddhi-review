@@ -399,6 +399,14 @@ def _convert_pointer() -> str:
             "and re-run setup.")
 
 
+def convert_checkout_prompt() -> str:
+    """The line to show BEFORE :func:`convert` starts its paste flow, pointing the
+    user at checkout. Exposed so the caller can render it through its own formatting
+    (e.g. the wizard's ``_row``) instead of ``convert`` writing straight to the
+    stream out-of-band with the rest of the wizard's output."""
+    return f"Subscribe or re-subscribe at {CHECKOUT_URL} — Keygen emails your Pro key."
+
+
 def _expiry_phrase(attrs: Optional[dict]) -> str:
     """A friendly 'runs to <date>' phrase from the server-stamped end date, or the
     plain '14-day' fallback. This DISPLAYS the server value — it does no date math."""
@@ -623,9 +631,6 @@ def convert(*, transport=None, clipboard_reader=None,
     validated tokenlessly), then write ~/.netrc + install + daemon. Never mints a paid
     license itself and never holds a privileged token — open registration +
     validate-key only."""
-    out = stream or sys.stdout
-    print(f"Subscribe or re-subscribe at {CHECKOUT_URL} — Keygen emails your Pro key.",
-          file=out)
     key = detect_pasted_key(transport=transport, clipboard_reader=clipboard_reader,
                             paste_input=paste_input, confirm_input=confirm_input)
     if not key:
