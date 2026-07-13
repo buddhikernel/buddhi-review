@@ -96,3 +96,26 @@ def test_no_trailing_newline_still_separates(tmp_path):
     nw.upsert("index.example", "license", "K", path=p)
     out = _read(p)
     assert "password t\nmachine index.example" in out   # a separator was inserted
+
+
+def test_unreadable_existing_file_is_not_clobbered(tmp_path):
+    p = tmp_path / ".netrc"
+    original = "machine github.com login ghuser password ghtok\n"
+    p.write_text(original, encoding="utf-8")
+    p.chmod(0o000)
+    try:
+        if os.access(p, os.R_OK):
+            return  # running as root or on a platform that ignores chmod(0)
+        ok, action = nw.upsert("index.example", "license", "NEWKEY", path=p)
+    finally:
+        p.chmod(0o600)
+    assert ok is False and action == "read-error"
+    assert _read(p) == original   # the unreadable file was left untouched
+
+
+def test_undecodable_existing_file_is_not_clobbered(tmp_path):
+    p = tmp_path / ".netrc"
+    p.write_bytes(b"machine github.com login ghuser password \xff\xfe\n")
+    ok, action = nw.upsert("index.example", "license", "NEWKEY", path=p)
+    assert ok is False and action == "read-error"
+    assert p.read_bytes() == b"machine github.com login ghuser password \xff\xfe\n"

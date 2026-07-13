@@ -143,13 +143,15 @@ def _atomic_write_0600(path: Path, content: str) -> bool:
 def upsert(host: str, login: str, password: str, *, path: Optional[Path] = None) -> Tuple[bool, str]:
     """Upsert the ``machine <host>`` stanza into ``~/.netrc`` (merge-preserving,
     idempotent, atomic, 0600). Returns ``(ok, action)`` where ``action`` ∈
-    {``created``, ``updated``, ``appended-unparsed``}; ``ok`` is False only on a
-    write error (the live file is then left untouched)."""
+    {``created``, ``updated``, ``appended-unparsed``, ``read-error``}; ``ok`` is
+    False on a write error OR when an existing file can't be read/decoded — we
+    never treat an unreadable file as empty, since that would overwrite it and
+    destroy every other stanza it holds (the live file is then left untouched)."""
     target = path or default_path()
     try:
         content = target.read_text(encoding="utf-8") if target.exists() else ""
-    except OSError:
-        content = ""
+    except (OSError, UnicodeDecodeError):
+        return False, "read-error"
     new_content, action = _replace_or_append(content, host, login, password)
     ok = _atomic_write_0600(target, new_content)
     return ok, action

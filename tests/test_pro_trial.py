@@ -267,6 +267,91 @@ def test_start_trial_pip_failed_netrc_intact(tmp_path):
     assert "intact" in out.message.lower()
 
 
+def test_start_trial_pip_failed_message_includes_index_url(tmp_path):
+    """The manual retry command in the pip_failed message must carry the SAME
+    --index-url pip_install() itself uses — plain PyPI does not host the private
+    package, so a bare 'pip install buddhi-review-pro' cannot recover this state."""
+    runner = lambda c: types.SimpleNamespace(returncode=1, stdout="", stderr="network down")
+    out = _start(runner=runner, tmp=tmp_path)
+    assert not out.ok and out.status == "pip_failed"
+    assert f"--index-url {pro_trial._index_url()}" in out.message
+
+
+# ── start_trial: pending-credential retry (token/license failure must not burn the email) ──
+
+def test_start_trial_retries_after_token_failure_reuse_same_password(tmp_path):
+    """A registration that succeeds but whose token mint fails right after must not
+    permanently lock the email out of its own account: a retry should mint a token
+    with the SAME password instead of re-registering (which the server would now
+    refuse as already-taken, dead-ending into email_registered)."""
+    attempt = {"n": 0}
+
+    def tokens(body):
+        attempt["n"] += 1
+        return (0, None) if attempt["n"] == 1 else _TOKENS_OK
+
+    t = _full(tokens=tokens)
+    out1 = _start(transport=t, tmp=tmp_path)
+    assert not out1.ok and out1.status == "token_failed"
+    assert len([c for c in t.calls if c["url"].endswith("/users")]) == 1
+
+    out2 = _start(transport=t, tmp=tmp_path)
+    assert out2.ok and out2.status == "active"
+    # no second registration attempt on retry
+    assert len([c for c in t.calls if c["url"].endswith("/users")]) == 1
+    token_calls = [c for c in t.calls if c["url"].endswith("/tokens")]
+    assert len(token_calls) == 2
+    assert token_calls[0]["auth"] == token_calls[1]["auth"]   # same password both times
+
+
+def test_start_trial_retries_after_license_failure_reuse_same_password(tmp_path):
+    attempt = {"n": 0}
+
+    def licenses(body):
+        attempt["n"] += 1
+        return (0, None) if attempt["n"] == 1 else _LICENSE_OK
+
+    t = _full(licenses=licenses)
+    out1 = _start(transport=t, tmp=tmp_path)
+    assert not out1.ok and out1.status == "license_failed"
+
+    out2 = _start(transport=t, tmp=tmp_path)
+    assert out2.ok and out2.status == "active"
+    assert len([c for c in t.calls if c["url"].endswith("/users")]) == 1
+
+
+def test_start_trial_clears_pending_credential_after_success(tmp_path):
+    out = _start(tmp=tmp_path)
+    assert out.ok
+    state = json.loads((tmp_path / "trial.json").read_text(encoding="utf-8"))
+    assert "pending_password" not in state
+    assert "pending_email" not in state
+    assert "pending_user_id" not in state
+
+
+def test_start_trial_pending_state_file_is_0600(tmp_path):
+    t = _full(tokens=lambda body: (0, None))
+    out = _start(transport=t, tmp=tmp_path)
+    assert not out.ok and out.status == "token_failed"
+    sp = tmp_path / "trial.json"
+    assert sp.exists()
+    assert stat.S_IMODE(os.stat(sp).st_mode) == 0o600
+
+
+def test_start_trial_pending_credential_ignored_for_a_different_email(tmp_path):
+    """A pending credential for one email must never be reused to mint a token for a
+    DIFFERENT email — only an exact-email match is a legitimate same-account retry."""
+    t = _full(tokens=lambda body: (0, None))
+    out1 = _start(email="me@x.io", transport=t, tmp=tmp_path)
+    assert not out1.ok and out1.status == "token_failed"
+
+    t2 = _full()
+    out2 = _start(email="someone-else@x.io", transport=t2, tmp=tmp_path)
+    assert out2.ok
+    # the second email registered fresh — it did not reuse the first email's pending slot
+    assert len([c for c in t2.calls if c["url"].endswith("/users")]) == 1
+
+
 def test_start_trial_not_activated_unique_per_policy(tmp_path):
     # install succeeds, but the machine never activates (already used its one trial).
     out = _start(is_active=False, tmp=tmp_path)

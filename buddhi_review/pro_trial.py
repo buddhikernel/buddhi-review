@@ -150,9 +150,13 @@ def valid_email(email: str) -> bool:
 
 
 def _gen_password() -> str:
-    """A throwaway password used ONLY to mint the user token in the same call flow;
-    it is never stored or shown. The unprotected account requires a credential pair
-    to issue a user token, so we generate a strong random one and discard it."""
+    """A throwaway password used ONLY to mint the user token; never shown to the
+    user. The unprotected account requires a credential pair to issue a user token,
+    so we generate a strong random one. If registration succeeds but a later step
+    (token or license) fails, it is kept as a short-lived local retry-state
+    credential (0600, see ``_save_pending_credential``) — cleared as soon as the
+    trial license is minted — so a same-email retry is not permanently locked out
+    of the account it just opened."""
     return secrets.token_urlsafe(24)
 
 
@@ -366,7 +370,8 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
                                 "active yet — wait a moment and re-run setup.")
         return TrialOutcome(False, "pip_failed",
                             "Install did not complete — your license is set up and ~/.netrc is "
-                            f"intact, so just re-run: pip install {_PACKAGE}")
+                            f"intact, so just re-run: pip install {_PACKAGE} "
+                            f"--index-url {_index_url()}")
 
     start_daemon(backends=backends)
     if _await_active(backends=backends, is_active=is_active, sleep=sleep, attempts=attempts):
@@ -388,24 +393,37 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
 
 
 def start_trial(email: str, *, transport=None, backends=None, runner=None,
-                netrc_path=None, is_active=None, sleep=None, attempts=20) -> TrialOutcome:
+                netrc_path=None, is_active=None, sleep=None, attempts=20,
+                state_path=None) -> TrialOutcome:
     """Run the full server-less trial acquisition for ``email``. Returns a
     :class:`TrialOutcome`; the wizard prints ``.message``. Fully seam-injectable so
-    the path is unit-testable without network, pip, or a real backend."""
+    the path is unit-testable without network, pip, or a real backend.
+
+    A registration that succeeds but fails before a license is minted (the token or
+    license call errors — e.g. a transient network hiccup) saves its password as a
+    short-lived pending credential (see ``_pending_credential``). A later retry for
+    the SAME email reuses it to mint a token directly, instead of re-registering —
+    which the server would now refuse as already-taken, with no password on this
+    end to answer it."""
     if not valid_email(email):
         return TrialOutcome(False, "bad_email", "That doesn't look like an email address.")
 
-    password = _gen_password()
-    status, user_id, code = register_user(email, password, transport=transport)
-    if user_id is None:
-        # An already-registered email cannot be continued tokenlessly (we do not hold
-        # the existing user's password), so route them to the convert path.
-        if status in (409, 422) or "TAKEN" in code or "CONFLICT" in code:
-            return TrialOutcome(False, "email_registered",
-                                "That email already has a Buddhi account. "
-                                + _convert_pointer())
-        return TrialOutcome(False, "register_failed",
-                            "Could not start the trial (registration failed) — try again later.")
+    pending = _pending_credential(state_path)
+    if pending is not None and pending[0] == email:
+        password, user_id = pending[1], pending[2]
+    else:
+        password = _gen_password()
+        status, user_id, code = register_user(email, password, transport=transport)
+        if user_id is None:
+            # An already-registered email cannot be continued tokenlessly (we do not hold
+            # the existing user's password), so route them to the convert path.
+            if status in (409, 422) or "TAKEN" in code or "CONFLICT" in code:
+                return TrialOutcome(False, "email_registered",
+                                    "That email already has a Buddhi account. "
+                                    + _convert_pointer())
+            return TrialOutcome(False, "register_failed",
+                                "Could not start the trial (registration failed) — try again later.")
+        _save_pending_credential(email, password, user_id, state_path=state_path)
 
     token = mint_user_token(email, password, transport=transport)
     if not token:
@@ -417,6 +435,7 @@ def start_trial(email: str, *, transport=None, backends=None, runner=None,
         return TrialOutcome(False, "license_failed",
                             "Could not create the trial license — try again later.")
 
+    _clear_pending_credential(state_path=state_path)
     return _finish_install(attrs["key"], attrs=attrs, backends=backends, runner=runner,
                            netrc_path=netrc_path, is_active=is_active, sleep=sleep,
                            attempts=attempts)
@@ -541,12 +560,15 @@ def convert(*, transport=None, clipboard_reader=None,
                            attempts=attempts)
 
 
-# ═══════════════════ First-run offer gating (durable dismiss) ═══════════════════
-# Reuses the OSS upsell conventions: BUDDHI_NO_UPSELL suppresses; an active Pro
-# backend suppresses (re-run suppression); a durable decline sticks; and a
-# frequency cap (the shared upsell env knobs) bounds re-offers on later setups. The
-# state lives in this module's own file so a trial decline never entangles the
-# in-run nudge's counters.
+# ═════════ Local state file (offer gating + pending-credential retry) ══════════
+# Reuses the OSS upsell conventions for the first-run offer: BUDDHI_NO_UPSELL
+# suppresses; an active Pro backend suppresses (re-run suppression); a durable
+# decline sticks; and a frequency cap (the shared upsell env knobs) bounds
+# re-offers on later setups. The SAME file also holds a short-lived
+# pending-credential slot (see ``_pending_credential`` below) so a registration
+# that never reached a minted license can be retried without dead-ending into
+# "email already registered". The state lives in this module's own file so
+# neither concern leaks into the shared upsell counters' schema.
 
 def _state_path() -> Path:
     override = os.environ.get("BUDDHI_TRIAL_STATE")
@@ -565,14 +587,49 @@ def _read_state(path: Optional[Path]) -> dict:
 
 
 def _write_state(path: Optional[Path], state: dict) -> None:
+    """Atomic write. Locked to 0600 because this file may hold the pending-
+    credential's throwaway password (see ``_save_pending_credential``), not just
+    non-secret offer counters."""
     p = path or _state_path()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + ".tmp")
         tmp.write_text(json.dumps(state), encoding="utf-8")
         os.replace(tmp, p)
+        os.chmod(p, 0o600)
     except OSError:
         pass
+
+
+def _pending_credential(state_path: Optional[Path]) -> Optional[Tuple[str, str, str]]:
+    """The ``(email, password, user_id)`` saved by a registration that succeeded but
+    did not reach a minted license. Returns None if there is no pending attempt —
+    the caller only reuses it when it matches the email being (re)started."""
+    state = _read_state(state_path)
+    email = state.get("pending_email")
+    password = state.get("pending_password")
+    user_id = state.get("pending_user_id")
+    if (isinstance(email, str) and email and isinstance(password, str) and password
+            and isinstance(user_id, str) and user_id):
+        return email, password, user_id
+    return None
+
+
+def _save_pending_credential(email: str, password: str, user_id: str, *,
+                             state_path: Optional[Path] = None) -> None:
+    state = _read_state(state_path)
+    state["pending_email"] = email
+    state["pending_password"] = password
+    state["pending_user_id"] = user_id
+    _write_state(state_path, state)
+
+
+def _clear_pending_credential(*, state_path: Optional[Path] = None) -> None:
+    state = _read_state(state_path)
+    state.pop("pending_email", None)
+    state.pop("pending_password", None)
+    state.pop("pending_user_id", None)
+    _write_state(state_path, state)
 
 
 def offer_allowed(*, backends=None, now=None, state_path=None) -> bool:
