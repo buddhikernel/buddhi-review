@@ -179,7 +179,15 @@ echo "Telemetry (live log) — follow it with:  tail -n +1 -f \"$LOG\"" >&2
 # lines above are kept unchanged for backward compatibility with any existing
 # parser. On open-pr this launcher's stdout is folded into the actuator's stderr,
 # so the PR URL stays the last line of the actuator's stdout — the NOTICE line
-# never touches that contract.
+# never touches that contract. NOTICE: lines belong on stdout ON PURPOSE (not
+# stderr) — no caller in this repo captures the launcher's whole stdout as a
+# single `log:` value (the GETTING_STARTED.md "drive the CLI directly" example
+# runs the launcher without capturing stdout at all); the real consumer
+# (tests/conftest.py:extract_log, and the SKILL.md relay) parses stdout
+# line-by-line and is unaffected by extra lines. Moving this to stderr would
+# break test_stdout_carries_log_path_plus_notice_relay_lines and
+# test_notice_lines_point_at_the_live_log in tests/test_tail_auto_open.py,
+# which assert NOTICE: lines are on stdout by design.
 printf 'NOTICE: Watch the live log:  tail -n +1 -f %q\n' "$LOG"
 
 # ── macOS: click-to-tail .command + opt-in auto-open ─────────────────────────
