@@ -468,6 +468,60 @@ def test_manual_paste_is_shape_gated_before_validation():
     assert t.calls == []                                  # never even validated
 
 
+# ── a just-bought key has no activation on it yet (it must still convert) ───────
+
+def test_convert_accepts_a_key_that_is_not_activated_yet(tmp_path):
+    """A node-locked key Keygen emailed minutes ago validates ``false`` with
+    ``NO_MACHINE`` until something activates this box — and the thing that activates
+    it is the Pro wheel THIS flow is about to install. Demanding ``valid=True`` here
+    would therefore bounce every legitimate new buyer before _finish_install() could
+    write ~/.netrc, i.e. nobody could convert from the wizard at all."""
+    t = _full(validate=(200, {"meta": {"valid": False, "code": "NO_MACHINE"}}))
+    out = pro_trial.convert(
+        transport=t, clipboard_reader=lambda: "", paste_input=lambda *a: "PAIDKEY-NEW-001",
+        backends=[FakeProBackend(True)],
+        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+        netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
+        attempts=2, stream=io.StringIO())
+    assert out.ok and out.status == "active"
+    assert "PAIDKEY-NEW-001" in (tmp_path / ".netrc").read_text()
+
+
+def test_detect_pasted_key_accepts_the_floating_no_machines_verdict():
+    t = _full(validate=(200, {"meta": {"valid": False, "code": "NO_MACHINES"}}))
+    got = pro_trial.detect_pasted_key(transport=t, clipboard_reader=lambda: "",
+                                      paste_input=lambda *a: "PAIDKEY-NEW-001")
+    assert got == "PAIDKEY-NEW-001"
+
+
+def test_consented_clipboard_key_awaiting_activation_is_accepted():
+    t = _full(validate=(200, {"meta": {"valid": False, "code": "no_machine"}}))
+    got = pro_trial.detect_pasted_key(transport=t, clipboard_reader=lambda: "PAIDKEY-CLIP",
+                                      confirm_input=lambda *a: "y", paste_input=lambda *a: "")
+    assert got == "PAIDKEY-CLIP"          # the code compare is case-insensitive
+
+
+@pytest.mark.parametrize("code", ["SUSPENDED", "EXPIRED", "BANNED", "NOT_FOUND",
+                                  "OVERDUE", "TOO_MANY_MACHINES", ""])
+def test_a_dead_key_is_still_rejected(code):
+    """The not-yet-activated carve-out is exactly two codes wide: every genuinely
+    dead verdict must still fall through to 'no valid key entered'."""
+    t = _full(validate=(200, {"meta": {"valid": False, "code": code}}))
+    got = pro_trial.detect_pasted_key(transport=t, clipboard_reader=lambda: "",
+                                      paste_input=lambda *a: "DEADKEY-1234-5678")
+    assert got is None
+    # rejected on the SERVER's verdict, not incidentally on the local shape gate
+    assert [c for c in t.calls if "validate-key" in c["url"]]
+
+
+def test_key_installable_predicate():
+    assert pro_trial._key_installable(True, "VALID") is True
+    assert pro_trial._key_installable(False, "NO_MACHINE") is True
+    assert pro_trial._key_installable(False, "NO_MACHINES") is True
+    assert pro_trial._key_installable(False, "SUSPENDED") is False
+    assert pro_trial._key_installable(False, "") is False
+
+
 def test_looks_like_license_key_shape_gate():
     ok = ["2A26D5-D74C39-D5CDCA-38DA05-4F70E5-V3",          # Keygen hyphen-grouped hex
           "40680ca7-99c5-4569-8c1d-611713612d3d",           # a UUID key
@@ -547,6 +601,46 @@ def test_request_non_numeric_status_is_fail_open():
     assert pro_trial._request("POST", "/users", transport=weird) == (0, None)
 
 
+# ── the state file never strands the pending password in a temp file ────────────
+
+def test_write_state_leaves_no_temp_file_behind(tmp_path):
+    sp = tmp_path / "trial.json"
+    pro_trial._write_state(sp, {"shown_count": 1})
+    assert json.loads(sp.read_text(encoding="utf-8")) == {"shown_count": 1}
+    assert stat.S_IMODE(os.stat(sp).st_mode) == 0o600
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_write_state_removes_the_temp_file_when_replace_fails(tmp_path, monkeypatch):
+    """The write is fail-soft, but a failed os.replace must not leave the temp file
+    sitting there: it holds the pending credential's password, and that stray copy
+    would outlive the state file the success path later clears."""
+    sp = tmp_path / "trial.json"
+
+    def boom(_src, _dst):
+        raise OSError("EXDEV: cross-device link")
+    monkeypatch.setattr(os, "replace", boom)
+
+    pro_trial._write_state(sp, {"pending_password": "SECRET-PW"})   # must not raise
+
+    assert not sp.exists()
+    on_disk = [p for p in tmp_path.iterdir() if p.is_file()]
+    assert on_disk == [], f"temp file left behind: {on_disk}"
+
+
+def test_write_state_survives_an_unwritable_directory(tmp_path):
+    """Fail-soft is preserved: an unwritable state dir is a no-op, never a crash."""
+    unwritable = tmp_path / "ro"
+    unwritable.mkdir()
+    os.chmod(unwritable, 0o500)
+    try:
+        pro_trial._write_state(unwritable / "trial.json", {"shown_count": 1})
+        assert not (unwritable / "trial.json").exists()
+        assert list(unwritable.iterdir()) == []
+    finally:
+        os.chmod(unwritable, 0o700)
+
+
 # ── offer gating ────────────────────────────────────────────────────────────────
 
 def test_offer_allowed_default(tmp_path):
@@ -574,6 +668,67 @@ def test_offer_frequency_cap(tmp_path, monkeypatch):
     pro_trial.record_offer_shown(now=1000.0, state_path=sp)
     assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], now=1001.0,
                                    state_path=sp) is False
+
+
+def test_offer_interval_is_waived_while_a_credential_is_pending(tmp_path):
+    """The offer is the ONLY door to start_trial, and it stamps itself shown just
+    before the attempt that failed — so the 24h interval would hide the very retry
+    the pending credential exists to serve, for exactly as long as it is worth
+    anything. A pending credential waives the interval; nothing else."""
+    sp = tmp_path / "trial.json"
+    pro_trial.record_offer_shown(now=1000.0, state_path=sp)
+    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], now=1001.0,
+                                   state_path=sp) is False        # no pending: cap holds
+
+    pro_trial._save_pending_credential("me@x.io", "PW", "user-1", state_path=sp)
+    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], now=1001.0,
+                                   state_path=sp) is True         # retry is reachable
+
+    pro_trial._clear_pending_credential(state_path=sp)
+    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], now=1001.0,
+                                   state_path=sp) is False        # and the cap is back
+
+
+def test_a_failed_trial_can_be_retried_on_the_very_next_setup_run(tmp_path):
+    """End to end over the wizard's own sequence (offer_allowed → record_offer_shown
+    → start_trial): a token failure saves the pending credential, and the next run
+    minutes later must still be offered the trial so that credential can be used."""
+    sp = tmp_path / "trial.json"
+    backends = [FakeProBackend(False)]
+    assert pro_trial.offer_allowed(backends=backends, now=1000.0, state_path=sp) is True
+    pro_trial.record_offer_shown(now=1000.0, state_path=sp)
+
+    out = pro_trial.start_trial(
+        "me@x.io", transport=_full(tokens=lambda body: (0, None)), backends=backends,
+        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
+        netrc_path=tmp_path / ".netrc", is_active=lambda: False, sleep=lambda s: None,
+        attempts=1, state_path=sp)
+    assert not out.ok and out.status == "token_failed"
+    assert pro_trial._pending_credential(sp) is not None
+
+    # 60 s later — deep inside the 24h interval — the retry must still be offered
+    assert pro_trial.offer_allowed(backends=backends, now=1060.0, state_path=sp) is True
+
+
+def test_a_pending_credential_never_overrides_the_other_gates(tmp_path, monkeypatch):
+    """The waiver is the interval leg ONLY: suppression, a durable decline, an active
+    Pro backend and the max-shows ceiling all still say no."""
+    sp = tmp_path / "trial.json"
+    pro_trial._save_pending_credential("me@x.io", "PW", "user-1", state_path=sp)
+    free = [FakeProBackend(False)]
+
+    assert pro_trial.offer_allowed(backends=[FakeProBackend(True)], state_path=sp) is False
+    monkeypatch.setenv("BUDDHI_NO_UPSELL", "1")
+    assert pro_trial.offer_allowed(backends=free, state_path=sp) is False
+    monkeypatch.delenv("BUDDHI_NO_UPSELL")
+
+    monkeypatch.setenv("BUDDHI_UPSELL_MAX_SHOWS", "1")
+    pro_trial.record_offer_shown(now=1000.0, state_path=sp)
+    assert pro_trial.offer_allowed(backends=free, now=1e9, state_path=sp) is False
+    monkeypatch.delenv("BUDDHI_UPSELL_MAX_SHOWS")
+
+    pro_trial.record_declined(state_path=sp)
+    assert pro_trial.offer_allowed(backends=free, now=1e9, state_path=sp) is False
 
 
 # ── adversarial: the key never leaks into output or a world-readable file ────────

@@ -211,14 +211,36 @@ def create_trial_license(user_token: str, user_id: str, *, transport=None) -> Op
 def validate_key(key: str, *, transport=None) -> Tuple[bool, str]:
     """Validate a license key via the PUBLIC tokenless ``validate-key`` action
     (``POST /licenses/actions/validate-key``, NO auth — the key IS the proof). Used
-    on the convert path to confirm a pasted paid key before installing. Returns
-    ``(valid, code)`` (code e.g. ``VALID`` / ``SUSPENDED`` / ``EXPIRED``)."""
+    on the convert path to confirm a pasted paid key before installing. Returns the
+    server's verdict verbatim as ``(valid, code)`` (code e.g. ``VALID`` /
+    ``SUSPENDED`` / ``EXPIRED`` / ``NO_MACHINE``). Callers decide what to DO with a
+    given code — see :func:`_key_installable`."""
     status, data = _request("POST", "/licenses/actions/validate-key",
                             body={"meta": {"key": key}}, transport=transport)
     if _ok(status) and isinstance(data, dict):
         meta = data.get("meta") or {}
         return bool(meta.get("valid")), str(meta.get("code") or "")
     return False, ""
+
+
+# The codes that mean "this key is REAL — it just has no activation on it yet". A
+# license whose policy limits it to N machines validates ``false`` while it has none:
+# ``NO_MACHINE`` (the node-locked case) / ``NO_MACHINES`` (the floating case). A key
+# Keygen emailed minutes ago is in exactly that state — the Pro wheel's own first run
+# is what activates this box — so requiring ``valid=True`` here would bounce every
+# freshly-bought key before ``_finish_install`` could write ~/.netrc and let the wheel
+# do it, i.e. nobody could ever convert from the wizard. Accepting them is NOT an
+# entitlement decision (still zero enforcement here, §E.1/§E.3): a key that is not
+# actually entitled is refused by the private index (→ the ``index_403`` path), and
+# the wheel checks itself regardless. Every genuinely dead verdict — SUSPENDED,
+# EXPIRED, BANNED, NOT_FOUND, … — stays rejected.
+_ACTIVATION_PENDING_CODES = frozenset({"NO_MACHINE", "NO_MACHINES"})
+
+
+def _key_installable(valid: bool, code: str) -> bool:
+    """Is this validate-key verdict good enough to go install against? True for a
+    plain ``valid`` key and for the not-yet-activated codes above — nothing else."""
+    return bool(valid) or (code or "").strip().upper() in _ACTIVATION_PENDING_CODES
 
 
 def write_index_credential(key: str, *, path: Optional[Path] = None) -> Tuple[bool, str]:
@@ -235,21 +257,28 @@ def _index_url() -> str:
     return f"https://{_INDEX_HOST}/{_ACCOUNT}/simple"
 
 
-def pip_install(*, runner: Optional[Callable] = None) -> Tuple[bool, int, str]:
+def pip_install(*, runner: Optional[Callable] = None,
+                netrc_path: Optional[Path] = None) -> Tuple[bool, int, str]:
     """``pip install buddhi-review-pro`` from the license-gated index. Returns
     ``(ok, returncode, output)``. The index credential is NOT on the command line —
-    pip reads it from the ``~/.netrc`` written just before this call — so the key is
+    pip reads it from the netrc file written just before this call — so the key is
     never exposed in argv. The ``runner`` seam keeps this network-free under test.
 
+    ``netrc_path`` is exported as ``NETRC`` in the subprocess environment: pip's own
+    netrc lookup (vendored requests' ``get_netrc_auth``) honors the ``NETRC`` env var
+    and only falls back to ``~/.netrc`` when it is unset, so a custom write location
+    (``BUDDHI_NETRC`` or an explicit override) would otherwise be invisible to pip.
+
     ``--no-input`` (pip ≥ 21.1) is what keeps a credential failure FAST: setup runs on an
-    inherited TTY, so an ignored / malformed ~/.netrc or a 401 from the index would
+    inherited TTY, so an ignored / malformed netrc or a 401 from the index would
     otherwise leave pip blocking on its interactive user/password prompt — the wizard
     would simply look hung until the 600 s timeout instead of falling into the
     ``pip_failed`` / ``index_403`` paths below."""
     cmd = [sys.executable, "-m", "pip", "install", "--upgrade", _PACKAGE,
            "--index-url", _index_url(), "--no-input"]
+    env = {**os.environ, "NETRC": str(netrc_path)} if netrc_path is not None else None
     run = runner or (lambda c: subprocess.run(c, capture_output=True, text=True,
-                                              timeout=600))
+                                              timeout=600, env=env))
     try:
         proc = run(cmd)
     except Exception as exc:
@@ -365,7 +394,7 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
                             "shares a line with another entry) — your new credential was appended "
                             f"instead. Please clean up {resolved_netrc} by hand, then re-run setup.")
 
-    installed, rc, output = pip_install(runner=runner)
+    installed, rc, output = pip_install(runner=runner, netrc_path=resolved_netrc)
     if not installed:
         if _looks_like_403(rc, output):
             return TrialOutcome(False, "index_403",
@@ -532,11 +561,12 @@ def detect_pasted_key(*, transport=None, clipboard_reader=None,
     the narrow key shape AND be explicitly confirmed before it is POSTed to validate-key.
     Everything else falls through to the manual paste, so declining costs one paste and
     leaks nothing. Validation uses the public tokenless validate-key action (allowed at
-    acquisition — it is proof-of-possession, not lease enforcement)."""
+    acquisition — it is proof-of-possession, not lease enforcement) and accepts the
+    not-yet-activated verdicts too (:func:`_key_installable`), because a just-bought key
+    has no activation on it until the wheel this very flow installs puts one there."""
     clip = _read_clipboard(clipboard_reader)
     if clip and _looks_like_license_key(clip) and _clipboard_consented(clip, confirm_input):
-        valid, _code = validate_key(clip, transport=transport)
-        if valid:
+        if _key_installable(*validate_key(clip, transport=transport)):
             return clip
     try:
         raw = (paste_input("Paste your Pro key (input hidden): ") or "").strip()
@@ -544,8 +574,7 @@ def detect_pasted_key(*, transport=None, clipboard_reader=None,
         return None
     if not raw or not _looks_like_license_key(raw):
         return None
-    valid, _code = validate_key(raw, transport=transport)
-    return raw if valid else None
+    return raw if _key_installable(*validate_key(raw, transport=transport)) else None
 
 
 def convert(*, transport=None, clipboard_reader=None,
@@ -602,27 +631,40 @@ def _write_state(path: Optional[Path], state: dict) -> None:
     non-secret offer counters. The temp file is created via ``os.open`` with mode
     0600 from its first byte — unlike ``Path.write_text``, which creates at the
     umask-derived default (often 0644) and would briefly expose the password
-    before the post-replace chmod below catches up."""
+    before the post-replace chmod below catches up.
+
+    The write is fail-soft (a read-only / full disk must never crash setup), but it
+    never LEAVES the password behind: the temp file is pid-unique (so two concurrent
+    setups cannot truncate each other's half-written file) and is unlinked in the
+    ``finally`` — without which a failing ``os.replace`` would strand a stray
+    ``pro_trial.json.<pid>.tmp`` holding ``pending_password`` for backups and later
+    readers to pick up, long after the state file itself was cleared."""
     p = path or _state_path()
+    tmp: Optional[Path] = None
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".tmp")
+        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
         fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(state))
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, p)
+        tmp = None                  # replaced: the path is the state file now, not a leftover
         os.chmod(p, 0o600)
     except OSError:
         pass
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
 
 
-def _pending_credential(state_path: Optional[Path]) -> Optional[Tuple[str, str, str]]:
-    """The ``(email, password, user_id)`` saved by a registration that succeeded but
-    did not reach a minted license. Returns None if there is no pending attempt —
-    the caller only reuses it when it matches the email being (re)started."""
-    state = _read_state(state_path)
+def _pending_from_state(state: dict) -> Optional[Tuple[str, str, str]]:
+    """``_pending_credential`` against an ALREADY-read state dict, so a caller that
+    holds the state (``offer_allowed``) does not re-read the file to ask."""
     email = state.get("pending_email")
     password = state.get("pending_password")
     user_id = state.get("pending_user_id")
@@ -630,6 +672,13 @@ def _pending_credential(state_path: Optional[Path]) -> Optional[Tuple[str, str, 
             and isinstance(user_id, str) and user_id):
         return email, password, user_id
     return None
+
+
+def _pending_credential(state_path: Optional[Path]) -> Optional[Tuple[str, str, str]]:
+    """The ``(email, password, user_id)`` saved by a registration that succeeded but
+    did not reach a minted license. Returns None if there is no pending attempt —
+    the caller only reuses it when it matches the email being (re)started."""
+    return _pending_from_state(_read_state(state_path))
 
 
 def _save_pending_credential(email: str, password: str, user_id: str, *,
@@ -652,7 +701,17 @@ def _clear_pending_credential(*, state_path: Optional[Path] = None) -> None:
 def offer_allowed(*, backends=None, now=None, state_path=None) -> bool:
     """True iff the wizard may show the first-run trial offer: not suppressed
     (BUDDHI_NO_UPSELL), not already on Pro, not durably declined, and within the
-    shared upsell frequency cap. Reuses upsell's suppression + cap knobs."""
+    shared upsell frequency cap. Reuses upsell's suppression + cap knobs.
+
+    ONE carve-out: the min-interval leg of the cap is waived while a pending
+    credential is on disk. The offer is the ONLY door to ``start_trial`` (the wizard
+    shows it, then calls), and the shown-stamp is written when the offer is shown —
+    i.e. just before the attempt that failed and left the pending credential. So
+    applying the interval to that state would hide the offer for the full window
+    (24 h by default) and make the retry slot unreachable for exactly as long as it
+    is worth anything, stranding a half-opened account behind an "email already
+    registered" wall. Suppression, an active Pro backend, a durable decline and the
+    max-shows ceiling all still apply — the retry is bounded, not unlimited."""
     from buddhi_review import upsell
     import time
     if upsell.upsell_suppressed():
@@ -667,6 +726,8 @@ def offer_allowed(*, backends=None, now=None, state_path=None) -> bool:
     shown = shown if isinstance(shown, int) else 0
     if shown >= upsell._max_shows():
         return False
+    if _pending_from_state(state) is not None:
+        return True
     last = state.get("last_shown")
     if isinstance(last, (int, float)) and (now - last) < upsell._min_interval_seconds():
         return False
