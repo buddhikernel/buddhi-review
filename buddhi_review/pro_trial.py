@@ -44,6 +44,7 @@ import secrets
 import ssl
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -668,17 +669,22 @@ def _write_state(path: Optional[Path], state: dict) -> None:
     before the post-replace chmod below catches up.
 
     The write is fail-soft (a read-only / full disk must never crash setup), but it
-    never LEAVES the password behind: the temp file is pid-unique (so two concurrent
-    setups cannot truncate each other's half-written file) and is unlinked in the
-    ``finally`` — without which a failing ``os.replace`` would strand a stray
-    ``pro_trial.json.<pid>.tmp`` holding ``pending_password`` for backups and later
+    never LEAVES the password behind: the temp file gets an unpredictable name via
+    ``tempfile.mkstemp`` (opened O_EXCL under the hood, so a pre-created file or
+    symlink at a guessed name is refused rather than truncated-through — relevant
+    because ``BUDDHI_TRIAL_STATE`` can point at a shared directory) and is unlinked
+    in the ``finally`` — without which a failing ``os.replace`` would strand a stray
+    ``pro_trial.json.tmp*`` holding ``pending_password`` for backups and later
     readers to pick up, long after the state file itself was cleared."""
     p = path or _state_path()
     tmp: Optional[Path] = None
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{p.name}.", suffix=".tmp", dir=str(p.parent)
+        )
+        tmp = Path(tmp_name)
+        os.chmod(tmp, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(json.dumps(state))
             f.flush()
