@@ -162,6 +162,14 @@ _CLASSIFY_CASES = [
     ("gradle-pass", tr.GRADLE, 0, "BUILD SUCCESSFUL in 4s", tr.PASSED),
     ("gradle-fail", tr.GRADLE, 1, "> There were failing tests. BUILD FAILED", tr.FAILED),
     ("gradle-compile", tr.GRADLE, 1, "> Task :compileJava FAILED\nCompilation failed", tr.COMPILE_ERROR),
+    # A bare NO-SOURCE is generic Gradle task-outcome text (e.g. a project with no
+    # src/main/resources prints `> Task :processResources NO-SOURCE`), not a
+    # test-specific signal — it must not false the gate into NO_TESTS on a green,
+    # fully-passing run.
+    ("gradle-nonsource-resources-still-pass", tr.GRADLE, 0,
+     "> Task :processResources NO-SOURCE\n> Task :test\nBUILD SUCCESSFUL in 4s", tr.PASSED),
+    ("gradle-test-task-nonsource-is-no-tests", tr.GRADLE, 0,
+     "> Task :test NO-SOURCE\nBUILD SUCCESSFUL in 1s", tr.NO_TESTS),
 
     # ---- dotnet (VSTest SILENT EXIT 0 + MTP) ----
     ("dotnet-pass", tr.DOTNET, 0, "Passed!  - Failed: 0, Passed: 12, Total: 12", tr.PASSED),
@@ -170,6 +178,11 @@ _CLASSIFY_CASES = [
     ("dotnet-vstest-filter-no-match", tr.DOTNET, 0, "...but no test matches the specified selection criteria.", tr.NO_TESTS),
     ("dotnet-mtp-no-tests-8", tr.DOTNET, 8, "", tr.NO_TESTS),
     ("dotnet-build-fail", tr.DOTNET, 1, "Build FAILED.\nProgram.cs(3,1): error CS1002", tr.COMPILE_ERROR),
+    # `error CS\d+` / `error MSB\d+` are rc-gated: a green run (rc 0) that merely
+    # PRINTS that literal text as test output (e.g. a Roslyn analyzer test asserting
+    # on the exact diagnostic string) must never false-red.
+    ("dotnet-green-printing-error-cs-string", tr.DOTNET, 0,
+     "Passed!  - Failed: 0, Passed: 1, Total: 1\n  expected diagnostic: error CS1002", tr.PASSED),
     # The no-tests markers are rc==0-GATED. A repo with no tests exits 0 by DEFAULT, so a
     # NONZERO exit whose ONLY signal is a no-tests marker is never a benign empty run —
     # it is opt-in <TreatNoTestsAsError> or a BROKEN discovery (missing adapter / TFM
@@ -448,8 +461,13 @@ _ARGV_CASES = [
     (["./manage.py", "test", "app"], tr.DJANGO),
     (["python3", "-m", "nox"], tr.NOX),
     (["tox"], tr.TOX),
+    (["python", "-I", "-m", "pytest", "tests/"], tr.PYTEST),
+    (["python", "-X", "dev", "-m", "pytest"], tr.PYTEST),
+    (["python", "-I", "manage.py", "test"], tr.DJANGO),
     (["npx", "vitest", "run"], tr.VITEST),
     (["npx", "jest"], tr.JEST),
+    (["npx", "-y", "jasmine"], tr.JASMINE),
+    (["npx", "--yes", "vitest", "run"], tr.VITEST),
     (["node_modules/.bin/jest"], tr.JEST),
     (["mocha", "test/"], tr.MOCHA),
     (["jasmine"], tr.JASMINE),
@@ -691,6 +709,28 @@ class TestGateNoTestsSkip:
         out = capsys.readouterr().out
         assert "no tests detected for jasmine" in out
         assert "gate SKIPPED" in out and "not green" in out
+
+    def test_npx_yes_flag_jasmine_no_tests_skips_not_green(self, monkeypatch, capsys):
+        # `npx -y jasmine` / `npx --yes jasmine` (npm's noninteractive flag) must
+        # still resolve to jasmine, not fall through to UNKNOWN's generic classifier
+        # (which would false-green a silent "No specs found" rc==0 run).
+        monkeypatch.setenv("BUDDHI_TEST_COMMAND", "npx --yes jasmine")
+        status, tail = commit_push.run_test_gate(
+            "/w", run=_run_returning(0, "Started\nNo specs found\n"), notice=_silent)
+        assert status == "skipped"
+        assert tail == ""
+        assert "no tests detected for jasmine" in capsys.readouterr().out
+
+    def test_python_dash_i_dash_m_pytest_exit5_is_skip_not_red(self, monkeypatch, capsys):
+        # `python -I -m pytest` (an interpreter option before `-m`) must still
+        # resolve to pytest, not UNKNOWN — else exit 5 misclassifies as a generic
+        # `failed` instead of `no_tests`.
+        monkeypatch.setenv("BUDDHI_TEST_COMMAND", "python -I -m pytest -q")
+        status, tail = commit_push.run_test_gate(
+            "/w", run=_run_returning(5, "no tests ran in 0.01s"), notice=_silent)
+        assert status == "skipped"
+        assert tail == ""
+        assert "no tests detected for pytest" in capsys.readouterr().out
 
     def test_pytest_exit5_is_skip_not_red(self, monkeypatch, capsys):
         # pytest exit 5 (no tests collected) is a SKIP, not a red gate — the "pytest

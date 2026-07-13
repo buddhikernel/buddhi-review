@@ -132,6 +132,11 @@ _LAUNCHERS = ("npx", "bunx", "pnpx")
 _LAUNCHER_PAIRS = (("bundle", "exec"), ("poetry", "run"), ("uv", "run"),
                    ("pipenv", "run"), ("rye", "run"), ("pdm", "run"))
 
+#: npm's documented `-y`/`--yes` flag suppresses npx's install-confirmation prompt
+#: (`npx -y <pkg>` / `npx --yes <pkg>`) — it precedes the runner token, not the
+#: runner itself, so it must be dropped alongside the launcher.
+_NPX_NONINTERACTIVE_FLAGS = ("-y", "--yes")
+
 
 def _basename_token(tok: str) -> str:
     """The trailing path component of an argv token, minus a trailing `.exe`,
@@ -156,6 +161,8 @@ def _strip_launchers(argv: list) -> list:
         if head in _LAUNCHERS:
             toks = toks[1:]
             changed = True
+            while toks and _basename_token(toks[0]) in _NPX_NONINTERACTIVE_FLAGS:
+                toks = toks[1:]
             continue
         if len(toks) >= 2:
             for a, b in _LAUNCHER_PAIRS:
@@ -164,6 +171,27 @@ def _strip_launchers(argv: list) -> list:
                     changed = True
                     break
     return toks
+
+
+#: Interpreter options that consume a SEPARATE following argument (`-X dev`,
+#: `-W ignore`) — case-sensitive since `-x` (skip the `#!` line) is a distinct,
+#: argument-less flag from `-X` (set an implementation option).
+_PY_OPTS_WITH_ARG = ("-X", "-W")
+
+
+def _skip_python_interpreter_opts(toks: list) -> int:
+    """Index of the first token after `python` that is not a leading interpreter
+    option (`-I`, `-X dev`, `-O`, …), so `-m <module>` / `manage.py` is found even
+    behind `python -I -m pytest` / `python -X dev manage.py test`."""
+    i = 1
+    while i < len(toks):
+        tok = str(toks[i])
+        if not tok.startswith("-") or tok == "-m":
+            break
+        i += 1
+        if tok in _PY_OPTS_WITH_ARG:
+            i += 1
+    return i
 
 
 def _runner_from_argv(argv: list) -> Optional[str]:
@@ -177,17 +205,25 @@ def _runner_from_argv(argv: list) -> Optional[str]:
         return None
     head = _basename_token(toks[0])
 
-    # `python -m <module>` — pytest / unittest / nox / tox / … run as a module.
-    if head in ("python", "python2", "python3", "py") and len(toks) >= 3 and _basename_token(toks[1]) == "-m":
-        mod = _basename_token(toks[2])
-        return {
-            "pytest": PYTEST, "unittest": UNITTEST, "nox": NOX, "tox": TOX,
-            "nose2": UNITTEST, "mypy": None,  # nose2 is unittest-based
-        }.get(mod)
+    # `python -m <module>` / `python manage.py test` — skip leading interpreter
+    # options first (`python -I -m pytest`, `python -X dev manage.py test`) so `-m`
+    # /`manage.py` is recognized regardless of how many precede it.
+    if head in ("python", "python2", "python3", "py"):
+        idx = _skip_python_interpreter_opts(toks)
 
-    # `python manage.py test` / `./manage.py test` — Django's unittest runner.
-    if head in ("python", "python2", "python3", "py") and len(toks) >= 3 and _basename_token(toks[1]) == "manage.py":
-        return DJANGO if "test" in [str(t).lower() for t in toks[2:]] else None
+        # `python -m <module>` — pytest / unittest / nox / tox / … run as a module.
+        if idx < len(toks) - 1 and _basename_token(toks[idx]) == "-m":
+            mod = _basename_token(toks[idx + 1])
+            return {
+                "pytest": PYTEST, "unittest": UNITTEST, "nox": NOX, "tox": TOX,
+                "nose2": UNITTEST, "mypy": None,  # nose2 is unittest-based
+            }.get(mod)
+
+        # `python manage.py test` — Django's unittest runner.
+        if idx < len(toks) and _basename_token(toks[idx]) == "manage.py":
+            return DJANGO if "test" in [str(t).lower() for t in toks[idx + 1:]] else None
+
+    # `./manage.py test` — Django's unittest runner, no interpreter prefix.
     if head == "manage.py":
         return DJANGO if "test" in [str(t).lower() for t in toks[1:]] else None
 
@@ -893,7 +929,13 @@ def _classify_gradle(rc: int, out: str) -> str:
             r"(?m)^\s*(?:[a-zA-Z]:)?[^:\n]+\.(?:java|kt|scala):\d+:\s*error:"):
         return COMPILE_ERROR
     if rc == 0:
-        if _has(out, r"NO-SOURCE", r"No tests found for given includes") and not _has(
+        # NO-SOURCE is a generic Gradle task-outcome marker, not test-specific — it
+        # also prints for e.g. `> Task :processResources NO-SOURCE` on any project
+        # with no src/main/resources, even when the test task ran and passed. Anchor
+        # to the TEST task's own NO-SOURCE line so an unrelated task's NO-SOURCE
+        # can't false the gate into NO_TESTS on a green run.
+        if _has(out, r"(?m)^> Task :\S*[Tt]est\S* NO-SOURCE",
+                r"No tests found for given includes") and not _has(
                 out, r"\bBUILD SUCCESSFUL\b.*\d+ test"):
             return NO_TESTS
         return PASSED
@@ -905,8 +947,16 @@ def _classify_gradle(rc: int, out: str) -> str:
 # ---- .NET / Elixir --------------------------------------------------------------
 
 def _classify_dotnet(rc: int, out: str) -> str:
-    # A build error precedes the test run.
-    if _has(out, r"Build FAILED", r"error CS\d+", r"error MSB\d+"):
+    # A build error precedes the test run. `Build FAILED` is the dotnet CLI's own
+    # summary banner — a green run can never legitimately print it, so it stays
+    # unconditional. The `error CS\d+` / `error MSB\d+` diagnostic substrings are
+    # rc-gated: a green run (rc 0) can legitimately emit that literal text as test
+    # OUTPUT (e.g. a Roslyn analyzer/source-generator test asserting on the exact
+    # compiler diagnostic string) and must never false-red — same invariant as the
+    # abort branch below.
+    if _has(out, r"Build FAILED"):
+        return COMPILE_ERROR
+    if rc != 0 and _has(out, r"error CS\d+", r"error MSB\d+"):
         return COMPILE_ERROR
     # Microsoft Testing Platform (opt-in): 8 = no tests, 2 = test failure.
     if rc == 8:

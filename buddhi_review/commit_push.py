@@ -80,6 +80,13 @@ _PYTEST_SECTION_RE = re.compile(
 # detail (the FAILURES / short-test-summary section) lives near the END.
 _PYTEST_PROGRESS_RE = re.compile(r"^[.FExsX\s]+(?:\[\s*\d+%\])?\s*$")
 
+# The leading class headline `run_test_gate` prepends on a `compile_error` /
+# `env_error` red (`_gate_class_headline`). Recognized so `failure_excerpt` can
+# pull it out of the truncatable tail and always reattach it — it is control
+# text naming WHY the gate is red, not part of the captured run output, and
+# must survive the excerpt regardless of where the real failure detail falls.
+_GATE_HEADLINE_RE = re.compile(r"^\[local-tests\] ✗ gate RED — ")
+
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
@@ -273,19 +280,29 @@ def failure_excerpt(tail: Optional[str], max_lines: int = _FAILURE_EXCERPT_LINES
     of the tail — NEVER the leading progress dots (``...... [ 68%]``), which on a
     byte-capped tail are all the head holds. Pure progress lines are dropped and
     the result is capped to ``max_lines`` with a truncation note so nothing drops
-    silently. Pure/testable; the red-gate panel renders this (via
-    ``format_pytest_tail``) so the operator reads what FAILED, not screens of
-    dots."""
+    silently. A leading ``run_test_gate`` class headline (``_GATE_HEADLINE_RE``,
+    e.g. ``compile_error``/``env_error``) is pulled out first and always
+    reattached as its own line — it names WHY the gate is red and must survive
+    even when the real failure detail is long enough to fill the whole cap.
+    Pure/testable; the red-gate panel renders this (via ``format_pytest_tail``)
+    so the operator reads what FAILED, not screens of dots."""
     # Clamp: both capping branches keep ``max_lines - 1`` real lines + a one-line
     # truncation note, so a value below 2 would slice to ``[:0]`` (note-only,
     # content lost) or hit the ``[-0:]`` whole-list slice. The escalation always
     # wants at least one real line plus the note (mirrors ``format_pytest_tail``'s
     # own ``limit <= 0`` guard).
     max_lines = max(2, max_lines)
-    lines = (tail or "").splitlines()
+    raw = tail or ""
+    headline, _, rest = raw.partition("\n")
+    if _GATE_HEADLINE_RE.match(headline):
+        raw = rest
+    else:
+        headline = ""
+    lines = raw.splitlines()
     meaningful = [ln for ln in lines if not _PYTEST_PROGRESS_RE.match(ln)]
     if not meaningful:
-        return "(no failure detail in the captured pytest output)"
+        body = "(no failure detail in the captured pytest output)"
+        return f"{headline}\n{body}" if headline else body
 
     def _find(pred: Callable[[str], bool]) -> Optional[int]:
         return next((i for i, ln in enumerate(meaningful) if pred(ln)), None)
@@ -310,7 +327,8 @@ def failure_excerpt(tail: Optional[str], max_lines: int = _FAILURE_EXCERPT_LINES
         if omitted > 0:
             sect = [f"… (+{omitted} earlier line(s) omitted — re-run the test "
                     f"suite for the full output)"] + sect
-    return "\n".join(sect)
+    body = "\n".join(sect)
+    return f"{headline}\n{body}" if headline else body
 
 
 def _print_red_gate_panel(
@@ -390,9 +408,12 @@ def run_test_gate(
       * ``failed`` / ``timeout``       → ``red`` (tail byte-identical to before F2).
 
     ``output_tail`` is the full combined stdout+stderr (the caller caps + formats
-    it for display). ``repo`` (``owner/repo``) scopes the per-repo ``test_command``
-    resolution; ``None`` reads env → global → auto-detect. A ``skipped`` on no
-    detectable suite stays loud, never silent."""
+    it for display) for ``green``/``red`` — but ALWAYS ``""`` for ``skipped``
+    (no detectable suite, or a `no_tests` classification), regardless of what the
+    command printed: a skip verified nothing, so there is no failure detail to
+    show and callers must not infer one from the tail. ``repo`` (``owner/repo``)
+    scopes the per-repo ``test_command`` resolution; ``None`` reads env → global
+    → auto-detect. A ``skipped`` on no detectable suite stays loud, never silent."""
     try:
         cmd = resolve_test_command(cwd, repo)
         if cmd is None:
