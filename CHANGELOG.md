@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+* **skills:** converge the `/open-pr` and `/review-pr` skill text to the shared skill-UX contract — an engine-backed rebase gate on both commands (routed through the `rebase-check` / `rebase` verbs), the "No changes to commit" exit, the post-launch hero block, and the `NOTICE:`-line relay contract. `/review-pr` gains a pre-launch rebase gate it never had.
+* **open-pr:** accept `--max-rounds <N>`, overriding the review loop's default cap of 10 rounds (it was already accepted by `review-pr`).
+* **launcher:** emit the "where to watch" pointer as `NOTICE:`-prefixed stdout lines (the full-replay `tail` command, plus a clickable `file://` link on macOS). The skill relays every `NOTICE:` line into its chat reply, so the live-log link is no longer buried in collapsed tool output. The existing `log:` / `Telemetry` lines are unchanged.
+
+### Bug Fixes
+
+* **review-pr:** refuse to launch when the selected PR's branch is not the one checked out in the target directory. The loop applies its fixes in that directory and pushes whatever branch is checked out there, so launching against a checkout sitting on the base branch could land automated review-fix commits on the wrong branch. The skill now stops and asks you to check the PR out in a dedicated worktree first.
+* **open-pr:** the no-op exit now reports `No changes to commit in <repo>. Nothing to do.` (was "No changes to ship"), matching the wording the skill relays.
+
+### Documentation
+
+* **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
+
 ## [0.3.0](https://github.com/buddhikernel/buddhi-review/compare/v0.2.1...v0.3.0) (2026-07-11)
 
 

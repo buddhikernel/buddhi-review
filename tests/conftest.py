@@ -21,6 +21,15 @@ import pytest
 from buddhi_review import fix_apply, gh_ingest
 
 
+def _log_line(stdout):
+    """The single `log: <path>` line from the launcher's stdout, which now also
+    carries S3 `NOTICE: ` relay lines. Returns the line WITHOUT the `log: ` prefix."""
+    for ln in stdout.splitlines():
+        if ln.startswith("log: "):
+            return ln[len("log: "):]
+    raise AssertionError(f"no `log:` line on stdout:\n{stdout}")
+
+
 def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
     """Bridge single_select for _ask_yes_no on a forced TTY: reads the test's
     input_fn (which supplies 'y'/'n'/'') and maps to an option index."""

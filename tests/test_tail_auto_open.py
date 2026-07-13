@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import _log_line
+
 from buddhi_review import tmp_paths
 
 _PUBLIC_ROOT = Path(__file__).resolve().parent.parent
@@ -107,6 +109,8 @@ def _opened(harness):
     return harness.open_argv.read_text().strip() if harness.open_argv.exists() else ""
 
 
+
+
 # ── Cross-platform: arg validation + stream contract ───────────────────────────
 
 def test_usage_when_no_args():
@@ -128,13 +132,40 @@ def test_rejects_zero_pr():
     assert r.returncode == 2
 
 
-def test_log_path_is_the_only_stdout_datum(harness):
+def test_stdout_carries_log_path_plus_notice_relay_lines(harness):
     r = harness()
     assert r.returncode == 0, r.stderr
-    # stdout carries exactly one labeled line: `log: <path>`; launch notice → stderr.
-    assert r.stdout.strip() == f"log: {harness.log}"
+    lines = r.stdout.splitlines()
+    # stdout carries the machine-readable `log:` datum FIRST, then the S3 NOTICE:
+    # relay lines (the tier-neutral SKILL.md relays every NOTICE: line to chat).
+    # Non-NOTICE decoration ("Cleared for takeoff", the follow hint) stays on stderr.
+    assert lines[0] == f"log: {harness.log}"
+    notices = [ln for ln in lines if ln.startswith("NOTICE: ")]
+    assert notices, f"no NOTICE: line on stdout — the S3 relay would be dead:\n{r.stdout}"
+    # Every stdout line is either the log datum or a NOTICE: line — no stray
+    # decoration leaked onto the machine-readable stream.
+    assert all(ln == f"log: {harness.log}" or ln.startswith("NOTICE: ") for ln in lines), r.stdout
     assert "launched" not in r.stdout
     assert "launched" in r.stderr
+
+
+def test_notice_lines_point_at_the_live_log(harness):
+    """The launcher emits `NOTICE: `-prefixed stdout lines that the tier-neutral
+    SKILL.md relays verbatim — this engine's "where to watch" pointer is the local
+    live log. Under the Darwin harness both the universal `tail` NOTICE and the
+    macOS clickable `file://` NOTICE are present."""
+    r = harness()
+    assert r.returncode == 0, r.stderr
+    notices = [ln for ln in r.stdout.splitlines() if ln.startswith("NOTICE: ")]
+    # Universal pointer (every OS): the full-replay tail command.
+    assert any("tail -n +1 -f" in ln for ln in notices), notices
+    # macOS clickable pointer (the harness forces Darwin via the uname stub).
+    assert any("file://" in ln for ln in notices), notices
+    # Every relayed pointer resolves to THIS run's local log — the launcher never
+    # points the user at a remote/off-box surface.
+    assert all(str(harness.log) in ln or str(harness.tailcmd) in ln for ln in notices), notices
+    assert "://" not in "".join(
+        ln.split("file://")[0] for ln in notices), notices  # no other URL scheme
 
 
 def test_follow_hint_uses_full_replay(harness):
@@ -154,7 +185,7 @@ def test_log_name_carries_the_repo_short_name(harness):
     # repo reviewing PR #9 writes a different file and the two never stomp.
     r = harness()
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == f"log: {harness.tmp / 'buddhi-demo-PR9.log'}"
+    assert _log_line(r.stdout) == str(harness.tmp / "buddhi-demo-PR9.log")
     assert "buddhi-review-PR9.log" not in r.stdout  # the old repo-less name is gone
 
 
@@ -170,8 +201,8 @@ def test_log_name_falls_back_to_local_without_repo(tmp_path):
     r = subprocess.run(["bash", str(_LAUNCHER), _PR],
                        capture_output=True, text=True, env=env, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip() == f"log: {tmp_path / tmp_paths.log_name(_PR)}"
-    assert r.stdout.strip().endswith("buddhi-local-PR9.log")
+    assert _log_line(r.stdout) == str(tmp_path / tmp_paths.log_name(_PR))
+    assert _log_line(r.stdout).endswith("buddhi-local-PR9.log")
 
 
 def test_log_name_ignores_flags_as_repo_value(tmp_path):
@@ -186,7 +217,7 @@ def test_log_name_ignores_flags_as_repo_value(tmp_path):
     r = subprocess.run(["bash", str(_LAUNCHER), _PR, "--repo", "--cwd", "/some/path"],
                        capture_output=True, text=True, env=env, cwd=str(tmp_path))
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip().endswith("buddhi-local-PR9.log")
+    assert _log_line(r.stdout).endswith("buddhi-local-PR9.log")
 
 
 # ── A. Full-replay click-to-tail body (macOS) ──────────────────────────────────
@@ -306,7 +337,7 @@ def test_buddhi_review_tmp_overrides_base_and_handles_spaces(tmp_path):
     log = base / tmp_paths.log_name(_PR, _REPO)
     tailcmd = base / tmp_paths.tailcmd_name(_PR, _REPO)
     # The log path on stdout reflects the BUDDHI_REVIEW_TMP base, not /tmp.
-    assert r.stdout.strip() == f"log: {log}"
+    assert _log_line(r.stdout) == str(log)
     assert tailcmd.exists(), "the .command must be written under BUDDHI_REVIEW_TMP"
     assert "tail -n +1 -f" in tailcmd.read_text()
     # The auto-open path handles the space in the base via %q (no crash, right path).

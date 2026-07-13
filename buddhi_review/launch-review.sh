@@ -171,6 +171,25 @@ echo "log: $LOG"
 echo "Cleared for takeoff — buddhi-review launched (PID $PID) on PR #${PR}" >&2
 echo "Telemetry (live log) — follow it with:  tail -n +1 -f \"$LOG\"" >&2
 
+# The "where to watch" pointer as a NOTICE: line on STDOUT. The tier-neutral
+# SKILL.md relays every NOTICE: line verbatim, so this telemetry pointer reaches
+# the user's chat reply without the skill hard-coding any engine-specific content
+# itself — an engine with a richer place to watch simply prints its own NOTICE:
+# line instead, and the same skill text carries it. The `log:` / stderr `Telemetry`
+# lines above are kept unchanged for backward compatibility with any existing
+# parser. On open-pr this launcher's stdout is folded into the actuator's stderr,
+# so the PR URL stays the last line of the actuator's stdout — the NOTICE line
+# never touches that contract. NOTICE: lines belong on stdout ON PURPOSE (not
+# stderr) — no caller in this repo captures the launcher's whole stdout as a
+# single `log:` value (the GETTING_STARTED.md "drive the CLI directly" example
+# runs the launcher without capturing stdout at all); the real consumer
+# (tests/conftest.py:extract_log, and the SKILL.md relay) parses stdout
+# line-by-line and is unaffected by extra lines. Moving this to stderr would
+# break test_stdout_carries_log_path_plus_notice_relay_lines and
+# test_notice_lines_point_at_the_live_log in tests/test_tail_auto_open.py,
+# which assert NOTICE: lines are on stdout by design.
+printf 'NOTICE: Watch the live log:  tail -n +1 -f %q\n' "$LOG"
+
 # ── macOS: click-to-tail .command + opt-in auto-open ─────────────────────────
 if [ "$(uname)" = "Darwin" ]; then
   TAILCMD="${TMP_BASE%/}/review-tail-${REPO_SHORT}-PR${PR}.command"
@@ -200,6 +219,10 @@ if [ "$(uname)" = "Darwin" ]; then
     TAILCMD_URL=$("$LAUNCH_PY" -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$TAILCMD" 2>/dev/null || true)
     [ -n "$TAILCMD_URL" ] || TAILCMD_URL=$(printf '%s' "$TAILCMD" | sed 's/ /%20/g')
     echo "Telemetry (live log) — Watch in a new terminal: file://$TAILCMD_URL" >&2
+    # S3 contract: the clickable file:// pointer as a NOTICE: line on STDOUT so the
+    # skill relays it to chat (macOS only — the .command exists). A Mac user gets a
+    # one-click Watch link; the universal `tail` NOTICE above still covers every OS.
+    printf 'NOTICE: Watch the live log (clickable):  file://%s\n' "$TAILCMD_URL"
 
     # Opt-in auto-open (default OFF). The file:// link above is always the
     # universal fallback; this only ADDS a background open when opted in.

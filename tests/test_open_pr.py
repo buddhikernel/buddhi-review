@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from buddhi_review import open_pr
+from buddhi_review import backends, open_pr
 
 
 # ── git temp-repo helpers ──────────────────────────────────────────────────────────
@@ -152,6 +152,17 @@ def test_path_d_nothing_to_do(tmp_path):
     assert not any(c[:3] == ["gh", "pr", "create"] for c in calls)
     assert "Nothing to do" in err
     assert launched == []
+
+
+def test_nothing_to_do_uses_canonical_wording(tmp_path):
+    """The "nothing to do" notice uses the cross-tree canonical wording — "No
+    changes to commit" — not the old "No changes to ship" phrasing."""
+    work, _ = _init_repo_with_remote(tmp_path)  # clean, on main, pushed
+    run, launch, calls, launched = _seam()
+    rc, out, err = _run_actuate(work, run, launch)
+    assert rc == 0
+    assert "No changes to commit in acme/widgets. Nothing to do." in err
+    assert "to ship" not in err
 
 
 def test_already_exists_reuses_pr(tmp_path):
@@ -331,3 +342,63 @@ def test_case3_shared_history_divergence_rebases(tmp_path):
     assert "local commit on base" in msgs
     assert "upstream commit" in msgs
     assert launched and launched[0][0] == "7"
+
+
+# ── --max-rounds threading (open-pr → the launch seam) ─────────────────────────────
+
+def test_max_rounds_reaches_launch_seam(tmp_path):
+    """--max-rounds threads through actuate() → create_and_launch() → the launch
+    seam, forwarded as a keyword argument."""
+    work, _ = _init_repo_with_remote(tmp_path)
+    _git(work, "checkout", "-b", "feat/mr")
+    (work / "f.txt").write_text("change\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "work")
+    run, _launch, calls, _launched = _seam()
+    seen = []
+
+    def launch(pr_number, repo, cwd, err, max_rounds=None):
+        seen.append((pr_number, repo, cwd, max_rounds))
+
+    rc, out, err = _run_actuate(work, run, launch, max_rounds=20)
+    assert rc == 0
+    assert seen == [("7", "acme/widgets", str(work), 20)]
+
+
+def test_max_rounds_omitted_keeps_launch_call_byte_identical(tmp_path):
+    """Omitting --max-rounds calls the launch seam with the historical
+    ``(pr_number, repo, cwd, err)`` signature — no ``max_rounds`` keyword at all
+    — so a caller-injected launch fixture that predates the flag keeps working
+    unchanged."""
+    work, _ = _init_repo_with_remote(tmp_path)
+    _git(work, "checkout", "-b", "feat/nomr")
+    (work / "f.txt").write_text("change\n", encoding="utf-8")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-m", "work")
+    run, launch, calls, launched = _seam()  # historical 4-arg launch(pr, repo, cwd, err)
+    rc, out, err = _run_actuate(work, run, launch)  # max_rounds not passed
+    assert rc == 0
+    assert launched == [("7", "acme/widgets", str(work))]  # unchanged shape
+
+
+def test_dispatch_launch_forwards_max_rounds_to_loop_argv(monkeypatch):
+    """The default launch callable (``_dispatch_launch``) threads --max-rounds
+    through to the detached run-loop invocation when it is set."""
+    rec = []
+    monkeypatch.setattr(backends, "discover_backends",
+                        lambda **k: [backends.FreeBackend()])
+    monkeypatch.setattr(backends, "_detached_run", lambda cmd, *a, **kw: rec.append(cmd))
+    open_pr._dispatch_launch("7", "acme/widgets", "/work", io.StringIO(), max_rounds=20)
+    assert rec and rec[0][0] == "bash" and "7" in rec[0]
+    assert rec[0][rec[0].index("--max-rounds") + 1] == "20"
+
+
+def test_dispatch_launch_omits_max_rounds_when_none(monkeypatch):
+    """Omitting --max-rounds (the default, None) never adds it to the run-loop
+    argv — byte-identical to today's behavior."""
+    rec = []
+    monkeypatch.setattr(backends, "discover_backends",
+                        lambda **k: [backends.FreeBackend()])
+    monkeypatch.setattr(backends, "_detached_run", lambda cmd, *a, **kw: rec.append(cmd))
+    open_pr._dispatch_launch("7", "acme/widgets", "/work", io.StringIO())
+    assert rec and "--max-rounds" not in rec[0]

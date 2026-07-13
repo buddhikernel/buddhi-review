@@ -65,9 +65,11 @@ _GITHUB_APP_BOTS = ("copilot", "gemini", "codex")  # claude is workflow/mention-
 _MODEL_TIERS = ("opus", "sonnet", "haiku")
 
 # Each locked teaser is a single-line, single-BENEFIT contextual upgrade nudge
-# (exec-plan §E: the one permitted paid reference — a benefit, NEVER a paid product
-# name or mechanism enumeration), suppressible with BUDDHI_NO_UPSELL. The paid web
-# work-tracking surface is deliberately NOT named or advertised here (it may be cut).
+# (exec-plan §E: one of the sanctioned paid-reference surfaces in OSS, not the
+# only one — cli.py's unclaimed-command notice is its sibling — a benefit,
+# NEVER a paid product name or mechanism enumeration), suppressible with
+# BUDDHI_NO_UPSELL. The paid web work-tracking surface is deliberately NOT
+# named or advertised here (it may be cut).
 _BUDGETS_TEASER = "Budget controls — paid tier"
 _MONITORING_TEASER = "Live run monitoring — paid tier"
 # A single-line, suppressible benefit-only nudge (exec-plan §E: benefit only,

@@ -69,6 +69,10 @@ else
 fi
 ```
 
+**Re-run this block after every `pip install -U buddhi-review`** — it copies the
+skill files rather than linking them, so upgrading the package alone does not
+refresh `~/.claude/skills/`.
+
 </details>
 
 **Restart Claude Code** so it loads the new skills, then run **`/review-pr setup`**

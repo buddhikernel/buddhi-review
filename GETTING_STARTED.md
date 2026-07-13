@@ -46,6 +46,10 @@ else
 fi
 ```
 
+Re-run this block after every `pip install -U buddhi-review`; it copies the skill
+files rather than linking them, so upgrading the package alone does not refresh
+`~/.claude/skills/`.
+
 Restart Claude Code to load the new skills. Each skill is installed under
 `~/.claude/skills/<name>/SKILL.md`. If a slash command with the same name already
 exists, the skill takes precedence.
