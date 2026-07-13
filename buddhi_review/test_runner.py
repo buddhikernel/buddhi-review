@@ -887,9 +887,13 @@ def _classify_mocha(rc: int, out: str) -> str:
 
 def _classify_jasmine(rc: int, out: str) -> str:
     # jasmine EXITS 0 on "No specs found" — the canonical silent-green class. The
-    # marker MUST be parsed or a zero-test run false-greens.
+    # marker MUST be parsed or a zero-test run false-greens. Gated on the absence of a
+    # real "N specs, M failures" summary (nonzero N) so a genuinely-run suite whose OWN
+    # failure output happens to quote that marker text (e.g. a spec asserting on a
+    # CLI's own "No specs found" message) can't be misread as an empty run — same
+    # run-evidence guard shape as the jest classifier above.
     if _has(out, r"No specs found", r"Incomplete: No specs found",
-            r"\b0 specs,\s*0 failures"):
+            r"\b0 specs,\s*0 failures") and not _has(out, r"\b[1-9]\d* specs?,"):
         return NO_TESTS
     if rc != 0 and _js_env(out):
         return ENV_ERROR
