@@ -4,7 +4,7 @@ import subprocess
 from dataclasses import replace
 from datetime import datetime, timezone
 
-from buddhi_review import detectors, gh_ingest, round_driver
+from buddhi_review import detectors, gh_ingest, polish_state, round_driver
 from buddhi_review.actuators import FixDispatch
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.fix_apply import FixOutcome
@@ -1820,3 +1820,250 @@ def test_quota_recheck_evicts_reaction_done_bot_from_done():
     assert driver.store.is_excluded("codex")
     assert "codex" not in driver.done           # evicted from done by quota detection
     assert "codex" not in driver._reaction_done  # in sync with done
+
+
+# ------------------------------------------------- --rr-active restart (F1)
+# --rr-active is the RESTART flag. The preflight snapshot — switched OFF under it
+# until now — is what lets a restart reconstruct who already responded, so no
+# reviewer whose verdict is already in hand is re-summoned, re-delayed, and
+# re-polled. The tests below pin the four gates that make that safe.
+
+def test_rr_active_preflight_defers_responders_in_round1():
+    # A bot with an UNRESOLVED pre-existing finding already gave its verdict, so
+    # round 1 neither summons nor polls it: its comment is fixed IMMEDIATELY (at
+    # t=0 — no register delay, no poll window). The deferral only POSTPONES the
+    # summon: the bot is asked in the next round, on the head those fixes produced.
+    fixed_at = []
+
+    def fix(c, r):
+        fixed_at.append(clock.t)
+        return FixOutcome(status="applied")
+
+    times = RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
+                       idle_timeout=900, max_wait_total=1800, register_delay=60)
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        rr_active=True, preflight=True, times=times,
+        answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert outcome.status == "clean"
+    assert "claude" in driver._preflight_responders   # deferred out of round 1 …
+    assert fixed_at == [0]                            # … its comment fixed with NO wait
+    assert outcome.rounds == 2                        # … and asked in the next round
+    assert len(gh.matching("@claude review")) == 1    # summoned exactly once (round 2)
+
+
+def test_rr_active_deferred_bot_is_summoned_even_when_round1_fixes_nothing():
+    # THE restart case, and the one the deferral must never lose. A killed run
+    # already fixed the finding and pushed, but never resolved its thread. On the
+    # restart the stale comment re-fixes to "already fixed" — NO substantive
+    # progress — so the run would clean-exit at round 1 with the reviewer never
+    # asked about the head carrying its own fix, and (with --auto-merge) merge it.
+    # The deferral owes that summon: the run does not finish until it is paid.
+    fix = lambda c, r: FixOutcome(status="skipped", detail="already fixed on this head")
+    timeline = [(0, Comment(id="a", text="this null check is missing", source="claude[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        rr_active=True, preflight=True, auto_merge=True,
+        answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert [a.final for a in outcome.actions] == ["skipped-already-fixed"]  # no new work
+    assert "claude" not in driver.reviewed_no_change   # a replay is not a verdict …
+    assert gh.matching("@claude review")               # … so it IS asked about this head
+    assert outcome.rounds >= 2
+
+
+def test_rr_active_leftover_review_body_still_gets_its_summon():
+    # The resolved-thread filter can only reach INLINE roots — a reviewer's leftover
+    # REVIEW BODY ("## Pull request overview…") has no thread and folds normally, so
+    # it still defers its author. That deferral must not become permanent either.
+    threads = FakeThreads().thread("T1", root_comment_id="a", is_resolved=True)
+    timeline = [
+        (0, Comment(id="a", text="rename tmp for clarity", source="copilot[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@")),          # resolved → skipped
+        (0, Comment(id="b", text="## Pull request overview\nThis PR restores the gate.",
+                    source="copilot[bot]")),                          # leftover body
+    ]
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=label_runner("OUTDATED"), rr_active=True,
+        preflight=True, auto_merge=True, threads_fetch=threads.fetch,
+        resolve_thread=threads.resolve, answer_waiter=lambda esc, **k: {})
+    driver.run()
+    assert gh.matching("requested_reviewers")   # summoned — never silently dropped
+    assert "copilot" not in driver.done         # the stale body is not a fresh verdict
+
+
+def test_rr_active_failure_placeholder_is_never_an_approval():
+    # A failure placeholder states its own zero output ("no comments were posted"),
+    # which reads CLEAN to the clean-review detector on its own. It is a RESPONSE,
+    # not a review: crowning it "Approved" would satisfy the never-merge-unreviewed
+    # gate and auto-merge a PR nobody looked at.
+    timeline = [(0, Comment(id="e", text="The review run failed; no comments were posted.",
+                            source="claude[bot]", from_issue_channel=True))]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY, rr_active=True,
+                                    preflight=True, auto_merge=True)
+    outcome = driver.run()
+    assert "claude" not in driver.approved        # not a sign-off …
+    assert "claude" not in driver.reviewed_ever   # … and not a review
+    assert driver.store.is_excluded("claude")     # it is an ERRORED placeholder
+    assert outcome.merged is False                # SAFETY gate blocks the merge
+
+
+def test_rr_active_preflight_resummons_bot_with_only_resolved_comments():
+    # The resolved-thread guard. A bot whose pre-existing comments all sit on
+    # RESOLVED threads has NO outstanding verdict. Folding them would make it a
+    # deferred responder, re-fix its finished comments to "already fixed", demote it
+    # to reviewed-no-change, and drop it from re-request for the whole run — the bot
+    # would never be asked at all. It must be summoned in round 1 like any other.
+    fixed = []
+
+    def fix(c, r):
+        fixed.append(c.id)
+        return FixOutcome(status="applied")
+
+    threads = FakeThreads().thread("T1", root_comment_id="a", is_resolved=True)
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        rr_active=True, preflight=True, threads_fetch=threads.fetch,
+        resolve_thread=threads.resolve, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert fixed == []                                   # resolved work is not re-fixed
+    assert outcome.actions == []
+    assert driver._preflight_responders == set()         # not a responder …
+    assert driver._preflight_seen == set()
+    assert gh.matching("@claude review")                 # … so round 1 summons it
+    assert "claude" not in driver.reviewed_no_change     # never silently dropped
+
+
+def test_rr_active_preflight_deferred_bot_resummoned_in_round2():
+    # A deferred bot is NOT folded into done: once round 1's fix lands, round 2
+    # re-summons it — on the FIXED head — so it reviews the code its finding produced.
+    fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    timeline = [(0, Comment(id="a", text="this null check is missing", source="claude[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"), fix=fix,
+        rr_active=True, preflight=True, max_rounds=2,
+        answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert outcome.rounds == 2
+    assert gh.matching("git", "push")                   # round 1's fix landed first
+    assert len(gh.matching("@claude review")) == 1      # summoned in round 2 only
+    assert "claude" not in driver.done                  # a finding-poster is never folded
+
+
+def test_rr_active_preflight_disabled_at_max_rounds_1():
+    # SAFETY: with a single round there is no round 2 to review the fix, so the
+    # deferral's justification does not hold — the snapshot is NOT taken and the
+    # fleet is summoned exactly as today (no unreviewed single-round merge).
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        max_rounds=1, answer_waiter=lambda esc, **k: {})
+    driver.run()
+    # _preflight_seen is written ONLY by the snapshot and never cleared, so an empty
+    # set is real evidence the snapshot did not run (unlike _preflight_batch, which
+    # round 1 consumes either way).
+    assert driver._preflight_seen == set()           # snapshot never ran …
+    assert driver._preflight_responders == set()
+    assert gh.matching("@claude review")              # … so the fleet is summoned
+
+
+def test_rr_active_run_start_fleet_still_full_after_restores(tmp_path, monkeypatch):
+    # The SAFETY gate's discriminator must NOT shrink. The run-start fleet is
+    # snapshotted BEFORE the approval re-derive / polish restore / preflight fold, so
+    # an all-approved + all-polish restart still reads as "reviewers existed and
+    # reviewed" (merge), never "no reviewers configured" (quiet skip).
+    monkeypatch.setenv(polish_state.STATE_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(round_driver.HEAD_SHA_ENV, "H1")
+    polish_state.write_polish_state("7", "o/r", "H1", ["copilot"])
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
+    timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]",
+                            from_issue_channel=True))]
+    driver, clock, gh = make_driver(timeline, cfg=cfg, rr_active=True, preflight=True,
+                                    auto_merge=True)
+    outcome = driver.run()
+    assert driver._run_start_fleet == {"claude", "copilot"}   # unchanged by the restores
+    assert "claude" in driver.approved                        # re-derived approval
+    assert "copilot" in driver.polishing                      # restored polish verdict
+    assert driver.reviewed_ever == {"claude", "copilot"}      # both count as reviewed
+    assert outcome.merged is True                             # SAFETY gate still passes
+    assert gh.matching("@claude review") == []                # nobody re-asked
+
+
+def test_rr_active_empty_round_still_pays_the_deferred_summon():
+    # A round can end with NO actionable comment at all and still owe a summon: a
+    # rate-limited reviewer is a preflight responder (it "responded"), and round 1's
+    # comeback releases it — so it is expected, deferred, and has no work. That exit
+    # runs BEFORE the substantive-progress gate, so it must pay the debt too, or the
+    # run finishes (and here, with a second reviewer's approval on file, MERGES)
+    # having asked the released reviewer nothing.
+    marker = Comment(id="m", from_issue_channel=True, source="github-actions[bot]",
+                     created_at="2026-07-01T10:00:00Z",
+                     text="<!-- claude-review-unavailable-v1 type=rate_limited resets_at=0 -->")
+    timeline = [
+        (0, marker),
+        (0, Comment(id="x", text="I'm reviewing this PR now.", source="claude[bot]",
+                    from_issue_channel=True, created_at="2026-07-01T10:05:00Z")),
+        (0, Comment(id="c", text="No issues found.", source="copilot[bot]",
+                    from_issue_channel=True, created_at="2026-07-01T10:06:00Z")),
+    ]
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
+    driver, clock, gh = make_driver(timeline, cfg=cfg, rr_active=True, preflight=True,
+                                    auto_merge=True)
+    outcome = driver.run()
+    assert "claude" in driver._preflight_responders  # deferred out of round 1 …
+    assert gh.matching("@claude review")             # … and still asked, in round 2
+    assert outcome.rounds >= 2
+
+
+# ---------------------------------------------------------- default-launch guard
+# The two restart-only preflight rules (skip already-resolved findings; latest
+# message wins for the clean fold) BOTH depend on round 1 actually summoning the
+# reviewer they release — which only --rr / --rr-active do. A default round 1
+# summons `auto_on_open: false` reviewers only, so a reviewer released there would
+# be polled but never asked. The default path therefore keeps its existing fold,
+# and these two tests pin that it is untouched.
+
+def test_default_launch_still_folds_a_resolved_comment():
+    threads = FakeThreads().thread("T1", root_comment_id="a", is_resolved=True)
+    fixed = []
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"),
+        preflight=True, threads_fetch=threads.fetch, resolve_thread=threads.resolve,
+        answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert fixed == ["a"]                            # folded and fixed, exactly as before
+    assert "claude" in driver._preflight_responders
+    assert outcome.rounds == 1
+
+
+def test_default_launch_still_folds_a_superseded_clean_review():
+    # A sign-off followed by later chatter still marks the reviewer done on a default
+    # launch (unchanged): only the --rr-active restart applies latest-message-wins.
+    timeline = [
+        (0, Comment(id="ok", text="No issues found.", source="claude[bot]",
+                    from_issue_channel=True, created_at="2026-07-01T10:00:00Z")),
+        (0, Comment(id="s", text="Claude has finished reviewing this pull request.",
+                    source="claude[bot]", from_issue_channel=True,
+                    created_at="2026-07-02T10:00:00Z")),
+    ]
+    driver, clock, gh = make_driver(timeline, cfg=CLAUDE_ONLY, preflight=True,
+                                    auto_merge=True)
+    outcome = driver.run()
+    assert "claude" in driver.approved and "claude" in driver.reviewed_ever
+    assert gh.matching("@claude review") == []       # not re-asked …
+    assert outcome.merged is True                    # … and the approval still merges
