@@ -373,7 +373,8 @@ def _extract_url(text: str) -> Optional[str]:
 
 
 def create_and_launch(repo: str, cwd: str, base: str, head: str, *, title: str, body: str,
-                      run, launch: Callable, out, err, no_loop: bool = False) -> str:
+                      run, launch: Callable, out, err, no_loop: bool = False,
+                      max_rounds: Optional[int] = None) -> str:
     """``gh pr create`` (idempotent on "already exists") → launch the loop detached.
     Returns the PR URL and prints it as the LAST stdout line."""
     cr = run(["gh", "pr", "create", "-R", repo, "--base", base, "--head", head,
@@ -402,8 +403,14 @@ def create_and_launch(repo: str, cwd: str, base: str, head: str, *, title: str, 
     if no_loop:
         print("• --no-loop set; skipping the review-loop launch.", file=err)
     else:
-        # Launch the review loop detached and return immediately.
-        launch(pr_number, repo, cwd, err)
+        # Launch the review loop detached and return immediately. max_rounds is
+        # forwarded as a keyword ONLY when set, so a caller-injected `launch` seam
+        # with the historical (pr_number, repo, cwd, err) signature keeps working
+        # unchanged when --max-rounds is not passed.
+        if max_rounds is not None:
+            launch(pr_number, repo, cwd, err, max_rounds=max_rounds)
+        else:
+            launch(pr_number, repo, cwd, err)
 
     # stdout DATA contract: the PR URL is the LAST stdout line (may be preceded by
     # automation_notice transparency lines).
@@ -411,7 +418,8 @@ def create_and_launch(repo: str, cwd: str, base: str, head: str, *, title: str, 
     return url
 
 
-def _dispatch_launch(pr_number: str, repo: str, cwd: str, err) -> None:
+def _dispatch_launch(pr_number: str, repo: str, cwd: str, err, *,
+                     max_rounds: Optional[int] = None) -> None:
     """Default launch callable: route the loop launch through the front-door
     dispatcher so a separately-installed, active backend can take over the same
     ``/open-pr`` — with none installed it runs the free loop, unchanged. Imported
@@ -421,7 +429,7 @@ def _dispatch_launch(pr_number: str, repo: str, cwd: str, err) -> None:
     # The chosen backend's launcher prints its own "where to watch" line (free → a
     # terminal-log link) to stderr, so the actuator's stdout stays the PR URL.
     try:
-        launch_review_loop(pr_number, repo, cwd, out=err, err=err)
+        launch_review_loop(pr_number, repo, cwd, out=err, err=err, max_rounds=max_rounds)
     except Exception as exc:  # never crash the actuator after the PR is open
         print(f"⚠ could not launch the review loop ({exc}); run it manually: "
               f"python3 -m buddhi_review review-pr {pr_number} --repo {repo} --cwd {cwd}", file=err)
@@ -431,7 +439,8 @@ def _dispatch_launch(pr_number: str, repo: str, cwd: str, err) -> None:
 
 def actuate(*, repo: Optional[str], cwd: Optional[str], base: Optional[str], title: str,
             body: str, branch: Optional[str] = None, branch_prefix: str = "feat",
-            no_loop: bool = False, run: Optional[Callable] = None,
+            no_loop: bool = False, max_rounds: Optional[int] = None,
+            run: Optional[Callable] = None,
             launch: Optional[Callable] = None, out=None, err=None) -> int:
     """Run the full silent open-pr flow. Returns an exit code (0 on success).
     Decoration → ``err`` (stderr); the PR URL is the last line on ``out`` (stdout)."""
@@ -454,7 +463,7 @@ def actuate(*, repo: Optional[str], cwd: Optional[str], base: Optional[str], tit
         head = prepare_branch(cwd, repo, state, path, title=title, body=body, branch=branch,
                               branch_prefix=branch_prefix, run=run, err=err)
         if head is None:
-            print(f"No changes to ship in {repo}. Nothing to do.", file=err)
+            print(f"No changes to commit in {repo}. Nothing to do.", file=err)
             return 0
 
         behind = behind_count(cwd, base, run)
@@ -470,7 +479,8 @@ def actuate(*, repo: Optional[str], cwd: Optional[str], base: Optional[str], tit
                 stream=out)
 
         create_and_launch(repo, cwd, base, head, title=title, body=body, run=run,
-                          launch=launch, out=out, err=err, no_loop=no_loop)
+                          launch=launch, out=out, err=err, no_loop=no_loop,
+                          max_rounds=max_rounds)
         return 0
     except OpenPrError as exc:
         print(f"open-pr: {exc}", file=err)

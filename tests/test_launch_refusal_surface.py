@@ -98,6 +98,15 @@ def harness(tmp_path):
     return run
 
 
+def _log_line(stdout):
+    """The `log: <path>` datum from the launcher's stdout, which also carries the
+    S3 `NOTICE: ` relay lines. Returns the path (the `log: ` prefix stripped)."""
+    for ln in stdout.splitlines():
+        if ln.startswith("log: "):
+            return ln[len("log: "):]
+    raise AssertionError(f"no `log:` line on stdout:\n{stdout}")
+
+
 def test_refusal_surfaces_panel_on_stderr_and_exits_2(harness):
     r = harness(harness.refusal)
     assert r.returncode == 2, (r.stdout, r.stderr)
@@ -106,8 +115,10 @@ def test_refusal_surfaces_panel_on_stderr_and_exits_2(harness):
     assert f"PR #{_PR}" in r.stderr
     # The "why" tail of the log (carrying the gate's marker line) is echoed too.
     assert REFUSED_TO_LAUNCH_MARKER in r.stderr
-    # A refused launch must NOT print the success `log:` datum on stdout.
+    # A refused launch must NOT print the success `log:` datum on stdout — nor any
+    # S3 `NOTICE: ` relay line: there is no live run to point the user at.
     assert "log:" not in r.stdout
+    assert "NOTICE:" not in r.stdout
 
 
 def test_refusal_panel_is_plain_text_under_no_color(harness):
@@ -124,7 +135,7 @@ def test_alive_loop_prints_normal_output_and_exits_0(harness):
     # stdout, the launch notice on stderr, exit 0, and NO refusal panel.
     r = harness(harness.alive, liveness_wait=1)
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert r.stdout.strip() == f"log: {harness.log}"
+    assert _log_line(r.stdout) == str(harness.log)
     assert "launched" in r.stderr
     assert "refused to launch" not in r.stderr.lower()
 
@@ -135,7 +146,7 @@ def test_skip_liveness_check_bypasses_the_poll(harness):
     # success output. The refusal is then only visible in the log, by design.
     r = harness(harness.refusal, extra_env={"BUDDHI_SKIP_LIVENESS_CHECK": "1"})
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert r.stdout.strip() == f"log: {harness.log}"
+    assert _log_line(r.stdout) == str(harness.log)
     assert "refused to launch" not in r.stderr.lower()
 
 
@@ -148,5 +159,5 @@ def test_fast_clean_exit_without_marker_proceeds_normally(harness):
     noop.chmod(0o755)
     r = harness(noop)
     assert r.returncode == 0, (r.stdout, r.stderr)
-    assert r.stdout.strip() == f"log: {harness.log}"
+    assert _log_line(r.stdout) == str(harness.log)
     assert "refused to launch" not in r.stderr.lower()

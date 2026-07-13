@@ -227,6 +227,7 @@ def _open_pr(args: argparse.Namespace) -> int:
         branch=args.branch,
         branch_prefix=args.branch_prefix,
         no_loop=args.no_loop,
+        max_rounds=args.max_rounds,
     )
 
 
@@ -399,6 +400,8 @@ def build_parser() -> argparse.ArgumentParser:
                                      "(default: <prefix>/<slug-from-title>)")
     cp.add_argument("--branch-prefix", default="feat",
                     help="branch prefix when deriving a name (feat/fix/refactor; default feat)")
+    cp.add_argument("--max-rounds", type=int, default=None,
+                    help="maximum review→fix rounds (default: BUDDHI_MAX_ROUNDS env → diff auto-size → 10)")
     cp.add_argument("--no-loop", action="store_true",
                     help="create the PR but skip launching the review loop")
 
