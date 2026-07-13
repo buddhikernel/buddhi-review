@@ -28,6 +28,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import _log_line
+
 from buddhi_review import tmp_paths
 from buddhi_review.round_driver import REFUSED_TO_LAUNCH_MARKER
 
@@ -98,13 +100,6 @@ def harness(tmp_path):
     return run
 
 
-def _log_line(stdout):
-    """The `log: <path>` datum from the launcher's stdout, which also carries the
-    S3 `NOTICE: ` relay lines. Returns the path (the `log: ` prefix stripped)."""
-    for ln in stdout.splitlines():
-        if ln.startswith("log: "):
-            return ln[len("log: "):]
-    raise AssertionError(f"no `log:` line on stdout:\n{stdout}")
 
 
 def test_refusal_surfaces_panel_on_stderr_and_exits_2(harness):

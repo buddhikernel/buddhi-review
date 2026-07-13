@@ -14,6 +14,8 @@ arguments:
 allowed-tools:
   - Bash
   - Read
+  # Edit/Write: Step 2.5 option 1 ("I resolve the conflicts") has the agent edit
+  # conflicted files mid-rebase before `git add` + `rebase --continue`.
   - Edit
   - Write
   - AskUserQuestion
@@ -287,9 +289,12 @@ Parse the JSON object on stdout and act on `status`:
   → ask with **AskUserQuestion**, the same three options as `/open-pr` Step 2:
 
   1. **Rebase — I resolve the conflicts** *(recommended)*: run
-     `BUDDHI_ALLOW_MANUAL_GIT=1 git -C "$TARGET_CWD" rebase origin/$BASE_BRANCH` (the override
+     `BUDDHI_ALLOW_MANUAL_GIT=1 git -C "$TARGET_CWD" rebase <base_resolved>` (the override
      prefix must be the very START of the command — the git guardrail hook blocks a bare
-     agent-run `rebase`, and honors the prefix only there), resolve each conflicted file,
+     agent-run `rebase`, and honors the prefix only there — and `<base_resolved>` is the
+     `base_resolved` field from the `rebase-check`/`rebase` JSON, e.g. `upstream/main` in a
+     fork checkout, NOT a hard-coded `origin/$BASE_BRANCH`, which can point at the fork's own
+     stale copy of the base), resolve each conflicted file,
      `git -C "$TARGET_CWD" add` them, then
      `BUDDHI_ALLOW_MANUAL_GIT=1 git -C "$TARGET_CWD" rebase --continue` until done. The PR
      branch is already on the remote, so its upload needs a force-push, which the agent never

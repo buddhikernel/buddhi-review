@@ -14,6 +14,8 @@ arguments:
 allowed-tools:
   - Bash
   - Read
+  # Edit/Write: Step 2 option 1 ("I resolve the conflicts") has the agent edit
+  # conflicted files mid-rebase before `git add` + `rebase --continue`.
   - Edit
   - Write
   - AskUserQuestion
@@ -297,10 +299,13 @@ Parse the JSON object on stdout and act on `status`:
       `dirty`, where `conflict_files` is empty.
     - Options:
       1. **Rebase — I resolve the conflicts** *(recommended)*: commit any pending work, run
-         `BUDDHI_ALLOW_MANUAL_GIT=1 git -C "$TARGET_CWD" rebase origin/$BASE_BRANCH` (the
+         `BUDDHI_ALLOW_MANUAL_GIT=1 git -C "$TARGET_CWD" rebase <base_resolved>` (the
          override prefix must be the very START of the command — the git guardrail hook
-         blocks a bare agent-run `rebase`, and honors the prefix only there), edit each
-         conflicted file to a correct merged state, `git -C "$TARGET_CWD" add` them, then
+         blocks a bare agent-run `rebase`, and honors the prefix only there — and
+         `<base_resolved>` is the `base_resolved` field from the `rebase-check`/`rebase`
+         JSON, e.g. `upstream/main` in a fork checkout, NOT a hard-coded
+         `origin/$BASE_BRANCH`, which can point at the fork's own stale copy of the base),
+         edit each conflicted file to a correct merged state, `git -C "$TARGET_CWD" add` them, then
          `BUDDHI_ALLOW_MANUAL_GIT=1 git -C "$TARGET_CWD" rebase --continue` until done.
          Upload: a branch NOT yet on the remote takes a plain
          `git -C "$TARGET_CWD" push -u origin HEAD`; a branch ALREADY on the remote needs a

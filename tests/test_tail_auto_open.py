@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from conftest import _log_line
+
 from buddhi_review import tmp_paths
 
 _PUBLIC_ROOT = Path(__file__).resolve().parent.parent
@@ -107,13 +109,6 @@ def _opened(harness):
     return harness.open_argv.read_text().strip() if harness.open_argv.exists() else ""
 
 
-def _log_line(stdout):
-    """The single `log: <path>` line from the launcher's stdout, which now also
-    carries S3 `NOTICE: ` relay lines. Returns the line WITHOUT the `log: ` prefix."""
-    for ln in stdout.splitlines():
-        if ln.startswith("log: "):
-            return ln[len("log: "):]
-    raise AssertionError(f"no `log:` line on stdout:\n{stdout}")
 
 
 # ── Cross-platform: arg validation + stream contract ───────────────────────────
