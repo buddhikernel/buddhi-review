@@ -234,6 +234,22 @@ def test_notice_is_exempt_from_no_upsell(monkeypatch):
     assert "not included in this free installation" in buf.getvalue()
 
 
+def test_claimant_run_command_exception_does_not_crash_the_cli():
+    # An installed backend is third-party code; a bug in its run_command() must not
+    # propagate and crash the free front door — it gets a warning and a non-zero exit.
+    class BoomOnRun(ClaimingBackend):
+        def run_command(self, name, argv):
+            raise RuntimeError("kaboom")
+
+    buf = io.StringIO()
+    rc = cli._dispatch_unclaimed_command("review-batch", [], backends=[BoomOnRun()], stream=buf)
+    assert rc != 0
+    assert rc != 2  # distinct from the no-claimant notice path
+    out = buf.getvalue()
+    assert "review-batch" in out
+    assert "kaboom" in out
+
+
 # ── main(): end-to-end wiring through the front door ───────────────────────────────
 
 def test_main_routes_unknown_command_to_active_claimant(monkeypatch):

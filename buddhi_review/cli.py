@@ -394,10 +394,15 @@ def _dispatch_unclaimed_command(command: str, trailing: List[str], *,
     ``backends`` / ``stream`` are injectable for tests.
     """
     backend = select_command_backend(command, backends=backends)
+    out = stream if stream is not None else sys.stderr
     if backend is not None:
-        return backend.run_command(command, trailing)
-    print(_UNCLAIMED_COMMAND_NOTICE.format(command=command),
-          file=stream if stream is not None else sys.stderr)
+        try:
+            return backend.run_command(command, trailing)
+        except Exception as exc:  # an installed backend must never crash the free front door
+            print(f"⚠ backend {getattr(backend, 'name', repr(backend))!r} failed "
+                  f"running {command!r} ({exc})", file=out)
+            return 1
+    print(_UNCLAIMED_COMMAND_NOTICE.format(command=command), file=out)
     return 2
 
 
