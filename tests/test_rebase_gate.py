@@ -1,7 +1,9 @@
 """F3 rebase-gate engine verb — ``python -m buddhi_review rebase-check``.
 
 Every test drives real git against a local bare remote (no network); the
-free path is proven mutation-free (tree hash unchanged after rebase_check).
+free path is proven mutation-free (HEAD/tree hash, ``git status
+--porcelain``, and ``git diff``/``--cached`` all unchanged after
+rebase_check).
 """
 from __future__ import annotations
 
@@ -27,7 +29,12 @@ def _sha(cwd, ref="HEAD"):
 
 
 def _tree_hash(cwd, ref="HEAD"):
-    """The tree object SHA at ref — unchanged iff the working tree was not mutated."""
+    """The committed tree object SHA at ref.
+
+    Reflects only the tree of the commit at ``ref`` — it does NOT change for
+    working-tree, staged (index), or untracked-file mutations that were never
+    committed. Use alongside ``git status --porcelain``/``git diff`` checks
+    to actually prove the working tree and index are untouched."""
     return _g(cwd, "rev-parse", f"{ref}^{{tree}}").stdout.strip()
 
 
@@ -184,18 +191,34 @@ def test_cwd_does_not_exist():
 # ── 6. Mutation-free proof ────────────────────────────────────────────────────
 
 def test_free_path_does_not_mutate_tree(repo):
-    """rebase_check NEVER changes the working tree — tree hash is identical before and after."""
+    """rebase_check NEVER changes HEAD, the index, or the working tree.
+
+    Tree/HEAD hashes only prove no new commit was made; ``git status
+    --porcelain`` and ``git diff``/``--cached`` are what actually prove the
+    working tree and index (staged + unstaged + untracked) are untouched."""
     _advance_base(repo)
-    # Also add a staged-but-uncommitted change to ensure dirty probe is passive.
+    # A staged change and a separate unstaged/untracked change so both the
+    # index and the working tree are covered by the before/after diff.
     _write(repo / "wip.py", "pending = 1\n")
+    _g(repo, "add", "wip.py")
+    _write(repo / "unstaged.py", "also_pending = 1\n")
 
     tree_before = _tree_hash(repo)
     head_before = _sha(repo)
+    status_before = _g(repo, "status", "--porcelain").stdout
+    diff_before = _g(repo, "diff").stdout
+    diff_cached_before = _g(repo, "diff", "--cached").stdout
 
     rebase_gate.rebase_check(str(repo), "main")
 
     assert _sha(repo) == head_before, "rebase_check must not commit or reset HEAD"
-    assert _tree_hash(repo) == tree_before, "rebase_check must not mutate the working tree"
+    assert _tree_hash(repo) == tree_before, "rebase_check must not create a new commit"
+    assert _g(repo, "status", "--porcelain").stdout == status_before, \
+        "rebase_check must not change staged/unstaged/untracked file state"
+    assert _g(repo, "diff").stdout == diff_before, \
+        "rebase_check must not mutate the working tree"
+    assert _g(repo, "diff", "--cached").stdout == diff_cached_before, \
+        "rebase_check must not mutate the index"
 
 
 # ── 7. Capability hook — fake paid backend ────────────────────────────────────

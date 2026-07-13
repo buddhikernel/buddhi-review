@@ -60,16 +60,27 @@ def _count_commits(cwd: str, rev_range: str, run: Any) -> Optional[int]:
     return int(val) if val.isdigit() else None
 
 
-def _resolve_baseref(cwd: str, base: str, remote: str,
-                     run: Any) -> Optional[str]:
+def _resolve_baseref(cwd: str, base: str, remote: str, run: Any,
+                     *, try_fetch_head: bool = False) -> Optional[str]:
     """Resolve ``origin/<base>`` to the ref the commit-counting can use.
 
-    Prefers the remote-tracking ref (refreshed by fetch); falls back to a
-    plain local ref of the same name."""
-    for ref in (f"refs/remotes/{remote}/{base}", f"{remote}/{base}"):
+    Prefers the remote-tracking ref (refreshed by fetch). When
+    ``try_fetch_head`` is set (an explicit ``git fetch <remote> <base>`` for
+    this base just ran), FETCH_HEAD is tried next: in a narrow/single-branch
+    checkout the fetch can succeed while leaving ``refs/remotes/<remote>/<base>``
+    absent or stale, because that refspec never mapped the base branch.
+    FETCH_HEAD is exactly what the fetch just wrote, independent of refspec
+    config — mirrors ``buddhi_review.merge._branch_is_behind_base``'s
+    ``HEAD..FETCH_HEAD`` fallback for this same checkout shape. Falls back
+    last to a plain local ref of the same name."""
+    for ref in (f"{remote}/{base}", f"refs/remotes/{remote}/{base}"):
         r = _git(cwd, "rev-parse", "--verify", "--quiet", ref, run=run)
         if _rc(r) == 0 and _stdout(r):
             return ref
+    if try_fetch_head:
+        r = _git(cwd, "rev-parse", "--verify", "--quiet", "FETCH_HEAD", run=run)
+        if _rc(r) == 0 and _stdout(r):
+            return "FETCH_HEAD"
     r = _git(cwd, "rev-parse", "--verify", "--quiet", base, run=run)
     if _rc(r) == 0 and _stdout(r):
         return base
@@ -87,9 +98,9 @@ def _merge_tree_clean(cwd: str, baseref: str,
     two FINAL trees whereas a real rebase replays each commit as a patch, so a
     branch whose intermediate commit edits a base-changed line and a later
     commit reverts it nets to a clean final tree (reported 'clean' here) yet
-    conflicts on replay. Accepted: ``do_rebase`` (paid tier) is the truth
+    conflicts on replay. Accepted: ``run_rebase`` (paid tier) is the truth
     source; this is operator-facing context only."""
-    r = run(["git", "merge-tree", "--write-tree", baseref, "HEAD"], cwd=cwd)
+    r = _git(cwd, "merge-tree", "--write-tree", baseref, "HEAD", run=run)
     blob = (_stdout(r) + "\n" + _stderr(r)).lower()
     if _rc(r) == 0:
         return "clean", []
@@ -103,7 +114,7 @@ def _merge_tree_clean(cwd: str, baseref: str,
     mb_r = _git(cwd, "merge-base", baseref, "HEAD", run=run)
     if _rc(mb_r) != 0 or not _stdout(mb_r):
         return "unknown", []
-    r2 = run(["git", "merge-tree", _stdout(mb_r), baseref, "HEAD"], cwd=cwd)
+    r2 = _git(cwd, "merge-tree", _stdout(mb_r), baseref, "HEAD", run=run)
     if _rc(r2) != 0:
         return "unknown", []
     return ("conflicts", []) if "<<<<<<<" in (_stdout(r2) + _stderr(r2)) else ("clean", [])
@@ -131,18 +142,19 @@ def rebase_check(cwd: str, base: str, *, fetch: bool = True,
     dirty_r = _git(cwd, "status", "--porcelain", run=run)
     dirty = _rc(dirty_r) == 0 and bool(_stdout(dirty_r))
 
-    # Resolve the configured remote for this branch.
-    branch_r = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD", run=run)
-    branch = _stdout(branch_r) if _rc(branch_r) == 0 else ""
-    has_branch = bool(branch) and branch != "HEAD"
+    # Resolve the remote that hosts the BASE branch (branch.<base>.remote),
+    # not the feature branch's remote: in a fork checkout the feature branch
+    # tracks origin (the fork) while the PR base lives on upstream, so
+    # comparing against origin/<base> would silently miss commits merged
+    # straight to upstream. Mirrors ``buddhi_review.merge._base_remote``'s
+    # ``branch.<base>.remote`` lookup.
     remote = "origin"
-    if has_branch:
-        cfg_r = _git(cwd, "config", f"branch.{branch}.remote", run=run)
-        if _rc(cfg_r) == 0 and _stdout(cfg_r):
-            remote = _stdout(cfg_r)
+    cfg_r = _git(cwd, "config", f"branch.{base}.remote", run=run)
+    if _rc(cfg_r) == 0 and _stdout(cfg_r):
+        remote = _stdout(cfg_r)
 
     if fetch:
-        fr = run(["git", "fetch", remote, base], cwd=cwd)
+        fr = _git(cwd, "fetch", remote, base, run=run)
         if _rc(fr) != 0:
             out: Dict[str, Any] = {
                 "status": "error", "base": base, "base_resolved": None,
@@ -155,7 +167,7 @@ def rebase_check(cwd: str, base: str, *, fetch: bool = True,
                 out["dirty"] = True
             return out
 
-    baseref = _resolve_baseref(cwd, base, remote, run)
+    baseref = _resolve_baseref(cwd, base, remote, run, try_fetch_head=fetch)
     if not baseref:
         return {"status": "error", "base": base, "base_resolved": None,
                 "detail": f"could not resolve base ref for {base!r}"}
@@ -211,7 +223,7 @@ _MANUAL_STEPS = """\
   1. Commit or stash any pending work:
        git stash --include-untracked   # or: git add -A && git commit -m "wip"
   2. Rebase onto the latest base:
-       git rebase origin/{base}
+       git rebase {baseref}
   3. If conflicts arise, resolve them, then run:
        git rebase --continue
   4. Push the rebased branch:
@@ -234,15 +246,16 @@ def guidance_text(result: Dict[str, Any]) -> str:
     if status == "dirty":
         behind_msg = (f" (also {behind} commit(s) behind {baseref})"
                       if behind else "")
+        rebase_msg = (f"Then rebase:\n  git rebase {baseref}" if behind
+                     else "No rebase needed once committed/stashed.")
         return (f"Uncommitted changes present{behind_msg}; "
                 "commit or stash them before rebasing:\n"
-                f"  git stash --include-untracked\nThen rebase:\n"
-                f"  git rebase origin/{base}")
+                f"  git stash --include-untracked\n{rebase_msg}")
 
     if status == "clean":
         return (f"Branch is {behind} commit(s) behind {baseref}; "
                 "rebase looks clean.\nTo rebase manually:\n"
-                + _MANUAL_STEPS.format(base=base))
+                + _MANUAL_STEPS.format(baseref=baseref))
 
     if status == "conflicts":
         files = result.get("conflict_files", [])
@@ -251,7 +264,7 @@ def guidance_text(result: Dict[str, Any]) -> str:
         return (f"Branch is {behind} commit(s) behind {baseref}; "
                 f"rebase would conflict.{file_list}\n"
                 "Resolve conflicts manually after:\n"
-                + _MANUAL_STEPS.format(base=base))
+                + _MANUAL_STEPS.format(baseref=baseref))
 
     # error
     detail = result.get("detail", "")
