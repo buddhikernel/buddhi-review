@@ -291,6 +291,41 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                         "accidentally-silent fleet)")
 
 
+def _rebase_check(args: argparse.Namespace) -> int:
+    """The ``rebase-check`` verb: report rebase state as JSON + guidance.
+
+    Free default is check-only (never mutates). When the active backend
+    exposes ``run_rebase``, it delegates the actual rebase to it instead."""
+    from buddhi_review import rebase_gate
+    from buddhi_review.backends import discover_backends, select_backend
+
+    cwd = args.cwd or os.getcwd()
+    base = args.base or "main"
+
+    # Auto-detect base if not supplied (mirrors open_pr.detect_base).
+    if not args.base:
+        from buddhi_review.open_pr import detect_base, _default_run as _opr_run
+        try:
+            base = detect_base(cwd, _opr_run)
+        except Exception:
+            base = "main"
+
+    # Capability hook: resolve the active backend so a paid ``run_rebase`` can
+    # take over the action. The free FreeBackend has no ``run_rebase``, so it
+    # is silently treated as free-tier inside ``run_check_verb``.
+    try:
+        backend = select_backend(discover_backends())
+    except Exception:
+        backend = None
+
+    return rebase_gate.run_check_verb(
+        cwd, base,
+        fetch=not args.no_fetch,
+        backend=backend,
+        json_only=args.json_only,
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="buddhi-review", description="Buddhi PR-review skill.")
     p.add_argument("--version", action="version", version=f"buddhi_review {__version__}")
@@ -322,6 +357,17 @@ def build_parser() -> argparse.ArgumentParser:
     cp.add_argument("--no-loop", action="store_true",
                     help="create the PR but skip launching the review loop")
 
+    # S2 — the free rebase-gate verb (check-only, never mutates).
+    rc = sub.add_parser("rebase-check",
+                        help="report whether the branch needs a rebase (JSON + guidance)")
+    rc.add_argument("--cwd", help="repo directory (default: cwd)")
+    rc.add_argument("--base", default=None,
+                    help="base branch to check against (default: auto-detect origin/HEAD)")
+    rc.add_argument("--no-fetch", action="store_true",
+                    help="skip git fetch (use local tracking refs; may be stale)")
+    rc.add_argument("--json-only", action="store_true",
+                    help="print only the JSON result, no guidance text")
+
     sp = sub.add_parser("setup", help="interactive onboarding wizard")
     sp.add_argument("--repo", help="pre-bind this owner/repo (per-repo confirm mode)")
 
@@ -340,6 +386,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _run_loop(args)
     if args.command == "open-pr":
         return _open_pr(args)
+    if args.command == "rebase-check":
+        return _rebase_check(args)
     if args.command == "setup":
         return _setup(args)
     if args.command == "status":
