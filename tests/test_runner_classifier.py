@@ -103,6 +103,12 @@ _CLASSIFY_CASES = [
     ("mocha-pass", tr.MOCHA, 0, "  5 passing (20ms)", tr.PASSED),
     ("mocha-fail", tr.MOCHA, 2, "  3 passing\n  2 failing", tr.FAILED),
     ("mocha-no-tests", tr.MOCHA, 1, "Error: No test files found", tr.NO_TESTS),
+    # rc==0 zero-runnable-test run (empty suite / --grep matching nothing) — mocha
+    # prints only "0 passing" with none of the "No test files found" markers above,
+    # and exits 0 unless --fail-zero is passed. Verified empirically against a real
+    # mocha install: `mocha --grep nonexistent` and an empty `describe()` block both
+    # exit 0 printing "\n\n  0 passing (1ms)\n".
+    ("mocha-zero-runnable-rc0", tr.MOCHA, 0, "\n\n  0 passing (1ms)\n", tr.NO_TESTS),
 
     # ---- jasmine (marker-first: v2 exits 0, v3 exits 1, v4+ exits 2 on no specs;
     #      the "No specs found" marker is present in ALL versions) ----

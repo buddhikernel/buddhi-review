@@ -893,6 +893,14 @@ def _classify_mocha(rc: int, out: str) -> str:
             r"cannot resolve path.*spec") and not _has(
             out, r"\b[1-9]\d* passing\b", r"\b[1-9]\d* failing\b"):
         return NO_TESTS
+    # mocha exits 0 on a run with zero runnable tests (empty suite / a --grep
+    # filter matching nothing) unless --fail-zero is passed, printing "0 passing"
+    # with none of the "No test files found"-style markers above. Gated on the
+    # absence of a real nonzero "N passing" summary — same run-evidence guard
+    # shape as the jest/vitest classifiers — so an actually-run suite isn't
+    # misread.
+    if rc == 0 and _has(out, r"\b0 passing\b") and not _has(out, r"\b[1-9]\d* passing\b"):
+        return NO_TESTS
     if rc == 0:
         return PASSED
     if _has(out, r"error TS\d+", r"SyntaxError"):
