@@ -1958,23 +1958,31 @@ def test_rr_active_preflight_deferred_bot_resummoned_in_round2():
     assert "claude" not in driver.done                  # a finding-poster is never folded
 
 
-def test_rr_active_preflight_disabled_at_max_rounds_1():
+def test_rr_active_deferral_only_is_disabled_at_max_rounds_1():
     # SAFETY: with a single round there is no round 2 to review the fix, so the
-    # deferral's justification does not hold — the snapshot is NOT taken and the
-    # fleet is summoned exactly as today (no unreviewed single-round merge).
-    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
-                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    # DEFERRAL's justification does not hold and it is dropped — round 1 summons and
+    # polls the fleet as today. The snapshot itself still runs: everything it learns
+    # (sign-offs, hard exclusions, the pre-existing comments to fix) is exactly as
+    # useful with one round, and skipping it would re-summon a quota-dead reviewer.
+    timeline = [
+        (0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@")),
+        (0, Comment(id="q", text="Rate limit exceeded for this model.",
+                    source="copilot[bot]", from_issue_channel=True)),
+    ]
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        timeline, cfg=cfg, classify=label_runner("COSMETIC"),
         fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
         max_rounds=1, answer_waiter=lambda esc, **k: {})
     driver.run()
-    # _preflight_seen is written ONLY by the snapshot and never cleared, so an empty
-    # set is real evidence the snapshot did not run (unlike _preflight_batch, which
-    # round 1 consumes either way).
-    assert driver._preflight_seen == set()           # snapshot never ran …
-    assert driver._preflight_responders == set()
-    assert gh.matching("@claude review")              # … so the fleet is summoned
+    assert driver._preflight_seen                      # the snapshot DID run …
+    assert driver._preflight_responders == set()      # … but nothing is deferred
+    assert driver._deferred_summon == set()
+    assert gh.matching("@claude review")              # the fleet is summoned …
+    assert driver.store.is_excluded("copilot")        # … except the quota-dead bot
+    assert gh.matching("requested_reviewers") == []
 
 
 def test_rr_active_run_start_fleet_still_full_after_restores(tmp_path, monkeypatch):
@@ -2067,3 +2075,166 @@ def test_default_launch_still_folds_a_superseded_clean_review():
     assert "claude" in driver.approved and "claude" in driver.reviewed_ever
     assert gh.matching("@claude review") == []       # not re-asked …
     assert outcome.merged is True                    # … and the approval still merges
+
+
+def test_summon_debt_at_max_rounds_exhaustion_blocks_the_merge():
+    # THE INVARIANT's backstop. A deferred bot can be OUT of the expected set at the
+    # final round's start (errored here), so no summon is even attempted for it — and
+    # then re-enter mid-round via the errored comeback. The debt is still owed, but a
+    # `continue` on the final round falls straight out of the loop into the
+    # round-budget clean exit. That exit must REFUSE to merge, not launder the unpaid
+    # debt into one.
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
+    timeline = [
+        # Pre-existing: claude's unresolved finding → it is a preflight responder, so
+        # round 1 defers it and the debt is booked.
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@",
+                    created_at="2026-07-01T09:00:00Z")),
+        # Mid-round-1: claude errors out → excluded, so round 2 does not even TRY to
+        # summon it and the debt cannot be paid by a landed re-request.
+        (10, Comment(id="e", text="The review run failed; no comments were posted.",
+                     source="claude[bot]", from_issue_channel=True,
+                     created_at="2026-07-01T10:00:00Z")),
+        # copilot keeps the run going into round 2 (a real finding, so it stays expected).
+        (30, Comment(id="c", text="this retry loop is unbounded", source="copilot[bot]",
+                     path="y.py", diff_hunk="@@ -2 +2 @@",
+                     created_at="2026-07-01T10:30:00Z")),
+        # Mid-round-2: claude posts review output NEWER than its error → the errored
+        # comeback retracts the exclusion and claude is expected again — still unasked.
+        (120, Comment(id="b", text="this null check is still missing",
+                      source="claude[bot]", path="x.py", diff_hunk="@@ -1 +1 @@",
+                      created_at="2026-07-02T10:00:00Z")),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        max_rounds=2, auto_merge=True, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert "claude" in driver.expected_bots()                     # back in the fleet …
+    assert "claude" in driver._deferred_summon                    # … with its debt unpaid
+    assert gh.matching("@claude review") == []                    # never summoned …
+    assert outcome.merged is False                                # … so NO merge
+    assert not gh.matching("gh", "merge", "--squash")
+
+
+def test_summon_debt_is_only_paid_by_a_LANDED_summon():
+    # A re-request that failed to post (gh error / 422 / no trigger) leaves the
+    # reviewer exactly as unasked as the deferral did — the debt must survive it, and
+    # with it the merge block.
+    class FailingSummon(GhRecorder):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            proc = super().__call__(argv, cwd=cwd, timeout=timeout)
+            if any("@claude review" in a for a in argv):
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="422")
+            return proc
+
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    gh = FailingSummon()
+    driver, clock, _ = make_driver(
+        timeline, cfg=CLAUDE_ONLY, gh=gh, classify=label_runner("COSMETIC"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        auto_merge=True, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert gh.matching("@claude review")            # summons were ATTEMPTED …
+    assert "claude" in driver._deferred_summon      # … none landed, so the debt stands
+    assert outcome.merged is False                  # and the merge stays blocked
+
+
+def test_preflight_batch_skips_the_round1_register_delay():
+    # Work already in hand: fixing the pre-existing comments takes far longer than the
+    # register delay, so sleeping it out before the poll is a pure stall — the trigger
+    # has long registered by the time the poll opens.
+    times = RoundTimes(quiescence=1, poll_interval=1, min_bot_wait=0,
+                       idle_timeout=1, max_wait_total=10, register_delay=60)
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="copilot[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=label_runner("COSMETIC"),
+        fix=lambda c, r: FixOutcome(status="applied"), preflight=True, times=times,
+        max_rounds=1, answer_waiter=lambda esc, **k: {})
+    driver.run()
+    assert gh.matching("@claude review")   # claude WAS summoned (a landed re-request) …
+    assert clock.t < times.register_delay  # … and the round did not stall on the delay
+
+
+def test_silence_never_forgives_the_summon_debt():
+    # The debt is forgiven ONLY by a HARD cause (which makes a bot unsummonable).
+    # Silence is a SOFT drop — and for a reviewer whose every re-request FAILED to
+    # post, the silence is the loop's doing, not the reviewer's. Dropping it would
+    # quietly cancel the debt and merge a head it was never asked about. An
+    # auto_on_open reviewer is the sharp case: _was_review_expected treats it as
+    # expected even when it was never successfully summoned.
+    class FailingSummon(GhRecorder):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            proc = super().__call__(argv, cwd=cwd, timeout=timeout)
+            if any("requested_reviewers" in a for a in argv):
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="422")
+            return proc
+
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="copilot[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    gh = FailingSummon()
+    driver, clock, _ = make_driver(
+        timeline, cfg=cfg, gh=gh, classify=label_runner("COSMETIC"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        auto_merge=True, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert gh.matching("requested_reviewers")        # every summon was attempted …
+    assert "copilot" in driver._deferred_summon      # … none landed, so the debt stands
+    assert "copilot" not in driver.silent_dropped    # silence did not forgive it
+    assert outcome.merged is False                   # and the merge stays blocked
+
+
+def test_a_rate_limited_reviewer_does_not_forgive_the_summon_debt():
+    # A rate limit is a TIMED, self-reversing window — not a hard cause. Reading it as
+    # "unsummonable" would forgive a debt the very next round boundary could pay: the
+    # comeback pops the window, re-admits the reviewer, and the loop asks it. Draining
+    # or merging past that ends the run on a head the reviewer was never asked about.
+    marker = Comment(id="m", from_issue_channel=True, source="github-actions[bot]",
+                     created_at="2026-07-01T10:00:00Z",
+                     text="<!-- claude-review-unavailable-v1 type=rate_limited resets_at=0 -->")
+    timeline = [
+        # claude's pre-existing finding → deferred out of round 1, debt booked.
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@",
+                    created_at="2026-07-01T09:00:00Z")),
+        # …and mid-round-1 the workflow reports claude is rate-limited (unknown reset →
+        # "retry next round"), which drops it from expected_bots() — a SOFT drop.
+        (10, marker),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        auto_merge=True, max_rounds=3, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert gh.matching("@claude review")     # the comeback round summoned it after all
+    assert driver._deferred_summon == set()  # …which is what paid the debt
+    assert outcome.rounds >= 2
+
+
+def test_terminal_drain_does_not_run_over_a_pending_rate_limit_comeback():
+    # The drain is for a TERMINALLY empty fleet. A rate-limited reviewer is coming back
+    # (the next round's boundary pops its window), so an empty expected set is not
+    # terminal — draining there would merge a head it never saw. Default launch: no
+    # deferral, no debt, so this is the drain guard alone.
+    marker = Comment(id="m", from_issue_channel=True, source="github-actions[bot]",
+                     created_at="2026-07-01T10:00:00Z",
+                     text="<!-- claude-review-unavailable-v1 type=rate_limited resets_at=0 -->")
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@")),
+        (0, marker),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), auto_merge=True, max_rounds=3,
+        answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert outcome.rounds >= 2                        # round 2 exists for the comeback …
+    assert len(gh.matching("@claude review")) >= 2    # … and it re-summons claude there

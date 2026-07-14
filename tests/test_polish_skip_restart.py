@@ -112,8 +112,16 @@ class GhHead:
 
 
 def classify(prompt):
-    """Per-comment labels: the null-check finding is real work, the rename is not."""
-    label = "SUBSTANTIVE" if "null check" in prompt else "COSMETIC"
+    """Per-comment labels: the null-check finding is real work, the retention-policy
+    comment is a question for a human, the rename is neither. The markers are matched
+    against the whole classifier PROMPT, so they must be phrases the prompt's own
+    guidance cannot contain."""
+    if "retention policy" in prompt:
+        label = "BUSINESS_QUESTION"
+    elif "null check" in prompt:
+        label = "SUBSTANTIVE"
+    else:
+        label = "COSMETIC"
     return json.dumps({"label": label, "reason": "t"})
 
 
@@ -126,6 +134,7 @@ def make_driver(timeline, *, gh, cfg=None, clock=None, **kw):
     kw.setdefault("preflight", False)
     kw.setdefault("threads_fetch", lambda pr, repo=None, cwd=None: [])
     kw.setdefault("resolve_thread", lambda thread_id, cwd=None: True)
+    kw.setdefault("answer_waiter", lambda esc, **k: {})
     driver = RoundDriver(
         PR, repo=REPO, cwd="/nonexistent", cfg=cfg or FLEET,
         adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),
@@ -135,7 +144,6 @@ def make_driver(timeline, *, gh, cfg=None, clock=None, **kw):
         gh_run=gh, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
         times=RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
                          idle_timeout=900, max_wait_total=1800, register_delay=0),
-        answer_waiter=lambda esc, **k: {},
         **kw,
     )
     return driver, clock
@@ -318,3 +326,58 @@ def test_state_is_keyed_on_repo_and_pr():
     assert polish_state.read_polish_state(PR, "other/repo") is None  # another repo
     assert polish_state.clear_polish_state(PR, REPO) is True
     assert polish_state.read_polish_state(PR, REPO) is None
+
+
+# ---------------------------------------------------------------------------
+# The verdict survives EVERY exit, not just a completed round
+# ---------------------------------------------------------------------------
+
+def test_polish_verdict_survives_an_escalation_handback_and_restart():
+    # The flagship --rr-active flow: the loop escalates a business question and hands
+    # back, the operator answers it out of band and re-runs. That hand-back fires
+    # BEFORE the round's push, so a stamp written only after a completed round is
+    # never written at all — and the restart re-summons the polish-only reviewers the
+    # run had already finished with.
+    question = Comment(id="q", text="who owns the retention policy for this table?",
+                       source="claude[bot]", path="z.py", diff_hunk="@@ -3 +3 @@")
+    gh = GhHead(head="H0")
+    driver, clock = make_driver([(0, question), (0, COSMETIC)], gh=gh, max_rounds=3,
+                                answer_waiter=lambda esc, **k: {"q": None})
+    outcome = driver.run()
+    assert outcome.status == "needs-human"           # handed back, nothing pushed
+    assert driver.polishing == {"copilot"}
+    state = polish_state.read_polish_state(PR, REPO)
+    assert state["bots"] == ["copilot"] and state["tip_sha"] == "H0"
+
+    # The operator answers the question, then re-runs --rr-active at the same head.
+    gh2 = GhHead(head="H0")
+    driver2, _ = make_driver([(0, question), (0, COSMETIC)], gh=gh2, rr_active=True,
+                             preflight=True, max_rounds=3)
+    driver2.run()
+    assert "copilot" in driver2.polishing                # verdict restored …
+    assert gh2.matching("requested_reviewers") == []     # … so it is never re-asked
+
+
+def test_an_empty_polish_set_never_erases_a_verdict_at_the_same_tip():
+    # NO-CLOBBER. Only --rr-active restores the verdict, so any other run mode reaches
+    # its round end with an EMPTY set purely because it never read the record — and
+    # must not erase, at the very commit it is describing, a verdict another run
+    # legitimately reached.
+    assert polish_state.write_polish_state(PR, REPO, "H1", ["copilot"]) is True
+    assert polish_state.write_polish_state(PR, REPO, "H1", []) is False    # refused
+    assert polish_state.read_polish_state(PR, REPO)["bots"] == ["copilot"]
+    # A MOVED tip is a different commit — the old record no longer speaks for it.
+    assert polish_state.write_polish_state(PR, REPO, "H2", []) is True
+    assert polish_state.read_polish_state(PR, REPO)["bots"] == []
+
+
+def test_a_plain_rerun_does_not_erase_the_verdict_at_the_same_tip():
+    # The end-to-end shape of the same rule: a DEFAULT launch (which restores nothing)
+    # reaches its round end with an empty polish set at an unchanged HEAD. The record
+    # a prior run reached at that commit must survive it.
+    polish_state.write_polish_state(PR, REPO, "H1", ["copilot"])
+    gh = GhHead(head="H1")
+    driver, clock = make_driver([(0, SUBSTANTIVE)], gh=gh, max_rounds=1, push=False)
+    driver.run()
+    assert driver.polishing == set()                                    # nothing restored
+    assert polish_state.read_polish_state(PR, REPO)["bots"] == ["copilot"]
