@@ -2351,3 +2351,29 @@ def test_summon_debt_blocks_the_round1_fast_exit_too():
     assert "claude" in driver._owed_summons()   # booked before the loop, so the …
     assert gh.matching("@claude review") == []  # … fast exit sees it and cannot summon it
     assert outcome.merged is False              # → hand back, never merge past it
+
+
+def test_errored_responder_whose_latest_message_reads_clean_is_still_summoned():
+    # Ordering guard: the debt is booked AFTER the un-crowning that strips a
+    # placeholder-crowned reviewer back out of `done`. This reviewer errored (t1), then
+    # retried with a real nit (t2), then its latest message reads clean (t3). The
+    # re-derive folds it done on t3; the snapshot errored-excludes it on t1; the
+    # un-crowning removes it from done. If the debt were booked BEFORE the un-crowning it
+    # would read the still-`done` bot and drop it — and the errored-comeback would then
+    # un-exclude it mid-round and merge past it, never summoned. Booked after, it owes.
+    timeline = [
+        (0, Comment(id="e", text="Review run failed.", source="claude[bot]",
+                    from_issue_channel=True, created_at="2026-07-01T10:00:00Z")),
+        (0, Comment(id="c", text="nit: rename tmp for clarity", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@", created_at="2026-07-01T11:00:00Z")),
+        (0, Comment(id="ok", text="No issues found.", source="claude[bot]",
+                    from_issue_channel=True, created_at="2026-07-01T12:00:00Z")),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        auto_merge=True, max_rounds=3, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert gh.matching("@claude review")            # summoned on the fixed head …
+    assert "claude" not in driver.polishing         # … never soft-demoted on stale work
+    assert outcome.rounds >= 2                       # it reviewed the fix before the merge

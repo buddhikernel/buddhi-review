@@ -1958,22 +1958,7 @@ class RoundDriver:
             # sign-offs it folded, the quota / errored bots it excluded, and the
             # pre-existing comments it queued as round 1's work. Skipping the snapshot
             # outright would re-summon a quota-exhausted reviewer.
-            if self.max_rounds >= 2:
-                # Book the SUMMON DEBT now, before the round loop — so no exit inside
-                # it (the round-1 "no still-active reviewers" fast exit fires BEFORE
-                # round 1's body) can slip a deferred reviewer past the fail-closed
-                # gate unbooked. Booked from WHO RESPONDED, minus the genuinely decided
-                # (see _owed_summons); a soft, reversible reason a responder is out of
-                # expected_bots() — a rate-limit window, a retractable errored exclusion
-                # — must not drop it from the debt.
-                self._deferred_summon = {
-                    b for b in self._preflight_responders
-                    if b not in self.done
-                    and b not in self.polishing
-                    and b not in self.reviewed_no_change
-                }
-                deferred = set(self._deferred_summon)
-            else:
+            if self.max_rounds < 2:
                 self._preflight_responders.clear()
             # A HARD CAUSE always wins over a re-derived verdict. The snapshot reads
             # every comment through the full exclusion path, so it can hard-exclude
@@ -1991,6 +1976,24 @@ class RoundDriver:
                 self.done.discard(bot)
                 self.approved.discard(bot)
                 self.polishing.discard(bot)
+            # Book the SUMMON DEBT now — AFTER the un-crowning above (it may have just
+            # stripped a placeholder-crowned reviewer back out of ``done``, and the
+            # ``b not in self.done`` filter must see that corrected set, or an
+            # errored-but-clean-latest responder would be dropped from the debt and
+            # merged past) and BEFORE the round loop (so no exit inside it — the round-1
+            # "no still-active reviewers" fast exit fires BEFORE round 1's body — can
+            # slip a deferred reviewer past the fail-closed gate unbooked). Booked from
+            # WHO RESPONDED, minus the genuinely decided (see _owed_summons); a soft,
+            # reversible reason a responder is out of expected_bots() — a rate-limit
+            # window, a retractable errored exclusion — must not drop it from the debt.
+            if self.max_rounds >= 2:
+                self._deferred_summon = {
+                    b for b in self._preflight_responders
+                    if b not in self.done
+                    and b not in self.polishing
+                    and b not in self.reviewed_no_change
+                }
+                deferred = set(self._deferred_summon)
         fleet = set(self._run_start_fleet)
         # A preserved approval / polish verdict IS a genuine review (restricted to
         # the run-start fleet, mirroring the gate's own universe). Without this fold
