@@ -35,6 +35,142 @@ def _silent(*a, **k):
     return ""
 
 
+# ── REAL Gradle console output ───────────────────────────────────────────────────
+# Verbatim `gradle test` / `gradle check` output, lifecycle tasks INCLUDED. Gradle
+# always prints the compile / resource / lifecycle tasks around the `:test` EXECUTION
+# task, and their statuses say NOTHING about whether tests ran:
+#
+#   > Task :compileTestJava NO-SOURCE      ← compile task: no test sources to compile
+#   > Task :processTestResources NO-SOURCE ← resource task
+#   > Task :testClasses UP-TO-DATE         ← LIFECYCLE task: it has no actions, so it is
+#                                            UP-TO-DATE — it is NEVER "NO-SOURCE"
+#   > Task :test NO-SOURCE                 ← the EXECUTION task — the ONLY zero-test evidence
+#
+# A classifier keyed on a `\S*[Tt]est\S*` NAME-match sees all four and, requiring every
+# match to be NO-SOURCE, is defeated by `testClasses UP-TO-DATE` — so the empty project
+# falls through to `passed` and the gate goes GREEN on ZERO tests. That is the exact
+# false-green these fixtures exist to pin. Every Gradle fixture here is real output; a
+# 1–3 line synthetic (written to the regex instead of to Gradle) is what let it ship.
+
+_GRADLE_ZERO_TEST = """> Task :compileJava UP-TO-DATE
+> Task :processResources NO-SOURCE
+> Task :classes UP-TO-DATE
+> Task :compileTestJava NO-SOURCE
+> Task :processTestResources NO-SOURCE
+> Task :testClasses UP-TO-DATE
+> Task :test NO-SOURCE
+
+BUILD SUCCESSFUL in 1s
+3 actionable tasks: 3 up-to-date"""
+
+_GRADLE_PASSING = """> Task :compileJava
+> Task :processResources NO-SOURCE
+> Task :classes
+> Task :compileTestJava
+> Task :processTestResources NO-SOURCE
+> Task :testClasses
+> Task :test
+
+BUILD SUCCESSFUL in 3s
+4 actionable tasks: 4 executed"""
+
+# `gradle check`: the unit-test task is empty (NO-SOURCE) but the integrationTest
+# sibling REALLY RAN — a verified pass, never an empty run.
+_GRADLE_CHECK_MIXED = """> Task :compileJava UP-TO-DATE
+> Task :classes UP-TO-DATE
+> Task :compileTestJava NO-SOURCE
+> Task :processTestResources NO-SOURCE
+> Task :testClasses UP-TO-DATE
+> Task :test NO-SOURCE
+> Task :compileIntegrationTestJava
+> Task :integrationTestClasses
+> Task :integrationTest
+> Task :check
+
+BUILD SUCCESSFUL in 6s
+5 actionable tasks: 3 executed, 2 up-to-date"""
+
+# A multi-module build where EVERY module's execution task is empty.
+_GRADLE_MULTI_MODULE_ZERO = """> Task :app:compileTestJava NO-SOURCE
+> Task :app:processTestResources NO-SOURCE
+> Task :app:testClasses UP-TO-DATE
+> Task :app:test NO-SOURCE
+> Task :lib:compileTestJava NO-SOURCE
+> Task :lib:processTestResources NO-SOURCE
+> Task :lib:testClasses UP-TO-DATE
+> Task :lib:test NO-SOURCE
+
+BUILD SUCCESSFUL in 2s
+6 actionable tasks: 6 up-to-date"""
+
+# The suite EXISTS and is up-to-date (nothing changed since the last green run).
+_GRADLE_UP_TO_DATE = """> Task :compileJava UP-TO-DATE
+> Task :processResources NO-SOURCE
+> Task :classes UP-TO-DATE
+> Task :compileTestJava UP-TO-DATE
+> Task :processTestResources NO-SOURCE
+> Task :testClasses UP-TO-DATE
+> Task :test UP-TO-DATE
+
+BUILD SUCCESSFUL in 800ms
+4 actionable tasks: 4 up-to-date"""
+
+# REAL Android-Gradle-Plugin (AGP) output. The unit-test variant generates SUPPORT
+# tasks whose names ALSO end in "Test" and execute with a bare header
+# (`javaPreCompileDebugUnitTest`, `packageDebugUnitTestForUnitTest`) — an `endswith
+# ("Test")` name-match reads them as "a task ran" and discards the genuine
+# `:app:testDebugUnitTest NO-SOURCE`, greening a ZERO-TEST Android module. Only the
+# `:testDebugUnitTest` EXECUTION task's own status is evidence. (Task lines here are
+# verbatim shapes from real Android CI logs.)
+_GRADLE_ANDROID_ZERO_TEST = """> Task :app:preDebugUnitTestBuild UP-TO-DATE
+> Task :app:processDebugUnitTestJavaRes NO-SOURCE
+> Task :app:javaPreCompileDebugUnitTest
+> Task :app:packageDebugUnitTestForUnitTest
+> Task :app:compileDebugUnitTestKotlin NO-SOURCE
+> Task :app:compileDebugUnitTestJavaWithJavac NO-SOURCE
+> Task :app:testDebugUnitTest NO-SOURCE
+
+BUILD SUCCESSFUL in 47s
+42 actionable tasks: 5 executed, 37 up-to-date"""
+
+_GRADLE_ANDROID_PASSING = """> Task :app:preDebugUnitTestBuild UP-TO-DATE
+> Task :app:javaPreCompileDebugUnitTest
+> Task :app:compileDebugUnitTestJavaWithJavac
+> Task :app:testDebugUnitTest
+
+BUILD SUCCESSFUL in 12s
+44 actionable tasks: 12 executed, 32 up-to-date"""
+
+_GRADLE_FAILING = """> Task :compileJava
+> Task :classes
+> Task :compileTestJava
+> Task :testClasses
+> Task :test FAILED
+
+DemoTest > addsTwoNumbers() FAILED
+    org.opentest4j.AssertionFailedError: expected: <3> but was: <4>
+
+2 tests completed, 1 failed
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':test'.
+> There were failing tests.
+
+BUILD FAILED in 4s"""
+
+_GRADLE_COMPILE_ERROR = """> Task :compileJava FAILED
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':compileJava'.
+> Compilation failed; see the compiler error output for details.
+
+BUILD FAILED in 2s"""
+
+
 # ── The classifier table ─────────────────────────────────────────────────────────
 
 # (id, runner, exit_code, output, expected_class). Output strings are the real
@@ -110,13 +246,18 @@ _CLASSIFY_CASES = [
     # exit 0 printing "\n\n  0 passing (1ms)\n".
     ("mocha-zero-runnable-rc0", tr.MOCHA, 0, "\n\n  0 passing (1ms)\n", tr.NO_TESTS),
 
-    # ---- jasmine (marker-first: v2 exits 0, v3 exits 1, v4+ exits 2 on no specs;
-    #      the "No specs found" marker is present in ALL versions) ----
+    # ---- jasmine — the no-specs marker is RC-GATED (a nonzero exit is NEVER a benign
+    #      empty run; same invariant _classify_dotnet documents in its own branch).
+    #      jasmine v2 exits 0 on no specs (the silent-green class → no_tests SKIP);
+    #      v3 exits 1 and v4+ exits 2 BECAUSE jasmine itself treats an empty run as an
+    #      ERROR — so those RED, and a broken run (bad spec_dir / a helper that threw)
+    #      printing the same marker at a nonzero exit REDs too, instead of skipping the
+    #      gate and letting the push proceed unverified. ----
     ("jasmine-pass", tr.JASMINE, 0, "5 specs, 0 failures", tr.PASSED),
     ("jasmine-fail", tr.JASMINE, 3, "5 specs, 2 failures", tr.FAILED),
     ("jasmine-no-specs-v2-exit0", tr.JASMINE, 0, "Started\n\nNo specs found\nFinished", tr.NO_TESTS),
-    ("jasmine-no-specs-v3-exit1", tr.JASMINE, 1, "Started\nNo specs found\nIncomplete: No specs found", tr.NO_TESTS),
-    ("jasmine-no-specs-v4-exit2", tr.JASMINE, 2, "Started\nNo specs found\nIncomplete: No specs found", tr.NO_TESTS),
+    ("jasmine-no-specs-v3-exit1-is-failed", tr.JASMINE, 1, "Started\nNo specs found\nIncomplete: No specs found", tr.FAILED),
+    ("jasmine-no-specs-v4-exit2-is-failed", tr.JASMINE, 2, "Started\nNo specs found\nIncomplete: No specs found", tr.FAILED),
 
     # ---- Karma / ng test: "Executed 0 of N" marker wins over exit code. Default
     #      failOnEmptyTestSuite=true → empty suite EXITS 1 (false-red risk); the
@@ -221,25 +362,25 @@ _CLASSIFY_CASES = [
     ("maven-fail", tr.MAVEN, 1, "Tests run: 5, Failures: 1\nBUILD FAILURE", tr.FAILED),
     ("maven-no-tests", tr.MAVEN, 0, "Tests run: 0, Failures: 0\nBUILD SUCCESS", tr.NO_TESTS),
     ("maven-compile", tr.MAVEN, 1, "COMPILATION ERROR\nBUILD FAILURE", tr.COMPILE_ERROR),
-    ("gradle-pass", tr.GRADLE, 0, "BUILD SUCCESSFUL in 4s", tr.PASSED),
-    ("gradle-fail", tr.GRADLE, 1, "> There were failing tests. BUILD FAILED", tr.FAILED),
-    ("gradle-compile", tr.GRADLE, 1, "> Task :compileJava FAILED\nCompilation failed", tr.COMPILE_ERROR),
-    # A bare NO-SOURCE is generic Gradle task-outcome text (e.g. a project with no
-    # src/main/resources prints `> Task :processResources NO-SOURCE`), not a
-    # test-specific signal — it must not false the gate into NO_TESTS on a green,
-    # fully-passing run.
-    ("gradle-nonsource-resources-still-pass", tr.GRADLE, 0,
-     "> Task :processResources NO-SOURCE\n> Task :test\nBUILD SUCCESSFUL in 4s", tr.PASSED),
-    ("gradle-test-task-nonsource-is-no-tests", tr.GRADLE, 0,
-     "> Task :test NO-SOURCE\nBUILD SUCCESSFUL in 1s", tr.NO_TESTS),
-    # `gradle test integrationTest` (or `gradle check`) runs MULTIPLE test-named
-    # tasks — one can be NO-SOURCE (e.g. no unit tests) while a sibling actually
-    # executes. Normal Gradle console output never prints a "BUILD SUCCESSFUL ... N
-    # test" count, so this must NOT be masked as an empty run just because one of
-    # the test tasks was NO-SOURCE.
-    ("gradle-multi-test-task-sibling-ran-not-no-tests", tr.GRADLE, 0,
-     "> Task :test NO-SOURCE\n> Task :integrationTest\nBUILD SUCCESSFUL in 5s\n"
-     "3 actionable tasks: 3 executed", tr.PASSED),
+    # Gradle fixtures are REAL `gradle test` / `gradle check` console output — INCLUDING
+    # the lifecycle tasks Gradle always emits around the execution task
+    # (`compileTestJava`, `processTestResources`, `testClasses`). A synthetic 1–3 line
+    # fixture is what let the FALSE-GREEN below ship: written to the regex, not to
+    # Gradle. See _GRADLE_* above and TestGradleZeroTestIsNeverGreen.
+    ("gradle-pass", tr.GRADLE, 0, _GRADLE_PASSING, tr.PASSED),
+    ("gradle-zero-test-is-no-tests", tr.GRADLE, 0, _GRADLE_ZERO_TEST, tr.NO_TESTS),
+    ("gradle-check-empty-plus-sibling-that-ran", tr.GRADLE, 0, _GRADLE_CHECK_MIXED, tr.PASSED),
+    ("gradle-multi-module-zero-test", tr.GRADLE, 0, _GRADLE_MULTI_MODULE_ZERO, tr.NO_TESTS),
+    # Android (AGP): the support tasks `javaPreCompileDebugUnitTest` /
+    # `packageDebugUnitTestForUnitTest` END in "Test" and run with a bare header, but
+    # only `:app:testDebugUnitTest NO-SOURCE` is zero-test evidence.
+    ("gradle-android-zero-test-is-no-tests", tr.GRADLE, 0, _GRADLE_ANDROID_ZERO_TEST, tr.NO_TESTS),
+    ("gradle-android-passing-run", tr.GRADLE, 0, _GRADLE_ANDROID_PASSING, tr.PASSED),
+    # `> Task :test UP-TO-DATE` — the suite EXISTS and was up-to-date. UP-TO-DATE is
+    # NON-evidence (it neither ran now nor says the suite is empty) → a green build.
+    ("gradle-test-up-to-date-is-pass", tr.GRADLE, 0, _GRADLE_UP_TO_DATE, tr.PASSED),
+    ("gradle-fail", tr.GRADLE, 1, _GRADLE_FAILING, tr.FAILED),
+    ("gradle-compile", tr.GRADLE, 1, _GRADLE_COMPILE_ERROR, tr.COMPILE_ERROR),
 
     # ---- dotnet (VSTest SILENT EXIT 0 + MTP) ----
     ("dotnet-pass", tr.DOTNET, 0, "Passed!  - Failed: 0, Passed: 12, Total: 12", tr.PASSED),
@@ -541,6 +682,132 @@ class TestSwiftRunBannerGate:
 
     def test_no_target_is_no_tests_at_any_exit(self):
         assert tr.classify(tr.SWIFT, 1, "error: no tests found; create a target") == tr.NO_TESTS
+
+
+class TestGradleZeroTestIsNeverGreen:
+    """THE false-green this module exists to prevent: a Gradle project with ZERO TESTS
+    must classify `no_tests` (the gate SKIPs, loudly), never `passed`.
+
+    Zero-test evidence is the `:test` / `:integrationTest` EXECUTION task's own status
+    line and NOTHING else. Gradle always prints the compile / resource / LIFECYCLE tasks
+    around it, and a `\\S*[Tt]est\\S*` name-match sweeps them all in:
+
+        > Task :compileTestJava NO-SOURCE       ← compile task
+        > Task :processTestResources NO-SOURCE  ← resource task
+        > Task :testClasses UP-TO-DATE          ← LIFECYCLE task — no actions, so
+                                                  UP-TO-DATE, NEVER "NO-SOURCE"
+        > Task :test NO-SOURCE                  ← the EXECUTION task
+
+    An "EVERY test-named task is NO-SOURCE" rule is therefore defeated by
+    `testClasses UP-TO-DATE` — the no-tests branch never fires and the empty project
+    falls through to `passed`. Both directions are pinned here, on REAL output.
+    """
+
+    def test_zero_test_project_is_no_tests_not_passed(self):
+        got = tr.classify(tr.GRADLE, 0, _GRADLE_ZERO_TEST)
+        assert got == tr.NO_TESTS, f"zero-test Gradle project false-greened as {got}"
+
+    def test_the_lifecycle_task_cannot_defeat_the_no_tests_branch(self):
+        # The regression in one line: `testClasses` is UP-TO-DATE (never NO-SOURCE), so
+        # any all()-over-test-NAMED-tasks rule reads False here and returns `passed`.
+        assert "> Task :testClasses UP-TO-DATE" in _GRADLE_ZERO_TEST
+        assert "> Task :test NO-SOURCE" in _GRADLE_ZERO_TEST
+        assert tr.classify(tr.GRADLE, 0, _GRADLE_ZERO_TEST) == tr.NO_TESTS
+
+    @pytest.mark.parametrize("name", [
+        "compileTestJava", "processTestResources", "testClasses",
+        "compileIntegrationTestJava", "integrationTestClasses", "testFixturesJar",
+    ])
+    def test_a_non_execution_test_named_task_is_never_zero_test_evidence(self, name):
+        # NO-SOURCE on a compile/resource/lifecycle task says NOTHING about whether the
+        # suite ran — only the execution task does. On its own it must not skip the gate.
+        out = f"> Task :{name} NO-SOURCE\n> Task :test\n\nBUILD SUCCESSFUL in 2s"
+        assert tr.classify(tr.GRADLE, 0, out) == tr.PASSED
+
+    def test_real_passing_run_is_passed(self):
+        assert tr.classify(tr.GRADLE, 0, _GRADLE_PASSING) == tr.PASSED
+
+    def test_up_to_date_execution_task_is_non_evidence(self):
+        # UP-TO-DATE / SKIPPED say neither "it ran" nor "the suite is empty" → not a skip.
+        assert tr.classify(tr.GRADLE, 0, _GRADLE_UP_TO_DATE) == tr.PASSED
+        assert tr.classify(
+            tr.GRADLE, 0, "> Task :test SKIPPED\n\nBUILD SUCCESSFUL in 1s") == tr.PASSED
+
+    def test_check_run_with_one_empty_task_and_a_sibling_that_ran_is_passed(self):
+        # A real run ANYWHERE wins — `gradle check` may have an empty `:test` beside an
+        # `:integrationTest` that really executed. That is a verified pass, not an empty run.
+        assert tr.classify(tr.GRADLE, 0, _GRADLE_CHECK_MIXED) == tr.PASSED
+
+    def test_multi_module_all_execution_tasks_empty_is_no_tests(self):
+        assert tr.classify(tr.GRADLE, 0, _GRADLE_MULTI_MODULE_ZERO) == tr.NO_TESTS
+
+    def test_multi_module_one_module_ran_is_passed(self):
+        out = ("> Task :app:testClasses UP-TO-DATE\n> Task :app:test NO-SOURCE\n"
+               "> Task :lib:testClasses\n> Task :lib:test\n\nBUILD SUCCESSFUL in 3s")
+        assert tr.classify(tr.GRADLE, 0, out) == tr.PASSED
+
+    def test_failing_and_compile_error_are_unchanged(self):
+        assert tr.classify(tr.GRADLE, 1, _GRADLE_FAILING) == tr.FAILED
+        assert tr.classify(tr.GRADLE, 1, _GRADLE_COMPILE_ERROR) == tr.COMPILE_ERROR
+
+    def test_android_agp_zero_test_module_is_no_tests_not_passed(self):
+        # AGP prints support tasks that END in "Test" and run with a bare header
+        # (javaPreCompileDebugUnitTest, packageDebugUnitTestForUnitTest). An
+        # `endswith("Test")` name-match reads them as "a task ran" and discards the
+        # genuine `:app:testDebugUnitTest NO-SOURCE` — greening a ZERO-TEST module.
+        got = tr.classify(tr.GRADLE, 0, _GRADLE_ANDROID_ZERO_TEST)
+        assert got == tr.NO_TESTS, f"zero-test Android module false-greened as {got}"
+
+    def test_android_agp_passing_run_is_passed(self):
+        assert tr.classify(tr.GRADLE, 0, _GRADLE_ANDROID_PASSING) == tr.PASSED
+
+    @pytest.mark.parametrize("name,is_exec", [
+        # genuine Test-TYPE EXECUTION tasks
+        ("test", True), ("integrationTest", True), ("functionalTest", True),
+        ("myServiceTest", True), ("testDebugUnitTest", True),
+        ("testReleaseUnitTest", True), ("connectedDebugAndroidTest", True),
+        ("checkoutFlowTest", True),   # leading word "checkout", NOT the verb "check"
+        # NON-execution support / lifecycle tasks (some END in "Test")
+        ("javaPreCompileDebugUnitTest", False), ("packageDebugUnitTestForUnitTest", False),
+        ("javaPreCompileDebugAndroidTest", False), ("packageDebugAndroidTest", False),
+        ("compileTestJava", False), ("compileTestKotlin", False),
+        ("testClasses", False), ("processTestResources", False),
+        ("processDebugUnitTestJavaRes", False), ("preDebugUnitTestBuild", False),
+    ])
+    def test_execution_task_predicate(self, name, is_exec):
+        assert tr._is_gradle_test_execution_task(name) is is_exec
+
+
+class TestJasmineNoSpecsIsExitGated:
+    """jasmine: a NONZERO exit is NEVER a benign empty run — the same invariant
+    `_classify_dotnet` documents in its own branch. jasmine v3+ exits nonzero on an
+    empty run BECAUSE jasmine treats that as an error, and a broken run (a bad
+    `spec_dir`, a helper that threw before loading) prints the same marker at a nonzero
+    exit. Reporting either as a green SKIP lets the push proceed unverified."""
+
+    def test_rc0_no_specs_is_no_tests(self):
+        assert tr.classify(tr.JASMINE, 0, "Started\n\nNo specs found\nFinished") == tr.NO_TESTS
+
+    @pytest.mark.parametrize("rc", [1, 2, 3])
+    def test_nonzero_exit_with_only_a_no_specs_marker_is_failed(self, rc):
+        got = tr.classify(tr.JASMINE, rc, "No specs found")
+        assert got == tr.FAILED, f"nonzero jasmine run green-skipped as {got}"
+
+    def test_nonzero_incomplete_no_specs_is_failed(self):
+        out = "Started\nNo specs found\nIncomplete: No specs found"
+        assert tr.classify(tr.JASMINE, 2, out) == tr.FAILED
+
+    def test_real_spec_failure_stays_failed(self):
+        assert tr.classify(tr.JASMINE, 3, "5 specs, 2 failures") == tr.FAILED
+
+    def test_passing_run_stays_passed(self):
+        assert tr.classify(tr.JASMINE, 0, "5 specs, 0 failures") == tr.PASSED
+
+    def test_missing_dependency_is_still_env_error(self):
+        # The env branch runs BEFORE the marker branch — a nonzero run whose real cause
+        # is a missing dep is named env_error, not a bare failure.
+        assert tr.classify(
+            tr.JASMINE, 1, "Cannot find module 'jasmine-core'") == tr.ENV_ERROR
 
 
 # ── Detection — argv ─────────────────────────────────────────────────────────────
@@ -929,6 +1196,56 @@ class TestGateNoTestsSkip:
         assert status == "skipped"
         assert tail == ""
         assert "no tests detected for pytest" in capsys.readouterr().out
+
+    def test_gradle_zero_test_project_skips_the_gate_never_greens_it(self, monkeypatch, capsys):
+        # END-TO-END on the false-green: a real zero-test `gradle test` run exits 0, so
+        # the gate MUST classify no_tests and SKIP (loudly). A "green" here is the bug.
+        monkeypatch.setenv("BUDDHI_TEST_COMMAND", "gradle test")
+        status, tail = commit_push.run_test_gate(
+            "/w", run=_run_returning(0, _GRADLE_ZERO_TEST), notice=_silent)
+        assert status == "skipped", f"zero-test Gradle gate returned {status!r}, not a skip"
+        assert tail == ""
+        assert "no tests detected for gradle" in capsys.readouterr().out
+
+    def test_gradle_passing_run_greens_the_gate(self, monkeypatch, capsys):
+        # The other direction: a real passing Gradle run must still be GREEN, not a skip.
+        monkeypatch.setenv("BUDDHI_TEST_COMMAND", "gradle test")
+        status, _ = commit_push.run_test_gate(
+            "/w", run=_run_returning(0, _GRADLE_PASSING), notice=_silent)
+        assert status == "green"
+        assert "no tests detected" not in capsys.readouterr().out
+
+    def test_android_zero_test_module_skips_never_greens(self, monkeypatch, capsys):
+        # END-TO-END on the AGP false-green: `./gradlew testDebugUnitTest` on a zero-test
+        # Android module exits 0; the gate MUST classify no_tests and SKIP, never green.
+        monkeypatch.setenv("BUDDHI_TEST_COMMAND", "./gradlew testDebugUnitTest")
+        status, tail = commit_push.run_test_gate(
+            "/w", run=_run_returning(0, _GRADLE_ANDROID_ZERO_TEST), notice=_silent)
+        assert status == "skipped", f"zero-test Android gate returned {status!r}, not a skip"
+        assert tail == ""
+        assert "no tests detected for gradle" in capsys.readouterr().out
+
+
+class TestGateJasmineNonzeroReds:
+    """A nonzero jasmine run whose only signal is a no-specs marker must RED the gate —
+    it must never SKIP it and let the push proceed unverified."""
+
+    def test_nonzero_no_specs_reds_the_gate(self, monkeypatch, capsys):
+        monkeypatch.setenv("BUDDHI_TEST_COMMAND", "npx jasmine")
+        status, tail = commit_push.run_test_gate(
+            "/w", run=_run_returning(1, "Started\nNo specs found\n"), notice=_silent)
+        assert status == "red", f"nonzero jasmine gate returned {status!r}, not red"
+        # a plain `failed` → no class headline; the runner's own tail is shown
+        assert "compile_error" not in tail and "env_error" not in tail
+        assert "no tests detected" not in capsys.readouterr().out   # NOT a skip
+
+    def test_rc0_no_specs_still_skips(self, monkeypatch, capsys):
+        monkeypatch.setenv("BUDDHI_TEST_COMMAND", "npx jasmine")
+        status, tail = commit_push.run_test_gate(
+            "/w", run=_run_returning(0, "Started\nNo specs found\n"), notice=_silent)
+        assert status == "skipped"
+        assert tail == ""
+        assert "no tests detected for jasmine" in capsys.readouterr().out
 
 
 class TestGateEnvAndCompileError:

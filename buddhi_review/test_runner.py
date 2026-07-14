@@ -909,17 +909,24 @@ def _classify_mocha(rc: int, out: str) -> str:
 
 
 def _classify_jasmine(rc: int, out: str) -> str:
-    # jasmine EXITS 0 on "No specs found" — the canonical silent-green class. The
-    # marker MUST be parsed or a zero-test run false-greens. Gated on the absence of a
-    # real "N specs, M failures" summary (nonzero N) so a genuinely-run suite whose OWN
-    # failure output happens to quote that marker text (e.g. a spec asserting on a
-    # CLI's own "No specs found" message) can't be misread as an empty run — same
-    # run-evidence guard shape as the jest classifier above.
-    if _has(out, r"No specs found", r"Incomplete: No specs found",
-            r"\b0 specs,\s*0 failures") and not _has(out, r"\b[1-9]\d* specs?,"):
-        return NO_TESTS
     if rc != 0 and _js_env(out):
         return ENV_ERROR
+    # jasmine EXITS 0 on "No specs found" — the canonical silent-green class. The
+    # marker MUST be parsed or a zero-test run false-greens. TWO guards scope it to a
+    # benign empty run:
+    #   * rc == 0 — a NONZERO exit is NEVER a benign empty run (the same invariant
+    #     `_classify_dotnet` documents in its own branch). jasmine v3+ deliberately
+    #     exits nonzero when it finds no specs BECAUSE its maintainers treat that as an
+    #     error, and a broken/misconfigured run (a bad `spec_dir`, a helper that threw
+    #     before loading) also exits nonzero while printing the same marker — reporting
+    #     any of those as a green SKIP lets the push proceed unverified.
+    #   * no real "N specs, M failures" summary (nonzero N) — so a genuinely-run suite
+    #     whose OWN failure output quotes that marker text (a spec asserting on a CLI's
+    #     "No specs found" message) can't be misread as an empty run. Same run-evidence
+    #     guard shape as the jest classifier above.
+    if rc == 0 and _has(out, r"No specs found", r"Incomplete: No specs found",
+                        r"\b0 specs,\s*0 failures") and not _has(out, r"\b[1-9]\d* specs?,"):
+        return NO_TESTS
     if rc == 0:
         return PASSED
     return FAILED
@@ -1197,6 +1204,43 @@ def _classify_maven(rc: int, out: str) -> str:
     return FAILED
 
 
+# Leading camelCase VERBS of Gradle / Android-Gradle-Plugin task names that are
+# NOT test-execution tasks even though the name ends in "…Test" / "…AndroidTest": the
+# AGP unit-test variant generates COMPILE / PACKAGE / PROCESS support tasks whose names
+# end in "Test" (`javaPreCompileDebugUnitTest`, `packageDebugUnitTestForUnitTest`,
+# `packageDebugAndroidTest`). A genuine Test-TYPE execution task never leads with one of
+# these verbs — `test`, `integrationTest`, `connectedDebugAndroidTest`, a user's
+# `fooTest` don't. The leading word is matched EXACTLY (a camelCase boundary), so a user
+# task like `checkoutFlowTest` (leading word "checkout", not "check") is still a test task.
+_GRADLE_NON_TEST_TASK_VERBS = frozenset({
+    "compile", "process", "package", "merge", "generate", "bundle", "assemble",
+    "java", "kapt", "ksp", "dex", "map", "extract", "transform", "strip",
+    "desugar", "lint", "jacoco", "sync", "pre", "collect", "write", "create",
+    "parse", "optimize", "verify", "install", "copy", "prepare", "bind",
+})
+
+
+def _is_gradle_test_execution_task(name: str) -> bool:
+    """True when a Gradle task NAME (the last ``:`` segment) is a Test-TYPE EXECUTION
+    task — the only task whose status is test-run evidence.
+
+    Matches `test` / `integrationTest` / a user `fooTest` / AGP `testDebugUnitTest` /
+    `connectedDebugAndroidTest`. Rejects the COMPILE / RESOURCE / LIFECYCLE tasks Gradle
+    prints around the real one — including the AGP support tasks that merely END in
+    "Test" (`javaPreCompileDebugUnitTest`, `packageDebugUnitTestForUnitTest`) — by their
+    leading verb, and `compileTestJava` / `testClasses` / `processTestResources` by their
+    non-"Test" suffix. Keying the no-tests decision on a broad `\\S*[Tt]est\\S*` (or even
+    `endswith("Test")` alone) name-match is what shipped a FALSE-GREEN: those support
+    tasks execute with a bare header, so their `ran`-evidence discards the genuine
+    `:testDebugUnitTest NO-SOURCE` and a zero-test Android module greens."""
+    if name == "test":
+        return True
+    if not name.endswith("Test"):
+        return False
+    m = re.match(r"[a-z]+", name)          # the leading camelCase word
+    return (m.group(0) if m else "") not in _GRADLE_NON_TEST_TASK_VERBS
+
+
 def _classify_gradle(rc: int, out: str) -> str:
     # A bare "error: " is too broad — any test that logs that literal substring on an
     # otherwise-green build would false-red. Anchor to the javac/scalac diagnostic
@@ -1207,23 +1251,52 @@ def _classify_gradle(rc: int, out: str) -> str:
             r"(?m)^\s*(?:[a-zA-Z]:)?[^:\n]+\.(?:java|kt|scala):\d+:\s*error:"):
         return COMPILE_ERROR
     if rc == 0:
-        # NO-SOURCE is a generic Gradle task-outcome marker, not test-specific — it
-        # also prints for e.g. `> Task :processResources NO-SOURCE` on any project
-        # with no src/main/resources, even when the test task ran and passed. Anchor
-        # to test-NAMED tasks' own status lines, and require EVERY matched test task
-        # to be NO-SOURCE: a multi-task invocation (`gradle check`, `gradle test
-        # integrationTest`) can have one empty test task print NO-SOURCE beside a
-        # sibling that actually ran — normal Gradle console output never prints a
-        # "BUILD SUCCESSFUL ... N test" count to use as counter-evidence, so keying
-        # off a single NO-SOURCE line would false the gate into NO_TESTS despite real
-        # tests executing.
-        test_task_statuses = re.findall(
-            r"(?m)^> Task :\S*[Tt]est\S*(?:[ \t]+(\S[^\n]*))?[ \t]*$", out)
-        if test_task_statuses:
-            if all((status or "").strip().upper() == "NO-SOURCE"
-                    for status in test_task_statuses):
-                return NO_TESTS
+        # Zero-test evidence comes from the test EXECUTION task's own status line and
+        # nothing else (see `_is_gradle_test_execution_task`). Gradle prints a chain of
+        # COMPILE / RESOURCE / LIFECYCLE tasks around the real one, and a broad name-match
+        # sweeps them in — which is exactly what shipped a FALSE-GREEN. A zero-test
+        # project prints:
+        #     > Task :compileTestJava NO-SOURCE
+        #     > Task :processTestResources NO-SOURCE
+        #     > Task :testClasses UP-TO-DATE          ← a LIFECYCLE task (no actions):
+        #     > Task :test NO-SOURCE                    UP-TO-DATE, NEVER NO-SOURCE
+        # and an Android module additionally prints support tasks that END in "Test" and
+        # execute with a bare header (`javaPreCompileDebugUnitTest`,
+        # `packageDebugUnitTestForUnitTest`). Both defeat a name-match rule — the first by
+        # never being NO-SOURCE, the second by looking like a task that "ran". Only the
+        # `:test` / `:integrationTest` / `:testDebugUnitTest` EXECUTION task's own status
+        # counts.
+        # Evidence is read from the persisted `> Task :<name> <STATUS>` lines. The gate
+        # captures output with a pipe (non-TTY), so Gradle's default `--console=auto`
+        # resolves to PLAIN and prints exactly these lines — verified against real Gradle
+        # 8.11.1. (Inherent blind spot, NOT reachable on the default path: a user who
+        # forces `org.gradle.console=rich` gets output that persists NO `> Task` status
+        # line at all — the statuses live only in an erased ephemeral progress area — so a
+        # zero-test project is unclassifiable from console text and falls through to
+        # PASSED. Catching that needs `build/test-results/**/*.xml`, outside this pure
+        # function; do NOT fake it with an ANSI strip — real rich output has no line to
+        # strip.)
+        ran, empty = False, False
+        for task, status in re.findall(
+                r"(?m)^> Task (:\S+)(?:[ \t]+(\S[^\n]*?))?[ \t]*$", out):
+            if not _is_gradle_test_execution_task(task.rsplit(":", 1)[-1]):
+                continue                       # not an execution task — no evidence
+            st = (status or "").strip().upper()
+            if st == "NO-SOURCE":
+                empty = True                   # this execution task had zero tests
+            elif st in ("UP-TO-DATE", "SKIPPED"):
+                continue                       # NON-evidence: it did not run now, and it
+                                               # does not say the suite is empty either
+            else:
+                ran = True                     # no status / FROM-CACHE → it executed
+        # A real run anywhere WINS: `gradle check` / `gradle test integrationTest` can
+        # have one empty execution task beside a sibling that really ran, and that is a
+        # verified pass. Only when NO execution task ran AND at least one was NO-SOURCE
+        # is the suite genuinely empty.
+        if ran:
             return PASSED
+        if empty:
+            return NO_TESTS
         if _has(out, r"No tests found for given includes"):
             return NO_TESTS
         return PASSED
