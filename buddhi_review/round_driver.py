@@ -2496,22 +2496,24 @@ class RoundDriver:
             # --rr-active restart path, whose deferred reviewers last spoke on an
             # OLDER head: a default launch's preflight semantics are untouched.
             if round_no == 1 and self.rr_active:
-                deferred = set(expected) - set(poll_expected)
-                # A responder held out of `expected` by a RATE-LIMIT window is missing
-                # from BOTH sides of that subtraction, so it would owe nothing — and the
-                # canonical restart is exactly this: the killed run died ON its usage
-                # limit, so the marker is already on the PR at launch. The window is
-                # soft and self-reversing (the next round's comeback pops it), so such a
-                # reviewer is owed a summon like any other deferred one. Bots held out
-                # for a real reason — a hard exclusion, a restored polish verdict, a
-                # sign-off — are NOT booked: they are not deferred, they are decided.
-                deferred |= {b for b in self._preflight_responders
-                             if b in self._rate_limited_until
-                             and b not in self.done
-                             and b not in self.polishing
-                             and b not in self.reviewed_no_change
-                             and not self.store.is_excluded(b)}
-                self._deferred_summon = deferred
+                # Book the debt from WHO RESPONDED, minus only the ones that are truly
+                # DECIDED — a verdict already given (``done``), a restored polish
+                # verdict, or a reviewed-no-change from a prior run. Everything else a
+                # responder can be at this point is a SOFT, reversible reason to be out
+                # of ``expected_bots()``: a rate-limit window (the next round's comeback
+                # pops it) or an ERRORED exclusion (round 1's own errored-comeback
+                # retracts it the moment it processes the responder's real finding).
+                # Booking off ``expected_bots()`` would silently drop both — the
+                # reviewer would be un-excluded mid-round and then merged past, never
+                # summoned. ``_owed_summons()`` filters the store exclusions DYNAMICALLY,
+                # so a still-excluded bot owes nothing (a permanent quota exclusion never
+                # becomes owed), while a retracted one resurfaces the debt on its own.
+                self._deferred_summon = {
+                    b for b in self._preflight_responders
+                    if b not in self.done
+                    and b not in self.polishing
+                    and b not in self.reviewed_no_change
+                }
             # Snapshot the stale-reaction set before re-requesting: a +1 already on
             # the PR is stale; one arriving after the re-request is a fresh signal.
             self._capture_reaction_baseline()

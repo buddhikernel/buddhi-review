@@ -2296,3 +2296,28 @@ def test_a_verdict_that_arrives_without_a_summon_discharges_the_debt():
     assert "claude" in driver.done                 # it spoke, without needing the summon
     assert driver._owed_summons() == set()         # …which discharges the debt
     assert outcome.merged is True                  # so the PR is not held hostage
+
+
+def test_an_errored_responder_retracted_mid_run_is_still_summoned():
+    # The killed run saw claude ERROR, then claude retried and posted a real finding —
+    # both are on the PR at restart. The errored exclusion is retractable (round 1's
+    # own errored-comeback pops it the moment it processes the finding), so booking the
+    # debt off expected_bots() (which drops the still-excluded bot) would let the run
+    # un-exclude claude mid-round and then merge past it, never summoned. Booking off
+    # WHO RESPONDED keeps the debt, and _owed_summons() unmasks it once the exclusion
+    # lifts — so claude is summoned in round 2 on the fixed head.
+    timeline = [
+        (0, Comment(id="e", text="Review run failed.", source="claude[bot]",
+                    from_issue_channel=True, created_at="2026-07-01T10:00:00Z")),
+        (0, Comment(id="c", text="nit: rename tmp for clarity", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@", created_at="2026-07-01T11:00:00Z")),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        auto_merge=True, max_rounds=3, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert "claude" in driver._deferred_summon or gh.matching("@claude review")
+    assert gh.matching("@claude review")             # summoned after the comeback …
+    assert "claude" not in driver.polishing          # … and NOT soft-demoted on stale work
+    assert outcome.rounds >= 2                        # it reviewed the fixed head first
