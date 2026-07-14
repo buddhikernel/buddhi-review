@@ -38,7 +38,7 @@ in round 2 or later.
 <br>
 
 New here? Run `pip install buddhi-review`, then follow
-**[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
+**[Getting started](GETTING_STARTED.md)**
 to your first reviewed PR.
 
 ## Install
@@ -54,7 +54,7 @@ opens and then reviews a PR. They are included in the package but are not added 
 Claude Code automatically. Install them by copying each skill to
 `~/.claude/skills/<name>/SKILL.md`:
 
-<details>
+<details markdown="1">
 <summary><b>Install the /review-pr and /open-pr skills</b></summary>
 
 ```bash
@@ -76,7 +76,7 @@ refresh `~/.claude/skills/`.
 </details>
 
 **Restart Claude Code** so it loads the new skills, then run **`/review-pr setup`**
-once to onboard (see [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)).
+once to onboard (see [Getting started](GETTING_STARTED.md)).
 If a slash-command of the same name already exists, the skill takes precedence.
 
 Each skill's `SKILL.md` frontmatter includes a Git guardrail hook. While a review is
@@ -107,7 +107,7 @@ python3 -m buddhi_review self-check
 SELF-CHECK OK — the kernel decided every disposition.
 ```
 
-<details>
+<details markdown="1">
 <summary><b>Full self-check output</b></summary>
 
 ```text
@@ -162,7 +162,7 @@ check still ends with `SELF-CHECK OK`.
 ```
 
 To drive the CLI directly or detach the loop as a background process, see
-[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#6-advanced-drive-the-cli-directly).
+[Getting started](GETTING_STARTED.md#6-advanced-drive-the-cli-directly).
 
 ## Provider usage and cost
 
@@ -171,7 +171,7 @@ accounts you connect. The loop itself uses your Claude subscription, and each en
 reviewer uses its associated plan or account. Buddhi does not bill you or proxy
 reviews through its own accounts.
 
-See **[What a review costs you](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)**
+See **[What a review costs you](GETTING_STARTED.md#what-a-review-costs-you)**
 for the full breakdown.
 
 ## What real review runs show
@@ -185,7 +185,7 @@ and many bugs surface only after earlier fixes are applied. The research discuss
 in [Why a panel and why rounds](#why-a-panel-and-why-rounds) helps explain both
 patterns.
 
-<details>
+<details markdown="1">
 <summary>How runs qualify (the selection criteria)</summary>
 
 A run is counted when all three rules hold:
@@ -250,7 +250,7 @@ fixes themselves introduce or expose.
 - **Line:** the aggregate share across all 88 qualifying runs, which is 50.1%. The
   selected larger runs generally have a higher round-2-or-later share.
 
-<details>
+<details markdown="1">
 <summary><b>The data behind the charts</b></summary>
 
 The chart below breaks down every qualifying run with 20 or more valid bugs, seven
@@ -339,7 +339,7 @@ found nothing further to act on within the configured review budget.
   <img src="docs/assets/review-loop.svg" alt="How a Buddhi review loop works: a cross-vendor panel of four labs (Claude, Codex, Gemini, Copilot) reviews the code; the kernel decides each finding as fix, ask-you, skip, or defer; each round re-requests only reviewers that raised a substantive finding, dropping those that approved, found nothing, or were cosmetic-only, and repeats until clean or the round budget is reached; then tests and CI must pass before an opt-in auto-merge." width="100%">
 </picture>
 
-<details>
+<details markdown="1">
 <summary><b>The research behind this</b></summary>
 
 - **Ensemble diversity / error decorrelation.** A group's error shrinks in proportion

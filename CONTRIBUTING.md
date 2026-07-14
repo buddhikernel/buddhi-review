@@ -1,3 +1,7 @@
+---
+title: Contributing
+---
+
 # Contributing
 
 Thanks for helping improve `buddhi-review`. It is a small adapter that re-homes the

@@ -1,3 +1,7 @@
+---
+title: Security policy
+---
+
 # Security policy
 
 `buddhi-review` is alpha software. Security fixes land on the latest released
