@@ -23,7 +23,10 @@ _SKILLS = ("open-pr", "review-pr")
 # bounds it (so a marker matched elsewhere in the file can never pass the scan).
 _GATE_HEADER = "### 1.1 Per-repo reviewer confirmation gate"
 _NEXT_SECTION = {
-    "open-pr": "### 2. Pre-launch rebase gate",
+    # open-pr's per-repo gate is now followed by the candidate-selection gate (1.5),
+    # not the rebase gate — bound the scan there so this test keeps asserting on the
+    # per-repo gate ALONE and never bleeds into the section after it.
+    "open-pr": "### 1.5 Select which checkout to open the PR from",
     "review-pr": "### 2. Select which PR to review",
 }
 
