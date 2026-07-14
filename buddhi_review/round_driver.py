@@ -1959,7 +1959,20 @@ class RoundDriver:
             # pre-existing comments it queued as round 1's work. Skipping the snapshot
             # outright would re-summon a quota-exhausted reviewer.
             if self.max_rounds >= 2:
-                deferred = set(self._preflight_responders)
+                # Book the SUMMON DEBT now, before the round loop — so no exit inside
+                # it (the round-1 "no still-active reviewers" fast exit fires BEFORE
+                # round 1's body) can slip a deferred reviewer past the fail-closed
+                # gate unbooked. Booked from WHO RESPONDED, minus the genuinely decided
+                # (see _owed_summons); a soft, reversible reason a responder is out of
+                # expected_bots() — a rate-limit window, a retractable errored exclusion
+                # — must not drop it from the debt.
+                self._deferred_summon = {
+                    b for b in self._preflight_responders
+                    if b not in self.done
+                    and b not in self.polishing
+                    and b not in self.reviewed_no_change
+                }
+                deferred = set(self._deferred_summon)
             else:
                 self._preflight_responders.clear()
             # A HARD CAUSE always wins over a re-derived verdict. The snapshot reads
@@ -2492,28 +2505,8 @@ class RoundDriver:
             # on an already-reviewed PR. Later rounds re-request + poll it as usual.
             poll_expected = ([b for b in expected if b not in self._preflight_responders]
                              if round_no == 1 else list(expected))
-            # Record the reviewers this round DEFERS (round 1 only). Confined to the
-            # --rr-active restart path, whose deferred reviewers last spoke on an
-            # OLDER head: a default launch's preflight semantics are untouched.
-            if round_no == 1 and self.rr_active:
-                # Book the debt from WHO RESPONDED, minus only the ones that are truly
-                # DECIDED — a verdict already given (``done``), a restored polish
-                # verdict, or a reviewed-no-change from a prior run. Everything else a
-                # responder can be at this point is a SOFT, reversible reason to be out
-                # of ``expected_bots()``: a rate-limit window (the next round's comeback
-                # pops it) or an ERRORED exclusion (round 1's own errored-comeback
-                # retracts it the moment it processes the responder's real finding).
-                # Booking off ``expected_bots()`` would silently drop both — the
-                # reviewer would be un-excluded mid-round and then merged past, never
-                # summoned. ``_owed_summons()`` filters the store exclusions DYNAMICALLY,
-                # so a still-excluded bot owes nothing (a permanent quota exclusion never
-                # becomes owed), while a retracted one resurfaces the debt on its own.
-                self._deferred_summon = {
-                    b for b in self._preflight_responders
-                    if b not in self.done
-                    and b not in self.polishing
-                    and b not in self.reviewed_no_change
-                }
+            # The summon debt was booked before the loop (see _rr_active_restore);
+            # here it is only PAID DOWN, by each landed summon below.
             # Snapshot the stale-reaction set before re-requesting: a +1 already on
             # the PR is stale; one arriving after the re-request is a fresh signal.
             self._capture_reaction_baseline()

@@ -2321,3 +2321,33 @@ def test_an_errored_responder_retracted_mid_run_is_still_summoned():
     assert gh.matching("@claude review")             # summoned after the comeback …
     assert "claude" not in driver.polishing          # … and NOT soft-demoted on stale work
     assert outcome.rounds >= 2                        # it reviewed the fixed head first
+
+
+def test_summon_debt_blocks_the_round1_fast_exit_too():
+    # The round-1 "no still-active reviewers — clean exit" fast path fires BEFORE
+    # round 1's body, so the debt must be booked before the loop (in _rr_active_restore),
+    # not inside it. A reviewer whose only pre-existing comment is non-actionable chatter
+    # and who is rate-limited leaves the expected set empty and the preflight batch empty
+    # — straight to the fast exit. It must still hand back, not merge past the responder.
+    reset = datetime(2026, 7, 4, 13, 0, tzinfo=UTC)
+    marker = Comment(id="m", from_issue_channel=True, source="github-actions[bot]",
+                     created_at="2026-07-04T10:00:00Z",
+                     text=("<!-- claude-review-unavailable-v1 type=rate_limited "
+                           f"resets_at={int(reset.timestamp())} -->"))
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
+    timeline = [
+        (0, marker),
+        (0, Comment(id="x", text="I'm reviewing this PR now.", source="claude[bot]",
+                    from_issue_channel=True, created_at="2026-07-04T10:05:00Z")),
+        (0, Comment(id="c", text="No issues found.", source="copilot[bot]",
+                    from_issue_channel=True, created_at="2026-07-04T10:06:00Z")),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, rr_active=True, preflight=True, auto_merge=True, max_rounds=2,
+        wall_clock=lambda: datetime(2026, 7, 4, 12, 0, tzinfo=UTC),
+        answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert "claude" in driver._owed_summons()   # booked before the loop, so the …
+    assert gh.matching("@claude review") == []  # … fast exit sees it and cannot summon it
+    assert outcome.merged is False              # → hand back, never merge past it
