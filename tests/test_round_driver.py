@@ -2238,3 +2238,61 @@ def test_terminal_drain_does_not_run_over_a_pending_rate_limit_comeback():
     outcome = driver.run()
     assert outcome.rounds >= 2                        # round 2 exists for the comeback …
     assert len(gh.matching("@claude review")) >= 2    # … and it re-summons claude there
+
+
+def test_a_reviewer_rate_limited_at_preflight_is_still_owed_its_summon():
+    # THE canonical restart: the killed run died ON its usage limit, so the marker is
+    # already on the PR at launch. The reviewer is then absent from the expected set
+    # before round 1 even books the debt — so it would owe nothing, be summoned zero
+    # times, and the run would merge a head it never saw. The debt is booked from the
+    # responders, so a rate-limit window (soft, self-reversing) cannot erase it.
+    notices = []
+    reset = datetime(2026, 7, 4, 13, 0, tzinfo=UTC)     # a real, future reset
+    marker = Comment(id="m", from_issue_channel=True, source="github-actions[bot]",
+                     created_at="2026-07-04T10:00:00Z",
+                     text=("<!-- claude-review-unavailable-v1 type=rate_limited "
+                           f"resets_at={int(reset.timestamp())} -->"))
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@",
+                    created_at="2026-07-04T09:00:00Z")),
+        (0, marker),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        auto_merge=True, max_rounds=2, wall_clock=lambda: datetime(2026, 7, 4, 12, 0, tzinfo=UTC),
+        answer_waiter=lambda esc, **k: {})
+    driver.notice = lambda action, detail, **k: notices.append((action, detail)) or ""
+    outcome = driver.run()
+    assert "claude" in driver._owed_summons()      # the window did NOT erase the debt
+    assert gh.matching("@claude review") == []     # it could not be summoned …
+    assert outcome.merged is False                 # … so the PR is handed back, not merged
+    debt = [d for a, d in notices if a == "summon-debt"]
+    assert debt and "claude" in debt[0]            # and the hand-back NAMES the debtor
+
+
+def test_a_verdict_that_arrives_without_a_summon_discharges_the_debt():
+    # The mirror image: a deferred reviewer's in-flight review from the killed run lands
+    # DURING round 1 as a clean all-clear. It is now `done` — the very outcome the summon
+    # exists to obtain — and expected_bots() excludes `done`, so it can never be summoned
+    # again. Keeping the debt would make it UNPAYABLE and hand back a PR that every
+    # reviewer approved and whose every finding was fixed.
+    cfg = {"active_reviewers": ["claude", "copilot"],
+           "auto_on_open": {"claude": False, "copilot": True}}
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@")),          # → deferred, debt booked
+        (30, Comment(id="ok", text="No issues found.", source="claude[bot]",
+                     from_issue_channel=True)),                       # → its verdict lands
+        (30, Comment(id="c", text="No issues found.", source="copilot[bot]",
+                     from_issue_channel=True)),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=cfg, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        auto_merge=True, max_rounds=3, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert "claude" in driver.done                 # it spoke, without needing the summon
+    assert driver._owed_summons() == set()         # …which discharges the debt
+    assert outcome.merged is True                  # so the PR is not held hostage

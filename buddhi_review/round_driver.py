@@ -2110,13 +2110,31 @@ class RoundDriver:
         rate-limit window never resets inside the budget therefore hands the PR back
         rather than merging it: it is not unsummonable, it is merely unavailable, and
         the honest outcome is a hand-back."""
-        for bot in self._deferred_summon:
-            if self.store.is_excluded(bot):
-                continue                  # quota / PR-too-large / errored — unsummonable
-            if bot not in active_reviewers(self.cfg, self.repo):
-                continue                  # the operator removed it from the fleet
-            return True
-        return False
+        return bool(self._owed_summons())
+
+    def _owed_summons(self) -> Set[str]:
+        """The reviewers this run still owes a summon — the debt, minus the ONLY three
+        things that discharge it without one:
+
+        * a HARD exclusion (quota / PR-too-large / errored) — unsummonable;
+        * removal from the fleet — the operator no longer wants it;
+        * ``done`` — it gave its VERDICT anyway (a clean review or a ``+1`` that landed
+          during a round without needing the summon). That is the outcome the summon
+          exists to obtain, and ``expected_bots()`` excludes ``done``, so the loop could
+          never summon it again in any case: keeping the debt would make it unpayable
+          and hand back a PR every reviewer approved. The round-end promotion also
+          writes ``done``, but an owed reviewer is exempt from it, so only a genuine
+          verdict can reach this arm.
+
+        Every OTHER reason a bot leaves ``expected_bots()`` — a rate-limit window (timed,
+        self-reversing), a silent drop, a soft demotion — leaves the debt standing.
+        This is the single definition of the debt: the gate, the round loop, and the
+        hand-back notice all read it, so they can never drift apart."""
+        fleet = active_reviewers(self.cfg, self.repo)
+        return {b for b in self._deferred_summon
+                if not self.store.is_excluded(b)
+                and b not in self.done
+                and b in fleet}
 
     def _is_sign_off(self, text: str) -> bool:
         """True only for a message that is a GENUINE clean review — the same
@@ -2478,7 +2496,22 @@ class RoundDriver:
             # --rr-active restart path, whose deferred reviewers last spoke on an
             # OLDER head: a default launch's preflight semantics are untouched.
             if round_no == 1 and self.rr_active:
-                self._deferred_summon = set(expected) - set(poll_expected)
+                deferred = set(expected) - set(poll_expected)
+                # A responder held out of `expected` by a RATE-LIMIT window is missing
+                # from BOTH sides of that subtraction, so it would owe nothing — and the
+                # canonical restart is exactly this: the killed run died ON its usage
+                # limit, so the marker is already on the PR at launch. The window is
+                # soft and self-reversing (the next round's comeback pops it), so such a
+                # reviewer is owed a summon like any other deferred one. Bots held out
+                # for a real reason — a hard exclusion, a restored polish verdict, a
+                # sign-off — are NOT booked: they are not deferred, they are decided.
+                deferred |= {b for b in self._preflight_responders
+                             if b in self._rate_limited_until
+                             and b not in self.done
+                             and b not in self.polishing
+                             and b not in self.reviewed_no_change
+                             and not self.store.is_excluded(b)}
+                self._deferred_summon = deferred
             # Snapshot the stale-reaction set before re-requesting: a +1 already on
             # the PR is stale; one arriving after the re-request is a fresh signal.
             self._capture_reaction_baseline()
@@ -2699,13 +2732,17 @@ class RoundDriver:
         # running out (a `continue` on the final round falls straight out of the for
         # loop) and any other route into this method. Refuse to merge, and hand the PR
         # back honestly, rather than laundering an unpaid debt into a merge.
-        if self._owes_deferred_summon():
-            owed = sorted(self._deferred_summon & set(self.expected_bots()))
+        owed = sorted(self._owed_summons())
+        if owed:
+            # Named from the SAME set the gate tests — a debtor is usually one the
+            # loop could not summon (a rate-limit window that never reset, a
+            # re-request that never posted), and such a bot is absent from
+            # expected_bots(), so naming it from there would name nobody at all.
             self.notice("summon-debt",
                         f"PR #{self.pr}: {', '.join(owed)} responded before this run "
-                        f"and was never re-requested during it — not merging; handing "
-                        f"back", status="stop",
-                        hint="re-run to summon it, or raise the round budget")
+                        f"and the loop never managed to re-request it during the run — "
+                        f"not merging; handing back", status="stop",
+                        hint="re-run once it is available again, or raise the round budget")
             return RunOutcome("clean", rounds, False, self.actions)
         # #g9a NOTIFICATION (never a block, never gates the flow below): if the
         # loop's primary reviewer (@claude) was expected but its trigger never
