@@ -125,6 +125,16 @@ def _escape_cmd_chars(cmdline: str) -> str:
     return "".join(result)
 
 
+def _escape_windows_set_value(value):
+    """Escape a value for embedding inside a ``set "VAR=value"`` cmd.exe token.
+
+    Doubling ``%`` stops cmd.exe from expanding a coincidental ``%VAR%``-shaped
+    substring (e.g. a literal ``%USERPROFILE%`` in the value). Doubling ``"``
+    keeps cmd.exe's quote-count-based parser balanced so an embedded quote can't
+    close the token early and chain extra commands after the trailing ``&&``."""
+    return value.replace("%", "%%").replace('"', '""')
+
+
 def _windows_shell_command(python_bin, wizard_args=(), *, pythonpath=None):
     """The cmd.exe command equivalent — used for the print fallback on Windows.
 
@@ -135,7 +145,7 @@ def _windows_shell_command(python_bin, wizard_args=(), *, pythonpath=None):
     if wizard_args:
         python_cmd += f" {_escape_cmd_chars(subprocess.list2cmdline(list(wizard_args)))}"
     if pythonpath:
-        python_cmd = f'set "PYTHONPATH={pythonpath}"&& {python_cmd}'
+        python_cmd = f'set "PYTHONPATH={_escape_windows_set_value(pythonpath)}"&& {python_cmd}'
     return python_cmd
 
 
@@ -253,9 +263,13 @@ def spawn_wizard(*, system=None, which=None, popen=None, environ=None,
                 raw_args = subprocess.list2cmdline(list(wizard_args))
                 args_cmd = f" {_escape_cmd_chars(raw_args)}".replace("%", "%%")
             invocation = f'"{python_bin_escaped}" -m {_MODULE} {_SETUP_SUBCOMMAND}{args_cmd}'
+            pythonpath_set = ""
+            if pythonpath:
+                pythonpath_set = f'set "PYTHONPATH={_escape_windows_set_value(pythonpath)}"\n'
             bat_content = (
                 "@echo off\n"
                 "chcp 65001 >nul\n"
+                f"{pythonpath_set}"
                 f"{invocation}\n"
                 "pause\n"
             )
