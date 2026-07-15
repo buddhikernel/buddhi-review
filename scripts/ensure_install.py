@@ -40,13 +40,19 @@ def _site_dir(data_dir):
 
 
 def already_importable(site_dir, *, python=None, runner=None):
-    """True iff ``import buddhi_review`` succeeds with ``site_dir`` (when it exists)
-    prepended to the path — the ONLY skip signal.
+    """True iff ``import buddhi_review`` succeeds either on the default import
+    path (a global install) or with ``site_dir`` prepended (a prior data-dir
+    install) — the ONLY skip signal.
+
+    Checks the default path FIRST, without ``site_dir`` on it, so a global
+    install always wins and is never shadowed by a stale or broken data-dir
+    copy — matching the priority the guardrail entry itself applies at runtime.
+    Only falls back to the ``site_dir``-prepended probe when the default path
+    doesn't already have the package, so an existing data-dir install is still
+    never reinstalled over.
 
     Uses a CHILD interpreter (never this process's own possibly-primed import
-    state) so the probe reflects exactly what the guardrail entry will see. A
-    global install makes this true even with ``site_dir`` on the path, so an
-    already-installed package is never reinstalled over.
+    state) so each probe reflects exactly what the guardrail entry will see.
 
     Runs from a neutral cwd (the system temp dir), never the hook process's own
     cwd — ``python -c`` puts cwd on ``sys.path``, so a hook invoked from inside a
@@ -55,19 +61,26 @@ def already_importable(site_dir, *, python=None, runner=None):
     """
     python = python or sys.executable or "python3"
     runner = runner or subprocess.run
-    env = dict(os.environ)
-    if site_dir and os.path.isdir(site_dir):
-        env["PYTHONPATH"] = site_dir + os.pathsep + env.get("PYTHONPATH", "")
-    try:
-        proc = runner(
-            [python, "-c", f"import {IMPORT_NAME}"],
-            env=env, capture_output=True, timeout=30, cwd=tempfile.gettempdir(),
-        )
-    except Exception:
-        # A probe that cannot even run is treated as "not importable" so the
-        # install is attempted; the install itself also fails open.
+
+    def _probe(env):
+        try:
+            proc = runner(
+                [python, "-c", f"import {IMPORT_NAME}"],
+                env=env, capture_output=True, timeout=30, cwd=tempfile.gettempdir(),
+            )
+        except Exception:
+            # A probe that cannot even run is treated as "not importable" so the
+            # install is attempted; the install itself also fails open.
+            return False
+        return proc.returncode == 0
+
+    if _probe(dict(os.environ)):
+        return True
+    if not (site_dir and os.path.isdir(site_dir)):
         return False
-    return proc.returncode == 0
+    env = dict(os.environ)
+    env["PYTHONPATH"] = site_dir + os.pathsep + env.get("PYTHONPATH", "")
+    return _probe(env)
 
 
 def install(site_dir, *, python=None, runner=None):

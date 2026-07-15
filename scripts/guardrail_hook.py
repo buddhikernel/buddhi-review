@@ -6,7 +6,8 @@ When the skills run from a ``/plugin install`` (rather than a ``pip install`` +
 import path — the SessionStart hook (``ensure_install.py``) installs it into
 ``${CLAUDE_PLUGIN_DATA}/site``. This entry:
 
-1. puts that install directory on ``sys.path`` so the package resolves, then
+1. tries the default import path first (a global install always wins), falling
+   back to that install directory only when the package isn't there, then
 2. delegates to the real hook (:mod:`buddhi_review.git_guardrail_hook`).
 
 If the package is STILL absent (e.g. an offline first run before the install
@@ -51,13 +52,28 @@ def _prepend_data_site():
         sys.path.insert(0, site)
 
 
+def _import_git_guardrail_hook():
+    """Import the real guardrail, trying the default import path first (a global
+    install) before falling back to the SessionStart install target. The data-dir
+    copy is a fallback only, so it never shadows an already-working global
+    install."""
+    try:
+        from buddhi_review import git_guardrail_hook
+        return git_guardrail_hook
+    except ModuleNotFoundError as exc:
+        if exc.name != "buddhi_review":
+            raise
+    _prepend_data_site()
+    from buddhi_review import git_guardrail_hook
+    return git_guardrail_hook
+
+
 def run():
     """Delegate to the real guardrail, or degrade fail-open. Returns the process
     exit code (0 on the degrade path; whatever the real hook returns otherwise —
     also 0, since the guardrail never breaks a session)."""
-    _prepend_data_site()
     try:
-        from buddhi_review import git_guardrail_hook
+        git_guardrail_hook = _import_git_guardrail_hook()
     except ModuleNotFoundError as exc:
         if exc.name == "buddhi_review":
             sys.stderr.write(DEGRADE_MESSAGE + "\n")
