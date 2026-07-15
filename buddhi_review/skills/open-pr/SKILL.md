@@ -24,7 +24,13 @@ hooks:
     - matcher: Bash
       hooks:
         - type: command
-          command: python3 -m buddhi_review.git_guardrail_hook
+          # Shell-agnostic dispatch (works under sh AND cmd.exe — no POSIX builtins):
+          # plugin install ($CLAUDE_PLUGIN_ROOT set) runs the plugin entry, which makes
+          # the SessionStart-installed package importable and degrades fail-open (one
+          # stderr line, exit 0) if it is still absent; pip install (skill copied to
+          # ~/.claude/skills, no $CLAUDE_PLUGIN_ROOT) runs the module directly, unchanged.
+          # Both invoke buddhi_review.git_guardrail_hook.
+          command: python3 -c "import os,sys,runpy; root=os.environ.get('CLAUDE_PLUGIN_ROOT'); entry=os.path.join(root,'scripts','guardrail_hook.py') if root else ''; runpy.run_path(entry,run_name='__main__') if (entry and os.path.isfile(entry)) else runpy.run_module('buddhi_review.git_guardrail_hook',run_name='__main__')"
 ---
 
 # /open-pr — create a PR, then review it

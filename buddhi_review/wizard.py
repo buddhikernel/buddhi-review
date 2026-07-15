@@ -2566,7 +2566,7 @@ def step_pro_trial(_repo: Optional[str], *, pal, stream, input_fn=input,
             input_fn=input_fn, stream=stream, pal=pal):
         _row("step", pro_trial.convert_checkout_prompt(), pal, stream)
         paste = paste_input or (lambda prompt: _read_pasted_secret(prompt, _default_getpass))
-        conv = pro_trial.convert(paste_input=paste, confirm_input=input_fn, stream=stream)
+        conv = pro_trial.convert(paste_input=paste, confirm_input=input_fn)
         _row("ok" if conv.ok else "info", conv.message, pal, stream)
 
 
