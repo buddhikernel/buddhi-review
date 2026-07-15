@@ -120,7 +120,7 @@ test -s ~/.config/review-loop/config.yaml && echo configured || echo unconfigure
 
        ```bash
        SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
-       bash "$SETUP"
+       PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" bash "$SETUP"
        ```
 
        On success, reply exactly: ``Setup opened in a new window — finish it there, then
@@ -214,7 +214,7 @@ NEVER block the loop. Otherwise parse the single JSON object (`{"repo_confirmed"
 
        ```bash
        SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
-       bash "$SETUP" --repo "$OWNER_REPO"
+       PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" bash "$SETUP" --repo "$OWNER_REPO"
        ```
 
        On a headless host the launcher prints the one-liner to run by hand instead. After it
@@ -370,7 +370,7 @@ fresh terminal window via the bundled launcher:
 
 ```bash
 SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
-bash "$SETUP"
+PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" bash "$SETUP"
 ```
 
 `launch-setup.sh` ships inside the `buddhi_review` package; the one-liner resolves its installed

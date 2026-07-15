@@ -58,8 +58,14 @@ def run():
     _prepend_data_site()
     try:
         from buddhi_review import git_guardrail_hook
-    except ModuleNotFoundError:
-        sys.stderr.write(DEGRADE_MESSAGE + "\n")
+    except ModuleNotFoundError as exc:
+        if exc.name == "buddhi_review":
+            sys.stderr.write(DEGRADE_MESSAGE + "\n")
+        else:
+            # A transitive import inside buddhi_review is missing — not the same as
+            # the package itself being absent. Route through BROKEN_INSTALL_MESSAGE
+            # so a real regression doesn't masquerade as "not installed yet".
+            sys.stderr.write(BROKEN_INSTALL_MESSAGE.format(exc=exc) + "\n")
         return 0
     except Exception as exc:  # noqa: BLE001 - still fail open, but flag it distinctly
         sys.stderr.write(BROKEN_INSTALL_MESSAGE.format(exc=exc) + "\n")
