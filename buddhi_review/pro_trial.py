@@ -625,7 +625,7 @@ def detect_pasted_key(*, transport=None, clipboard_reader=None,
 def convert(*, transport=None, clipboard_reader=None,
             paste_input: Callable = _hidden_paste_input, confirm_input: Callable = input,
             backends=None, runner=None, netrc_path=None, is_active=None, sleep=None,
-            attempts=20, stream=None) -> TrialOutcome:
+            attempts=20) -> TrialOutcome:
     """The convert / re-subscribe path: point at the checkout, concierge-paste the
     emailed paid key (consent-gated clipboard detect, then a HIDDEN manual paste;
     validated tokenlessly), then write ~/.netrc + install + daemon. Never mints a paid

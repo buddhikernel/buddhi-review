@@ -439,7 +439,7 @@ def test_convert_uses_valid_clipboard_key(tmp_path):
         confirm_input=lambda *a: "y", backends=[FakeProBackend(True)],
         runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
         netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2, stream=io.StringIO())
+        attempts=2)
     assert out.ok and out.status == "active"
     assert (tmp_path / ".netrc").read_text().find("PAIDKEY-FROM-CLIP") >= 0
 
@@ -456,7 +456,7 @@ def test_convert_falls_back_to_manual_paste_when_clipboard_invalid(tmp_path):
         paste_input=lambda *a: "GOODKEY-PASTE", backends=[FakeProBackend(True)],
         runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
         netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2, stream=io.StringIO())
+        attempts=2)
     assert out.ok and "GOODKEY-PASTE" in (tmp_path / ".netrc").read_text()
 
 
@@ -468,7 +468,7 @@ def test_clipboard_is_never_posted_without_explicit_consent(tmp_path):
     t = _full()
     out = pro_trial.convert(
         transport=t, clipboard_reader=lambda: "ghp_STALE_GITHUB_TOKEN_abcdef123456",
-        confirm_input=lambda *a: "n", paste_input=lambda *a: "", stream=io.StringIO(),
+        confirm_input=lambda *a: "n", paste_input=lambda *a: "",
         netrc_path=tmp_path / ".netrc")
     assert not out.ok and out.status == "no_key"
     assert t.calls == []                                  # nothing left the machine at all
@@ -485,7 +485,7 @@ def test_declined_clipboard_falls_through_to_manual_paste(tmp_path):
         backends=[FakeProBackend(True)],
         runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
         netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2, stream=io.StringIO())
+        attempts=2)
     assert out.ok
     sent = [c["body"]["meta"]["key"] for c in t.calls if "validate-key" in c["url"]]
     assert sent == ["GOODKEY-PASTE"]                      # the clipboard value was NOT sent
@@ -531,7 +531,7 @@ def test_convert_accepts_a_key_that_is_not_activated_yet(tmp_path):
         backends=[FakeProBackend(True)],
         runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
         netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2, stream=io.StringIO())
+        attempts=2)
     assert out.ok and out.status == "active"
     assert "PAIDKEY-NEW-001" in (tmp_path / ".netrc").read_text()
 
@@ -634,7 +634,7 @@ def test_hidden_paste_input_never_falls_back_to_an_echoing_read(monkeypatch):
 def test_convert_no_key_entered(tmp_path):
     t = _full(validate=(200, {"meta": {"valid": False, "code": "NOT_FOUND"}}))
     out = pro_trial.convert(transport=t, clipboard_reader=lambda: "",
-                            paste_input=lambda *a: "", stream=io.StringIO())
+                            paste_input=lambda *a: "")
     assert not out.ok and out.status == "no_key"
 
 

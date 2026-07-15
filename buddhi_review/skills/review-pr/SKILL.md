@@ -24,7 +24,13 @@ hooks:
     - matcher: Bash
       hooks:
         - type: command
-          command: python3 -m buddhi_review.git_guardrail_hook
+          # Shell-agnostic dispatch (works under sh AND cmd.exe — no POSIX builtins):
+          # plugin install ($CLAUDE_PLUGIN_ROOT set) runs the plugin entry, which makes
+          # the SessionStart-installed package importable and degrades fail-open (one
+          # stderr line, exit 0) if it is still absent; pip install (skill copied to
+          # ~/.claude/skills, no $CLAUDE_PLUGIN_ROOT) runs the module directly, unchanged.
+          # Both invoke buddhi_review.git_guardrail_hook.
+          command: python3 -c "import os,sys,runpy; root=os.environ.get('CLAUDE_PLUGIN_ROOT'); entry=os.path.join(root,'scripts','guardrail_hook.py') if root else ''; runpy.run_path(entry,run_name='__main__') if (entry and os.path.isfile(entry)) else runpy.run_module('buddhi_review.git_guardrail_hook',run_name='__main__')"
 ---
 
 # /review-pr — automated PR review loop
@@ -113,8 +119,8 @@ test -s ~/.config/review-loop/config.yaml && echo configured || echo unconfigure
        you cannot drive), then **EXIT**:
 
        ```bash
-       SETUP=$(python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
-       bash "$SETUP"
+       SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
+       PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" bash "$SETUP"
        ```
 
        On success, reply exactly: ``Setup opened in a new window — finish it there, then
@@ -155,9 +161,18 @@ checkout while the real work sits in a `git -C <worktree>` elsewhere. Consult th
      hook stores via `data.get("session_id")`, so the resolver lookup key matches exactly.
      Not to be confused with the remote-bridge vars (`CLAUDE_CODE_BRIDGE_SESSION_ID` /
      `CLAUDE_CODE_REMOTE_SESSION_ID`) which are set only during remote/cloud connections
-     and carry a prefix. -->
+     and carry a prefix.
+     The PYTHONPATH prefix on this and every other `python3 -m buddhi_review` call below
+     makes a plugin-only install (package installed by SessionStart into
+     ${CLAUDE_PLUGIN_DATA}/site, never on the default import path) resolve. `${CLAUDE_PLUGIN_DATA}`
+     here is a literal Claude Code placeholder substituted into skill content at load time —
+     NOT a Bash-tool environment variable (plugin env vars are exported only to hook/MCP/LSP
+     subprocesses, not to skill-authored Bash calls) — so this resolves for a plugin install.
+     For a pip install the placeholder is left literal, Bash expands the unset var to "", and
+     PYTHONPATH just gets a harmless "/site:" prefix ahead of the package that's already
+     importable. -->
 ```bash
-RESOLVED=$(python3 -m buddhi_review.worktree_target resolve \
+RESOLVED=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
   --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD" 2>/dev/null)
 if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CWD" ]; then
   CWD="$RESOLVED"
@@ -182,7 +197,7 @@ installed per repo, and `claude[bot]` needs `claude-code-review.yml` committed i
 resolved in Step 1, ask the status reader whether THIS repo's reviewers have been confirmed:
 
 ```bash
-python3 -m buddhi_review status --repo "$OWNER_REPO" 2>/dev/null
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review status --repo "$OWNER_REPO" 2>/dev/null
 ```
 
 If `OWNER/REPO` could not be resolved, or the command is absent / prints nothing /
@@ -203,8 +218,8 @@ NEVER block the loop. Otherwise parse the single JSON object (`{"repo_confirmed"
        can finish it:
 
        ```bash
-       SETUP=$(python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
-       bash "$SETUP" --repo "$OWNER_REPO"
+       SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
+       PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" bash "$SETUP" --repo "$OWNER_REPO"
        ```
 
        On a headless host the launcher prints the one-liner to run by hand instead. After it
@@ -269,7 +284,7 @@ every tier and never mutates your tree:
 
 ```bash
 BASE_BRANCH=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" --json baseRefName -q .baseRefName)
-python3 -m buddhi_review rebase-check --cwd "$TARGET_CWD" --base "$BASE_BRANCH" --repo "$OWNER_REPO"
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review rebase-check --cwd "$TARGET_CWD" --base "$BASE_BRANCH" --repo "$OWNER_REPO"
 ```
 
 Parse the JSON object on stdout and act on `status`:
@@ -281,7 +296,7 @@ Parse the JSON object on stdout and act on `status`:
   engine without it prints the manual steps and declines to touch your tree.
 
   ```bash
-  python3 -m buddhi_review rebase --cwd "$TARGET_CWD" --base "$BASE_BRANCH" --repo "$OWNER_REPO"
+  PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review rebase --cwd "$TARGET_CWD" --base "$BASE_BRANCH" --repo "$OWNER_REPO"
   ```
 
   Read the JSON result: `status` is `rebased` (with `pushed == true` when the branch is already
@@ -321,7 +336,7 @@ Run this EXACT command — substitute the angle-bracket placeholders, AND replac
 between Bash calls; an empty `--repo` / `--cwd` would silently fall back to the tool's own cwd):
 
 ```bash
-python3 -m buddhi_review review-pr <PR_NUMBER> --repo <OWNER_REPO> --cwd "<TARGET_CWD>" [--rr or --rr-active or --rr-none if the user passed it]
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review review-pr <PR_NUMBER> --repo <OWNER_REPO> --cwd "<TARGET_CWD>" [--rr or --rr-active or --rr-none if the user passed it]
 ```
 
 This is the front door: it selects the review engine, **detaches the process and returns
@@ -359,8 +374,8 @@ Then **your job is done.** Do NOT:
 fresh terminal window via the bundled launcher:
 
 ```bash
-SETUP=$(python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
-bash "$SETUP"
+SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" bash "$SETUP"
 ```
 
 `launch-setup.sh` ships inside the `buddhi_review` package; the one-liner resolves its installed

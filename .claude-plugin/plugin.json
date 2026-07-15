@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "buddhi-review",
+  "version": "1.0.0",
+  "description": "Free PR review-and-fix loop for Claude Code: fans out review bots, classifies each comment, applies fixes, and merges on a clean pass (opt-in).",
+  "author": {
+    "name": "M. Srivastava"
+  },
+  "homepage": "https://github.com/buddhikernel/buddhi-review",
+  "repository": "https://github.com/buddhikernel/buddhi-review",
+  "license": "MIT",
+  "keywords": [
+    "code-review",
+    "pull-request",
+    "claude-code",
+    "cognitive-budget",
+    "human-in-the-loop",
+    "agents"
+  ],
+  "skills": "./buddhi_review/skills/",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${CLAUDE_PLUGIN_ROOT}/scripts/ensure_install.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

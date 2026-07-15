@@ -89,6 +89,31 @@ def test_spawn_wizard_forwards_repo_arg():
     assert "--repo acme/widgets" in written[0]
 
 
+def test_windows_shell_command_escapes_percent_in_pythonpath():
+    cmd = setup_launcher._windows_shell_command(
+        "C:\\Python\\python.exe", pythonpath="C:\\site%USERPROFILE%stuff")
+    assert '%USERPROFILE%stuff"' not in cmd
+    assert "%%USERPROFILE%%" in cmd
+
+
+def test_windows_shell_command_escapes_quote_in_pythonpath():
+    cmd = setup_launcher._windows_shell_command(
+        "C:\\Python\\python.exe", pythonpath='C:\\site" & calc.exe & echo "')
+    # the embedded quote must not terminate the `set` token and chain a command
+    assert "&& calc.exe &&" not in cmd
+    assert cmd.count('"') % 2 == 0
+
+
+def test_spawn_wizard_windows_bat_scopes_pythonpath(tmp_path):
+    setup_launcher.spawn_wizard(
+        system="Windows", which=_which_none, popen=lambda *a: None,
+        environ={"USERNAME": "alice", "PYTHONPATH": "C:\\plugin\\site"},
+        command_file_dir=str(tmp_path), python_bin="C:\\Python\\python.exe")
+    bat_path = tmp_path / "setup-launcher-alice" / "buddhi-review-setup.bat"
+    content = bat_path.read_text(encoding="utf-8")
+    assert 'set "PYTHONPATH=C:\\plugin\\site"' in content
+
+
 def test_spawn_command_macos_keeps_window_open():
     written = []
 

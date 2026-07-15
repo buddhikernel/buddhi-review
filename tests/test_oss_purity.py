@@ -122,6 +122,11 @@ def _collect_public_repo_files(repo_root: Path, tests_dir: Path):
     candidates += (repo_root / "docs").rglob("*.svg")
     candidates += (repo_root / ".github" / "workflows").glob("*.yml")
     candidates += (repo_root / ".github" / "workflows").glob("*.yaml")
+    # The Claude Code plugin manifest + its bootstrap scripts ship in the public
+    # marketplace plugin (FREE-6) but never in the wheel/sdist, so — like the
+    # docs/workflows above — only this guard scans them for a paid/private leak.
+    candidates += (repo_root / ".claude-plugin").glob("*.json")
+    candidates += (repo_root / "scripts").glob("*.py")
     return sorted(
         p for p in candidates
         if p.relative_to(repo_root).as_posix() not in _VOCAB_SCAFFOLDING
@@ -155,6 +160,10 @@ def test_public_repo_surface_is_actually_covered():
     assert any(p.suffix == ".svg" for p in files), "docs SVG surface not scanned"
     assert any(p.parent.name == "workflows" and p.suffix in (".yml", ".yaml")
                for p in files), "public workflow YAML surface not scanned"
+    # The plugin manifest + bootstrap scripts (public plugin, never the wheel).
+    assert any(p.name == "plugin.json" for p in files), "plugin manifest not scanned"
+    assert any(p.parent.name == "scripts" and p.suffix == ".py"
+               for p in files), "plugin bootstrap scripts not scanned"
 
 
 @pytest.mark.parametrize("rel", sorted(_VOCAB_SCAFFOLDING))
