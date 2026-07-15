@@ -1,3 +1,7 @@
+---
+title: Getting started
+---
+
 # Getting started
 
 This guide takes you from the required tools and accounts to your first PR reviewed by
@@ -113,7 +117,7 @@ Config keys and the plan → model mapping are in
 
 ### Claude workflow setup
 
-<details>
+<details markdown="1">
 <summary><b>Only if you enable the Claude reviewer</b></summary>
 
 Claude review is workflow-driven, not app-driven. Install the bundled GitHub Actions
@@ -191,7 +195,7 @@ During a run, you will see:
   question to an editable answer file and prints a `file://` link; enter a number (or
   your own text) on the answer line, save, and the loop continues.
 
-<details>
+<details markdown="1">
 <summary><b>Example run output</b></summary>
 
 The launcher prints a log path and a live-log hint:
@@ -259,7 +263,7 @@ commands and drive the loop yourself:
 python3 -m buddhi_review review-pr 123 --repo OWNER/REPO --cwd /path/to/checkout
 ```
 
-<details>
+<details markdown="1">
 <summary><b>Run it as a detached background loop</b></summary>
 
 ```bash

@@ -1,3 +1,7 @@
+---
+title: Architecture
+---
+
 # Architecture
 
 `buddhi-review` is an adapter of the [Buddhi kernel](https://github.com/buddhikernel/buddhi)
