@@ -72,7 +72,8 @@ def install(site_dir, *, python=None, runner=None):
     try:
         os.makedirs(site_dir, exist_ok=True)
         proc = runner(
-            [python, "-m", "pip", "install", "--target", site_dir, "--upgrade", PACKAGE],
+            [python, "-m", "pip", "install", "--target", site_dir, "--upgrade",
+             "--no-input", "--disable-pip-version-check", PACKAGE],
             capture_output=True, timeout=300,
         )
         return proc.returncode == 0

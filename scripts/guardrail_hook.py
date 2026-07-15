@@ -30,6 +30,14 @@ DEGRADE_MESSAGE = (
     "run: pip install buddhi-review"
 )
 
+# Printed instead of DEGRADE_MESSAGE when the import fails for a reason OTHER than
+# the package being absent (e.g. a syntax error or a broken transitive import) —
+# so a real regression doesn't masquerade as "not installed yet".
+BROKEN_INSTALL_MESSAGE = (
+    "buddhi-review failed to import (not a missing-package issue) — "
+    "the git guardrail is inactive for now: {exc!r}"
+)
+
 
 def _prepend_data_site():
     """Prepend ``${CLAUDE_PLUGIN_DATA}/site`` (the SessionStart install target) to
@@ -50,8 +58,11 @@ def run():
     _prepend_data_site()
     try:
         from buddhi_review import git_guardrail_hook
-    except Exception:
+    except ModuleNotFoundError:
         sys.stderr.write(DEGRADE_MESSAGE + "\n")
+        return 0
+    except Exception as exc:  # noqa: BLE001 - still fail open, but flag it distinctly
+        sys.stderr.write(BROKEN_INSTALL_MESSAGE.format(exc=exc) + "\n")
         return 0
     return git_guardrail_hook.main()
 
