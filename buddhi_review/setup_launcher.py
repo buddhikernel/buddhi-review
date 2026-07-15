@@ -145,6 +145,17 @@ def _windows_shell_command(python_bin, wizard_args=(), *, pythonpath=None):
     if wizard_args:
         python_cmd += f" {_escape_cmd_chars(subprocess.list2cmdline(list(wizard_args)))}"
     if pythonpath:
+        # No delayed-expansion (`!VAR!`) neutralization is applied here, and none
+        # can be: a PYTHONPATH containing `!` only mis-expands when delayed
+        # expansion is enabled, which is OFF by default so `!` is literal in the
+        # normal case. This is a SINGLE interactive command line — cmd.exe fixes
+        # the delayed-expansion state when it reads a line, so a same-line
+        # `setlocal DisableDelayedExpansion &&` prefix would NOT change how `!` in
+        # the rest of the line is parsed (setlocal only affects lines read after
+        # it), and no `!`-escaping is correct in both the on and off states. The
+        # generated .bat launcher (see spawn_wizard) is the Windows path that IS
+        # hardened, with an own-line `setlocal DisableDelayedExpansion` that
+        # genuinely takes effect for its `set` line.
         python_cmd = f'set "PYTHONPATH={_escape_windows_set_value(pythonpath)}"&& {python_cmd}'
     return python_cmd
 
@@ -269,8 +280,16 @@ def spawn_wizard(*, system=None, which=None, popen=None, environ=None,
             bat_content = (
                 "@echo off\n"
                 "chcp 65001 >nul\n"
+                # DisableDelayedExpansion so a PYTHONPATH (or invocation arg)
+                # containing '!' — e.g. a path component like foo!bar — is stored
+                # literally instead of being expanded as !VAR! at parse time. This
+                # own-line setlocal takes effect for the set/invocation below,
+                # unlike a same-line setlocal on a compound command; endlocal scopes
+                # the environment change to this launcher.
+                "setlocal DisableDelayedExpansion\n"
                 f"{pythonpath_set}"
                 f"{invocation}\n"
+                "endlocal\n"
                 "pause\n"
             )
             try:

@@ -74,6 +74,13 @@ def already_importable(site_dir, *, python=None, runner=None):
             return False
         return proc.returncode == 0
 
+    # Deliberately does NOT scrub an inherited PYTHONPATH from this first probe:
+    # guardrail_hook.py's own runtime import (`from buddhi_review import ...`)
+    # also runs under the ambient environment and would resolve the same
+    # PYTHONPATH entry first. Stripping it here would only desync this probe
+    # from what the guardrail actually imports at runtime, forcing a wasted
+    # reinstall the guardrail would never use (its plain import already wins
+    # over anything ensure_install puts in site_dir).
     if _probe(dict(os.environ)):
         return True
     if not (site_dir and os.path.isdir(site_dir)):
