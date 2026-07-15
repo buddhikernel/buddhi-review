@@ -38,7 +38,9 @@ in round 2 or later.
 <br>
 
 New here? Run `pip install buddhi-review`, then follow
-**[Getting started](GETTING_STARTED.md)**
+<!-- Absolute URL, not repo-relative: this README is also the PyPI package readme
+     (see pyproject.toml `readme`), which does not resolve relative links. -->
+**[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)**
 to your first reviewed PR.
 
 ## Install
@@ -76,7 +78,7 @@ refresh `~/.claude/skills/`.
 </details>
 
 **Restart Claude Code** so it loads the new skills, then run **`/review-pr setup`**
-once to onboard (see [Getting started](GETTING_STARTED.md)).
+once to onboard (see [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)).
 If a slash-command of the same name already exists, the skill takes precedence.
 
 Each skill's `SKILL.md` frontmatter includes a Git guardrail hook. While a review is
@@ -162,7 +164,7 @@ check still ends with `SELF-CHECK OK`.
 ```
 
 To drive the CLI directly or detach the loop as a background process, see
-[Getting started](GETTING_STARTED.md#6-advanced-drive-the-cli-directly).
+[Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#6-advanced-drive-the-cli-directly).
 
 ## Provider usage and cost
 
@@ -171,7 +173,7 @@ accounts you connect. The loop itself uses your Claude subscription, and each en
 reviewer uses its associated plan or account. Buddhi does not bill you or proxy
 reviews through its own accounts.
 
-See **[What a review costs you](GETTING_STARTED.md#what-a-review-costs-you)**
+See **[What a review costs you](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md#what-a-review-costs-you)**
 for the full breakdown.
 
 ## What real review runs show
