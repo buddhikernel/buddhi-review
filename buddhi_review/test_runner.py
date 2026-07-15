@@ -1284,7 +1284,10 @@ def _classify_gradle(rc: int, out: str) -> str:
             st = (status or "").strip().upper()
             statuses.append(st)
             if st not in ("NO-SOURCE", "UP-TO-DATE", "SKIPPED"):
-                ran = True                     # no status / FROM-CACHE → it executed
+                ran = True                     # no status / FROM-CACHE → suite had tests
+                                                # (FROM-CACHE restores outputs, task itself
+                                                # didn't execute, but its presence proves
+                                                # the suite is non-empty)
         # A real run anywhere WINS: `gradle check` / `gradle test integrationTest` can
         # have one empty execution task beside a sibling that really ran, and that is a
         # verified pass. Otherwise, NO_TESTS requires EVERY detected execution task to be
