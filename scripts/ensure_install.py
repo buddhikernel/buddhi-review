@@ -27,6 +27,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import tempfile
 
 # The PyPI distribution name to install and the import name to probe for.
 PACKAGE = "buddhi-review"
@@ -46,6 +47,11 @@ def already_importable(site_dir, *, python=None, runner=None):
     state) so the probe reflects exactly what the guardrail entry will see. A
     global install makes this true even with ``site_dir`` on the path, so an
     already-installed package is never reinstalled over.
+
+    Runs from a neutral cwd (the system temp dir), never the hook process's own
+    cwd — ``python -c`` puts cwd on ``sys.path``, so a hook invoked from inside a
+    checkout/plugin bundle with an in-tree ``buddhi_review/`` dir would otherwise
+    import that instead of the real installed package, producing a false positive.
     """
     python = python or sys.executable or "python3"
     runner = runner or subprocess.run
@@ -55,7 +61,7 @@ def already_importable(site_dir, *, python=None, runner=None):
     try:
         proc = runner(
             [python, "-c", f"import {IMPORT_NAME}"],
-            env=env, capture_output=True, timeout=30,
+            env=env, capture_output=True, timeout=30, cwd=tempfile.gettempdir(),
         )
     except Exception:
         # A probe that cannot even run is treated as "not importable" so the

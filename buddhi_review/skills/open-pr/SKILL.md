@@ -110,8 +110,8 @@ test -s ~/.config/review-loop/config.yaml && echo configured || echo unconfigure
        you cannot drive), then **EXIT**:
 
        ```bash
-       SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
-       PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" bash "$SETUP"
+       SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
+       PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" bash "$SETUP"
        ```
 
        On success, reply exactly: ``Setup opened in a new window — finish it there, then
@@ -155,9 +155,13 @@ checkout of the target repo and differs from `$PWD`, else it echoes `$CWD` uncha
 # registers and the key looked up here are byte-identical.
 # The PYTHONPATH prefix on this and every other `python3 -m buddhi_review` call below
 # makes a plugin-only install (package installed by SessionStart into
-# ${CLAUDE_PLUGIN_DATA}/site, never on the default import path) resolve; it is a no-op
-# when CLAUDE_PLUGIN_DATA is unset (a pip install with the package already importable).
-RESOLVED=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
+# ${CLAUDE_PLUGIN_DATA}/site, never on the default import path) resolve. `${CLAUDE_PLUGIN_DATA}`
+# here is a literal Claude Code placeholder substituted into skill content at load time — NOT
+# a Bash-tool environment variable (plugin env vars are exported only to hook/MCP/LSP
+# subprocesses, not to skill-authored Bash calls) — so this resolves for a plugin install.
+# For a pip install the placeholder is left literal, Bash expands the unset var to "", and
+# PYTHONPATH just gets a harmless "/site:" prefix ahead of the package that's already importable.
+RESOLVED=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
   --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD" 2>/dev/null)
 if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CWD" ]; then
   TARGET_CWD="$RESOLVED"
@@ -198,7 +202,7 @@ repo — so a fleet confirmed for one repo must NOT be assumed for another. Ask 
 reader whether THIS repo's reviewers have been confirmed:
 
 ```bash
-PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -m buddhi_review status --repo "$OWNER_REPO" 2>/dev/null
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review status --repo "$OWNER_REPO" 2>/dev/null
 ```
 
 If `OWNER/REPO` cannot be resolved yet (a brand-new repo with no remote), or the command
@@ -219,8 +223,8 @@ is absent / prints nothing / unparseable output, **skip this gate** and proceed 
        user can finish it:
 
        ```bash
-       SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
-       PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" bash "$SETUP" --repo "$OWNER_REPO"
+       SETUP=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -c "import buddhi_review,os;print(os.path.join(os.path.dirname(buddhi_review.__file__),'launch-setup.sh'))")
+       PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" bash "$SETUP" --repo "$OWNER_REPO"
        ```
 
        On a headless host the launcher prints the one-liner to run by hand instead. After
@@ -257,7 +261,7 @@ On a feature branch, ask the engine for the rebase status — this verb is stric
 read-only on every tier and never mutates your tree:
 
 ```bash
-PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -m buddhi_review rebase-check --cwd "$TARGET_CWD" --base "$BASE_BRANCH" --repo "$OWNER_REPO"
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review rebase-check --cwd "$TARGET_CWD" --base "$BASE_BRANCH" --repo "$OWNER_REPO"
 ```
 
 Parse the JSON object on stdout and act on `status`:
@@ -296,7 +300,7 @@ Parse the JSON object on stdout and act on `status`:
   prints the manual steps and declines to touch your tree.
 
   ```bash
-  PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -m buddhi_review rebase --cwd "$TARGET_CWD" --base "$BASE_BRANCH" --repo "$OWNER_REPO"
+  PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review rebase --cwd "$TARGET_CWD" --base "$BASE_BRANCH" --repo "$OWNER_REPO"
   ```
 
   Read the JSON result:
@@ -350,7 +354,7 @@ ONLY if the user passed it as a slash-command argument — omit the flag entirel
 the loop uses its own default:
 
 ```bash
-PYTHONPATH="${CLAUDE_PLUGIN_DATA:+$CLAUDE_PLUGIN_DATA/site:}$PYTHONPATH" python3 -m buddhi_review open-pr \
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review open-pr \
   --title "<title>" --body "<body>" \
   --repo <OWNER_REPO> --cwd "<TARGET_CWD>" \
   [--branch-prefix <feat|fix|refactor>] [--branch "<explicit-branch-name>"] \

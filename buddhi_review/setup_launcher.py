@@ -88,12 +88,22 @@ def detect_strategy(system, which, environ=None):
     return "print"
 
 
-def _posix_shell_command(python_bin, wizard_args=()):
+def _posix_shell_command(python_bin, wizard_args=(), *, pythonpath=None):
     """The POSIX command that runs the wizard module, forwarding any extra args
-    (e.g. ``--repo owner/repo`` for the per-repo confirm mode)."""
+    (e.g. ``--repo owner/repo`` for the per-repo confirm mode).
+
+    ``pythonpath``, when set, is prefixed as ``PYTHONPATH=... <cmd>`` — this is the
+    calling process's own ``PYTHONPATH`` (a plugin-only install's SKILL.md sets it to
+    ``${CLAUDE_PLUGIN_DATA}/site:...`` before invoking this launcher). Without it, a
+    spawned terminal window or a hand-run print-fallback command starts a process
+    that does NOT inherit this one's environment, so ``import buddhi_review`` would
+    fail for a plugin-only install that never ran a global ``pip install``.
+    """
     cmd = f"{shlex.quote(str(python_bin))} -m {_MODULE} {_SETUP_SUBCOMMAND}"
     for arg in wizard_args:
         cmd += f" {shlex.quote(str(arg))}"
+    if pythonpath:
+        cmd = f"PYTHONPATH={shlex.quote(pythonpath)} {cmd}"
     return cmd
 
 
@@ -115,11 +125,17 @@ def _escape_cmd_chars(cmdline: str) -> str:
     return "".join(result)
 
 
-def _windows_shell_command(python_bin, wizard_args=()):
-    """The cmd.exe command equivalent — used for the print fallback on Windows."""
+def _windows_shell_command(python_bin, wizard_args=(), *, pythonpath=None):
+    """The cmd.exe command equivalent — used for the print fallback on Windows.
+
+    ``pythonpath`` mirrors ``_posix_shell_command``'s: prefixed as a ``set`` that
+    scopes to the ``&&``-chained command so a plugin-only install still resolves in
+    a freshly spawned window or a hand-run print-fallback command."""
     python_cmd = f'"{python_bin}" -m {_MODULE} {_SETUP_SUBCOMMAND}'
     if wizard_args:
         python_cmd += f" {_escape_cmd_chars(subprocess.list2cmdline(list(wizard_args)))}"
+    if pythonpath:
+        python_cmd = f'set "PYTHONPATH={pythonpath}"&& {python_cmd}'
     return python_cmd
 
 
@@ -192,11 +208,16 @@ def spawn_wizard(*, system=None, which=None, popen=None, environ=None,
     write_command_file = write_command_file or _write_command_file
     python_bin = python_bin or _python_bin()
     wizard_args = list(wizard_args or [])
+    # Carry this process's own PYTHONPATH into the constructed command so a plugin-
+    # only install (site dir on PYTHONPATH, not globally pip-installed) still
+    # resolves `import buddhi_review` in a freshly spawned terminal or a hand-run
+    # print-fallback command — neither inherits this process's environment.
+    pythonpath = environ.get("PYTHONPATH") or None
 
     if (system or "").lower() == "windows":
-        shell_cmd = _windows_shell_command(python_bin, wizard_args)
+        shell_cmd = _windows_shell_command(python_bin, wizard_args, pythonpath=pythonpath)
     else:
-        shell_cmd = _posix_shell_command(python_bin, wizard_args)
+        shell_cmd = _posix_shell_command(python_bin, wizard_args, pythonpath=pythonpath)
     strategy = detect_strategy(system, which, environ)
 
     def _fallback():
