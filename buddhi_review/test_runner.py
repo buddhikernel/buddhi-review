@@ -1276,26 +1276,27 @@ def _classify_gradle(rc: int, out: str) -> str:
         # PASSED. Catching that needs `build/test-results/**/*.xml`, outside this pure
         # function; do NOT fake it with an ANSI strip — real rich output has no line to
         # strip.)
-        ran, empty = False, False
+        ran, statuses = False, []
         for task, status in re.findall(
                 r"(?m)^> Task (:\S+)(?:[ \t]+(\S[^\n]*?))?[ \t]*$", out):
             if not _is_gradle_test_execution_task(task.rsplit(":", 1)[-1]):
                 continue                       # not an execution task — no evidence
             st = (status or "").strip().upper()
-            if st == "NO-SOURCE":
-                empty = True                   # this execution task had zero tests
-            elif st in ("UP-TO-DATE", "SKIPPED"):
-                continue                       # NON-evidence: it did not run now, and it
-                                               # does not say the suite is empty either
-            else:
+            statuses.append(st)
+            if st not in ("NO-SOURCE", "UP-TO-DATE", "SKIPPED"):
                 ran = True                     # no status / FROM-CACHE → it executed
         # A real run anywhere WINS: `gradle check` / `gradle test integrationTest` can
         # have one empty execution task beside a sibling that really ran, and that is a
-        # verified pass. Only when NO execution task ran AND at least one was NO-SOURCE
-        # is the suite genuinely empty.
+        # verified pass. Otherwise, NO_TESTS requires EVERY detected execution task to be
+        # NO-SOURCE: UP-TO-DATE means Gradle's own up-to-date check ran, which only
+        # happens for a task that HAS source (a sourceless task short-circuits straight
+        # to NO-SOURCE) — so a NO-SOURCE `:test` beside an UP-TO-DATE `:integrationTest`
+        # is a real, previously-verified suite, not an empty one. SKIPPED stays
+        # non-evidence either way (it says nothing about source), but must not let a
+        # sibling NO-SOURCE force NO_TESTS on its own.
         if ran:
             return PASSED
-        if empty:
+        if statuses and all(st == "NO-SOURCE" for st in statuses):
             return NO_TESTS
         if _has(out, r"No tests found for given includes"):
             return NO_TESTS

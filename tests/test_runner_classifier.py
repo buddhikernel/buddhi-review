@@ -103,6 +103,26 @@ _GRADLE_MULTI_MODULE_ZERO = """> Task :app:compileTestJava NO-SOURCE
 BUILD SUCCESSFUL in 2s
 6 actionable tasks: 6 up-to-date"""
 
+# `gradle test integrationTest`: the unit-test task is empty (NO-SOURCE) but the
+# integrationTest sibling is UP-TO-DATE, not NO-SOURCE. Gradle's own up-to-date check
+# only runs for a task that HAS source — a sourceless task short-circuits straight to
+# NO-SOURCE instead — so UP-TO-DATE here proves the suite exists and was previously
+# verified. A rule that requires EVERY execution task to be NO-SOURCE before returning
+# NO_TESTS must not fire here; it also must not need the UP-TO-DATE task to look like
+# "it ran" to reach that answer.
+_GRADLE_NO_SOURCE_PLUS_UP_TO_DATE_SIBLING = """> Task :compileJava UP-TO-DATE
+> Task :classes UP-TO-DATE
+> Task :compileTestJava NO-SOURCE
+> Task :processTestResources NO-SOURCE
+> Task :testClasses UP-TO-DATE
+> Task :test NO-SOURCE
+> Task :compileIntegrationTestJava UP-TO-DATE
+> Task :integrationTestClasses UP-TO-DATE
+> Task :integrationTest UP-TO-DATE
+
+BUILD SUCCESSFUL in 500ms
+3 actionable tasks: 3 up-to-date"""
+
 # The suite EXISTS and is up-to-date (nothing changed since the last green run).
 _GRADLE_UP_TO_DATE = """> Task :compileJava UP-TO-DATE
 > Task :processResources NO-SOURCE
@@ -370,6 +390,12 @@ _CLASSIFY_CASES = [
     ("gradle-pass", tr.GRADLE, 0, _GRADLE_PASSING, tr.PASSED),
     ("gradle-zero-test-is-no-tests", tr.GRADLE, 0, _GRADLE_ZERO_TEST, tr.NO_TESTS),
     ("gradle-check-empty-plus-sibling-that-ran", tr.GRADLE, 0, _GRADLE_CHECK_MIXED, tr.PASSED),
+    # `:test NO-SOURCE` beside `:integrationTest UP-TO-DATE` — UP-TO-DATE implies the
+    # sibling suite HAS source (a sourceless task would print NO-SOURCE, not
+    # UP-TO-DATE), so this must stay a pass, not fall to NO_TESTS just because no
+    # execution task looked like it "ran" this invocation.
+    ("gradle-no-source-plus-up-to-date-sibling-is-pass", tr.GRADLE, 0,
+     _GRADLE_NO_SOURCE_PLUS_UP_TO_DATE_SIBLING, tr.PASSED),
     ("gradle-multi-module-zero-test", tr.GRADLE, 0, _GRADLE_MULTI_MODULE_ZERO, tr.NO_TESTS),
     # Android (AGP): the support tasks `javaPreCompileDebugUnitTest` /
     # `packageDebugUnitTestForUnitTest` END in "Test" and run with a bare header, but
@@ -737,6 +763,15 @@ class TestGradleZeroTestIsNeverGreen:
         # A real run ANYWHERE wins — `gradle check` may have an empty `:test` beside an
         # `:integrationTest` that really executed. That is a verified pass, not an empty run.
         assert tr.classify(tr.GRADLE, 0, _GRADLE_CHECK_MIXED) == tr.PASSED
+
+    def test_no_source_beside_an_up_to_date_sibling_is_passed_not_skipped(self):
+        # UP-TO-DATE, unlike a fresh execution, doesn't set `ran` — but it still proves
+        # the sibling suite has source (NO-SOURCE would have fired instead if it didn't).
+        # A NO_TESTS rule keyed on "every execution task is NO-SOURCE" must not fire here.
+        assert "> Task :test NO-SOURCE" in _GRADLE_NO_SOURCE_PLUS_UP_TO_DATE_SIBLING
+        assert "> Task :integrationTest UP-TO-DATE" in _GRADLE_NO_SOURCE_PLUS_UP_TO_DATE_SIBLING
+        got = tr.classify(tr.GRADLE, 0, _GRADLE_NO_SOURCE_PLUS_UP_TO_DATE_SIBLING)
+        assert got == tr.PASSED, f"NO-SOURCE beside an UP-TO-DATE sibling false-skipped as {got}"
 
     def test_multi_module_all_execution_tasks_empty_is_no_tests(self):
         assert tr.classify(tr.GRADLE, 0, _GRADLE_MULTI_MODULE_ZERO) == tr.NO_TESTS
