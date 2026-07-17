@@ -941,23 +941,6 @@ class RoundDriver:
         #   the normal window rather than holding the round open as a never-seen
         #   bot would (matching how a fresh-launch round treats a bot that spoke).
         self._preflight_seen: Set[str] = set()
-        # _deferred_summon: the SUMMON DEBT. Reviewers dropped from ROUND 1's summon
-        #   + poll because they had already responded before the run started (the
-        #   preflight responders, on the --rr-active restart path). The deferral
-        #   POSTPONES their summon — it must never CANCEL it.
-        #
-        #   THE INVARIANT: a bot deferred out of round 1 is SUMMONED before the run
-        #   can clean-exit or auto-merge — or it has become HARD-EXCLUDED (quota /
-        #   PR-too-large / errored / user-excluded), which is unsummonable by
-        #   definition. There is no third outcome.
-        #
-        #   A name leaves this set ONLY when its re-request actually LANDED (a summon
-        #   that failed to post is not a summon), or when the bot leaves
-        #   expected_bots() — the hard-exclusion arm of the invariant. While the debt
-        #   stands the round loop runs another round to pay it, and _clean_exit
-        #   REFUSES to merge (fail-closed), so an unpaid debt can never be laundered
-        #   into a merge by the round budget running out.
-        self._deferred_summon: Set[str] = set()
         # _reaction_baseline: reaction ids considered STALE — captured at
         #   preflight and re-captured before every re-request. A +1 whose id is in
         #   this set was left before the current review round (an earlier commit /
@@ -1254,8 +1237,7 @@ class RoundDriver:
 
     # ------------------------------------------------------------- re-request
 
-    def _summon(self, round_no: int, expected: Sequence[str],
-                skip_register_delay: bool = False) -> Set[str]:
+    def _summon(self, round_no: int, expected: Sequence[str]) -> None:
         """Round 1 summons only ``auto_on_open: false`` reviewers (the others
         already review on PR open), resolved PER-REPO from the loop's bound repo
         so a reviewer's auto-review setting can differ across repos. ``--rr`` and
@@ -1265,18 +1247,10 @@ class RoundDriver:
         clean when nothing is active, handled in ``run``). Rounds ≥2 re-request
         every still-expected bot.
 
-        Returns the set of bots whose re-request actually LANDED. That, not the
-        target list, is what the caller may treat as "asked": a trigger that failed
-        to post (a gh error, a 422, no trigger for the bot) never summoned anybody,
-        so it can never pay the summon debt (see ``_deferred_summon``).
-
         After the re-requests are posted, wait ``register_delay`` for the review
         triggers to register before the caller opens the poll window — but only
         when a summon actually landed (an all-``auto_on_open`` round-1 with no
-        summon does not wait), and not when ``skip_register_delay`` says the round
-        has pre-existing work to do first: fixing the comments already in hand takes
-        far longer than the delay, so the trigger has registered by the time the poll
-        opens and the wait would be a pure stall."""
+        summon does not wait)."""
         if round_no == 1:
             targets = [
                 b for b in expected
@@ -1287,10 +1261,8 @@ class RoundDriver:
         # NB: a list comprehension, not any(...) — every target must be summoned;
         # any() would short-circuit on the first success and skip the rest.
         summoned = [self._request_review(bot) for bot in targets]
-        landed = {b for b, ok in zip(targets, summoned) if ok}
-        if landed and self.times.register_delay > 0 and not skip_register_delay:
+        if any(summoned) and self.times.register_delay > 0:
             self.sleep(self.times.register_delay)
-        return landed
 
     def _request_review(self, bot: str) -> bool:
         """Post ``bot``'s re-request trigger. Returns True iff the trigger
@@ -1682,8 +1654,7 @@ class RoundDriver:
         return bot
 
     def _promote_reviewed_no_findings(self, actionable: Sequence[Comment],
-                                      results: Sequence[CommentResult],
-                                      exempt: Iterable[str] = ()) -> None:
+                                      results: Sequence[CommentResult]) -> None:
         """A GENUINE review with zero findings is done for the run — the same
         scheduling as an explicit clean sentinel, but a distinct label: with no
         explicit sign-off it renders "Reviewed — no findings ✓", never the
@@ -1703,17 +1674,11 @@ class RoundDriver:
         "I wasn't able to review …" apology phrased past those regexes is caught
         by :data:`_NOT_A_REVIEW_RE` here — it keeps today's behaviour (expected,
         re-summoned, never labelled). The placeholder and errored-comeback
-        machinery itself is untouched.
-
-        ``exempt`` — reviewers DEFERRED out of this round (never summoned, never
-        polled). The comments scanned here are the ones they left BEFORE the run, so
-        they are no verdict on the current head and must not promote anyone: the
-        deferral owes them a summon, and a promotion would cancel it."""
-        exempt = set(exempt)
+        machinery itself is untouched."""
         verdict: Dict[str, bool] = {}
         for c, r in zip(actionable, results):
             bot = detectors.bot_for_login(c.source)
-            if bot is None or bot in exempt:
+            if bot is None:
                 continue
             no_finding = (not c.path and not c.diff_hunk
                           and not _NOT_A_REVIEW_RE.search(c.text)
@@ -1842,8 +1807,7 @@ class RoundDriver:
 
     def _update_polishing(self, actionable: Sequence[Comment],
                           results: Sequence[CommentResult],
-                          actions: Sequence[ActionResult] = (),
-                          exempt: Iterable[str] = ()) -> None:
+                          actions: Sequence[ActionResult] = ()) -> None:
         """Round-end demotions (both soft, --rr-clearable):
 
         * **polish** — a reviewer whose comments this round were ALL
@@ -1868,19 +1832,18 @@ class RoundDriver:
         voluntarily-done or is hard-excluded (quota / PR-too-large / errored)
         is never demoted here.
 
-        ``exempt`` — reviewers DEFERRED out of this round (never summoned, never
-        polled). What was processed for them is the comments they left BEFORE the
-        run, on an older head — replayed work, not this round's verdict. Demoting
-        them on it would drop them from ``expected_bots()`` and turn the deferral
-        into a permanent skip; they keep their slot and are summoned next round."""
-        exempt = set(exempt)
+        On an ``--rr-active`` restart a deferred responder's pre-existing comments ARE
+        its round-1 verdict, so they demote it exactly like any round: cosmetic-only →
+        polish (left alone next round), dismissed real findings → reviewed-no-change,
+        a surviving finding → keeps its slot and is re-requested by ``expected_bots()``.
+        That is how the restart needs no separate summon debt."""
         commented: Set[str] = set()
         surviving: Set[str] = set()   # ≥1 real finding still standing
         dismissed: Set[str] = set()   # ≥1 real finding reassessed away
         finals = {a.comment_id: a.final for a in actions}
         for c, r in zip(actionable, results):
             bot = detectors.bot_for_login(c.source)
-            if bot is None or bot in exempt:
+            if bot is None:
                 continue
             commented.add(bot)
             label = r.classification.label
@@ -1937,10 +1900,15 @@ class RoundDriver:
         * **polish-only** — restored from the persisted per-PR state, and ONLY when
           the PR's live HEAD still equals the tip that state was stamped against
           (see :mod:`buddhi_review.polish_state`).
-        * **already-responded** — the preflight snapshot folds the comments already
-          on the PR, so a reviewer that left findings is neither re-summoned nor
-          polled in round 1; its comments are fixed in that round instead, and it is
-          re-summoned in round 2 on the FIXED head.
+        * **already-responded** — the preflight snapshot (run only when
+          ``max_rounds >= 2``) folds the comments already on the PR, so a responder is
+          neither re-summoned nor polled in round 1; its pre-existing comments are
+          processed as its round-1 verdict instead. After that NOTHING is special: the
+          existing ``expected_bots()`` + end-of-round rules decide round 2 — a
+          substantive finding re-requests its bot to verify the fix, a cosmetic one
+          lands in ``self.polishing`` and is left alone, an approval is done. There is
+          no summon debt; the correct behaviour falls out of the rules the loop already
+          runs.
 
         The restored / re-derived reviewers are folded into ``reviewed_ever``: they
         genuinely reviewed this PR, so a restart of an all-approved / all-polish PR
@@ -1948,18 +1916,20 @@ class RoundDriver:
         approved = self._rederive_prior_approvals()
         restored = self._restore_polish_state()
         deferred: Set[str] = set()
-        if self.preflight:
+        # The DEFERRAL needs a SECOND round to be safe: with max_rounds == 1 a
+        # substantive round 1 falls straight through to the clean exit, so a responder
+        # deferred out of round 1 would never be asked about the code that round's fixes
+        # produced. So run the snapshot — which is what defers responders out of round
+        # 1's summon and poll — ONLY when there is a round 2 for the existing
+        # end-of-round rules to re-request them in. At max_rounds == 1 round 1 summons
+        # and polls the whole fleet, and the pre-existing comments are read in that
+        # round's poll instead. After the snapshot NOTHING is special: expected_bots()
+        # and the round-end re-request rules decide round 2 — a substantive comment gets
+        # its bot re-requested (it is in none of the exclusion sets), a cosmetic one
+        # lands in self.polishing and is left alone, an approval is done. No summon debt.
+        if self.preflight and self.max_rounds >= 2:
             self._preflight_snapshot(restart=True)
-            # The DEFERRAL — not the snapshot — is what needs a second round: with
-            # max_rounds == 1 a substantive round 1 falls straight through to the clean
-            # exit, so a bot deferred there would never be asked about the code that
-            # round's fixes produced. Drop the deferral (round 1 then summons and polls
-            # the whole fleet) while KEEPING everything else the snapshot learned — the
-            # sign-offs it folded, the quota / errored bots it excluded, and the
-            # pre-existing comments it queued as round 1's work. Skipping the snapshot
-            # outright would re-summon a quota-exhausted reviewer.
-            if self.max_rounds < 2:
-                self._preflight_responders.clear()
+            deferred = set(self._preflight_responders)
             # A HARD CAUSE always wins over a re-derived verdict. The snapshot reads
             # every comment through the full exclusion path, so it can hard-exclude
             # (quota / PR-too-large / errored) a reviewer whose message the re-derive
@@ -1976,24 +1946,6 @@ class RoundDriver:
                 self.done.discard(bot)
                 self.approved.discard(bot)
                 self.polishing.discard(bot)
-            # Book the SUMMON DEBT now — AFTER the un-crowning above (it may have just
-            # stripped a placeholder-crowned reviewer back out of ``done``, and the
-            # ``b not in self.done`` filter must see that corrected set, or an
-            # errored-but-clean-latest responder would be dropped from the debt and
-            # merged past) and BEFORE the round loop (so no exit inside it — the round-1
-            # "no still-active reviewers" fast exit fires BEFORE round 1's body — can
-            # slip a deferred reviewer past the fail-closed gate unbooked). Booked from
-            # WHO RESPONDED, minus the genuinely decided (see _owed_summons); a soft,
-            # reversible reason a responder is out of expected_bots() — a rate-limit
-            # window, a retractable errored exclusion — must not drop it from the debt.
-            if self.max_rounds >= 2:
-                self._deferred_summon = {
-                    b for b in self._preflight_responders
-                    if b not in self.done
-                    and b not in self.polishing
-                    and b not in self.reviewed_no_change
-                }
-                deferred = set(self._deferred_summon)
         fleet = set(self._run_start_fleet)
         # A preserved approval / polish verdict IS a genuine review (restricted to
         # the run-start fleet, mirroring the gate's own universe). Without this fold
@@ -2102,56 +2054,6 @@ class RoundDriver:
             print(f"[rr-active] {bot}: already approved this PR — not re-requesting")
         return folded
 
-    def _owes_deferred_summon(self) -> bool:
-        """True while a reviewer DEFERRED out of round 1 is still expected and its
-        re-request has still not LANDED — the outstanding summon debt.
-
-        THE INVARIANT this enforces: a bot deferred out of round 1 is SUMMONED before
-        the run can clean-exit or auto-merge — or it has become HARD-EXCLUDED (quota /
-        PR-too-large / errored / user-excluded), which is unsummonable by definition.
-        There is no third outcome.
-
-        The forgiveness arm is therefore the HARD causes THEMSELVES — the store's three
-        exclusion buckets, plus a reviewer the operator has removed from the fleet —
-        and NOT the far broader "has left ``expected_bots()``". That set also drops a
-        bot for SOFT, self-reversing reasons: a rate-limit window that the very next
-        round boundary would pop and re-summon, a silent-drop, a polish-only demotion.
-        Reading any of those as "unsummonable" would forgive a debt the loop could
-        still pay, and let the run merge a head the reviewer was never asked about.
-
-        Two consumers: the round loop, which pays the debt by running another round
-        (every in-loop clean exit and the terminal-empty drain check this), and
-        ``_clean_exit``, which REFUSES to merge while it stands — the backstop for the
-        one exit the loop cannot retry, the round budget running out. A reviewer whose
-        rate-limit window never resets inside the budget therefore hands the PR back
-        rather than merging it: it is not unsummonable, it is merely unavailable, and
-        the honest outcome is a hand-back."""
-        return bool(self._owed_summons())
-
-    def _owed_summons(self) -> Set[str]:
-        """The reviewers this run still owes a summon — the debt, minus the ONLY three
-        things that discharge it without one:
-
-        * a HARD exclusion (quota / PR-too-large / errored) — unsummonable;
-        * removal from the fleet — the operator no longer wants it;
-        * ``done`` — it gave its VERDICT anyway (a clean review or a ``+1`` that landed
-          during a round without needing the summon). That is the outcome the summon
-          exists to obtain, and ``expected_bots()`` excludes ``done``, so the loop could
-          never summon it again in any case: keeping the debt would make it unpayable
-          and hand back a PR every reviewer approved. The round-end promotion also
-          writes ``done``, but an owed reviewer is exempt from it, so only a genuine
-          verdict can reach this arm.
-
-        Every OTHER reason a bot leaves ``expected_bots()`` — a rate-limit window (timed,
-        self-reversing), a silent drop, a soft demotion — leaves the debt standing.
-        This is the single definition of the debt: the gate, the round loop, and the
-        hand-back notice all read it, so they can never drift apart."""
-        fleet = active_reviewers(self.cfg, self.repo)
-        return {b for b in self._deferred_summon
-                if not self.store.is_excluded(b)
-                and b not in self.done
-                and b in fleet}
-
     def _is_sign_off(self, text: str) -> bool:
         """True only for a message that is a GENUINE clean review — the same
         signal-first precedence ``_classify_signal`` applies, with the same
@@ -2234,12 +2136,13 @@ class RoundDriver:
 
         Runs on a default launch AND on the ``--rr-active`` RESTART path (through
         ``_rr_active_restore``, when ``max_rounds >= 2``) — there its responders are
-        deferred out of round 1's summon and poll, but never out of the RUN: they are
-        summoned in the next round, on the head round 1's fixes produced (see
-        ``_deferred_summon``). ``--rr`` and ``--rr-none`` skip it and keep their
-        round-1 semantics untouched. ``processed_ids`` de-dup guarantees the round-1
-        poll never re-processes a folded comment, and the marker scan here fires at
-        most once across preflight + poll.
+        deferred out of round 1's summon and poll, but never out of the RUN: their
+        pre-existing comments are processed as their round-1 verdict, and the existing
+        end-of-round re-request rules then decide round 2 (a substantive finding →
+        re-requested to verify the fix, a cosmetic one → polish, an approval → done).
+        ``--rr`` and ``--rr-none`` skip it and keep their round-1 semantics untouched.
+        ``processed_ids`` de-dup guarantees the round-1 poll never re-processes a folded
+        comment, and the marker scan here fires at most once across preflight + poll.
 
         ``restart`` — the ``--rr-active`` RESTART reading of the PR's history, and the
         ONLY caller that gets the two rules below. A default launch is left exactly as
@@ -2508,30 +2411,14 @@ class RoundDriver:
             # on an already-reviewed PR. Later rounds re-request + poll it as usual.
             poll_expected = ([b for b in expected if b not in self._preflight_responders]
                              if round_no == 1 else list(expected))
-            # The summon debt was booked before the loop (see _rr_active_restore);
-            # here it is only PAID DOWN, by each landed summon below.
             # Snapshot the stale-reaction set before re-requesting: a +1 already on
             # the PR is stale; one arriving after the re-request is a fresh signal.
             self._capture_reaction_baseline()
+            self._summon(round_no, poll_expected)
             # A chatter-only preflight bot that is still polled this round was seen
             # before it (it spoke at preflight), so it must not hold the round open
             # as a never-seen bot — stamp it seen at the poll's start.
-            preseen = ((self._preflight_seen & set(poll_expected))
-                       if round_no == 1 else set())
-            # Pre-existing work in hand → skip the post-summon register delay: fixing
-            # those comments takes far longer than the delay, so waiting it out is a
-            # pure stall. NOT when a PRESEEN bot is being polled, though: that bot is
-            # stamped seen at the poll's start, so it quiesces on the silence window
-            # alone — and dropping the delay would start that window 60s earlier and
-            # could close the round before the review this summon just asked for lands.
-            # A never-seen bot cannot be short-changed this way (it holds the round
-            # open until the minimum wait regardless).
-            landed = self._summon(round_no, poll_expected,
-                                  skip_register_delay=bool(preflight_batch) and not preseen)
-            # The debt is paid by a LANDED summon, never by the mere intent to send
-            # one: a re-request that failed to post (gh error, 422, no trigger) leaves
-            # the reviewer just as unasked as the deferral did.
-            self._deferred_summon -= landed
+            preseen = (self._preflight_seen & set(poll_expected)) if round_no == 1 else ()
             polled = self._wait_for_quiescence(poll_expected, self.clock(), preseen=preseen)
             self._record_round_attendance(poll_expected)  # silent-streak bookkeeping
 
@@ -2551,13 +2438,6 @@ class RoundDriver:
 
             if not actionable:
                 self._render_round(round_no, [], [], expected)  # status-only round summary
-                # An empty round is still a round in which a deferred reviewer was
-                # never asked anything — and this clean exit sits BEFORE the
-                # substantive-progress gate, so it must pay the same debt (a
-                # preflight responder with no actionable comments — e.g. one released
-                # by the rate-limit comeback — would otherwise exit, and merge, here).
-                if self._owes_deferred_summon():
-                    continue
                 return self._clean_exit(round_no)
 
             results = process_comments(
@@ -2580,27 +2460,22 @@ class RoundDriver:
             for a in round_actions:
                 print(f"  [{a.final:16}] comment {a.comment_id} ({a.disposition})"
                       + (f" — {a.detail}" if a.detail else ""))
-            # A reviewer that still OWES a summon has not answered one in this round —
-            # either it was deferred out of it, or every re-request failed to post. The
-            # comments processed above are therefore not its answer to the current head,
-            # and its round-end verdict must not be read off them: a demotion
-            # (polish-only / reviewed-no-change / reviewed-no-findings) would drop it
-            # from expected_bots() and quietly forgive the debt — a SOFT cause
-            # cancelling a summon the loop still owes. It keeps its slot until a summon
-            # lands, and its real verdict is recorded in the round that follows.
-            # (``_deferred_summon`` has already had this round's landed summons
-            # subtracted, so a reviewer that WAS asked is demoted normally.)
-            exempt = set(self._deferred_summon)
             # A summary-only genuine review (zero findings) is done for the run —
             # decided AFTER classification, BEFORE the table renders its status.
-            self._promote_reviewed_no_findings(actionable, results, exempt=exempt)
+            # A deferred responder's pre-existing comments ARE its round-1 verdict on
+            # the restart path, so they drive these demotions like any round's: a
+            # cosmetic-only responder lands in self.polishing and is left alone next
+            # round (the whole point — the loop already knows not to re-ask a polish
+            # bot), and a substantive one is re-requested by expected_bots() to verify
+            # the fix. That is why the deferral needs no summon debt.
+            self._promote_reviewed_no_findings(actionable, results)
             # Round-end demotions BEFORE the table renders, so a reviewer about
             # to be dropped shows its actual next-round disposition (Polish-only
             # / Reviewed — no change) instead of a stale "Active": a reviewer
             # whose whole round was non-substantive has nothing left to fix, and
             # one whose real findings were ALL dismissed on reassessment must
             # not be re-asked (it would loop against the same verdict).
-            self._update_polishing(actionable, results, round_actions, exempt=exempt)
+            self._update_polishing(actionable, results, round_actions)
             self._render_round(round_no, actionable, results, expected)  # per-reviewer round summary
 
             if self.adapter.escalation.delivered:
@@ -2678,21 +2553,6 @@ class RoundDriver:
                 for r, a in zip(results, round_actions)
             )
             if round_substantive and (committed_changes or self._worktree_has_changes()):
-                # TERMINAL-EMPTY DRAIN: the round only drained work that was already on
-                # the PR and nobody is left to review the fix, so another round would
-                # summon nobody and poll nobody — finish here instead of spending one.
-                # "Nobody left" must mean TERMINALLY nobody: a rate-limited reviewer is
-                # coming BACK (the next round's boundary pops its window and re-summons
-                # it), and an owed summon is a reviewer that has not been asked at all.
-                # Draining past either would end the run on a head they never saw.
-                if (not self.expected_bots() and not self.rr_none
-                        and not self._rate_limited_until
-                        and not self._owes_deferred_summon()):
-                    print("[round] pre-existing comments drained and no reviewer is "
-                          "left to re-request — finishing here")
-                    return self._clean_exit(round_no)
-                continue
-            if self._owes_deferred_summon():
                 continue
             return self._clean_exit(round_no)
 
@@ -2722,26 +2582,6 @@ class RoundDriver:
     def _clean_exit(self, rounds: int) -> RunOutcome:
         print("[round] clean — every expected reviewer is done/excluded and "
               "no actionable comments remain")
-        # ── SUMMON-DEBT gate (fail-CLOSED) ──────────────────────────────────────
-        # THE INVARIANT: a reviewer deferred out of round 1 is SUMMONED before the run
-        # can clean-exit or auto-merge — or it is HARD-EXCLUDED (unsummonable). There
-        # is no third outcome. The round loop pays the debt by running another round;
-        # this is the backstop for the exits that CANNOT do that — the round budget
-        # running out (a `continue` on the final round falls straight out of the for
-        # loop) and any other route into this method. Refuse to merge, and hand the PR
-        # back honestly, rather than laundering an unpaid debt into a merge.
-        owed = sorted(self._owed_summons())
-        if owed:
-            # Named from the SAME set the gate tests — a debtor is usually one the
-            # loop could not summon (a rate-limit window that never reset, a
-            # re-request that never posted), and such a bot is absent from
-            # expected_bots(), so naming it from there would name nobody at all.
-            self.notice("summon-debt",
-                        f"PR #{self.pr}: {', '.join(owed)} responded before this run "
-                        f"and the loop never managed to re-request it during the run — "
-                        f"not merging; handing back", status="stop",
-                        hint="re-run once it is available again, or raise the round budget")
-            return RunOutcome("clean", rounds, False, self.actions)
         # #g9a NOTIFICATION (never a block, never gates the flow below): if the
         # loop's primary reviewer (@claude) was expected but its trigger never
         # landed and it never reviewed — yet another reviewer did — say so loudly.
@@ -3395,15 +3235,6 @@ class RoundDriver:
                 self.silent_dropped.discard(bot)
             else:
                 self.silent_rounds[bot] = self.silent_rounds.get(bot, 0) + 1
-                if bot in self._deferred_summon:
-                    # It still OWES a summon: every re-request this run failed to
-                    # post, so its silence is the loop's doing, not the reviewer's.
-                    # Dropping it here would be a SOFT exclusion that quietly forgives
-                    # the summon debt (the debt is only ever forgiven by a HARD cause,
-                    # which makes a bot unsummonable) and would let the run merge a
-                    # head it was never asked about. Same doctrine as
-                    # _was_review_expected: never flag a bot the loop could not summon.
-                    continue
                 if self._was_review_expected(bot):
                     self.silent_dropped.add(bot)
 
