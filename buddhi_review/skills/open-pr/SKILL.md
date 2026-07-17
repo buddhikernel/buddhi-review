@@ -178,11 +178,11 @@ PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review sta
 ```
 
 If `OWNER/REPO` cannot be resolved yet (a brand-new repo with no remote), or the command
-is absent / prints nothing / unparseable output, **skip this gate** and proceed to Step 2
+is absent / prints nothing / unparseable output, **skip this gate** and proceed to Step 1.5
 — it is best-effort and must NEVER block the flow. Otherwise parse the single JSON object
 (`{"repo_confirmed": …, "has_global_default": …}`) and act on `repo_confirmed`:
 
-- **`true`** — proceed silently to Step 2.
+- **`true`** — proceed silently to Step 1.5.
 - **`false`** — ask with **AskUserQuestion** (a sanctioned gate; ask ONCE). **Do NOT
   configure reviewers in this session — every piece of deterministic setup (reviewer
   selection, auto-on-open, auto-merge, label-gated CI, GitHub-side provisioning) runs in
@@ -203,7 +203,7 @@ is absent / prints nothing / unparseable output, **skip this gate** and proceed 
        it returns, reply exactly: ``Setup opened in a new window — finish it there, then
        re-run /open-pr.`` and **EXIT**.
     2. **Use global defaults** *(offer only when `has_global_default` is `true`)* —
-       continue to Step 2 without writing a per-repo entry; the loop runs with your global
+       continue to Step 1.5 without writing a per-repo entry; the loop runs with your global
        default fleet. When `has_global_default` is `false`, omit this option entirely —
        there is no fallback fleet and the loop will refuse to launch; option 1 is the only
        path.

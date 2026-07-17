@@ -251,6 +251,22 @@ def test_session_registry_auto_selects_the_worked_in_worktree(tmp_path):
     assert report["caller_match"] == f"wt:{wtb}"    # the resolved auto-target
 
 
+def test_session_registry_matches_from_a_subdirectory_of_the_checkout(tmp_path):
+    """The git-guardrail hook records whatever directory ``git -C`` was invoked
+    against, which may be BELOW the worktree root — normalize before matching."""
+    repo = _init_repo(tmp_path / "repo")
+    _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a")
+    wtb = _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
+    sub = wtb / "pkg" / "deep"
+    sub.mkdir(parents=True)
+    sw.register("sess", str(sub))
+    report = _report(repo, caller_cwd=str(repo), session_id="sess")
+    present = report["present"]
+    assert present["mode"] == "caller"
+    assert present["auto_target"] == f"wt:{wtb}"
+    assert report["session_match"] == f"wt:{wtb}"
+
+
 def test_caller_cwd_wins_over_the_session_registry(tmp_path):
     """Both resolve → the LIVE cwd is authoritative; the registry is only a fallback."""
     repo = _init_repo(tmp_path / "repo")
@@ -502,6 +518,28 @@ def test_unreadable_pr_list_raises_rather_than_reporting_no_candidates(tmp_path,
         _report(repo, command="open-pr")
     with pytest.raises(RuntimeError, match="Failed to fetch"):
         _report(repo, command="review-pr")
+
+
+def test_open_pr_with_no_origin_remote_skips_the_pr_fetch(tmp_path, monkeypatch):
+    """A brand-new local repo with no ``origin`` yet (the /open-pr new-repo case,
+    before ``open_pr._prepare_on_base`` creates the remote via `gh repo create`) has
+    no remote to have any PRs against — the fetch must be skipped rather than raised,
+    or the new-repo creation path in Step 3 is never reached. Point the PR-list seam
+    at a nonexistent file so a RuntimeError here would prove the fetch was still
+    attempted, not merely lucky."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "README.md").write_text("x")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init", when="2024-01-01T00:00:00")
+    _dirty(repo)
+    monkeypatch.setenv(wt.PRLIST_JSON_ENV, str(tmp_path / "does-not-exist.json"))
+    report = _report(repo, command="open-pr")
+    assert report["candidate_count"] == 1
+    assert report["present"]["mode"] == "single"
 
 
 def test_non_repo_cwd_raises(tmp_path):

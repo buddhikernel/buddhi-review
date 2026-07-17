@@ -304,3 +304,59 @@ def test_introspect_id_collision_free_for_same_basename_worktrees(tmp_path):
 
     by_path = {r["path"]: r["id"] for r in recs}
     assert by_path[str(wt_a)] != by_path[str(wt_b)]
+
+
+# ── detect_base ────────────────────────────────────────────────────────────────
+def _init_bare(path, initial_branch):
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q", "--bare", "-b", initial_branch)
+    return path
+
+
+def test_detect_base_asks_the_remote_when_origin_head_is_unset_and_no_local_guess_matches(tmp_path):
+    """``git remote add`` + a manual ``fetch`` (unlike ``git clone``) never sets
+    origin/HEAD locally. When the real default is neither "main" nor "master" (e.g.
+    "trunk") and no matching local branch exists either, detect_base must still
+    resolve it by asking the remote directly instead of guessing "main". The
+    "origin" here is a local bare repo (a filesystem path) so this stays
+    network-free."""
+    bare = _init_bare(tmp_path / "bare.git", "trunk")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "trunk")
+    _git(seed, "config", "user.email", "t@t.t")
+    _git(seed, "config", "user.name", "t")
+    (seed / "README.md").write_text("x")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "init")
+    _git(seed, "remote", "add", "origin", str(bare))
+    _git(seed, "push", "-q", "origin", "trunk")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "scratch")   # local branch matches neither main/master
+    _git(work, "config", "user.email", "t@t.t")
+    _git(work, "config", "user.name", "t")
+    (work / "f.txt").write_text("y")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "init2")
+    _git(work, "remote", "add", "origin", str(bare))
+    _git(work, "fetch", "-q", "origin")         # manual fetch — origin/HEAD stays unset
+
+    assert wt._run_git(str(work), "symbolic-ref", "refs/remotes/origin/HEAD") is None
+    assert wt.detect_base(str(work)) == "trunk"
+
+
+def test_detect_base_still_defaults_to_main_with_no_origin_at_all(tmp_path):
+    """The brand-new-repo case (no remote yet) must keep falling back to "main"
+    unchanged — ``git remote show origin`` fails fast on a missing remote rather
+    than hanging or raising."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "scratch")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("y")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+    assert wt.detect_base(str(repo)) == "main"

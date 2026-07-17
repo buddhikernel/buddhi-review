@@ -260,7 +260,8 @@ def _git_int(cwd, *args):
 
 
 def detect_base(cwd):
-    """Resolve the base branch NAME: origin/HEAD → a local main/master → "main"."""
+    """Resolve the base branch NAME: origin/HEAD → a local main/master → the
+    remote's OWN advertised default → "main"."""
     ref = _run_git(cwd, "symbolic-ref", "refs/remotes/origin/HEAD")
     if ref:  # e.g. refs/remotes/origin/main
         prefix = "refs/remotes/origin/"
@@ -271,6 +272,21 @@ def detect_base(cwd):
         if _run_git(cwd, "rev-parse", "--verify", "--quiet",
                     f"refs/heads/{cand}") is not None:
             return cand
+    # `git remote add` + a manual `fetch` (unlike `git clone`) never sets
+    # origin/HEAD locally, so a custom default branch (e.g. "develop"/"trunk")
+    # falls through both checks above even though the remote itself knows its
+    # real default. Ask the remote directly — `git remote show origin` fails
+    # fast (missing origin, unreachable remote) rather than hanging, so a
+    # brand-new repo with no remote yet still falls through to "main" below.
+    shown = _run_git(cwd, "remote", "show", "origin", timeout=30)
+    if shown:
+        for line in shown.splitlines():
+            line = line.strip()
+            if line.startswith("HEAD branch:"):
+                name = line[len("HEAD branch:"):].strip()
+                if name and name != "(unknown)":
+                    return name
+                break
     return "main"
 
 
@@ -549,7 +565,8 @@ def _session_match_id(candidates, session_id, base):
         return None
     if not _is_live_worktree(recorded):
         return None
-    match = _match_candidate_by_path(candidates, recorded)
+    top = _run_git(recorded, "rev-parse", "--show-toplevel") or recorded
+    match = _match_candidate_by_path(candidates, top)
     if match is None:
         return None
     if match["kind"] == "primary" and match.get("branch") == base:
@@ -741,9 +758,19 @@ def build_report(cwd, repo, command, base=None, caller_cwd=None, session_id=None
     # squash-merged ones, which stay "ahead of base" forever); review-pr needs only the
     # open set. One gh call per command either way.
     if command == "open-pr":
-        all_prs = fetch_prs(repo, "all")
-        if all_prs is None:
-            raise RuntimeError(f"Failed to fetch PRs from GitHub for {repo}")
+        # No `origin` remote at all means this repo has never been pushed — the
+        # canonical brand-new-repo case ``open_pr._prepare_on_base`` handles via
+        # `gh repo create`. There is no remote to have any PRs against yet, so treat
+        # the list as empty instead of shelling out to `gh pr list` for a repo that
+        # (from THIS checkout's perspective) doesn't have a known remote home — an
+        # unconditional fetch here would otherwise raise and block the new-repo
+        # creation path before the actuator ever runs.
+        if _run_git(cwd, "remote", "get-url", "origin") is None:
+            all_prs = []
+        else:
+            all_prs = fetch_prs(repo, "all")
+            if all_prs is None:
+                raise RuntimeError(f"Failed to fetch PRs from GitHub for {repo}")
         open_list = [p for p in all_prs
                      if isinstance(p, dict)
                      and str(p.get("state", "OPEN")).upper() == "OPEN"]
