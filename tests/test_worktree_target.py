@@ -36,6 +36,18 @@ def _add_worktree(repo, branch, wtpath):
     return wtpath
 
 
+def _unset_origin_head(repo):
+    """Force ``refs/remotes/origin/HEAD`` absent, tolerating "already absent".
+
+    A ``git remote add`` + a manual ``fetch`` historically left origin/HEAD unset,
+    but newer git auto-populates it on fetch — so a test that needs the unset
+    precondition (to exercise ``detect_base``'s ask-the-remote path) must clear it
+    explicitly rather than rely on fetch leaving it alone. ``set-head -d`` exits
+    non-zero when the ref is already absent; that is expected and ignored here."""
+    subprocess.run(["git", "-C", str(repo), "remote", "set-head", "origin", "-d"],
+                   capture_output=True, text=True)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("BUDDHI_SESSION_WORKTREES_PATH",
@@ -492,7 +504,8 @@ def test_detect_base_asks_the_remote_when_origin_head_is_unset_and_no_local_gues
     _git(work, "add", "-A")
     _git(work, "commit", "-q", "-m", "init2")
     _git(work, "remote", "add", "origin", str(bare))
-    _git(work, "fetch", "-q", "origin")         # manual fetch — origin/HEAD stays unset
+    _git(work, "fetch", "-q", "origin")
+    _unset_origin_head(work)                    # newer git sets origin/HEAD on fetch; force it unset
 
     assert wt._run_git(str(work), "symbolic-ref", "refs/remotes/origin/HEAD") is None
     assert wt.detect_base(str(work)) == "trunk"
@@ -540,7 +553,8 @@ def test_detect_base_prefers_remote_default_over_a_same_named_local_branch(tmp_p
     _git(work, "add", "-A")
     _git(work, "commit", "-q", "-m", "init2")
     _git(work, "remote", "add", "origin", str(bare))
-    _git(work, "fetch", "-q", "origin")      # manual fetch — origin/HEAD stays unset
+    _git(work, "fetch", "-q", "origin")
+    _unset_origin_head(work)                 # newer git sets origin/HEAD on fetch; force it unset
 
     assert wt._run_git(str(work), "symbolic-ref", "refs/remotes/origin/HEAD") is None
     assert wt.detect_base(str(work)) == "trunk"
