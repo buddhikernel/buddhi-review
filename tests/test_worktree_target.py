@@ -309,6 +309,22 @@ def test_git_int_still_returns_zero_for_genuine_zero_count(tmp_path):
     assert wt._git_int(str(repo), "rev-list", "--count", "HEAD..HEAD") == 0
 
 
+def test_dirty_paths_raises_rather_than_reporting_clean_on_status_failure(tmp_path):
+    """A corrupt/unreadable index makes ``git status`` fail while commit-reading
+    commands (``rev-list``/``log``) still succeed. ``_dirty_paths`` must raise
+    rather than return ``[]`` — the same shape as a genuinely clean tree — or a
+    base checkout with real local work would silently drop out of ``present``."""
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".git" / "index").write_text("corrupt")
+    with pytest.raises(RuntimeError):
+        wt._dirty_paths(str(repo))
+
+
+def test_dirty_paths_returns_empty_for_a_genuinely_clean_tree(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    assert wt._dirty_paths(str(repo)) == []
+
+
 # ── introspect — collision-free candidate ids ─────────────────────────────────
 def test_introspect_id_collision_free_for_same_basename_worktrees(tmp_path):
     repo = _init_repo(tmp_path / "repo", origin="https://github.com/owner/repo.git")
@@ -324,6 +340,26 @@ def test_introspect_id_collision_free_for_same_basename_worktrees(tmp_path):
 
     by_path = {r["path"]: r["id"] for r in recs}
     assert by_path[str(wt_a)] != by_path[str(wt_b)]
+
+
+def test_list_worktrees_excludes_a_prunable_entry(tmp_path):
+    """A linked worktree whose directory was deleted without ``git worktree
+    remove`` shows up in ``--porcelain`` as a ``prunable`` entry with a path
+    that no longer exists on disk. Introspecting such a path would raise
+    (git commands fail against a missing cwd), so it must be dropped here
+    rather than handed to the caller — one stale checkout must not block
+    enumeration of every other, live candidate."""
+    repo = _init_repo(tmp_path / "repo")
+    stale = _add_worktree(repo, "feat/stale", tmp_path / "stale")
+    import shutil
+    shutil.rmtree(str(stale))
+
+    entries = wt.list_worktrees(str(repo))
+
+    assert [e["path"] for e in entries] == [str(repo)]
+    # introspecting every surviving entry must not raise for the missing path
+    for i, e in enumerate(entries):
+        wt.introspect(e, None, {}, is_primary=(i == 0))
 
 
 # ── detect_base ────────────────────────────────────────────────────────────────

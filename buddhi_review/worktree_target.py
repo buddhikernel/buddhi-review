@@ -264,7 +264,8 @@ def _git_int(cwd, *args):
     try:
         return int(val) if val else 0
     except ValueError:
-        return 0
+        raise RuntimeError(
+            f"git {' '.join(args)} for {cwd} printed non-integer output: {val!r}")
 
 
 def detect_base(cwd):
@@ -318,6 +319,13 @@ def list_worktrees(cwd):
     Each entry: ``{path, head, branch (or ''), detached (bool), bare (bool)}``. The
     FIRST entry is always the primary working tree (git's contract).
 
+    A worktree whose linked directory was deleted without ``git worktree remove``
+    carries a ``prunable <reason>`` line instead of a normal checkout — its path no
+    longer exists on disk, so introspecting it (``git status``/``rev-list`` etc.
+    against a missing cwd) would fail. Such entries are dropped here rather than
+    handed to the caller, so one stale checkout can't take down enumeration of
+    every other, live candidate.
+
     Raises RuntimeError when the command fails — same fail-loud contract as
     :func:`fetch_prs`/:func:`build_report`: a silently-empty worktree list would
     read as "no candidates" and hide every checkout from the operator instead of
@@ -328,10 +336,11 @@ def list_worktrees(cwd):
     entries, cur = [], None
     for line in out.splitlines():
         if line.startswith("worktree "):
-            if cur is not None:
+            if cur is not None and not cur["prunable"]:
                 entries.append(cur)
             cur = {"path": line[len("worktree "):], "head": "",
-                   "branch": "", "detached": False, "bare": False}
+                   "branch": "", "detached": False, "bare": False,
+                   "prunable": False}
         elif cur is None:
             continue
         elif line.startswith("HEAD "):
@@ -344,8 +353,12 @@ def list_worktrees(cwd):
             cur["detached"] = True
         elif line.strip() == "bare":
             cur["bare"] = True
-    if cur is not None:
+        elif line.startswith("prunable") or line.strip() == "prunable":
+            cur["prunable"] = True
+    if cur is not None and not cur["prunable"]:
         entries.append(cur)
+    for entry in entries:
+        del entry["prunable"]
     return entries
 
 
@@ -407,10 +420,16 @@ def _dirty_paths(cwd):
     """Changed paths via NUL-delimited porcelain. The ``-z`` form NEVER quotes paths,
     so spaces / non-ASCII / control chars survive intact (the default porcelain
     C-quotes them, which then fail to stat and degrade the activity ranking). ``[]``
-    on a clean tree OR a status failure."""
-    rc, out, _ = _run(["git", "-C", cwd, "status", "--porcelain", "-z"])
+    on a genuinely clean tree (empty stdout, rc 0).
+
+    Raises RuntimeError when the command itself fails (e.g. a corrupt or unreadable
+    index) — same fail-loud contract as :func:`_git_int`: a corrupt index can fail
+    ``git status`` while commit-reading commands like ``rev-list``/``log`` still
+    succeed, so silently returning ``[]`` here would make a dirty checkout with
+    real local work read as clean and drop it from ``present`` entirely."""
+    rc, out, err = _run(["git", "-C", cwd, "status", "--porcelain", "-z"])
     if rc != 0:
-        return []
+        raise RuntimeError(f"git status failed for {cwd}: {err.strip()}")
     fields = out.split("\0")
     paths, i = [], 0
     while i < len(fields):
