@@ -1900,8 +1900,8 @@ class RoundDriver:
         * **polish-only** — restored from the persisted per-PR state, and ONLY when
           the PR's live HEAD still equals the tip that state was stamped against
           (see :mod:`buddhi_review.polish_state`).
-        * **already-responded** — the preflight snapshot (run only when
-          ``max_rounds >= 2``) folds the comments already on the PR, so a responder is
+        * **already-responded** — the preflight snapshot folds the comments already on
+          the PR, so a responder is
           neither re-summoned nor polled in round 1; its pre-existing comments are
           processed as its round-1 verdict instead. After that NOTHING is special: the
           existing ``expected_bots()`` + end-of-round rules decide round 2 — a
@@ -1916,18 +1916,18 @@ class RoundDriver:
         approved = self._rederive_prior_approvals()
         restored = self._restore_polish_state()
         deferred: Set[str] = set()
-        # The DEFERRAL needs a SECOND round to be safe: with max_rounds == 1 a
-        # substantive round 1 falls straight through to the clean exit, so a responder
-        # deferred out of round 1 would never be asked about the code that round's fixes
-        # produced. So run the snapshot — which is what defers responders out of round
-        # 1's summon and poll — ONLY when there is a round 2 for the existing
-        # end-of-round rules to re-request them in. At max_rounds == 1 round 1 summons
-        # and polls the whole fleet, and the pre-existing comments are read in that
-        # round's poll instead. After the snapshot NOTHING is special: expected_bots()
-        # and the round-end re-request rules decide round 2 — a substantive comment gets
-        # its bot re-requested (it is in none of the exclusion sets), a cosmetic one
-        # lands in self.polishing and is left alone, an approval is done. No summon debt.
-        if self.preflight and self.max_rounds >= 2:
+        # Run the restart snapshot at EVERY max_rounds — it is what defers a
+        # verdict-in-hand bot out of round 1's summon and poll. The restart principle
+        # ("round 1 summons only active bots whose verdict is not in hand") carries no
+        # round-budget condition: at max_rounds == 1, summoning a deferred bot would
+        # only re-review the OLD head anyway (round 1 is the last round), so deferring
+        # is strictly more efficient with no safety change, and the reconstruction runs
+        # unconditionally on the restart path. After the snapshot NOTHING is
+        # special: expected_bots() and the round-end rules decide any further round — a
+        # substantive comment re-requests its bot (it is in none of the exclusion sets),
+        # a cosmetic one lands in self.polishing and is left alone, an approval is done.
+        # No summon debt.
+        if self.preflight:
             self._preflight_snapshot(restart=True)
             deferred = set(self._preflight_responders)
             # A HARD CAUSE always wins over a re-derived verdict. The snapshot reads
@@ -2135,7 +2135,7 @@ class RoundDriver:
         round 1 neither re-summons nor waits on a reviewer that already spoke.
 
         Runs on a default launch AND on the ``--rr-active`` RESTART path (through
-        ``_rr_active_restore``, when ``max_rounds >= 2``) — there its responders are
+        ``_rr_active_restore``, at every ``max_rounds``) — there its responders are
         deferred out of round 1's summon and poll, but never out of the RUN: their
         pre-existing comments are processed as their round-1 verdict, and the existing
         end-of-round re-request rules then decide round 2 (a substantive finding →

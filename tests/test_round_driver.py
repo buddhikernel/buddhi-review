@@ -1936,28 +1936,27 @@ def test_rr_active_preflight_deferred_bot_resummoned_in_round2():
     assert "claude" not in driver.done                  # a finding-poster is never folded
 
 
-def test_rr_active_snapshot_disabled_at_max_rounds_1():
-    # With a single round there is no round 2 for the end-of-round rules to re-request a
-    # deferred bot in, so the DEFERRAL's justification does not hold — the snapshot does
-    # not run and round 1 summons and polls the fleet as today. A reviewer's pre-existing
-    # quota comment is then read in round 1's poll and excludes it there instead.
-    timeline = [
-        (0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
-                    path="x.py", diff_hunk="@@ -1 +1 @@")),
-        (0, Comment(id="q", text="Rate limit exceeded for this model.",
-                    source="copilot[bot]", from_issue_channel=True)),
-    ]
-    cfg = {"active_reviewers": ["claude", "copilot"],
-           "auto_on_open": {"claude": False, "copilot": True}}
+def test_rr_active_defers_verdict_in_hand_bot_at_max_rounds_1():
+    # Cross-repo parity (G1): the restart principle "round 1 summons only active bots
+    # whose verdict is NOT in hand" carries no round-budget condition. A bot with an unresolved
+    # comment already on the PR has a verdict in hand, so at max_rounds == 1 it is
+    # deferred — NOT summoned, no re-request fired — and its comment is processed via the
+    # restart snapshot, IDENTICAL to the max_rounds >= 2 case. (Summoning here would only
+    # re-review the OLD head anyway, so deferring is strictly more efficient, no safety
+    # change.)
+    times = RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
+                       idle_timeout=900, max_wait_total=1800, register_delay=60)
+    timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                            path="x.py", diff_hunk="@@ -1 +1 @@"))]
     driver, clock, gh = make_driver(
-        timeline, cfg=cfg, classify=label_runner("COSMETIC"),
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
         fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
-        max_rounds=1, answer_waiter=lambda esc, **k: {})
+        max_rounds=1, times=times, answer_waiter=lambda esc, **k: {})
     driver.run()
-    assert driver._preflight_seen == set()            # the snapshot did NOT run …
-    assert driver._preflight_responders == set()      # … so nothing is deferred
-    assert gh.matching("@claude review")              # the fleet is summoned …
-    assert driver.store.is_excluded("copilot")        # … and the quota bot is excluded (via poll)
+    assert "claude" in driver._preflight_responders   # the snapshot ran and deferred it …
+    assert gh.matching("@claude review") == []        # … so NO summon / re-request fired
+    assert gh.matching("requested_reviewers") == []
+    assert "a" in driver.processed_ids                # its comment was processed via preflight
 
 
 def test_rr_active_run_start_fleet_still_full_after_restores(tmp_path, monkeypatch):
