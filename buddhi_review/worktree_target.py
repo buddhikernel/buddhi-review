@@ -251,8 +251,16 @@ def _run(argv, cwd=None, timeout=90):
 
 
 def _git_int(cwd, *args):
-    """A git command expected to print a single integer; 0 on any failure."""
+    """A git command expected to print a single integer. Raises RuntimeError when
+    the command itself fails or times out — ``_run_git`` returns ``None`` for
+    both — rather than coercing that into a count of 0: ``_candidates_create``
+    keys candidacy on ``ahead > 0``, so a silent 0 here would hide an actionable
+    checkout from the operator, exactly the failure mode this module's ``list``
+    verb otherwise fails loudly on (see the module docstring). A genuine empty
+    stdout on success is still 0."""
     val = _run_git(cwd, *args)
+    if val is None:
+        raise RuntimeError(f"git {' '.join(args)} failed for {cwd}")
     try:
         return int(val) if val else 0
     except ValueError:
@@ -260,24 +268,22 @@ def _git_int(cwd, *args):
 
 
 def detect_base(cwd):
-    """Resolve the base branch NAME: origin/HEAD → a local main/master → the
-    remote's OWN advertised default → "main"."""
+    """Resolve the base branch NAME: origin/HEAD → the remote's OWN advertised
+    default → a local main/master → "main"."""
     ref = _run_git(cwd, "symbolic-ref", "refs/remotes/origin/HEAD")
     if ref:  # e.g. refs/remotes/origin/main
         prefix = "refs/remotes/origin/"
         if ref.startswith(prefix):
             return ref[len(prefix):]
         return ref.rsplit("/", 1)[-1]
-    for cand in ("main", "master"):
-        if _run_git(cwd, "rev-parse", "--verify", "--quiet",
-                    f"refs/heads/{cand}") is not None:
-            return cand
     # `git remote add` + a manual `fetch` (unlike `git clone`) never sets
     # origin/HEAD locally, so a custom default branch (e.g. "develop"/"trunk")
-    # falls through both checks above even though the remote itself knows its
-    # real default. Ask the remote directly — `git remote show origin` fails
-    # fast (missing origin, unreachable remote) rather than hanging, so a
-    # brand-new repo with no remote yet still falls through to "main" below.
+    # would otherwise be masked by an identically-named local main/master guess
+    # below (a manually configured checkout can have BOTH a local "main" and a
+    # remote whose real default is "trunk"). Ask the remote directly, first —
+    # `git remote show origin` fails fast (missing origin, unreachable remote)
+    # rather than hanging, so a brand-new repo with no remote yet still falls
+    # through to the local-branch and "main" fallbacks below.
     shown = _run_git(cwd, "remote", "show", "origin", timeout=30)
     if shown:
         for line in shown.splitlines():
@@ -287,6 +293,10 @@ def detect_base(cwd):
                 if name and name != "(unknown)":
                     return name
                 break
+    for cand in ("main", "master"):
+        if _run_git(cwd, "rev-parse", "--verify", "--quiet",
+                    f"refs/heads/{cand}") is not None:
+            return cand
     return "main"
 
 

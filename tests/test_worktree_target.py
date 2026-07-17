@@ -289,6 +289,26 @@ def test_build_report_same_repo_pr_still_attaches_to_local_branch(
     assert pr_cand["path"] == str(worktree)
 
 
+# ── _git_int — fail loud instead of masking a failure as 0 ─────────────────────
+def test_git_int_raises_instead_of_returning_zero_on_git_failure(tmp_path):
+    """A failing git invocation (here: a bogus revision range) makes ``_run_git``
+    return None. ``_git_int`` must raise rather than coerce that into a count of
+    0 — ``_candidates_create`` keys candidacy on ``ahead > 0``, so a silent 0
+    here would hide an actionable checkout, same as a genuine timeout would."""
+    repo = _init_repo(tmp_path / "repo")
+    assert wt._run_git(str(repo), "rev-list", "--count",
+                       "not-a-real-ref..HEAD") is None
+    with pytest.raises(RuntimeError):
+        wt._git_int(str(repo), "rev-list", "--count", "not-a-real-ref..HEAD")
+
+
+def test_git_int_still_returns_zero_for_genuine_zero_count(tmp_path):
+    """A real ``rev-list --count`` of an empty range (base == HEAD) is a
+    genuine 0, not a failure — must not raise."""
+    repo = _init_repo(tmp_path / "repo")
+    assert wt._git_int(str(repo), "rev-list", "--count", "HEAD..HEAD") == 0
+
+
 # ── introspect — collision-free candidate ids ─────────────────────────────────
 def test_introspect_id_collision_free_for_same_basename_worktrees(tmp_path):
     repo = _init_repo(tmp_path / "repo", origin="https://github.com/owner/repo.git")
@@ -360,3 +380,36 @@ def test_detect_base_still_defaults_to_main_with_no_origin_at_all(tmp_path):
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "init")
     assert wt.detect_base(str(repo)) == "main"
+
+
+def test_detect_base_prefers_remote_default_over_a_same_named_local_branch(tmp_path):
+    """A manually configured checkout (``remote add`` + ``fetch``, so
+    origin/HEAD is unset) can have BOTH a local "main" branch AND a remote
+    whose real default is a custom branch like "trunk". detect_base must ask
+    the remote before accepting the local "main" guess, or every worktree of
+    the actual "trunk" base gets diffed against the wrong branch."""
+    bare = _init_bare(tmp_path / "bare.git", "trunk")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "trunk")
+    _git(seed, "config", "user.email", "t@t.t")
+    _git(seed, "config", "user.name", "t")
+    (seed / "README.md").write_text("x")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "init")
+    _git(seed, "remote", "add", "origin", str(bare))
+    _git(seed, "push", "-q", "origin", "trunk")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "main")   # a LOCAL "main" that is not the base
+    _git(work, "config", "user.email", "t@t.t")
+    _git(work, "config", "user.name", "t")
+    (work / "f.txt").write_text("y")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "init2")
+    _git(work, "remote", "add", "origin", str(bare))
+    _git(work, "fetch", "-q", "origin")      # manual fetch — origin/HEAD stays unset
+
+    assert wt._run_git(str(work), "symbolic-ref", "refs/remotes/origin/HEAD") is None
+    assert wt.detect_base(str(work)) == "trunk"

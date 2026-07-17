@@ -205,20 +205,31 @@ defaults. If you cannot prompt, proceed to Step 2 with defaults.
 
 ### 2. Select which PR to review
 
-If a PR number was given explicitly, use it directly — set `PR_NUMBER`, then resolve
-`TARGET_CWD` through the session→worktree registry rather than assuming `<CWD>`: when the
-work was done in a NEW worktree off `main` (the standing rule), `$PWD` can still point at the
-spawn checkout while the PR is actually checked out elsewhere, and the registry (populated by
-the git-guardrail hook on `git worktree add` / `git -C <worktree>`) knows where.
+If a PR number was given explicitly, use it directly — set `PR_NUMBER`. Prefer `<CWD>` when it
+is ALREADY checked out on that PR's own branch — consulting the registry in that case could
+override a correct checkout with a stale worktree the git-guardrail hook recorded earlier in
+the session. Only when `<CWD>` is NOT on the PR's branch, resolve `TARGET_CWD` through the
+session→worktree registry rather than assuming `<CWD>`: when the work was done in a NEW
+worktree off `main` (the standing rule), `$PWD` can still point at the spawn checkout while the
+PR is actually checked out elsewhere, and the registry (populated by the git-guardrail hook on
+`git worktree add` / `git -C <worktree>`) knows where.
 
 ```bash
-TARGET_CWD=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
-  --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD")
+PR_HEAD_BRANCH=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" --json headRefName -q .headRefName)
+if [ -n "$PR_HEAD_BRANCH" ] && [ "$(git -C "$CWD" branch --show-current)" = "$PR_HEAD_BRANCH" ]; then
+  TARGET_CWD="$CWD"
+else
+  TARGET_CWD=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
+    --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD")
+  : "${TARGET_CWD:=$CWD}"
+fi
 ```
 
-This never raises and always prints a usable path — `<CWD>` unchanged when nothing better is
-recorded, else the session's own worktree. Then skip to the **checked-out check** at the end
-of this step (it runs on EVERY path, including this one).
+The resolver itself never raises and always prints a usable path — `<CWD>` unchanged when
+nothing better is recorded, else the session's own worktree; the `:` fallback above additionally
+covers the invocation failing outright (e.g. a missing `python3`) and printing nothing at all.
+Then skip to the **checked-out check** at the end of this step (it runs on EVERY path, including
+this one).
 
 Otherwise enumerate the open PRs (each annotated with the worktree it is checked out in) —
 never silently pick the first one:
