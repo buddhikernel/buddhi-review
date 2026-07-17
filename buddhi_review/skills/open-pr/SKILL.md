@@ -44,9 +44,10 @@ to land (merge) on the base branch.
 - **Only sanctioned interactive gates, otherwise silent.** The ONLY questions you
   may ask are the **first-run onboarding** prompt (Step 0, only when this machine has
   no config), the **per-repo reviewer confirmation** prompt (Step 1.1, only when this
-  repo's reviewers are unconfirmed), and the **pre-launch rebase** prompt (Step 2,
-  only when the engine reports a non-clean rebase status). Everything else runs
-  silently.
+  repo's reviewers are unconfirmed), the **target-selection** prompt (Step 1.5), and
+  the **pre-launch rebase** prompt (Step 2) — and the last two ONLY when the engine
+  reports an ask is needed (`present.ask == true`, or a non-clean rebase status).
+  Everything else runs silently.
 - **NEVER pause for confirmation** between any OTHER steps. Run them back-to-back.
   Never ask the user what to do on error — log it and stop.
 - **Reviewers trigger based on the fleet confirmed for THIS repo** (per-repo, because
@@ -142,37 +143,8 @@ Resolve `OWNER/REPO` and `CWD` in this order:
    OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null)
    ```
 
-**Auto-target the worktree this session worked in.** When the work was done in a NEW
-worktree off `main` (the standing rule), the session's `$PWD` can still point at the
-spawn checkout while the real work sits in a `git -C <worktree>` elsewhere. Consult the
-resolver — it returns the session's recorded worktree only when that worktree is a live
-checkout of the target repo and differs from `$PWD`, else it echoes `$CWD` unchanged:
-
-```bash
-# $CLAUDE_CODE_SESSION_ID is a real Claude Code env var (a plain UUID, no prefix),
-# exported into every Bash tool call. The git-guardrail PreToolUse hook receives the
-# same value as the `session_id` field in its stdin JSON payload, so the key it
-# registers and the key looked up here are byte-identical.
-# The PYTHONPATH prefix on this and every other `python3 -m buddhi_review` call below
-# makes a plugin-only install (package installed by SessionStart into
-# ${CLAUDE_PLUGIN_DATA}/site, never on the default import path) resolve. `${CLAUDE_PLUGIN_DATA}`
-# here is a literal Claude Code placeholder substituted into skill content at load time — NOT
-# a Bash-tool environment variable (plugin env vars are exported only to hook/MCP/LSP
-# subprocesses, not to skill-authored Bash calls) — so this resolves for a plugin install.
-# For a pip install the placeholder is left literal, Bash expands the unset var to "", and
-# PYTHONPATH just gets a harmless "/site:" prefix ahead of the package that's already importable.
-RESOLVED=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
-  --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD" 2>/dev/null)
-if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CWD" ]; then
-  TARGET_CWD="$RESOLVED"
-  echo "Auto-selected this session's worktree: $TARGET_CWD"
-else
-  TARGET_CWD="$CWD"
-fi
-```
-
-This is silent (no ask) — it only prefers the session's own worktree over a stale
-`$PWD`. Use `TARGET_CWD` as the working directory for **every** subsequent step.
+Step 1.5 picks the checkout to work in (`TARGET_CWD`) — use it as the working directory
+for **every** subsequent step.
 
 > **Carry the resolved values forward yourself.** Each Bash call runs in its OWN shell, so
 > `TARGET_CWD` / `OWNER_REPO` / `BASE_BRANCH` do NOT survive from one step's code block to
@@ -206,11 +178,11 @@ PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review sta
 ```
 
 If `OWNER/REPO` cannot be resolved yet (a brand-new repo with no remote), or the command
-is absent / prints nothing / unparseable output, **skip this gate** and proceed to Step 2
+is absent / prints nothing / unparseable output, **skip this gate** and proceed to Step 1.5
 — it is best-effort and must NEVER block the flow. Otherwise parse the single JSON object
 (`{"repo_confirmed": …, "has_global_default": …}`) and act on `repo_confirmed`:
 
-- **`true`** — proceed silently to Step 2.
+- **`true`** — proceed silently to Step 1.5.
 - **`false`** — ask with **AskUserQuestion** (a sanctioned gate; ask ONCE). **Do NOT
   configure reviewers in this session — every piece of deterministic setup (reviewer
   selection, auto-on-open, auto-merge, label-gated CI, GitHub-side provisioning) runs in
@@ -231,14 +203,72 @@ is absent / prints nothing / unparseable output, **skip this gate** and proceed 
        it returns, reply exactly: ``Setup opened in a new window — finish it there, then
        re-run /open-pr.`` and **EXIT**.
     2. **Use global defaults** *(offer only when `has_global_default` is `true`)* —
-       continue to Step 2 without writing a per-repo entry; the loop runs with your global
+       continue to Step 1.5 without writing a per-repo entry; the loop runs with your global
        default fleet. When `has_global_default` is `false`, omit this option entirely —
        there is no fallback fleet and the loop will refuse to launch; option 1 is the only
        path.
 
 This gate is interactive-only and **never configures reviewers itself** — it only offers
 to launch the terminal wizard (the single deterministic setup brain) or falls back to
-global defaults. If you cannot prompt, proceed to Step 2 with defaults.
+global defaults. If you cannot prompt, proceed to Step 1.5 with defaults.
+
+### 1.5 Select which checkout to open the PR from
+
+A repo often has several git worktrees (work commonly lives in one under
+`.claude/worktrees/`, NOT the primary checkout). Never assume the primary `CWD` and never
+silently act on all of them — enumerate the *actionable* candidates:
+
+```bash
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target list \
+  --cwd "$CWD" --repo "$OWNER_REPO" --command open-pr \
+  --caller-cwd "$PWD" --session-id "$CLAUDE_CODE_SESSION_ID"
+```
+
+Pass `--caller-cwd "$PWD"` AND `--session-id "$CLAUDE_CODE_SESSION_ID"` **verbatim** (the
+shell expands both). `--caller-cwd` lets the engine recognise that one of the candidates
+IS this session's own checkout and auto-select it instead of asking a question whose
+answer is obvious. `--session-id` covers the case `--caller-cwd` cannot: when you did
+your work in a NEW worktree off `main` (the standing rule) your shell `$PWD` stays at the
+spawn checkout, so it does NOT name the worktree you worked in — but the git-guardrail
+hook recorded `session_id → that worktree` automatically when you ran `git worktree add`
+/ `git -C <worktree>`, so the engine resolves and auto-selects it. (`$CLAUDE_CODE_SESSION_ID`
+is a real Claude Code env var — a plain UUID, no prefix — exported into every Bash tool
+call; the hook receives the same value as the `session_id` field in its stdin JSON
+payload, so the key it registers and the key looked up here are byte-identical.)
+
+Parse the single JSON object on stdout and act on `present.mode`:
+
+- **`none`** — no actionable work anywhere. Print `No changes to commit in <repo>. Nothing
+  to do.` and **EXIT**. No PR is created.
+- **`single`** — exactly one candidate. Set `TARGET_CWD` to that candidate's `path` (the
+  entry in `candidates` whose `id == present.auto_target`). Do **not** ask. Continue.
+- **`caller`** — several candidates exist, but exactly one is this session's own checkout
+  — either the checkout `$PWD` is in (`caller_match`) or, when `$PWD` is elsewhere, the
+  worktree this session worked in, resolved from the session→worktree registry
+  (`session_match`). Set `TARGET_CWD` to that candidate's `path` (the entry whose
+  `id == present.auto_target`), print ONE line — `Auto-selected this session's worktree:
+  <path>` — and do **not** ask. Continue. (The engine already withholds this mode when the
+  session sits in the primary checkout on the base branch while worktrees also have work —
+  that case arrives as `two` / `many` below and IS asked.)
+- **`two`** / **`many`** — ask with **AskUserQuestion** (a sanctioned gate):
+  - Question: *"Which checkout should I open the PR from?"*
+  - Options: render each `present.options[]` (its `label` as the option, its `detail` as
+    the description). `value == "all"` is the "run on every candidate" choice. In `many`
+    mode `present.free_input` is `true` — the built-in **"Other"** is the 4th option; tell
+    the user they may type another branch / worktree name.
+  - Map the answer to `TARGET_CWD`:
+    - a candidate `value` → that candidate's `path`.
+    - `"all"` → run Steps 2–3 **once per candidate** (loop over every `candidates[].path`).
+      In EACH iteration re-bind `TARGET_CWD` to that candidate's `path` and re-derive
+      `BASE_BRANCH` (Step 2) for it, so the rebase gate and the actuator act on that
+      candidate — never carry the first candidate's `TARGET_CWD` / `BASE_BRANCH` into a
+      later iteration.
+    - free-text (Other) → match it against the **full** `candidates` array (by branch
+      substring or worktree directory name); if nothing matches, re-ask.
+
+Use `TARGET_CWD` as the working directory for **every** subsequent step. If the command
+fails (a non-zero exit with `{"status": "error", …}`), log its `detail` and STOP — a
+candidate set that could not be read must never be treated as "nothing to do".
 
 ### 2. Pre-launch rebase gate
 

@@ -36,6 +36,18 @@ def _add_worktree(repo, branch, wtpath):
     return wtpath
 
 
+def _unset_origin_head(repo):
+    """Force ``refs/remotes/origin/HEAD`` absent, tolerating "already absent".
+
+    A ``git remote add`` + a manual ``fetch`` historically left origin/HEAD unset,
+    but newer git auto-populates it on fetch — so a test that needs the unset
+    precondition (to exercise ``detect_base``'s ask-the-remote path) must clear it
+    explicitly rather than rely on fetch leaving it alone. ``set-head -d`` exits
+    non-zero when the ref is already absent; that is expected and ignored here."""
+    subprocess.run(["git", "-C", str(repo), "remote", "set-head", "origin", "-d"],
+                   capture_output=True, text=True)
+
+
 @pytest.fixture(autouse=True)
 def _isolate_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("BUDDHI_SESSION_WORKTREES_PATH",
@@ -200,3 +212,349 @@ def test_cli_prints_cwd_when_nothing_to_switch_to(tmp_path, capsys):
                   "--repo", "owner/repo", "--cwd", str(repo)])
     assert rc == 0
     assert capsys.readouterr().out.strip() == str(repo)
+
+
+# ── _pr_head_is_local — the fork-branch-collision guard ──────────────────────
+def test_pr_head_is_local_true_for_same_repo_or_missing_field():
+    assert wt._pr_head_is_local({"headRefName": "main"}, "owner/repo") is True
+    assert wt._pr_head_is_local({"isCrossRepository": False}, "owner/repo") is True
+
+
+def test_pr_head_is_local_false_for_fork_true_for_cross_pr_from_same_owner_repo():
+    fork_pr = {
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    assert wt._pr_head_is_local(fork_pr, "owner/repo") is False
+    same_repo_cross_pr = {
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "owner"},
+        "headRepository": {"name": "repo"},
+    }
+    assert wt._pr_head_is_local(same_repo_cross_pr, "owner/repo") is True
+
+
+def test_pr_head_is_local_false_when_repo_fields_missing_on_cross_repo_pr():
+    assert wt._pr_head_is_local({"isCrossRepository": True}, "owner/repo") is False
+
+
+# ── build_report — a fork PR must never attach by branch name alone ──────────
+def _write_prlist(tmp_path, prs, name="prlist.json"):
+    import json
+    p = tmp_path / name
+    p.write_text(json.dumps(prs))
+    return str(p)
+
+
+def test_build_report_fork_pr_does_not_attach_to_colliding_local_branch(
+        tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path / "repo", origin="https://github.com/owner/repo.git")
+    worktree = _add_worktree(repo, "shared-name", tmp_path / "wt-shared")
+    (worktree / "f.txt").write_text("x")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "work")
+
+    # An OPEN fork PR whose head branch happens to be named identically to the
+    # local worktree's branch — but it lives in a completely different repo.
+    fork_pr = {
+        "number": 99, "headRefName": "shared-name", "url": "https://x",
+        "title": "unrelated fork PR", "updatedAt": "2024-01-01T00:00:00Z",
+        "state": "OPEN", "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    monkeypatch.setenv(wt.PRLIST_JSON_ENV, _write_prlist(tmp_path, [fork_pr]))
+
+    open_pr_report = wt.build_report(str(repo), "owner/repo", "open-pr")
+    by_path = {c["path"]: c for c in open_pr_report["candidates"]}
+    # The fork PR must not hide the local branch's actionable work behind a
+    # phantom open_pr match.
+    assert str(worktree) in by_path
+    assert by_path[str(worktree)]["open_pr"] is None
+
+    review_report = wt.build_report(str(repo), "owner/repo", "review-pr")
+    pr_cand = next(c for c in review_report["candidates"] if c["id"] == "pr:99")
+    # The fork PR shows up as a review candidate but is NOT attached to the local
+    # worktree — it must read as not-checked-out-anywhere, not as that worktree.
+    assert pr_cand["kind"] == "pr-only"
+    assert pr_cand["path"] != str(worktree)
+
+
+def test_build_report_same_repo_pr_still_attaches_to_local_branch(
+        tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path / "repo", origin="https://github.com/owner/repo.git")
+    worktree = _add_worktree(repo, "feat/x", tmp_path / "wt-x")
+    (worktree / "f.txt").write_text("x")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "work")
+
+    same_repo_pr = {
+        "number": 7, "headRefName": "feat/x", "url": "https://x",
+        "title": "same-repo PR", "updatedAt": "2024-01-01T00:00:00Z",
+        "state": "OPEN", "isCrossRepository": False,
+    }
+    monkeypatch.setenv(wt.PRLIST_JSON_ENV, _write_prlist(tmp_path, [same_repo_pr]))
+
+    review_report = wt.build_report(str(repo), "owner/repo", "review-pr")
+    pr_cand = next(c for c in review_report["candidates"] if c["id"] == "pr:7")
+    assert pr_cand["path"] == str(worktree)
+
+
+def test_build_report_fork_pr_attaches_when_checkout_itself_is_the_fork(
+        tmp_path, monkeypatch):
+    """Reviewing a fork PR from a checkout of the CONTRIBUTOR's own fork (its
+    ``origin`` is the fork, not the ``--repo`` target/base repo) is a normal
+    setup — ``_pr_head_is_local`` alone is always False here (the PR's head repo
+    is never the target repo), so the checkout's OWN ``origin`` must be the
+    tie-breaker that still attaches the PR to the worktree it is actually
+    checked out in, instead of reporting it as ``pr-only``."""
+    repo = _init_repo(tmp_path / "repo",
+                       origin="https://github.com/someone-else/fork.git")
+    worktree = _add_worktree(repo, "feature", tmp_path / "wt-feature")
+    (worktree / "f.txt").write_text("x")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "work")
+
+    fork_pr = {
+        "number": 42, "headRefName": "feature", "url": "https://x",
+        "title": "fork PR", "updatedAt": "2024-01-01T00:00:00Z",
+        "state": "OPEN", "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    monkeypatch.setenv(wt.PRLIST_JSON_ENV, _write_prlist(tmp_path, [fork_pr]))
+
+    review_report = wt.build_report(str(repo), "owner/repo", "review-pr")
+    pr_cand = next(c for c in review_report["candidates"] if c["id"] == "pr:42")
+    assert pr_cand["kind"] == "worktree"
+    assert pr_cand["path"] == str(worktree)
+
+
+def test_pr_head_matches_worktree_true_when_worktree_origin_is_the_fork(tmp_path):
+    fork_pr = {
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    fork_wt = _init_repo(tmp_path / "fork-wt",
+                         origin="https://github.com/someone-else/fork.git")
+    assert wt._pr_head_matches_worktree(fork_pr, "owner/repo", str(fork_wt)) is True
+
+
+def test_pr_head_matches_worktree_false_when_worktree_origin_is_unrelated(tmp_path):
+    fork_pr = {
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    unrelated_wt = _init_repo(tmp_path / "unrelated-wt",
+                              origin="https://github.com/owner/repo.git")
+    assert wt._pr_head_matches_worktree(
+        fork_pr, "owner/repo", str(unrelated_wt)) is False
+
+
+# ── _git_int — fail loud instead of masking a failure as 0 ─────────────────────
+def test_git_int_raises_instead_of_returning_zero_on_git_failure(tmp_path):
+    """A failing git invocation (here: a bogus revision range) makes ``_run_git``
+    return None. ``_git_int`` must raise rather than coerce that into a count of
+    0 — ``_candidates_create`` keys candidacy on ``ahead > 0``, so a silent 0
+    here would hide an actionable checkout, same as a genuine timeout would."""
+    repo = _init_repo(tmp_path / "repo")
+    assert wt._run_git(str(repo), "rev-list", "--count",
+                       "not-a-real-ref..HEAD") is None
+    with pytest.raises(RuntimeError):
+        wt._git_int(str(repo), "rev-list", "--count", "not-a-real-ref..HEAD")
+
+
+def test_git_int_still_returns_zero_for_genuine_zero_count(tmp_path):
+    """A real ``rev-list --count`` of an empty range (base == HEAD) is a
+    genuine 0, not a failure — must not raise."""
+    repo = _init_repo(tmp_path / "repo")
+    assert wt._git_int(str(repo), "rev-list", "--count", "HEAD..HEAD") == 0
+
+
+def test_dirty_paths_raises_rather_than_reporting_clean_on_status_failure(tmp_path):
+    """A corrupt/unreadable index makes ``git status`` fail while commit-reading
+    commands (``rev-list``/``log``) still succeed. ``_dirty_paths`` must raise
+    rather than return ``[]`` — the same shape as a genuinely clean tree — or a
+    base checkout with real local work would silently drop out of ``present``."""
+    repo = _init_repo(tmp_path / "repo")
+    (repo / ".git" / "index").write_text("corrupt")
+    with pytest.raises(RuntimeError):
+        wt._dirty_paths(str(repo))
+
+
+def test_dirty_paths_returns_empty_for_a_genuinely_clean_tree(tmp_path):
+    repo = _init_repo(tmp_path / "repo")
+    assert wt._dirty_paths(str(repo)) == []
+
+
+# ── introspect — collision-free candidate ids ─────────────────────────────────
+def test_introspect_id_collision_free_for_same_basename_worktrees(tmp_path):
+    repo = _init_repo(tmp_path / "repo", origin="https://github.com/owner/repo.git")
+    wt_a = _add_worktree(repo, "feat/a", tmp_path / "groupA" / "task")
+    wt_b = _add_worktree(repo, "feat/b", tmp_path / "groupB" / "task")
+
+    entries = wt.list_worktrees(str(repo))
+    recs = [wt.introspect(e, None, {}, is_primary=(i == 0))
+            for i, e in enumerate(entries)]
+
+    ids = [r["id"] for r in recs]
+    assert len(ids) == len(set(ids))   # no id collides despite same basename
+
+    by_path = {r["path"]: r["id"] for r in recs}
+    assert by_path[str(wt_a)] != by_path[str(wt_b)]
+
+
+def test_list_worktrees_excludes_a_prunable_entry(tmp_path):
+    """A linked worktree whose directory was deleted without ``git worktree
+    remove`` shows up in ``--porcelain`` as a ``prunable`` entry with a path
+    that no longer exists on disk. Introspecting such a path would raise
+    (git commands fail against a missing cwd), so it must be dropped here
+    rather than handed to the caller — one stale checkout must not block
+    enumeration of every other, live candidate."""
+    repo = _init_repo(tmp_path / "repo")
+    stale = _add_worktree(repo, "feat/stale", tmp_path / "stale")
+    import shutil
+    shutil.rmtree(str(stale))
+
+    entries = wt.list_worktrees(str(repo))
+
+    assert [e["path"] for e in entries] == [str(repo)]
+    # introspecting every surviving entry must not raise for the missing path
+    for i, e in enumerate(entries):
+        wt.introspect(e, None, {}, is_primary=(i == 0))
+
+
+def test_introspect_unborn_head_does_not_raise(tmp_path):
+    """A brand-new repo with no first commit yet (uncommitted work, no commits) is
+    the exact input ``open_pr._prepare_on_base``'s Case 2 explicitly supports — it
+    creates the bootstrap commit for it. ``introspect`` must not raise for it:
+    ``git log``/``rev-list ...HEAD`` all fail against an unborn HEAD, which would
+    otherwise surface as a ``_git_int`` RuntimeError and crash the whole ``list``
+    verb before that supported flow is ever reached."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("y")   # untracked — no commit yet
+
+    entries = wt.list_worktrees(str(repo))
+    rec = wt.introspect(entries[0], None, {}, is_primary=True)
+
+    assert rec["uncommitted"] is True
+    assert rec["last_commit_ts"] == 0
+    assert rec["ahead"] == 0
+    assert rec["behind"] == 0
+
+
+def test_introspect_unborn_head_with_resolvable_baseref_does_not_raise(tmp_path):
+    """Same unborn-HEAD repo, but with a (bogus but truthy) ``baseref`` passed in —
+    covering the ``ahead``/``behind`` computation, not just ``last_commit_ts``: both
+    must skip an unborn HEAD rather than attempt (and fail) a ``rev-list``."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("y")
+
+    entries = wt.list_worktrees(str(repo))
+    rec = wt.introspect(entries[0], "refs/heads/does-not-exist", {}, is_primary=True)
+
+    assert rec["ahead"] == 0
+    assert rec["behind"] == 0
+    assert rec["last_commit_ts"] == 0
+
+
+# ── detect_base ────────────────────────────────────────────────────────────────
+def _init_bare(path, initial_branch):
+    path.mkdir(parents=True, exist_ok=True)
+    _git(path, "init", "-q", "--bare", "-b", initial_branch)
+    return path
+
+
+def test_detect_base_asks_the_remote_when_origin_head_is_unset_and_no_local_guess_matches(tmp_path):
+    """``git remote add`` + a manual ``fetch`` (unlike ``git clone``) never sets
+    origin/HEAD locally. When the real default is neither "main" nor "master" (e.g.
+    "trunk") and no matching local branch exists either, detect_base must still
+    resolve it by asking the remote directly instead of guessing "main". The
+    "origin" here is a local bare repo (a filesystem path) so this stays
+    network-free."""
+    bare = _init_bare(tmp_path / "bare.git", "trunk")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "trunk")
+    _git(seed, "config", "user.email", "t@t.t")
+    _git(seed, "config", "user.name", "t")
+    (seed / "README.md").write_text("x")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "init")
+    _git(seed, "remote", "add", "origin", str(bare))
+    _git(seed, "push", "-q", "origin", "trunk")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "scratch")   # local branch matches neither main/master
+    _git(work, "config", "user.email", "t@t.t")
+    _git(work, "config", "user.name", "t")
+    (work / "f.txt").write_text("y")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "init2")
+    _git(work, "remote", "add", "origin", str(bare))
+    _git(work, "fetch", "-q", "origin")
+    _unset_origin_head(work)                    # newer git sets origin/HEAD on fetch; force it unset
+
+    assert wt._run_git(str(work), "symbolic-ref", "refs/remotes/origin/HEAD") is None
+    assert wt.detect_base(str(work)) == "trunk"
+
+
+def test_detect_base_still_defaults_to_main_with_no_origin_at_all(tmp_path):
+    """The brand-new-repo case (no remote yet) must keep falling back to "main"
+    unchanged — ``git remote show origin`` fails fast on a missing remote rather
+    than hanging or raising."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "scratch")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("y")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "init")
+    assert wt.detect_base(str(repo)) == "main"
+
+
+def test_detect_base_prefers_remote_default_over_a_same_named_local_branch(tmp_path):
+    """A manually configured checkout (``remote add`` + ``fetch``, so
+    origin/HEAD is unset) can have BOTH a local "main" branch AND a remote
+    whose real default is a custom branch like "trunk". detect_base must ask
+    the remote before accepting the local "main" guess, or every worktree of
+    the actual "trunk" base gets diffed against the wrong branch."""
+    bare = _init_bare(tmp_path / "bare.git", "trunk")
+    seed = tmp_path / "seed"
+    seed.mkdir()
+    _git(seed, "init", "-q", "-b", "trunk")
+    _git(seed, "config", "user.email", "t@t.t")
+    _git(seed, "config", "user.name", "t")
+    (seed / "README.md").write_text("x")
+    _git(seed, "add", "-A")
+    _git(seed, "commit", "-q", "-m", "init")
+    _git(seed, "remote", "add", "origin", str(bare))
+    _git(seed, "push", "-q", "origin", "trunk")
+
+    work = tmp_path / "work"
+    work.mkdir()
+    _git(work, "init", "-q", "-b", "main")   # a LOCAL "main" that is not the base
+    _git(work, "config", "user.email", "t@t.t")
+    _git(work, "config", "user.name", "t")
+    (work / "f.txt").write_text("y")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-q", "-m", "init2")
+    _git(work, "remote", "add", "origin", str(bare))
+    _git(work, "fetch", "-q", "origin")
+    _unset_origin_head(work)                 # newer git sets origin/HEAD on fetch; force it unset
+
+    assert wt._run_git(str(work), "symbolic-ref", "refs/remotes/origin/HEAD") is None
+    assert wt.detect_base(str(work)) == "trunk"

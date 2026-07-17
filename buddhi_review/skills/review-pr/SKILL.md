@@ -150,38 +150,7 @@ Resolve `OWNER/REPO` and `CWD` in this order:
    OWNER_REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner)
    ```
 
-**Auto-target the worktree this session worked in.** When the work was done in a NEW
-worktree off `main` (the standing rule), the session's `$PWD` can still point at the spawn
-checkout while the real work sits in a `git -C <worktree>` elsewhere. Consult the resolver
-— it returns the session's recorded worktree only when that worktree is a live checkout of
-`OWNER_REPO` and differs from `$CWD`, else it echoes `$CWD` unchanged:
-
-<!-- `CLAUDE_CODE_SESSION_ID` is exported by the Claude Code harness to every Bash tool
-     invocation as a plain UUID (no "session_" prefix) — the same format the git-guardrail
-     hook stores via `data.get("session_id")`, so the resolver lookup key matches exactly.
-     Not to be confused with the remote-bridge vars (`CLAUDE_CODE_BRIDGE_SESSION_ID` /
-     `CLAUDE_CODE_REMOTE_SESSION_ID`) which are set only during remote/cloud connections
-     and carry a prefix.
-     The PYTHONPATH prefix on this and every other `python3 -m buddhi_review` call below
-     makes a plugin-only install (package installed by SessionStart into
-     ${CLAUDE_PLUGIN_DATA}/site, never on the default import path) resolve. `${CLAUDE_PLUGIN_DATA}`
-     here is a literal Claude Code placeholder substituted into skill content at load time —
-     NOT a Bash-tool environment variable (plugin env vars are exported only to hook/MCP/LSP
-     subprocesses, not to skill-authored Bash calls) — so this resolves for a plugin install.
-     For a pip install the placeholder is left literal, Bash expands the unset var to "", and
-     PYTHONPATH just gets a harmless "/site:" prefix ahead of the package that's already
-     importable. -->
-```bash
-RESOLVED=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
-  --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD" 2>/dev/null)
-if [ -n "$RESOLVED" ] && [ "$RESOLVED" != "$CWD" ]; then
-  CWD="$RESOLVED"
-  echo "Auto-selected this session's worktree: $CWD"
-fi
-```
-
-This is silent (no ask) — it only prefers the session's own worktree over a stale `$PWD`;
-every other step (PR selection, the rebase gate, launch) runs unchanged.
+Step 2 picks the PR to review and the checkout to review it in (`TARGET_CWD`).
 
 > **Carry the resolved values forward yourself.** Each Bash call runs in its OWN shell, so
 > `CWD` / `OWNER_REPO` / `PR_NUMBER` / `BASE_BRANCH` do NOT survive from one step's code block
@@ -236,28 +205,96 @@ defaults. If you cannot prompt, proceed to Step 2 with defaults.
 
 ### 2. Select which PR to review
 
-If a PR number was given explicitly, use it directly — set `PR_NUMBER` and
-`TARGET_CWD = <CWD>`, then skip to the **checked-out check** at the end of this step (it runs
-on EVERY path, including this one).
-
-Otherwise enumerate the open PRs — never silently pick the first one:
+If a PR number was given explicitly, use it directly — set `PR_NUMBER`. Prefer `<CWD>` when it
+is ALREADY checked out on that PR's own branch — consulting the registry in that case could
+override a correct checkout with a stale worktree the git-guardrail hook recorded earlier in
+the session. Only when `<CWD>` is NOT on the PR's branch, resolve `TARGET_CWD` through the
+session→worktree registry rather than assuming `<CWD>`: when the work was done in a NEW
+worktree off `main` (the standing rule), `$PWD` can still point at the spawn checkout while the
+PR is actually checked out elsewhere, and the registry (populated by the git-guardrail hook on
+`git worktree add` / `git -C <worktree>`) knows where.
 
 ```bash
-gh pr list --repo "$OWNER_REPO" --state open --json number,title,headRefName
+PR_HEAD_BRANCH=$(gh pr view "$PR_NUMBER" --repo "$OWNER_REPO" --json headRefName -q .headRefName)
+if [ -n "$PR_HEAD_BRANCH" ] && [ "$(git -C "$CWD" branch --show-current)" = "$PR_HEAD_BRANCH" ]; then
+  TARGET_CWD="$CWD"
+else
+  TARGET_CWD=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
+    --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD")
+  : "${TARGET_CWD:=$CWD}"
+fi
 ```
 
-- **No open PR** — print "No open PR found in <repo>. Nothing to review." and **EXIT**.
-- **Exactly one** — auto-select it (no question): `PR_NUMBER` = that number, `TARGET_CWD` =
-  `<CWD>`.
-- **More than one, but this session's checkout pins one** — when the current checkout's
-  branch (`git -C "$CWD" branch --show-current`) equals exactly one listed PR's
-  `headRefName`, this session is already working in that PR's checkout. Auto-select it (no
-  question): `PR_NUMBER` = that number, `TARGET_CWD` = `<CWD>`. Print ONE line:
-  `Auto-selected this session's worktree: PR #<n> (<CWD>)`. (A cwd on the base branch matches
-  no PR head, so it never short-circuits the ask.)
-- **More than one otherwise** — ask with **AskUserQuestion** (a sanctioned gate) which PR to
-  review. Match the answer against the listed numbers (with or without a leading `#`), then
-  branch substring; re-ask only if nothing matches.
+The resolver itself never raises and always prints a usable path — `<CWD>` unchanged when
+nothing better is recorded, else the session's own worktree; the `:` fallback above additionally
+covers the invocation failing outright (e.g. a missing `python3`) and printing nothing at all.
+Then skip to the **checked-out check** at the end of this step (it runs on EVERY path, including
+this one).
+
+Otherwise enumerate the open PRs (each annotated with the worktree it is checked out in) —
+never silently pick the first one:
+
+```bash
+PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target list \
+  --cwd "$CWD" --repo "$OWNER_REPO" --command review-pr \
+  --caller-cwd "$PWD" --session-id "$CLAUDE_CODE_SESSION_ID"
+```
+
+Pass `--caller-cwd "$PWD"` AND `--session-id "$CLAUDE_CODE_SESSION_ID"` **verbatim** (the
+shell expands both). `--caller-cwd` lets the engine recognise that this session is sitting
+in one candidate PR's checkout and auto-select that PR. `--session-id` covers the case it
+cannot: when you did your work in a NEW worktree off `main`, `$PWD` stays at the spawn
+checkout and does NOT name that worktree — but the git-guardrail hook recorded
+`session_id → that worktree` automatically (on `git worktree add` / `git -C <worktree>`),
+so the engine resolves and auto-selects the matching PR WITHOUT asking.
+(`$CLAUDE_CODE_SESSION_ID` is a real Claude Code env var — a plain UUID, no prefix —
+exported into every Bash tool call; the hook receives the same value as the `session_id`
+field in its stdin JSON payload, so the key it registers and the key looked up here are
+byte-identical.)
+
+Parse the single JSON object on stdout and act on `present.mode`:
+
+- **`none`** — print "No open PR found in <repo>. Nothing to review." and **EXIT**.
+- **`single`** — exactly one open PR. Auto-select it (no question): `PR_NUMBER` = that
+  candidate's `open_pr.number`, `TARGET_CWD` = its `path` — or `<CWD>` when that `path`
+  is `null` (the sole open PR is `kind == "pr-only"`, not checked out anywhere; see the
+  `pr-only` note below).
+- **`caller`** — several PRs are open, but exactly one candidate is this session's own
+  checkout — either where `$PWD` sits (`caller_match`) or, when `$PWD` is elsewhere, the
+  worktree this session worked in, resolved from the session→worktree registry
+  (`session_match`). Auto-select it (no question): `PR_NUMBER` = that candidate's
+  `open_pr.number`, `TARGET_CWD` = its `path`. (This candidate's `path` is never `null`
+  here — both `caller_match` and `session_match` are resolved by comparing worktree
+  paths, so only a candidate that already has a `path` can ever be matched.) Print ONE
+  line — `Auto-selected this session's worktree: PR #<n> (<path>)` — and continue.
+- **`two`** / **`many`** — ask with **AskUserQuestion** (a sanctioned gate) which PR to
+  review: render each `present.options[]` (its `label` as the option, its `detail` as the
+  description). Free-text **"Other"** is offered ONLY in `many` mode
+  (`present.free_input == true`); match the typed text against the full `candidates` array
+  by **PR number** (with or without a leading `#`) first, then branch substring — re-ask
+  only if nothing matches. `value == "all"` → review **each candidate whose `kind` is NOT
+  `"pr-only"`** sequentially (the option's own `label`/`detail` already say how many that
+  is and how many are skipped — see the `pr-only` note below), re-binding `PR_NUMBER` /
+  `TARGET_CWD` (and re-deriving `BASE_BRANCH` in Step 2.5) per iteration — never carry one
+  PR's values into the next. Otherwise (a single chosen option, not `All`) set `PR_NUMBER`
+  and `TARGET_CWD` from the chosen candidate exactly as in the `single` case.
+
+A candidate whose `path` is `null` (`kind == "pr-only"`) is an open PR that is **not
+checked out in any worktree**. The loop applies its fixes in `TARGET_CWD` and does not
+check the PR out for you, so such a PR cannot be launched as it stands:
+
+- **Chosen directly** (a single option, `single`, or `caller` mode) — set `TARGET_CWD` to
+  `<CWD>` and let the checked-out check below report the mismatch and stop with the
+  recovery instruction; this is the only candidate the operator asked for, so stopping the
+  whole flow to say so is correct.
+- **Inside an `All` run** — do NOT set `TARGET_CWD` to `<CWD>` and do NOT run the
+  checked-out check for it. `All` already excludes every `pr-only` candidate (its `label`
+  says how many); skip straight past one, print `Skipping PR #<n>: not checked out
+  locally.`, and continue to the next candidate — a `pr-only` PR encountered mid-fan-out
+  must never stop the run and strand later, genuinely launchable candidates unvisited.
+
+If the command fails (a non-zero exit with `{"status": "error", …}`), log its `detail` and
+STOP — a PR list that could not be read must never be treated as "nothing to review".
 
 **Checked-out check (runs on EVERY path, including an explicitly-passed PR number).** The loop
 applies its fixes IN `TARGET_CWD` and commits + pushes whatever branch is checked out there —
