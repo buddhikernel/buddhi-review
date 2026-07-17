@@ -21,6 +21,28 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.4.0](https://github.com/buddhikernel/buddhi-review/compare/v0.3.0...v0.4.0) (2026-07-15)
+
+
+### Features
+
+* **cli:** F1 — unclaimed-command fallback seam + lapsed-licence notice ([#74](https://github.com/buddhikernel/buddhi-review/issues/74)) ([9a4ceea](https://github.com/buddhikernel/buddhi-review/commit/9a4ceea49e299a5e9411a4d8718f72c45c1484b7))
+* **cli:** F3 — rebase-gate engine verb + paid-action capability hook ([#75](https://github.com/buddhikernel/buddhi-review/issues/75)) ([1f3fc8a](https://github.com/buddhikernel/buddhi-review/commit/1f3fc8ae40bff72bda36201dde17726835d9b632))
+* **plugin:** FREE-6 — plugin manifest + hook self-sufficiency ([#82](https://github.com/buddhikernel/buddhi-review/issues/82)) ([9b06b7d](https://github.com/buddhikernel/buddhi-review/commit/9b06b7dea606ade4f47773523f0aafcb0d00c78e))
+* **setup:** PRO-6 — first-run Pro trial bootstrap (server-less 14-day trial + convert path) ([#79](https://github.com/buddhikernel/buddhi-review/issues/79)) ([8351a44](https://github.com/buddhikernel/buddhi-review/commit/8351a44ef95bb66942ce7db76cdfc3b1017ae6c9))
+* **skills:** F2 — converge open-pr/review-pr SKILL.md to the parity contract ([#78](https://github.com/buddhikernel/buddhi-review/issues/78)) ([0a87353](https://github.com/buddhikernel/buddhi-review/commit/0a873533269d59080edd7ea7c0d1ae26e0341136))
+* **test-gate:** F2 — runner detection + outcome classifier in the OSS test gate ([#77](https://github.com/buddhikernel/buddhi-review/issues/77)) ([607ca0c](https://github.com/buddhikernel/buddhi-review/commit/607ca0cbcb869e3140fd33fa8d4fdec3d8fbc829))
+
+
+### Bug Fixes
+
+* **test-gate:** F2b — close the Gradle zero-test false-green + rc-gate jasmine no-specs ([#81](https://github.com/buddhikernel/buddhi-review/issues/81)) ([b5aaef6](https://github.com/buddhikernel/buddhi-review/commit/b5aaef6fd4864d000bcd05e31f8e94cf8782062d))
+
+
+### Documentation
+
+* **pages:** FREE-7 — GitHub Pages render polish (front matter, relative links, kramdown details fix) ([#80](https://github.com/buddhikernel/buddhi-review/issues/80)) ([414d065](https://github.com/buddhikernel/buddhi-review/commit/414d06588106c5afc3830e8bb910da9b1046f41b))
+
 ## [0.3.0](https://github.com/buddhikernel/buddhi-review/compare/v0.2.1...v0.3.0) (2026-07-11)
 
 
