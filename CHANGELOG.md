@@ -21,6 +21,13 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.5.0](https://github.com/buddhikernel/buddhi-review/compare/v0.4.0...v0.5.0) (2026-07-17)
+
+
+### Features
+
+* **cli:** F6 — OSS candidate enumerator + multi-checkout skill gate (closes O9) ([#83](https://github.com/buddhikernel/buddhi-review/issues/83)) ([82ee57e](https://github.com/buddhikernel/buddhi-review/commit/82ee57ea8f071739c7be9734c041b5c39127d457))
+
 ## [0.4.0](https://github.com/buddhikernel/buddhi-review/compare/v0.3.0...v0.4.0) (2026-07-15)
 
 
