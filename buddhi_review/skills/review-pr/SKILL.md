@@ -205,9 +205,20 @@ defaults. If you cannot prompt, proceed to Step 2 with defaults.
 
 ### 2. Select which PR to review
 
-If a PR number was given explicitly, use it directly — set `PR_NUMBER` and
-`TARGET_CWD = <CWD>`, then skip to the **checked-out check** at the end of this step (it runs
-on EVERY path, including this one).
+If a PR number was given explicitly, use it directly — set `PR_NUMBER`, then resolve
+`TARGET_CWD` through the session→worktree registry rather than assuming `<CWD>`: when the
+work was done in a NEW worktree off `main` (the standing rule), `$PWD` can still point at the
+spawn checkout while the PR is actually checked out elsewhere, and the registry (populated by
+the git-guardrail hook on `git worktree add` / `git -C <worktree>`) knows where.
+
+```bash
+TARGET_CWD=$(PYTHONPATH="${CLAUDE_PLUGIN_DATA}/site:$PYTHONPATH" python3 -m buddhi_review.worktree_target resolve \
+  --session-id "$CLAUDE_CODE_SESSION_ID" --repo "$OWNER_REPO" --cwd "$CWD")
+```
+
+This never raises and always prints a usable path — `<CWD>` unchanged when nothing better is
+recorded, else the session's own worktree. Then skip to the **checked-out check** at the end
+of this step (it runs on EVERY path, including this one).
 
 Otherwise enumerate the open PRs (each annotated with the worktree it is checked out in) —
 never silently pick the first one:

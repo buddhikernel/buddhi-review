@@ -290,11 +290,15 @@ def list_worktrees(cwd):
     """Parse ``git worktree list --porcelain`` into a list of dicts.
 
     Each entry: ``{path, head, branch (or ''), detached (bool), bare (bool)}``. The
-    FIRST entry is always the primary working tree (git's contract). ``[]`` when the
-    command fails."""
-    rc, out, _ = _run(["git", "-C", cwd, "worktree", "list", "--porcelain"])
+    FIRST entry is always the primary working tree (git's contract).
+
+    Raises RuntimeError when the command fails — same fail-loud contract as
+    :func:`fetch_prs`/:func:`build_report`: a silently-empty worktree list would
+    read as "no candidates" and hide every checkout from the operator instead of
+    surfacing the underlying git error."""
+    rc, out, err = _run(["git", "-C", cwd, "worktree", "list", "--porcelain"])
     if rc != 0:
-        return []
+        raise RuntimeError(f"git worktree list failed for {cwd}: {err.strip()}")
     entries, cur = [], None
     for line in out.splitlines():
         if line.startswith("worktree "):
@@ -332,7 +336,13 @@ def fetch_prs(repo, state="open"):
     for the open list stays valid); otherwise shells out to ``gh pr list``.
 
     Returns None on failure so a caller never confuses an error with "no PRs" — a
-    silently-empty PR list would make every branch look un-PR'd."""
+    silently-empty PR list would make every branch look un-PR'd. Also returns None
+    when the result hits the ``--limit`` boundary exactly: ``gh pr list --limit``
+    is "the maximum number of items to FETCH" (``gh pr list --help``), not a
+    server-side page size, so a full page means the true count may be larger and
+    older PRs (a branch's own prior PR, most likely) could be missing — the same
+    fail-loud contract as an outright ``gh`` failure, rather than silently acting
+    on a truncated set."""
     seam = os.environ.get(PRLIST_JSON_ENV)
     if seam:
         try:
@@ -346,19 +356,24 @@ def fetch_prs(repo, state="open"):
             return [p for p in data if isinstance(p, dict)
                     and str(p.get("state", "OPEN")).upper() == "OPEN"]
         return [p for p in data if isinstance(p, dict)]
+    limit = 2000
     rc, out, _ = _run([
         "gh", "pr", "list", "--repo", repo, "--state", state,
         "--json", "number,headRefName,url,title,updatedAt,state,"
                   "isCrossRepository,headRepositoryOwner,headRepository",
-        "--limit", "500",
-    ])
+        "--limit", str(limit),
+    ], timeout=180)
     if rc != 0:
         return None
     try:
         data = json.loads(out)
     except ValueError:
         return None
-    return data if isinstance(data, list) else None
+    if not isinstance(data, list):
+        return None
+    if len(data) >= limit:
+        return None
+    return data
 
 
 # ── per-checkout introspection ───────────────────────────────────────────────
@@ -378,9 +393,14 @@ def _dirty_paths(cwd):
         if len(entry) < 4:
             continue
         code, path = entry[:2], entry[3:]
+        # For R/C entries, `-z` output reverses the pair to "to from" (see
+        # `git help status`, Porcelain Format Version 1: "the field order is
+        # reversed (e.g from -> to becomes to from)") — so `path` here is
+        # already the DESTINATION path, the one that exists on disk. The
+        # NEXT NUL-delimited field is the source path, which no longer
+        # exists post-rename; consume it so it is not mis-parsed as its own
+        # status entry, but don't record it.
         paths.append(path)
-        # Rename/copy: the source path is the NEXT NUL-delimited field — consume it
-        # so it is not mis-parsed as its own status entry.
         if "R" in code or "C" in code:
             i += 1
     return paths
