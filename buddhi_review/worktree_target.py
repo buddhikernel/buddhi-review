@@ -339,7 +339,18 @@ def detect_base(cwd):
 
 def resolve_baseref(cwd, base, remote="origin"):
     """Prefer the remote-tracking ``<remote>/<base>`` (the real latest); fall back to
-    the local ``<base>`` ref; None when neither resolves."""
+    the local ``<base>`` ref; None when neither resolves.
+
+    Deliberately never fetches to populate a missing ``<remote>/<base>``: this module
+    is documented as read-only/network-free (see the module docstring and
+    ``tests/test_worktree_target.py``'s own "Network-free" contract, which relies on
+    a fake, never-fetched ``origin`` URL in most fixtures), and ``list`` runs BEFORE
+    the actuator, so a fetch here would run unconditionally on every enumeration
+    against an unfetched repo rather than once, lazily, for the single candidate the
+    operator actually picks (``open_pr.prepare_branch``'s ``C_or_D`` path, which fetches
+    for exactly this staleness reason). The local fallback can therefore understate
+    ``ahead`` for a checkout that IS ``base`` itself with unpushed, unfetched commits;
+    the actuator's own fetch-then-recheck is what correctly resolves that case."""
     if _run_git(cwd, "rev-parse", "--verify", "--quiet",
                 f"refs/remotes/{remote}/{base}") is not None:
         return f"{remote}/{base}"
@@ -543,11 +554,22 @@ def introspect(entry, baseref, open_by_branch, is_primary):
     rec["uncommitted_count"] = len(dirty)
     rec["uncommitted"] = bool(dirty)
 
-    if baseref:
+    # An UNBORN HEAD (a fresh `git init`/scaffolded repo with no first commit yet)
+    # has no `HEAD` any of these commands can resolve — `rev-list ...HEAD` and
+    # `log ... HEAD` all fail (exit 128), which `_git_int` turns into a RuntimeError
+    # that is never caught between here and `main()`'s CLI wrapper, crashing the
+    # WHOLE `list` verb. `open_pr._prepare_on_base`'s own Case 2 explicitly supports
+    # this exact input (uncommitted work, no commits yet) by creating the bootstrap
+    # commit — so the enumerator must not block that supported flow before the
+    # actuator ever gets to run. ahead/behind/last_commit_ts all default to 0.
+    has_head = _run_git(path, "rev-parse", "--verify", "--quiet", "HEAD") is not None
+
+    if baseref and has_head:
         rec["ahead"] = _git_int(path, "rev-list", "--count", f"{baseref}..HEAD")
         rec["behind"] = _git_int(path, "rev-list", "--count", f"HEAD..{baseref}")
 
-    rec["last_commit_ts"] = _git_int(path, "log", "-1", "--format=%ct", "HEAD")
+    if has_head:
+        rec["last_commit_ts"] = _git_int(path, "log", "-1", "--format=%ct", "HEAD")
     rec["activity_ts"] = rec["last_commit_ts"]
     if rec["uncommitted"]:
         rec["activity_ts"] = max(rec["activity_ts"], _dirty_mtime(path, dirty))
@@ -705,6 +727,12 @@ def _candidates_review(records, prs, repo):
     local branch's name by coincidence must never be treated as checked out
     there (that worktree holds unrelated commits on a different remote, so
     fixes would land on the wrong branch)."""
+    # `r["branch"]` is only ever truthy for a LIVE branch checkout — `list_worktrees`
+    # leaves it "" for both a bare entry (porcelain emits no `branch` line at all;
+    # `git worktree add --bare` isn't even a valid invocation, so bare only ever
+    # shows up as the PRIMARY worktree of a bare repo) and a detached one (porcelain
+    # emits `detached`, not `branch`) — so this filter already excludes both by
+    # construction, with no need to check `bare`/`detached` explicitly.
     by_branch_record = {r["branch"]: r for r in records if r["branch"]}
     out = []
     for pr in prs:

@@ -415,6 +415,48 @@ def test_list_worktrees_excludes_a_prunable_entry(tmp_path):
         wt.introspect(e, None, {}, is_primary=(i == 0))
 
 
+def test_introspect_unborn_head_does_not_raise(tmp_path):
+    """A brand-new repo with no first commit yet (uncommitted work, no commits) is
+    the exact input ``open_pr._prepare_on_base``'s Case 2 explicitly supports — it
+    creates the bootstrap commit for it. ``introspect`` must not raise for it:
+    ``git log``/``rev-list ...HEAD`` all fail against an unborn HEAD, which would
+    otherwise surface as a ``_git_int`` RuntimeError and crash the whole ``list``
+    verb before that supported flow is ever reached."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("y")   # untracked — no commit yet
+
+    entries = wt.list_worktrees(str(repo))
+    rec = wt.introspect(entries[0], None, {}, is_primary=True)
+
+    assert rec["uncommitted"] is True
+    assert rec["last_commit_ts"] == 0
+    assert rec["ahead"] == 0
+    assert rec["behind"] == 0
+
+
+def test_introspect_unborn_head_with_resolvable_baseref_does_not_raise(tmp_path):
+    """Same unborn-HEAD repo, but with a (bogus but truthy) ``baseref`` passed in —
+    covering the ``ahead``/``behind`` computation, not just ``last_commit_ts``: both
+    must skip an unborn HEAD rather than attempt (and fail) a ``rev-list``."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@t.t")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("y")
+
+    entries = wt.list_worktrees(str(repo))
+    rec = wt.introspect(entries[0], "refs/heads/does-not-exist", {}, is_primary=True)
+
+    assert rec["ahead"] == 0
+    assert rec["behind"] == 0
+    assert rec["last_commit_ts"] == 0
+
+
 # ── detect_base ────────────────────────────────────────────────────────────────
 def _init_bare(path, initial_branch):
     path.mkdir(parents=True, exist_ok=True)
