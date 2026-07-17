@@ -122,14 +122,14 @@ def test_none_when_no_checkout_has_actionable_work(tmp_path):
 # ── mode: single ─────────────────────────────────────────────────────────────
 def test_single_candidate_is_auto_selected_without_asking(tmp_path):
     repo = _init_repo(tmp_path / "repo")
-    _worktree_with_commit(repo, "feat/x", tmp_path / "wt-x")
+    wtx = _worktree_with_commit(repo, "feat/x", tmp_path / "wt-x")
     report = _report(repo)
     present = report["present"]
     assert present["mode"] == "single"
     assert present["ask"] is False
-    assert present["auto_target"] == "wt:wt-x"
+    assert present["auto_target"] == f"wt:{wtx}"
     assert present["free_input"] is False
-    assert _values(report) == ["wt:wt-x"]           # no "all" option on a sole candidate
+    assert _values(report) == [f"wt:{wtx}"]         # no "all" option on a sole candidate
 
 
 def test_uncommitted_only_worktree_is_actionable(tmp_path):
@@ -163,8 +163,8 @@ def test_primary_on_base_with_work_is_a_candidate(tmp_path):
 # ── mode: two ────────────────────────────────────────────────────────────────
 def test_two_candidates_ask_with_both_plus_all(tmp_path):
     repo = _init_repo(tmp_path / "repo")
-    _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a", when="2024-02-01T00:00:00")
-    _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b", when="2024-02-02T00:00:00")
+    wta = _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a", when="2024-02-01T00:00:00")
+    wtb = _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b", when="2024-02-02T00:00:00")
     report = _report(repo)
     present = report["present"]
     assert present["mode"] == "two"
@@ -172,7 +172,7 @@ def test_two_candidates_ask_with_both_plus_all(tmp_path):
     assert present["auto_target"] is None
     assert present["free_input"] is False           # no free-text "Other" in two mode
     # Most recent first, then the "all" fan-out.
-    assert _values(report) == ["wt:wt-b", "wt:wt-a", "all"]
+    assert _values(report) == [f"wt:{wtb}", f"wt:{wta}", "all"]
     assert present["options"][-1]["label"] == "All (2)"
 
 
@@ -182,9 +182,9 @@ def test_many_offers_recent_worktree_then_base_checkout_then_all(tmp_path):
     primary-on-base checkout (open-pr's "branch off main" path), option 3 is All —
     and free-text "Other" is enabled so the rest stay reachable."""
     repo = _init_repo(tmp_path / "repo")
-    _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a", when="2024-02-01T00:00:00")
-    _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b", when="2024-02-02T00:00:00")
-    _worktree_with_commit(repo, "feat/c", tmp_path / "wt-c", when="2024-02-03T00:00:00")
+    wta = _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a", when="2024-02-01T00:00:00")
+    wtb = _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b", when="2024-02-02T00:00:00")
+    wtc = _worktree_with_commit(repo, "feat/c", tmp_path / "wt-c", when="2024-02-03T00:00:00")
     _dirty(repo)                                    # primary on main, with work
     report = _report(repo)
     present = report["present"]
@@ -192,21 +192,21 @@ def test_many_offers_recent_worktree_then_base_checkout_then_all(tmp_path):
     assert present["ask"] is True
     assert present["auto_target"] is None
     assert present["free_input"] is True            # "Other" is the 4th option
-    assert _values(report) == ["wt:wt-c", "primary", "all"]
+    assert _values(report) == [f"wt:{wtc}", "primary", "all"]
     assert present["options"][-1]["label"] == "All (4)"
     # Every candidate is still in the full array even though only 2 are rendered.
-    assert set(_ids(report)) == {"primary", "wt:wt-a", "wt:wt-b", "wt:wt-c"}
+    assert set(_ids(report)) == {"primary", f"wt:{wta}", f"wt:{wtb}", f"wt:{wtc}"}
 
 
 def test_many_without_a_base_checkout_falls_back_to_second_worktree(tmp_path):
     """No primary-on-base candidate → option 2 is simply the 2nd-most-recent."""
     repo = _init_repo(tmp_path / "repo")
     _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a", when="2024-02-01T00:00:00")
-    _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b", when="2024-02-02T00:00:00")
-    _worktree_with_commit(repo, "feat/c", tmp_path / "wt-c", when="2024-02-03T00:00:00")
+    wtb = _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b", when="2024-02-02T00:00:00")
+    wtc = _worktree_with_commit(repo, "feat/c", tmp_path / "wt-c", when="2024-02-03T00:00:00")
     report = _report(repo)                          # primary is clean → not a candidate
     assert report["present"]["mode"] == "many"
-    assert _values(report) == ["wt:wt-c", "wt:wt-b", "all"]
+    assert _values(report) == [f"wt:{wtc}", f"wt:{wtb}", "all"]
 
 
 # ── mode: caller — the session's own checkout auto-wins ──────────────────────
@@ -218,10 +218,10 @@ def test_caller_cwd_auto_selects_this_sessions_own_checkout(tmp_path):
     present = report["present"]
     assert present["mode"] == "caller"              # would be "two" without the flag
     assert present["ask"] is False
-    assert present["auto_target"] == "wt:wt-b"
-    assert report["caller_match"] == "wt:wt-b"
+    assert present["auto_target"] == f"wt:{wtb}"
+    assert report["caller_match"] == f"wt:{wtb}"
     assert report["session_match"] is None
-    assert _values(report) == ["wt:wt-b"]
+    assert _values(report) == [f"wt:{wtb}"]
 
 
 def test_caller_cwd_matches_from_a_subdirectory_of_the_checkout(tmp_path):
@@ -233,7 +233,7 @@ def test_caller_cwd_matches_from_a_subdirectory_of_the_checkout(tmp_path):
     sub.mkdir(parents=True)
     report = _report(repo, caller_cwd=str(sub))
     assert report["present"]["mode"] == "caller"
-    assert report["present"]["auto_target"] == "wt:wt-b"
+    assert report["present"]["auto_target"] == f"wt:{wtb}"
 
 
 def test_session_registry_auto_selects_the_worked_in_worktree(tmp_path):
@@ -246,9 +246,9 @@ def test_session_registry_auto_selects_the_worked_in_worktree(tmp_path):
     report = _report(repo, caller_cwd=str(repo), session_id="sess")
     present = report["present"]
     assert present["mode"] == "caller"
-    assert present["auto_target"] == "wt:wt-b"
-    assert report["session_match"] == "wt:wt-b"
-    assert report["caller_match"] == "wt:wt-b"      # the resolved auto-target
+    assert present["auto_target"] == f"wt:{wtb}"
+    assert report["session_match"] == f"wt:{wtb}"
+    assert report["caller_match"] == f"wt:{wtb}"    # the resolved auto-target
 
 
 def test_caller_cwd_wins_over_the_session_registry(tmp_path):
@@ -258,8 +258,8 @@ def test_caller_cwd_wins_over_the_session_registry(tmp_path):
     wtb = _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
     sw.register("sess", str(wtb))
     report = _report(repo, caller_cwd=str(wta), session_id="sess")
-    assert report["present"]["auto_target"] == "wt:wt-a"
-    assert report["caller_match"] == "wt:wt-a"
+    assert report["present"]["auto_target"] == f"wt:{wta}"
+    assert report["caller_match"] == f"wt:{wta}"
     assert report["session_match"] is None          # never consulted
 
 
@@ -341,9 +341,9 @@ def test_branch_with_an_open_pr_is_not_an_open_pr_candidate(tmp_path, seed_prs):
     seed_prs([_pr(7, "feat/a")])
     repo = _init_repo(tmp_path / "repo")
     _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a")
-    _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
+    wtb = _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
     report = _report(repo, command="open-pr")
-    assert _ids(report) == ["wt:wt-b"]
+    assert _ids(report) == [f"wt:{wtb}"]
     assert report["present"]["mode"] == "single"
 
 
@@ -354,9 +354,9 @@ def test_squash_merged_branch_is_not_an_open_pr_candidate(tmp_path, seed_prs):
     seed_prs([_pr(7, "feat/a", state="MERGED")])
     repo = _init_repo(tmp_path / "repo")
     _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a")
-    _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
+    wtb = _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
     report = _report(repo, command="open-pr")
-    assert _ids(report) == ["wt:wt-b"]
+    assert _ids(report) == [f"wt:{wtb}"]
 
 
 def test_open_pr_branch_with_uncommitted_work_is_still_excluded(tmp_path, seed_prs):
@@ -368,9 +368,9 @@ def test_open_pr_branch_with_uncommitted_work_is_still_excluded(tmp_path, seed_p
     repo = _init_repo(tmp_path / "repo")
     wta = _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a")
     _dirty(wta)                                     # open-PR branch + new uncommitted work
-    _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
+    wtb = _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
     report = _report(repo, command="open-pr")
-    assert _ids(report) == ["wt:wt-b"]              # feat/a stays out despite the dirty tree
+    assert _ids(report) == [f"wt:{wtb}"]            # feat/a stays out despite the dirty tree
     assert report["present"]["mode"] == "single"
 
 
@@ -394,7 +394,7 @@ def test_merged_branch_with_uncommitted_work_stays_a_candidate(tmp_path, seed_pr
     wta = _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a")
     _dirty(wta)
     report = _report(repo, command="open-pr")
-    assert _ids(report) == ["wt:wt-a"]
+    assert _ids(report) == [f"wt:{wta}"]
 
 
 def test_detached_and_bare_checkouts_are_never_candidates(tmp_path):
@@ -527,7 +527,7 @@ def test_cli_list_emits_one_json_object(tmp_path, capsys):
     assert rc == 0
     report = json.loads(capsys.readouterr().out)
     assert report["present"]["mode"] == "single"
-    assert report["present"]["auto_target"] == "wt:wt-x"
+    assert report["present"]["auto_target"] == f"wt:{wtx}"
 
 
 def test_cli_list_reports_an_error_as_json_and_exit_1(tmp_path, capsys):

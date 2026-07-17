@@ -53,7 +53,9 @@ Pure stdlib (os / re / json / sys / subprocess / argparse) plus
 
 Test seam (no network, no ``gh`` required): ``$BUDDHI_REVIEW_PRLIST_JSON`` — a path
 to a JSON file with the PR list (the same shape ``gh pr list --json
-number,headRefName,url,title,updatedAt,state`` emits), used instead of shelling out.
+number,headRefName,url,title,updatedAt,state,isCrossRepository,headRepositoryOwner,
+headRepository`` emits), used instead of shelling out. A fixture may omit the last
+three fields — a missing/false ``isCrossRepository`` is treated as a same-repo PR.
 """
 from __future__ import annotations
 
@@ -163,6 +165,30 @@ def _repos_match(a, b):
     """``_specs_match`` over two raw string specs (an ``origin`` URL or a bare
     ``owner/repo``). Never raises."""
     return _specs_match(_split_repo(a), _split_repo(b))
+
+
+def _pr_head_is_local(pr, repo):
+    """True iff ``pr``'s head branch lives IN ``repo`` (never raises).
+
+    A fork PR can push ANY branch name — including one that collides with an
+    unrelated local branch, e.g. a fork opened from its own ``main`` — so a
+    branch-name-only match would attach that fork PR to the wrong checkout
+    (see the module's SAFETY section). ``isCrossRepository`` false, or absent
+    (a minimal test-seam fixture pre-dating this field, which represents a
+    same-repo PR), means the head is a branch of THIS repo — always local. A
+    cross-repository PR is local only when its head repo is, by coincidence,
+    the SAME ``owner/repo`` as ``repo`` (e.g. a PR opened repo-to-repo rather
+    than from a personal fork)."""
+    try:
+        if not pr.get("isCrossRepository"):
+            return True
+        owner = (pr.get("headRepositoryOwner") or {}).get("login") or ""
+        name = (pr.get("headRepository") or {}).get("name") or ""
+        if not owner or not name:
+            return False
+        return _repos_match(f"{owner}/{name}", repo)
+    except Exception:
+        return False
 
 
 def _toplevel(path):
@@ -294,7 +320,10 @@ def list_worktrees(cwd):
 
 
 def fetch_prs(repo, state="open"):
-    """PRs as a list of ``{number, headRefName, url, title, updatedAt, state}``.
+    """PRs as a list of ``{number, headRefName, url, title, updatedAt, state,
+    isCrossRepository, headRepositoryOwner, headRepository}`` — the last three
+    let :func:`_pr_head_is_local` qualify a branch-name match by source repo
+    instead of trusting ``headRefName`` alone (a fork can reuse any name).
 
     ``state`` is "open" or "all" — the latter so ``open-pr`` can exclude branches that
     were ALREADY turned into a PR, including squash-merged ones (which still read as
@@ -319,7 +348,9 @@ def fetch_prs(repo, state="open"):
         return [p for p in data if isinstance(p, dict)]
     rc, out, _ = _run([
         "gh", "pr", "list", "--repo", repo, "--state", state,
-        "--json", "number,headRefName,url,title,updatedAt,state", "--limit", "500",
+        "--json", "number,headRefName,url,title,updatedAt,state,"
+                  "isCrossRepository,headRepositoryOwner,headRepository",
+        "--limit", "500",
     ])
     if rc != 0:
         return None
@@ -382,7 +413,15 @@ def introspect(entry, baseref, open_by_branch, is_primary):
     path = entry["path"]
     branch = entry.get("branch", "")
     rec = {
-        "id": "primary" if is_primary else "wt:" + os.path.basename(path),
+        # The full path, not just its basename — two DIFFERENT worktrees (e.g. of
+        # different repos, or an old removed-and-recreated checkout) can share a
+        # basename, and this id is the ONLY key callers use to map a chosen option
+        # back to its candidate (present.options[].value, auto_target, the
+        # caller/session auto-select match below); a basename collision would let
+        # `_build_present` — or the consuming skill — silently operate on the
+        # wrong checkout. `git worktree list --porcelain` paths are absolute and
+        # never repeat, so this is collision-free by construction.
+        "id": "primary" if is_primary else "wt:" + path,
         "kind": "primary" if is_primary else "worktree",
         "path": path,
         "branch": branch,
@@ -551,18 +590,24 @@ def _candidates_create(records, base, prd_branches):
     return out
 
 
-def _candidates_review(records, prs):
+def _candidates_review(records, prs, repo):
     """Every OPEN PR, annotated with the worktree it is checked out in — or
     ``path: null`` / ``kind: "pr-only"`` when it is not checked out anywhere. Ranked
     by the PR's ``updatedAt`` (an ISO string sorts correctly), then last-commit
-    time."""
+    time.
+
+    A PR is matched to a local worktree by branch name ONLY when
+    :func:`_pr_head_is_local` confirms the PR's head lives in ``repo`` — a
+    fork PR sharing a local branch's name by coincidence must never be treated
+    as checked out there (that worktree holds unrelated commits on a
+    different remote, so fixes would land on the wrong branch)."""
     by_branch_record = {r["branch"]: r for r in records if r["branch"]}
     out = []
     for pr in prs:
         if not isinstance(pr, dict) or not pr.get("number"):
             continue
         branch = pr.get("headRefName", "")
-        rec = by_branch_record.get(branch)
+        rec = by_branch_record.get(branch) if _pr_head_is_local(pr, repo) else None
         if rec is not None:
             cand = dict(rec)
         else:
@@ -682,8 +727,12 @@ def build_report(cwd, repo, command, base=None, caller_cwd=None, session_id=None
         open_list = [p for p in all_prs
                      if isinstance(p, dict)
                      and str(p.get("state", "OPEN")).upper() == "OPEN"]
+        # Only a PR whose head is IN this repo can retire a local branch by name —
+        # a fork PR reusing a local branch's name is a coincidence, not a signal
+        # that the local branch was already turned into a PR (_pr_head_is_local).
         prd_branches = {p["headRefName"] for p in all_prs
-                        if isinstance(p, dict) and p.get("headRefName")}
+                        if isinstance(p, dict) and p.get("headRefName")
+                        and _pr_head_is_local(p, repo)}
     elif command == "review-pr":
         open_list = fetch_prs(repo, "open")
         if open_list is None:
@@ -692,8 +741,13 @@ def build_report(cwd, repo, command, base=None, caller_cwd=None, session_id=None
     else:
         raise ValueError(f"unknown command {command!r}")
 
+    # Same qualification for the open-PR-by-branch map that marks a checkout as
+    # "already has an open PR" (introspect's rec["open_pr"]) — an unqualified match
+    # would let an open fork PR hide actionable local work from open-pr (the
+    # "if rec['open_pr'] is not None: continue" guard in _candidates_create).
     open_by_branch = {p["headRefName"]: p for p in open_list
-                      if isinstance(p, dict) and p.get("headRefName")}
+                      if isinstance(p, dict) and p.get("headRefName")
+                      and _pr_head_is_local(p, repo)}
 
     records = [
         introspect(entry, baseref, open_by_branch, is_primary=idx == 0)
@@ -703,7 +757,7 @@ def build_report(cwd, repo, command, base=None, caller_cwd=None, session_id=None
     if command == "open-pr":
         candidates = _candidates_create(records, base, prd_branches)
     else:
-        candidates = _candidates_review(records, open_list)
+        candidates = _candidates_review(records, open_list, repo)
 
     # Only attempt caller/session matching with 2+ candidates: present.mode can never
     # become "caller" with 0/1 candidates (_build_present returns "none"/"single"

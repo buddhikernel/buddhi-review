@@ -200,3 +200,107 @@ def test_cli_prints_cwd_when_nothing_to_switch_to(tmp_path, capsys):
                   "--repo", "owner/repo", "--cwd", str(repo)])
     assert rc == 0
     assert capsys.readouterr().out.strip() == str(repo)
+
+
+# ── _pr_head_is_local — the fork-branch-collision guard ──────────────────────
+def test_pr_head_is_local_true_for_same_repo_or_missing_field():
+    assert wt._pr_head_is_local({"headRefName": "main"}, "owner/repo") is True
+    assert wt._pr_head_is_local({"isCrossRepository": False}, "owner/repo") is True
+
+
+def test_pr_head_is_local_false_for_fork_true_for_cross_pr_from_same_owner_repo():
+    fork_pr = {
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    assert wt._pr_head_is_local(fork_pr, "owner/repo") is False
+    same_repo_cross_pr = {
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "owner"},
+        "headRepository": {"name": "repo"},
+    }
+    assert wt._pr_head_is_local(same_repo_cross_pr, "owner/repo") is True
+
+
+def test_pr_head_is_local_false_when_repo_fields_missing_on_cross_repo_pr():
+    assert wt._pr_head_is_local({"isCrossRepository": True}, "owner/repo") is False
+
+
+# ── build_report — a fork PR must never attach by branch name alone ──────────
+def _write_prlist(tmp_path, prs, name="prlist.json"):
+    import json
+    p = tmp_path / name
+    p.write_text(json.dumps(prs))
+    return str(p)
+
+
+def test_build_report_fork_pr_does_not_attach_to_colliding_local_branch(
+        tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path / "repo", origin="https://github.com/owner/repo.git")
+    worktree = _add_worktree(repo, "shared-name", tmp_path / "wt-shared")
+    (worktree / "f.txt").write_text("x")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "work")
+
+    # An OPEN fork PR whose head branch happens to be named identically to the
+    # local worktree's branch — but it lives in a completely different repo.
+    fork_pr = {
+        "number": 99, "headRefName": "shared-name", "url": "https://x",
+        "title": "unrelated fork PR", "updatedAt": "2024-01-01T00:00:00Z",
+        "state": "OPEN", "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    monkeypatch.setenv(wt.PRLIST_JSON_ENV, _write_prlist(tmp_path, [fork_pr]))
+
+    open_pr_report = wt.build_report(str(repo), "owner/repo", "open-pr")
+    by_path = {c["path"]: c for c in open_pr_report["candidates"]}
+    # The fork PR must not hide the local branch's actionable work behind a
+    # phantom open_pr match.
+    assert str(worktree) in by_path
+    assert by_path[str(worktree)]["open_pr"] is None
+
+    review_report = wt.build_report(str(repo), "owner/repo", "review-pr")
+    pr_cand = next(c for c in review_report["candidates"] if c["id"] == "pr:99")
+    # The fork PR shows up as a review candidate but is NOT attached to the local
+    # worktree — it must read as not-checked-out-anywhere, not as that worktree.
+    assert pr_cand["kind"] == "pr-only"
+    assert pr_cand["path"] != str(worktree)
+
+
+def test_build_report_same_repo_pr_still_attaches_to_local_branch(
+        tmp_path, monkeypatch):
+    repo = _init_repo(tmp_path / "repo", origin="https://github.com/owner/repo.git")
+    worktree = _add_worktree(repo, "feat/x", tmp_path / "wt-x")
+    (worktree / "f.txt").write_text("x")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "work")
+
+    same_repo_pr = {
+        "number": 7, "headRefName": "feat/x", "url": "https://x",
+        "title": "same-repo PR", "updatedAt": "2024-01-01T00:00:00Z",
+        "state": "OPEN", "isCrossRepository": False,
+    }
+    monkeypatch.setenv(wt.PRLIST_JSON_ENV, _write_prlist(tmp_path, [same_repo_pr]))
+
+    review_report = wt.build_report(str(repo), "owner/repo", "review-pr")
+    pr_cand = next(c for c in review_report["candidates"] if c["id"] == "pr:7")
+    assert pr_cand["path"] == str(worktree)
+
+
+# ── introspect — collision-free candidate ids ─────────────────────────────────
+def test_introspect_id_collision_free_for_same_basename_worktrees(tmp_path):
+    repo = _init_repo(tmp_path / "repo", origin="https://github.com/owner/repo.git")
+    wt_a = _add_worktree(repo, "feat/a", tmp_path / "groupA" / "task")
+    wt_b = _add_worktree(repo, "feat/b", tmp_path / "groupB" / "task")
+
+    entries = wt.list_worktrees(str(repo))
+    recs = [wt.introspect(e, None, {}, is_primary=(i == 0))
+            for i, e in enumerate(entries)]
+
+    ids = [r["id"] for r in recs]
+    assert len(ids) == len(set(ids))   # no id collides despite same basename
+
+    by_path = {r["path"]: r["id"] for r in recs}
+    assert by_path[str(wt_a)] != by_path[str(wt_b)]

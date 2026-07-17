@@ -234,13 +234,17 @@ Parse the single JSON object on stdout and act on `present.mode`:
 
 - **`none`** — print "No open PR found in <repo>. Nothing to review." and **EXIT**.
 - **`single`** — exactly one open PR. Auto-select it (no question): `PR_NUMBER` = that
-  candidate's `open_pr.number`, `TARGET_CWD` = its `path`.
+  candidate's `open_pr.number`, `TARGET_CWD` = its `path` — or `<CWD>` when that `path`
+  is `null` (the sole open PR is `kind == "pr-only"`, not checked out anywhere; see the
+  `pr-only` note below).
 - **`caller`** — several PRs are open, but exactly one candidate is this session's own
   checkout — either where `$PWD` sits (`caller_match`) or, when `$PWD` is elsewhere, the
   worktree this session worked in, resolved from the session→worktree registry
   (`session_match`). Auto-select it (no question): `PR_NUMBER` = that candidate's
-  `open_pr.number`, `TARGET_CWD` = its `path`. Print ONE line — `Auto-selected this
-  session's worktree: PR #<n> (<path>)` — and continue.
+  `open_pr.number`, `TARGET_CWD` = its `path`. (This candidate's `path` is never `null`
+  here — both `caller_match` and `session_match` are resolved by comparing worktree
+  paths, so only a candidate that already has a `path` can ever be matched.) Print ONE
+  line — `Auto-selected this session's worktree: PR #<n> (<path>)` — and continue.
 - **`two`** / **`many`** — ask with **AskUserQuestion** (a sanctioned gate) which PR to
   review: render each `present.options[]` (its `label` as the option, its `detail` as the
   description). Free-text **"Other"** is offered ONLY in `many` mode
