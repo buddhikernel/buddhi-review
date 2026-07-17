@@ -328,6 +328,21 @@ def test_state_is_keyed_on_repo_and_pr():
     assert polish_state.read_polish_state(PR, REPO) is None
 
 
+def test_same_repo_name_under_different_owners_never_share_a_file():
+    # The key is the FULL owner/repo: alice/app#7 and bob/app#7 map to DISTINCT files,
+    # so two loops on same-named repos never fight over one filename. Each owner reads
+    # only its own verdict; clearing one leaves the other's untouched.
+    polish_state.write_polish_state("7", "alice/app", "HA", ["copilot"])
+    assert polish_state.read_polish_state("7", "bob/app") is None       # no cross-read
+    polish_state.write_polish_state("7", "bob/app", "HB", ["claude"])
+    assert (polish_state.state_path("7", "alice/app")
+            != polish_state.state_path("7", "bob/app"))                 # distinct files …
+    assert polish_state.read_polish_state("7", "alice/app")["bots"] == ["copilot"]
+    assert polish_state.read_polish_state("7", "bob/app")["bots"] == ["claude"]
+    assert polish_state.clear_polish_state("7", "bob/app") is True      # … so clearing one
+    assert polish_state.read_polish_state("7", "alice/app")["bots"] == ["copilot"]
+
+
 # ---------------------------------------------------------------------------
 # The verdict survives EVERY exit, not just a completed round
 # ---------------------------------------------------------------------------

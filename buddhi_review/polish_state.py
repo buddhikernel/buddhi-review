@@ -16,10 +16,12 @@ rebase) invalidates the verdict — the reviewer may have real findings on the n
 code — and nothing is restored.
 
 STORAGE. One JSON object per PR under ``$BUDDHI_POLISH_STATE_DIR`` (default
-``~/.cache/buddhi/polish-state``), named ``<repo_short>-PR<pr>.json``. The short
-repo tail can collide across owners (``a/foo`` vs ``b/foo``), so the record ALSO
-carries its full repo + PR and :func:`read_polish_state` re-verifies both — a
-collision therefore reads as "no state", never as another repo's verdict.
+``~/.cache/buddhi/polish-state``), named ``<owner__repo>-PR<pr>.json`` — the FULL
+``owner/repo`` slug, so two owners with the same repo name (``a/foo`` vs ``b/foo``)
+get distinct files and never fight over one filename. Belt-and-suspenders on top:
+the record ALSO carries its full repo + PR and :func:`read_polish_state`
+re-verifies both, so even a hand-moved or hand-edited file can only ever read as
+"no state", never as another repo's verdict.
 
 Every read is fail-CLOSED: a missing, corrupt, torn, foreign, or
 schema-mismatched record reads as ``None``, never an exception and never a
@@ -53,9 +55,13 @@ def state_dir() -> str:
 
 
 def state_path(pr, repo=None) -> str:
-    """``<dir>/<repo_short>-PR<pr>.json``."""
-    short = str(repo or "local").split("/")[-1] or "local"
-    return os.path.join(state_dir(), f"{_UNSAFE_RE.sub('_', short)}-PR{pr}.json")
+    """``<dir>/<owner__repo>-PR<pr>.json`` — keyed on the FULL ``owner/repo`` (the
+    ``/`` becomes ``__``), so same-named repos under different owners never share a
+    file. The one derivation for write, read, AND clear: all three call this, so
+    the key can never drift between them."""
+    full = str(repo or "local") or "local"
+    slug = _UNSAFE_RE.sub("_", full.replace("/", "__"))
+    return os.path.join(state_dir(), f"{slug}-PR{pr}.json")
 
 
 def _matches(stored, wanted) -> bool:
