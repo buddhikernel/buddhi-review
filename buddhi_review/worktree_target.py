@@ -167,6 +167,15 @@ def _repos_match(a, b):
     return _specs_match(_split_repo(a), _split_repo(b))
 
 
+def _pr_head_spec(pr):
+    """``owner/name`` of ``pr``'s head repository, or None when either field is
+    absent (a minimal test-seam fixture, or a GraphQL null for a deleted
+    fork). Never raises."""
+    owner = (pr.get("headRepositoryOwner") or {}).get("login") or ""
+    name = (pr.get("headRepository") or {}).get("name") or ""
+    return f"{owner}/{name}" if owner and name else None
+
+
 def _pr_head_is_local(pr, repo):
     """True iff ``pr``'s head branch lives IN ``repo`` (never raises).
 
@@ -178,15 +187,42 @@ def _pr_head_is_local(pr, repo):
     same-repo PR), means the head is a branch of THIS repo — always local. A
     cross-repository PR is local only when its head repo is, by coincidence,
     the SAME ``owner/repo`` as ``repo`` (e.g. a PR opened repo-to-repo rather
-    than from a personal fork)."""
+    than from a personal fork). See :func:`_pr_head_matches_worktree` for the
+    companion check that also matches a fork PR to a worktree of the FORK
+    itself."""
     try:
         if not pr.get("isCrossRepository"):
             return True
-        owner = (pr.get("headRepositoryOwner") or {}).get("login") or ""
-        name = (pr.get("headRepository") or {}).get("name") or ""
-        if not owner or not name:
+        spec = _pr_head_spec(pr)
+        return bool(spec) and _repos_match(spec, repo)
+    except Exception:
+        return False
+
+
+def _pr_head_matches_worktree(pr, repo, worktree_path):
+    """True iff ``pr``'s head branch lives in the checkout AT ``worktree_path``
+    (never raises).
+
+    :func:`_pr_head_is_local` alone answers "is this PR native to ``repo``?" —
+    the operator's base/target repo. That is enough for a same-repo PR (a
+    branch name is unambiguous within one repo), but it is always False for a
+    genuine fork PR, even when the PR IS checked out locally: reviewing from a
+    worktree of the CONTRIBUTOR's own fork (that worktree's ``origin`` is the
+    fork, not ``repo``) is a normal setup, and the fork's branch name still
+    only means anything relative to where it actually lives. So when the
+    same-repo check fails, also match when ``worktree_path``'s OWN ``origin``
+    names the PR's head repository — the fork-branch-collision guard in
+    :func:`_pr_head_is_local` stays intact (a same-repo PR still only matches
+    by branch name, never by remote), this only ADDS a second way for a
+    genuine fork PR to attach to the worktree that is actually its fork."""
+    try:
+        if _pr_head_is_local(pr, repo):
+            return True
+        spec = _pr_head_spec(pr)
+        if not spec:
             return False
-        return _repos_match(f"{owner}/{name}", repo)
+        remote = _run_git(worktree_path, "remote", "get-url", "origin")
+        return _repos_match(spec, remote)
     except Exception:
         return False
 
@@ -663,17 +699,21 @@ def _candidates_review(records, prs, repo):
     time.
 
     A PR is matched to a local worktree by branch name ONLY when
-    :func:`_pr_head_is_local` confirms the PR's head lives in ``repo`` — a
-    fork PR sharing a local branch's name by coincidence must never be treated
-    as checked out there (that worktree holds unrelated commits on a
-    different remote, so fixes would land on the wrong branch)."""
+    :func:`_pr_head_matches_worktree` confirms the PR's head lives IN THAT
+    WORKTREE — either ``repo`` itself (:func:`_pr_head_is_local`) or, for a
+    fork PR, a worktree whose OWN ``origin`` is the fork. A fork PR sharing a
+    local branch's name by coincidence must never be treated as checked out
+    there (that worktree holds unrelated commits on a different remote, so
+    fixes would land on the wrong branch)."""
     by_branch_record = {r["branch"]: r for r in records if r["branch"]}
     out = []
     for pr in prs:
         if not isinstance(pr, dict) or not pr.get("number"):
             continue
         branch = pr.get("headRefName", "")
-        rec = by_branch_record.get(branch) if _pr_head_is_local(pr, repo) else None
+        rec = by_branch_record.get(branch)
+        if rec is not None and not _pr_head_matches_worktree(pr, repo, rec["path"]):
+            rec = None
         if rec is not None:
             cand = dict(rec)
         else:
@@ -731,8 +771,25 @@ def _build_present(candidates, command, base, caller_id=None):
                 "free_input": False,
                 "options": [_opt(caller["id"], caller["label"], caller["detail"])]}
 
-    all_opt = _opt("all", f"All ({n})",
-                   "Run on every candidate, one after another.")
+    # A review-pr candidate can be `kind == "pr-only"` — an open PR not checked
+    # out in ANY worktree (`path: None`); `open-pr` candidates always have a
+    # real worktree path, so this is a no-op there. `review-pr` cannot launch
+    # such a PR from `<CWD>` — it stops at the checked-out check instead — so
+    # counting it in "All" would promise a run that always fails partway
+    # through and can strand later, genuinely launchable candidates unvisited.
+    # The label/count reflect only the launchable subset; the pr-only ones
+    # stay individually selectable (still surfaced, just not silently bundled
+    # into "All").
+    launchable = [c for c in candidates if c["kind"] != "pr-only"]
+    if len(launchable) < n:
+        skipped = n - len(launchable)
+        all_opt = _opt(
+            "all", f"All ({len(launchable)})",
+            f"Run on every checked-out candidate, one after another "
+            f"({skipped} not checked out locally — skipped).")
+    else:
+        all_opt = _opt("all", f"All ({n})",
+                       "Run on every candidate, one after another.")
     if n == 2:
         first, second = candidates[0], candidates[1]
         return {"ask": True, "mode": "two", "auto_target": None,
@@ -793,8 +850,18 @@ def build_report(cwd, repo, command, base=None, caller_cwd=None, session_id=None
         # the list as empty instead of shelling out to `gh pr list` for a repo that
         # (from THIS checkout's perspective) doesn't have a known remote home — an
         # unconditional fetch here would otherwise raise and block the new-repo
-        # creation path before the actuator ever runs.
-        if _run_git(cwd, "remote", "get-url", "origin") is None:
+        # creation path before the actuator ever runs. Probe via `git remote`
+        # (the remote NAME list), not `git remote get-url origin`: `_run_git`
+        # returns None for EVERY non-zero exit — a genuinely absent origin AND a
+        # broken repo/corrupt config both look identical through `get-url`. `git
+        # remote` itself only fails on the latter (a missing origin is just an
+        # empty/short list, exit 0), so it is the one call that can tell "no
+        # origin" apart from "can't tell" — and the latter must still fail loud
+        # rather than silently read as a brand-new repo and truncate candidates.
+        remotes = _run_git(cwd, "remote")
+        if remotes is None:
+            raise RuntimeError(f"git remote failed for {cwd}")
+        if "origin" not in remotes.splitlines():
             all_prs = []
         else:
             all_prs = fetch_prs(repo, "all")

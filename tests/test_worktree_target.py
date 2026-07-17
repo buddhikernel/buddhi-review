@@ -289,6 +289,59 @@ def test_build_report_same_repo_pr_still_attaches_to_local_branch(
     assert pr_cand["path"] == str(worktree)
 
 
+def test_build_report_fork_pr_attaches_when_checkout_itself_is_the_fork(
+        tmp_path, monkeypatch):
+    """Reviewing a fork PR from a checkout of the CONTRIBUTOR's own fork (its
+    ``origin`` is the fork, not the ``--repo`` target/base repo) is a normal
+    setup — ``_pr_head_is_local`` alone is always False here (the PR's head repo
+    is never the target repo), so the checkout's OWN ``origin`` must be the
+    tie-breaker that still attaches the PR to the worktree it is actually
+    checked out in, instead of reporting it as ``pr-only``."""
+    repo = _init_repo(tmp_path / "repo",
+                       origin="https://github.com/someone-else/fork.git")
+    worktree = _add_worktree(repo, "feature", tmp_path / "wt-feature")
+    (worktree / "f.txt").write_text("x")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "work")
+
+    fork_pr = {
+        "number": 42, "headRefName": "feature", "url": "https://x",
+        "title": "fork PR", "updatedAt": "2024-01-01T00:00:00Z",
+        "state": "OPEN", "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    monkeypatch.setenv(wt.PRLIST_JSON_ENV, _write_prlist(tmp_path, [fork_pr]))
+
+    review_report = wt.build_report(str(repo), "owner/repo", "review-pr")
+    pr_cand = next(c for c in review_report["candidates"] if c["id"] == "pr:42")
+    assert pr_cand["kind"] == "worktree"
+    assert pr_cand["path"] == str(worktree)
+
+
+def test_pr_head_matches_worktree_true_when_worktree_origin_is_the_fork(tmp_path):
+    fork_pr = {
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    fork_wt = _init_repo(tmp_path / "fork-wt",
+                         origin="https://github.com/someone-else/fork.git")
+    assert wt._pr_head_matches_worktree(fork_pr, "owner/repo", str(fork_wt)) is True
+
+
+def test_pr_head_matches_worktree_false_when_worktree_origin_is_unrelated(tmp_path):
+    fork_pr = {
+        "isCrossRepository": True,
+        "headRepositoryOwner": {"login": "someone-else"},
+        "headRepository": {"name": "fork"},
+    }
+    unrelated_wt = _init_repo(tmp_path / "unrelated-wt",
+                              origin="https://github.com/owner/repo.git")
+    assert wt._pr_head_matches_worktree(
+        fork_pr, "owner/repo", str(unrelated_wt)) is False
+
+
 # ── _git_int — fail loud instead of masking a failure as 0 ─────────────────────
 def test_git_int_raises_instead_of_returning_zero_on_git_failure(tmp_path):
     """A failing git invocation (here: a bogus revision range) makes ``_run_git``

@@ -272,16 +272,26 @@ Parse the single JSON object on stdout and act on `present.mode`:
   description). Free-text **"Other"** is offered ONLY in `many` mode
   (`present.free_input == true`); match the typed text against the full `candidates` array
   by **PR number** (with or without a leading `#`) first, then branch substring — re-ask
-  only if nothing matches. `value == "all"` → review **each** candidate PR sequentially,
-  re-binding `PR_NUMBER` / `TARGET_CWD` (and re-deriving `BASE_BRANCH` in Step 2.5) per
-  iteration — never carry one PR's values into the next. Otherwise set `PR_NUMBER` and
-  `TARGET_CWD` from the chosen candidate exactly as in the `single` case.
+  only if nothing matches. `value == "all"` → review **each candidate whose `kind` is NOT
+  `"pr-only"`** sequentially (the option's own `label`/`detail` already say how many that
+  is and how many are skipped — see the `pr-only` note below), re-binding `PR_NUMBER` /
+  `TARGET_CWD` (and re-deriving `BASE_BRANCH` in Step 2.5) per iteration — never carry one
+  PR's values into the next. Otherwise (a single chosen option, not `All`) set `PR_NUMBER`
+  and `TARGET_CWD` from the chosen candidate exactly as in the `single` case.
 
 A candidate whose `path` is `null` (`kind == "pr-only"`) is an open PR that is **not
 checked out in any worktree**. The loop applies its fixes in `TARGET_CWD` and does not
-check the PR out for you, so such a PR cannot be launched as it stands: set `TARGET_CWD` to
-`<CWD>` and let the checked-out check below report the mismatch and stop with the recovery
-instruction.
+check the PR out for you, so such a PR cannot be launched as it stands:
+
+- **Chosen directly** (a single option, `single`, or `caller` mode) — set `TARGET_CWD` to
+  `<CWD>` and let the checked-out check below report the mismatch and stop with the
+  recovery instruction; this is the only candidate the operator asked for, so stopping the
+  whole flow to say so is correct.
+- **Inside an `All` run** — do NOT set `TARGET_CWD` to `<CWD>` and do NOT run the
+  checked-out check for it. `All` already excludes every `pr-only` candidate (its `label`
+  says how many); skip straight past one, print `Skipping PR #<n>: not checked out
+  locally.`, and continue to the next candidate — a `pr-only` PR encountered mid-fan-out
+  must never stop the run and strand later, genuinely launchable candidates unvisited.
 
 If the command fails (a non-zero exit with `{"status": "error", …}`), log its `detail` and
 STOP — a PR list that could not be read must never be treated as "nothing to review".

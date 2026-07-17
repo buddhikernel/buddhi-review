@@ -449,6 +449,41 @@ def test_review_pr_enumerates_open_prs_and_annotates_the_checkout(tmp_path, seed
     assert alpha["open_pr"]["number"] == 11
 
 
+def test_review_pr_all_option_excludes_uncheckedout_prs_from_the_count(
+        tmp_path, seed_prs):
+    """A `pr-only` PR (not checked out anywhere) can never be launched by
+    review-pr — it stops at the checked-out check — so bundling it into "All"
+    would promise a run that always fails partway through and can strand later,
+    launchable candidates unvisited. The "All" option's count/detail must
+    reflect only the LAUNCHABLE (checked-out) candidates."""
+    seed_prs([
+        _pr(11, "feat/a", updated="2024-03-01T00:00:00Z"),
+        _pr(12, "feat/ghost", updated="2024-03-02T00:00:00Z"),
+    ])
+    repo = _init_repo(tmp_path / "repo")
+    _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a")
+    report = _report(repo, command="review-pr")
+    assert report["present"]["mode"] == "two"
+    all_opt = report["present"]["options"][-1]
+    assert all_opt["value"] == "all"
+    assert all_opt["label"] == "All (1)"
+    assert "not checked out locally" in all_opt["detail"]
+
+
+def test_review_pr_all_option_label_unchanged_when_every_pr_is_checked_out(
+        tmp_path, seed_prs):
+    """No `pr-only` candidates in the mix → the "All" option keeps its plain,
+    pre-existing wording (same assertion shape as the open-pr `All (n)` tests)."""
+    seed_prs([_pr(11, "feat/a"), _pr(12, "feat/b")])
+    repo = _init_repo(tmp_path / "repo")
+    _worktree_with_commit(repo, "feat/a", tmp_path / "wt-a")
+    _worktree_with_commit(repo, "feat/b", tmp_path / "wt-b")
+    report = _report(repo, command="review-pr")
+    all_opt = report["present"]["options"][-1]
+    assert all_opt["label"] == "All (2)"
+    assert all_opt["detail"] == "Run on every candidate, one after another."
+
+
 def test_review_pr_none_when_no_open_pr(tmp_path, seed_prs):
     seed_prs([_pr(9, "feat/a", state="MERGED")])
     repo = _init_repo(tmp_path / "repo")
@@ -540,6 +575,27 @@ def test_open_pr_with_no_origin_remote_skips_the_pr_fetch(tmp_path, monkeypatch)
     report = _report(repo, command="open-pr")
     assert report["candidate_count"] == 1
     assert report["present"]["mode"] == "single"
+
+
+def test_open_pr_raises_when_git_remote_itself_fails(tmp_path, monkeypatch):
+    """``git remote`` failing outright (repo corruption, an unreadable config, ...)
+    must raise — NOT be silently coerced into "no origin remote" and read as the
+    brand-new-repo case, which would truncate the candidate set instead of failing
+    loud. Distinct from ``test_open_pr_with_no_origin_remote_skips_the_pr_fetch``,
+    where ``git remote`` SUCCEEDS with an empty/short list."""
+    repo = _init_repo(tmp_path / "repo")
+    _worktree_with_commit(repo, "feat/x", tmp_path / "wt-x")
+
+    real_run_git = wt._run_git
+
+    def fake_run_git(cwd, *args, **kw):
+        if args == ("remote",):
+            return None
+        return real_run_git(cwd, *args, **kw)
+
+    monkeypatch.setattr(wt, "_run_git", fake_run_git)
+    with pytest.raises(RuntimeError, match="git remote failed"):
+        _report(repo, command="open-pr")
 
 
 def test_non_repo_cwd_raises(tmp_path):
