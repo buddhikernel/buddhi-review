@@ -182,6 +182,28 @@ def test_stale_lgtm_then_newer_inline_comment_is_resummoned():
     assert gh.matching(SUMMON)                  # re-summoned (round 2, on the fixed head)
 
 
+def test_same_instant_lgtm_beside_a_finding_does_not_fold_the_bot():
+    # A finding wins a TIE, not just a newer stamp. One review submission stamps its
+    # body and its inline comments with the SAME second, and inline comments are fetched
+    # before the body — so a "LGTM" summary body reaches the fold alongside a real
+    # same-submission finding. _supersedes reads the equal instants as a tie (False), so
+    # the strictly-newer rule cannot demote the body; the same-submission finding has to.
+    # Otherwise the finding is fixed in round 1 but its author is crowned done, dropped
+    # from expected_bots(), and the fixed head is never re-requested — the stale approval
+    # then satisfies the auto-merge review gate.
+    comments = [
+        Comment(id="f", text="this null check is missing", source="claude[bot]",
+                path="x.py", diff_hunk="@@ -1 +1 @@", created_at=NEW),  # inline finding
+        _lgtm(cid="ok", when=NEW),                                       # same-instant body
+    ]
+    driver, clock, gh = make_driver(comments, auto_merge=True)
+    driver.run()
+    assert "claude" not in driver.approved      # the same-instant LGTM did NOT fold it …
+    assert "claude" not in driver.done
+    assert "claude" in driver._preflight_responders  # its finding is the verdict in hand
+    assert gh.matching(SUMMON)                  # … re-summoned to verify the fixed head
+
+
 def test_stale_plus_one_beside_a_newer_inline_comment_is_resummoned():
     # A +1 reaction carries no timestamp, so it can never outrank a DATED message.
     # A reviewer whose newest message is substantive is still engaged, +1 or not.

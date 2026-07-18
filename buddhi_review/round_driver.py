@@ -2198,7 +2198,11 @@ class RoundDriver:
         * **Latest message wins for the clean fold** (``superseded``). Preflight reads
           the whole history at once in ENDPOINT order, which is not chronological, so
           an old "LGTM" could otherwise crown a reviewer voluntarily-done even though
-          it has since posted real findings."""
+          it has since posted real findings. A finding wins a TIE, too: a sign-off body
+          sharing its instant with an inline finding from the same bot (one review
+          submission stamps its body and inline comments alike) is that review's
+          summary, not proof the finding is resolved, so it never crowns the bot while
+          its own same-submission finding is still outstanding."""
         now = self.clock()
         fresh = self._ingest_new()
         # Establish the stale-reaction baseline: every reaction already on the PR
@@ -2246,6 +2250,23 @@ class RoundDriver:
                 self._fold_hard_signal(c)
                 continue
             rb = detectors.bot_for_login(c.source)
+            # A body sign-off (no path/diff_hunk) that shares its instant with an inline
+            # finding from the SAME bot is one review submission's SUMMARY, not a verdict
+            # that the finding is resolved: GitHub stamps a review body and its inline
+            # comments with the same created_at, and ``_supersedes`` reads equal instants
+            # as a tie (False), so the strictly-newer rule below never demotes such a
+            # body. The finding must win that tie — fold the body as superseded so a
+            # same-submission "LGTM" never crowns the bot voluntarily-done while its own
+            # finding is still outstanding. Without this the finding is fixed in round 1
+            # but its author lands in ``done``, is dropped from ``expected_bots()``, and
+            # the fixed head is never re-requested for verification — the stale approval
+            # then satisfies the auto-merge review gate. Only a BODY yields here: the
+            # finding comment itself is actionable regardless of this flag (``superseded``
+            # gates only the clean-review branch of ``_classify_signal``).
+            same_submission_finding = (
+                rb is not None and not (c.path or c.diff_hunk)
+                and any(_same_instant(stamp, c.created_at)
+                        for stamp in finding_stamps.get(rb, ())))
             # _supersedes, NOT _strictly_newer — the same predicate that BUILT
             # ``newest``, so the rule is symmetric. It differs in exactly one case:
             # an UNDATED comment (a degraded payload — GitHub always stamps). There a
@@ -2254,7 +2275,8 @@ class RoundDriver:
             # finding would never be summoned at all.
             bot = self._classify_signal(
                 c, now, batch_finding_stamps=finding_stamps,
-                superseded=rb is not None and _supersedes(newest.get(rb), c.created_at))
+                superseded=rb is not None and (
+                    _supersedes(newest.get(rb), c.created_at) or same_submission_finding))
             if bot is not None:
                 self._preflight_batch.append(c)
             if rb is not None:
