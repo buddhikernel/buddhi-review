@@ -78,6 +78,7 @@ from buddhi_review.config import (
     load_config, repo_entry,
 )
 from buddhi_review.loop import Comment, CommentResult, process_comments
+from buddhi_review.open_pr import OpenPrError, resolve_repo
 from buddhi_review.transparency import _colour_enabled, automation_notice
 
 
@@ -802,6 +803,11 @@ class RoundDriver:
         self.pr = str(pr)
         self.repo = repo
         self.cwd = cwd or os.getcwd()
+        # Lazily resolved by _polish_repo_key(): the owner/repo polish_state is
+        # keyed on, memoized once per run so a bare (--repo-less) invocation does
+        # not shell out to `gh repo view` on every read/write/clear.
+        self._polish_repo_resolved = False
+        self._polish_repo_cache: Optional[str] = None
         self.cfg = cfg if cfg is not None else load_config()
         # An unconfirmed repo (no repos[<repo>] entry) with NO global default to
         # fall back to is running purely on the built-in default fleet. This flag
@@ -1864,6 +1870,14 @@ class RoundDriver:
                       f"reassessment)")
             else:
                 self.polishing.add(bot)
+        # A bot with a SURVIVING finding this round must never stay parked in
+        # self.polishing: an --rr-active restore can restore a polish verdict
+        # stamped BEFORE the bot's later substantive comment on that same HEAD (the
+        # disk state only proves the tip matches, not that no newer comment
+        # arrived since the stamp was written). Without this discard, expected_bots()
+        # would keep filtering the bot out forever even though this round just
+        # dispatched a genuine fix for it that still needs verification.
+        self.polishing -= surviving
 
     def _worktree_has_changes(self) -> bool:
         """True when ``git status --porcelain`` reports any change in the loop's
@@ -1883,6 +1897,29 @@ class RoundDriver:
     def _head_sha(self) -> str:
         """This PR's live tip sha, or ``""`` when it cannot be read."""
         return _pr_head_sha(self.pr, self.repo, self.cwd, self.gh_run)
+
+    def _polish_repo_key(self) -> Optional[str]:
+        """The ``owner/repo`` :mod:`polish_state` keys its per-PR file on: ``self.repo``
+        when explicit, else inferred from ``self.cwd``'s GitHub remote (mirroring
+        :func:`open_pr.resolve_repo`), memoized for the run.
+
+        A bare CLI invocation (``--repo`` omitted) leaves ``self.repo`` as ``None``;
+        keying polish_state on that directly would fall back to a shared "local" file
+        that collides across every repo run the same way, and would never match a
+        state file a run with ``--repo`` explicitly passed had written for the SAME
+        PR. Resolving here keeps the key consistent across restarts regardless of
+        whether a given invocation happened to pass ``--repo``.
+
+        Falls back to ``self.repo`` (possibly ``None``) when the cwd has no readable
+        GitHub remote — polish_state's own repo+PR re-verify on read still keeps that
+        fallback safe (it reads as "no state" rather than another repo's verdict)."""
+        if not self._polish_repo_resolved:
+            try:
+                self._polish_repo_cache = resolve_repo(self.cwd, self.repo, self.gh_run)
+            except OpenPrError:
+                self._polish_repo_cache = self.repo
+            self._polish_repo_resolved = True
+        return self._polish_repo_cache
 
     def _rr_active_restore(self) -> None:
         """Reconstruct, before round 1, every verdict an ``--rr-active`` restart
@@ -2094,7 +2131,7 @@ class RoundDriver:
         head = self._head_sha()
         if not head:
             return set()   # unknown live HEAD → never restore (fail-closed)
-        state = polish_state.read_polish_state(self.pr, self.repo)
+        state = polish_state.read_polish_state(self.pr, self._polish_repo_key())
         if not state or state.get("tip_sha") != head:
             return set()
         # Restricted to the run-start fleet: a stale file must never resurrect a
@@ -2118,7 +2155,8 @@ class RoundDriver:
         tip = self._head_sha()
         if not tip:
             return
-        polish_state.write_polish_state(self.pr, self.repo, tip, sorted(self.polishing))
+        polish_state.write_polish_state(
+            self.pr, self._polish_repo_key(), tip, sorted(self.polishing))
 
     # ------------------------------------------------------------------- run
 
@@ -2674,7 +2712,7 @@ class RoundDriver:
         for that (best-effort; an unreadable state simply keeps the stamp) so a landed
         PR never leaves a stamp behind to age out."""
         if merged or self._pr_is_merged():
-            polish_state.clear_polish_state(self.pr, self.repo)
+            polish_state.clear_polish_state(self.pr, self._polish_repo_key())
         return RunOutcome("clean", rounds, merged, self.actions)
 
     def _pr_is_merged(self) -> bool:

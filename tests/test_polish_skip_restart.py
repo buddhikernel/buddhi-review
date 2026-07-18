@@ -81,13 +81,16 @@ class GhHead:
     the loop being killed mid-run."""
 
     def __init__(self, head="H0", advance_to="H1", kill_on=None, kill_after=0,
-                 head_fails=False):
+                 head_fails=False, name_with_owner=None):
         self.calls = []
         self.head = head
         self.advance_to = advance_to
         self.kill_on = kill_on           # substring of the spawn that kills the loop
         self.kill_after = kill_after     # …but let this many of them through first
         self.head_fails = head_fails     # the tip is unreadable (gh error)
+        # The `gh repo view` answer for a repo-less invocation's owner/repo
+        # inference; None models a cwd with no readable GitHub remote.
+        self.name_with_owner = name_with_owner
 
     def __call__(self, argv, *, cwd=None, timeout=None):
         argv = list(argv)
@@ -103,6 +106,10 @@ class GhHead:
             if self.head_fails:
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
             out = self.head + "\n"
+        elif argv[:3] == ["gh", "repo", "view"]:
+            if self.name_with_owner is None:
+                return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no remote")
+            out = self.name_with_owner + "\n"
         if argv[:2] == ["git", "push"]:
             self.head = self.advance_to
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
@@ -125,7 +132,7 @@ def classify(prompt):
     return json.dumps({"label": label, "reason": "t"})
 
 
-def make_driver(timeline, *, gh, cfg=None, clock=None, **kw):
+def make_driver(timeline, *, gh, cfg=None, clock=None, repo=REPO, **kw):
     clock = clock or FakeClock()
 
     def fetch(pr, repo=None, cwd=None):
@@ -136,7 +143,7 @@ def make_driver(timeline, *, gh, cfg=None, clock=None, **kw):
     kw.setdefault("resolve_thread", lambda thread_id, cwd=None: True)
     kw.setdefault("answer_waiter", lambda esc, **k: {})
     driver = RoundDriver(
-        PR, repo=REPO, cwd="/nonexistent", cfg=cfg or FLEET,
+        PR, repo=repo, cwd="/nonexistent", cfg=cfg or FLEET,
         adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),
         classify_runner=classify,
         fix_dispatch=lambda c, r: FixOutcome(status="applied"),
@@ -196,6 +203,71 @@ def test_mixed_round_polish_verdict_survives_a_kill_and_restart():
     assert outcome.merged is True                          # SAFETY gate satisfied → merge
     # A merged PR's state is dead — the file is dropped.
     assert not os.path.exists(polish_state.state_path(PR, REPO))
+
+
+# ---------------------------------------------------------------------------
+# A restored polish verdict must not outlive a NEW real finding on the SAME
+# stamped commit — a reviewer can post a later substantive comment after the
+# state file was written but before HEAD moves again.
+# ---------------------------------------------------------------------------
+
+def test_new_finding_evicts_a_restored_polish_verdict_so_the_fix_is_reverified():
+    # copilot's polish verdict was stamped at H1 by a prior run, but it later
+    # posted a REAL finding on that same commit — after the stamp was written —
+    # which is exactly what the restart preflight now finds sitting on the PR.
+    # The restart must process that finding as this round's real work, and once
+    # its fix lands copilot must be evicted from self.polishing so the next
+    # round re-requests it to verify the fix, rather than staying invisible to
+    # expected_bots() for the rest of the run.
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    polish_state.write_polish_state(PR, REPO, "H1", ["copilot"])
+    new_finding = Comment(id="c2", text="this null check is missing",
+                          source="copilot[bot]", path="y.py", diff_hunk="@@ -5 +5 @@")
+    gh = GhHead(head="H1", advance_to="H2")
+    driver, clock = make_driver([(0, new_finding)], gh=gh, cfg=cfg,
+                                rr_active=True, preflight=True, max_rounds=3)
+    driver.run()
+    assert "copilot" not in driver.polishing         # the new finding evicted the stale verdict
+    assert gh.head == "H2"                           # the fix was applied and pushed
+    # Round 1 defers copilot (it already spoke at preflight) but round 2 re-requests
+    # it to verify the fix — proof it is no longer stuck in self.polishing, which
+    # would have filtered it out of expected_bots() for the rest of the run.
+    assert gh.matching("requested_reviewers")
+
+
+# ---------------------------------------------------------------------------
+# A repo-less invocation (``--repo`` omitted → ``self.repo is None``) must key
+# polish_state on the SAME owner/repo a run WITH ``--repo`` uses, so a restart
+# restores regardless of whether either run happened to pass ``--repo``.
+# ---------------------------------------------------------------------------
+
+def test_repo_less_run_keys_polish_state_on_the_cwd_inferred_repo():
+    # repo=None: RoundDriver must infer "o/r" from the cwd's gh remote rather
+    # than falling back to the shared "local" key.
+    gh = GhHead(head="H0", advance_to="H1", kill_on="@claude review", kill_after=1,
+                name_with_owner=REPO)
+    driver, clock = make_driver([(0, SUBSTANTIVE), (0, COSMETIC)], gh=gh,
+                                 repo=None, max_rounds=3)
+    with pytest.raises(KeyboardInterrupt):
+        driver.run()
+    assert driver.polishing == {"copilot"}
+    # Stamped under the INFERRED repo, not the "local" fallback.
+    assert polish_state.read_polish_state(PR, REPO)["bots"] == ["copilot"]
+    assert not os.path.exists(polish_state.state_path(PR, None))
+
+
+def test_restart_omitting_repo_still_restores_a_run_that_passed_it():
+    # Run 1 passes --repo explicitly; the restart omits it but shares the same
+    # cwd/remote, so it must resolve to the SAME key and restore the verdict.
+    _killed_mixed_round()
+    assert polish_state.read_polish_state(PR, REPO)["tip_sha"] == "H1"
+
+    gh2 = GhHead(head="H1", advance_to="H2", name_with_owner=REPO)
+    driver2, clock2 = make_driver([(0, SUBSTANTIVE), (0, COSMETIC)], gh=gh2,
+                                  repo=None, rr_active=True, preflight=True, max_rounds=3)
+    driver2.run()
+    assert "copilot" in driver2.polishing                  # restored despite --repo omitted
+    assert gh2.matching("requested_reviewers") == []
 
 
 def test_polish_is_not_restored_when_head_has_moved():

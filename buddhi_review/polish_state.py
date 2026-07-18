@@ -177,10 +177,17 @@ def read_polish_state(pr, repo=None) -> Optional[Dict]:
 
 def clear_polish_state(pr, repo=None) -> bool:
     """Remove the per-PR stamp — the landed-PR cleanup, so a merged PR leaves nothing
-    behind to age out. Best-effort: a missing file or an OS error is not an error.
-    Returns True iff a file was actually removed."""
+    behind to age out. Also removes the sibling ``.lock`` file `write_polish_state`
+    takes during a write, so no orphan lock file accumulates per PR. Best-effort: a
+    missing file or an OS error is not an error. Returns True iff the state file was
+    actually removed."""
+    path = state_path(pr, repo)
     try:
-        os.remove(state_path(pr, repo))
+        os.remove(path + ".lock")
+    except OSError:
+        pass
+    try:
+        os.remove(path)
         return True
     except OSError:
         return False
