@@ -2034,3 +2034,29 @@ def test_rr_active_empty_summon_set_with_substantive_fix_goes_to_round2():
     outcome = driver.run()
     assert outcome.rounds >= 2                     # substantive fix → another round …
     assert gh.matching("@claude review")           # … which summons claude on the fixed head
+
+
+def test_rr_active_preflight_latest_message_uses_edit_time_not_post_time():
+    # A restart's latest-message-wins clean fold must order by EFFECTIVE stamp
+    # (updated_at-then-created_at), not raw created_at. claude posts a finding, THEN
+    # an LGTM (newer created_at) — but later EDITS the finding, so its updated_at
+    # postdates the LGTM. The LGTM is therefore STALE and must not fold claude
+    # voluntarily-done: the finding still stands and must be re-verified after the fix.
+    timeline = [
+        (0, Comment(id="a", text="this null check is missing", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@",
+                    created_at="2026-06-10T00:00:00Z",
+                    updated_at="2026-06-10T00:10:00Z")),   # edited AFTER the LGTM below
+        (0, Comment(id="b", text="No issues found.", source="claude[bot]",
+                    created_at="2026-06-10T00:05:00Z")),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("SUBSTANTIVE"),
+        fix=lambda c, r: FixOutcome(status="applied"), rr_active=True, preflight=True,
+        max_rounds=2, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert "claude" not in driver.approved              # stale LGTM must not fold it done
+    assert "claude" not in driver.done
+    assert outcome.rounds == 2
+    assert gh.matching("git", "push")                   # round 1's fix landed …
+    assert len(gh.matching("@claude review")) == 1      # … and claude IS re-summoned to verify it

@@ -2093,7 +2093,7 @@ class RoundDriver:
         if not fleet:
             return set()
         failures: List[str] = []
-        latest: Dict[str, Tuple[Optional[str], str]] = {}   # bot -> (created_at, text)
+        latest: Dict[str, Tuple[Optional[str], str]] = {}   # bot -> (effective stamp, text)
         comments_read = True
         try:
             comments = self.fetch(self.pr, repo=self.repo, cwd=self.cwd)
@@ -2105,9 +2105,16 @@ class RoundDriver:
             bot = detectors.bot_for_login(c.source)
             if bot is None:
                 continue
+            # updated_at-then-created_at (the same effective-stamp rule the errored
+            # comeback and the preflight snapshot's newest map both use): an inline
+            # finding EDITED after an older LGTM must prove its recency by its edit
+            # time, or the LGTM's created_at would still read as this bot's latest
+            # message and wrongly fold it voluntarily-done while the edited finding
+            # is still outstanding.
+            stamp = c.updated_at or c.created_at
             known = latest.get(bot)
-            if known is None or _supersedes(c.created_at, known[0]):
-                latest[bot] = (c.created_at, c.text or "")
+            if known is None or _supersedes(stamp, known[0]):
+                latest[bot] = (stamp, c.text or "")
         plus_one: Set[str] = set()
         try:
             for r in self.fetch_reactions(self.pr, repo=self.repo, cwd=self.cwd):
@@ -2306,8 +2313,15 @@ class RoundDriver:
                 continue
             if c.path or c.diff_hunk:
                 finding_stamps.setdefault(b, []).append(c.created_at)
-            if restart and _supersedes(c.created_at, newest.get(b)):
-                newest[b] = c.created_at
+            # updated_at-then-created_at (the same effective-stamp rule the errored
+            # comeback and the approval re-derive path below both use): an inline
+            # finding EDITED after an older LGTM must prove its recency by its edit
+            # time, or the LGTM's created_at would still win "newest" and wrongly
+            # fold the bot voluntarily-done while the edited finding is processed
+            # as actionable in the same preflight batch.
+            effective = c.updated_at or c.created_at
+            if restart and _supersedes(effective, newest.get(b)):
+                newest[b] = effective
         for c in fresh:
             # Only INLINE comments (thread roots AND their replies) live in review
             # threads, so only they can match the resolved set — which now holds
