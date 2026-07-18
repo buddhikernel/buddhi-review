@@ -431,6 +431,10 @@ def _dispatch_launch(pr_number: str, repo: str, cwd: str, err, *,
     # cli.py's _review_pr), so the wizard's repos[<repo>].auto_merge reaches a
     # directly-invoked non-free backend too — open-pr has no --auto-merge flag of
     # its own, so this is just the config lookup (no tri-state to layer on top).
+    # load_config()'s own missing/parse warnings print straight to sys.stderr
+    # (same as cli.py's _review_pr, which calls load_config() the same way) —
+    # not redirected to `err` here, since in real usage err IS sys.stderr and
+    # redirecting would only matter for a test-injected stream no test asserts on.
     auto_merge = resolve_auto_merge(load_config(), repo)
     # The chosen backend's launcher prints its own "where to watch" line (free → a
     # terminal-log link) to stderr, so the actuator's stdout stays the PR URL.
