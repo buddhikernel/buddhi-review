@@ -415,6 +415,17 @@ def test_same_repo_name_under_different_owners_never_share_a_file():
     assert polish_state.read_polish_state("7", "alice/app")["bots"] == ["copilot"]
 
 
+def test_unknown_repo_never_restores_even_its_own_write():
+    # An unknown repo (None) has no identity to key on: every repo-less run shares the
+    # one ``local-PR<pr>.json`` file, so two forks with the same PR number and a
+    # fork-shared head SHA would otherwise restore each other's verdict. Fail CLOSED —
+    # a None-repo write is never read back, not even by another None-repo read.
+    assert polish_state.write_polish_state("7", None, "H1", ["copilot"]) is True
+    assert polish_state.read_polish_state("7", None) is None
+    # A record hand-written with repo=None is likewise never handed to a None request.
+    assert polish_state.read_polish_state("7", None) is None
+
+
 # ---------------------------------------------------------------------------
 # The verdict survives EVERY exit, not just a completed round
 # ---------------------------------------------------------------------------

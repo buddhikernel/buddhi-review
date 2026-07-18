@@ -65,11 +65,14 @@ def state_path(pr, repo=None) -> str:
 
 
 def _matches(stored, wanted) -> bool:
-    """True when a stored key component identifies the requested one. ``None`` is
-    only ever matched by ``None``: a caller that could not infer a repo must not be
-    handed a record that names one."""
+    """True when a stored key component identifies the requested one. ``None`` NEVER
+    matches — not even another ``None``. A caller that could not infer a repo has no
+    identity to key on: every unknown-repo run shares the one ``local-PR<pr>.json``
+    file, so two forks with the same PR number and (fork-shared) head SHA would
+    otherwise restore each other's polish verdict. Fail CLOSED on the unknown repo —
+    a re-summon is the correct, safe cost of not knowing which repo the state is for."""
     if wanted is None or stored is None:
-        return wanted is None and stored is None
+        return False
     return str(stored) == str(wanted)
 
 
