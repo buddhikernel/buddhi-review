@@ -34,7 +34,7 @@ def repo(tmp_path):
 # same-model retry
 # ===========================================================================
 
-def test_effort_timeouts_single_source_medium_bumped():
+def test_effort_timeouts_single_source_medium_and_low_bumped():
     # The one table the fixer reads; medium bumped 300→600s so a substantive fix
     # on a large file is not abandoned to a too-short budget, and low bumped
     # 120→300s after real cosmetic haiku fixes tripped `>120s` repeatedly.
