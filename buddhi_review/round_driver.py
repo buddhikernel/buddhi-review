@@ -2385,7 +2385,12 @@ class RoundDriver:
             kept = []
             for c in self._preflight_batch:
                 b = detectors.bot_for_login(c.source)
-                if b in self.approved and _supersedes(newest.get(b), c.created_at):
+                # updated_at-then-created_at (the same effective-stamp rule the errored
+                # comeback uses): an EDITED finding must prove its recency by its edit
+                # time, or a stale approval posted between its original post and its
+                # edit would still crown it "newer" and this finding would be dropped as
+                # stale even though the edit postdates the approval.
+                if b in self.approved and _supersedes(newest.get(b), c.updated_at or c.created_at):
                     continue  # stale finding under this bot's newer approval — not re-fixed
                 kept.append(c)
             self._preflight_batch = kept

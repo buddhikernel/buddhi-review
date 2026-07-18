@@ -34,6 +34,7 @@ from buddhi_review.seams import ConsoleEscalation
 UTC = timezone.utc
 OLD = "2026-07-01T10:00:00Z"
 NEW = "2026-07-02T10:00:00Z"
+EVEN_NEWER = "2026-07-03T10:00:00Z"
 
 CLAUDE_ONLY = {"active_reviewers": ["claude"], "auto_on_open": {"claude": False}}
 SUMMON = "@claude review"
@@ -427,3 +428,21 @@ def test_a_stale_finding_under_a_newer_approval_is_not_re_dispatched():
     assert "claude" in driver.approved          # its newer approval stands …
     assert gh.matching(SUMMON) == []            # … so it is not re-summoned
     assert outcome.merged is True               # a genuine review happened → merge
+
+
+def test_a_finding_edited_after_a_newer_approval_is_still_re_dispatched():
+    # The finding's ORIGINAL post predates the approval (so created_at alone would call
+    # it stale), but the reviewer EDITED it after posting the approval — updated_at is
+    # the newest stamp of all. The edit postdates the sign-off, so it must still be
+    # re-fixed rather than dropped as a stale finding under a "newer" approval that is
+    # actually older than the edit.
+    fixed = []
+    comments = [
+        Comment(id="f", text="this null check is missing too", source="claude[bot]",
+                path="x.py", diff_hunk="@@ -1 +1 @@", created_at=OLD, updated_at=EVEN_NEWER),
+        _lgtm(cid="ok", when=NEW, from_issue_channel=True),   # approval predates the edit
+    ]
+    driver, clock, gh = make_driver(comments, auto_merge=True)
+    driver.fix_dispatch = lambda c, r: fixed.append(c.id) or FixOutcome(status="applied")
+    driver.run()
+    assert fixed == ["f"]                       # the edited finding WAS re-fixed
