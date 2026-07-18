@@ -16,11 +16,9 @@ engine (so a directly-invoked engine still honors the config).
 """
 from __future__ import annotations
 
-import io
-
 import pytest
 
-from buddhi_review import backends, cli, config
+from buddhi_review import backends, cli, config, open_pr
 
 REPO = "octocat/Hello-World"
 
@@ -174,6 +172,33 @@ def test_review_pr_explicit_off_overrides_config_on(monkeypatch):
     assert cap["auto_merge"] is False
 
 
+def test_review_pr_explicit_flag_skips_config_load(monkeypatch):
+    # An explicit --auto-merge/--no-auto-merge never needs the config file, so
+    # load_config() must not be called (no I/O, no missing-config warning).
+    calls = []
+    cap = {}
+    _patch_front_door(monkeypatch, _ON_CFG, cap)
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: calls.append(1) or _ON_CFG)
+    assert cli._review_pr(_args("--no-auto-merge")) == 0
+    assert not calls
+    assert cap["auto_merge"] is False
+
+
+def test_review_pr_no_repo_skips_config_load(monkeypatch):
+    # An unset flag with no --repo can never match a per-repo config entry, so
+    # load_config() must not be called either.
+    calls = []
+    cap = {}
+    monkeypatch.setattr(cli.update_banner, "maybe_emit_update_banner", lambda **k: None)
+    monkeypatch.setattr(cli, "load_config", lambda *a, **k: calls.append(1) or _ON_CFG)
+    monkeypatch.setattr(cli, "launch_review_loop",
+                        lambda pr, repo, cwd, **opts: cap.__setitem__("auto_merge", opts.get("auto_merge")) or 0)
+    ns = _parse(["review-pr", "7"])
+    assert cli._review_pr(ns) == 0
+    assert not calls
+    assert cap["auto_merge"] is False
+
+
 # ── backends argv seam — the resolved value flows through, no stray flag ───────
 
 def _run_front_door_capture_argv(monkeypatch, cfg, extra=()):
@@ -274,3 +299,48 @@ def test_run_loop_explicit_on_with_no_config(monkeypatch):
     _patch_run_loop(monkeypatch, _NO_CFG)
     cli._run_loop(_run_loop_args("--auto-merge"))
     assert _FakeDriver.last_auto_merge is True
+
+
+# ── open-pr's _dispatch_launch — the resolved bool reaches this hand-off too ────
+# open-pr has no --auto-merge flag of its own, so there is no tri-state to
+# layer on top here — just the repos[<repo>].auto_merge config lookup.
+
+def _patch_dispatch_launch(monkeypatch, cfg, captured):
+    # _dispatch_launch imports launch_review_loop locally from buddhi_review.backends
+    # on every call, so the patch target is the backends module, not open_pr.
+    monkeypatch.setattr(open_pr, "load_config", lambda *a, **k: cfg)
+
+    def _capture(pr, repo, cwd, **opts):
+        captured["auto_merge"] = opts.get("auto_merge")
+        return 0
+
+    monkeypatch.setattr(backends, "launch_review_loop", _capture)
+
+
+def test_dispatch_launch_unset_resolves_config_on_to_true(monkeypatch):
+    cap = {}
+    _patch_dispatch_launch(monkeypatch, _ON_CFG, cap)
+    open_pr._dispatch_launch("7", REPO, "/work", None)
+    assert cap["auto_merge"] is True  # reaches the (PRO) backend as a resolved bool
+
+
+def test_dispatch_launch_no_config_resolves_to_false(monkeypatch):
+    cap = {}
+    _patch_dispatch_launch(monkeypatch, _NO_CFG, cap)
+    open_pr._dispatch_launch("7", REPO, "/work", None)
+    assert cap["auto_merge"] is False  # fail-closed, still a concrete bool (not None)
+
+
+def test_dispatch_launch_argv_seam_carries_resolved_on(monkeypatch):
+    # Drive through the REAL FreeBackend launch and confirm the resolved bool
+    # reaches the detached run-loop argv — not just the direct kwarg capture.
+    rec = []
+    monkeypatch.setattr(open_pr, "load_config", lambda *a, **k: _ON_CFG)
+    monkeypatch.setattr(backends, "discover_backends",
+                        lambda **k: [backends.FreeBackend()])
+    monkeypatch.setattr(backends, "_detached_run",
+                        lambda cmd, *a, **kw: rec.append(cmd))
+    open_pr._dispatch_launch("7", REPO, "/work", None)
+    assert rec, "the launcher argv was not captured"
+    assert "--auto-merge" in rec[0]
+    assert "--no-auto-merge" not in rec[0]

@@ -178,7 +178,7 @@ def label_gated_ci(cfg: Dict[str, Any], repo: Optional[str] = None) -> bool:
 def auto_merge(cfg: Dict[str, Any], repo: Optional[str] = None) -> bool:
     """Whether a clean pass auto-merges (squash-merge + delete branch) the PR for
     ``repo``. A CONFIRMED repo's per-repo ``auto_merge`` (a ``repos[<repo>]`` entry
-    carrying a **bool** key) enables it; otherwise OFF (fail-closed). Unlike
+    with a **bool** value) enables it; otherwise OFF (fail-closed). Unlike
     :func:`label_gated_ci` there is deliberately NO global-default tier — the merge
     is opt-in PER REPO (the wizard's ``step_repo_auto_merge`` is the only writer),
     so this consults ONLY ``repos[<repo>]`` and never a top-level key. A non-bool

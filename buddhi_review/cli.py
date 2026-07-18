@@ -126,7 +126,12 @@ def _review_pr(args: argparse.Namespace) -> int:
     # resolved value reaches a separately-installed PRO backend as a definite bool
     # via the argv seam (an unset None would otherwise let per-repo config be lost
     # at the seam). Resolved again in run-loop for a directly-invoked engine.
-    effective_auto_merge = _effective_auto_merge(args, load_config())
+    # Only load config when the flag is unset AND a repo is given: an explicit
+    # --auto-merge/--no-auto-merge never consults cfg, and repo_entry() returns
+    # None for repo=None regardless of cfg — so both cases would pay for I/O and
+    # a possible missing-config warning for a value that's never used.
+    cfg = load_config() if args.auto_merge is None and args.repo else {}
+    effective_auto_merge = _effective_auto_merge(args, cfg)
     return launch_review_loop(
         args.pr, args.repo, cwd,
         auto_merge=effective_auto_merge,
