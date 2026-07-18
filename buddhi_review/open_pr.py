@@ -33,6 +33,7 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 
+from buddhi_review.config import auto_merge as resolve_auto_merge, load_config
 from buddhi_review.transparency import automation_notice
 
 
@@ -426,10 +427,20 @@ def _dispatch_launch(pr_number: str, repo: str, cwd: str, err, *,
     locally to keep ``open_pr``'s git decision tree free of a load-time
     dependency on the launch layer."""
     from buddhi_review.backends import launch_review_loop
+    # Resolve auto-merge to a concrete bool BEFORE the backend hand-off (mirrors
+    # cli.py's _review_pr), so the wizard's repos[<repo>].auto_merge reaches a
+    # directly-invoked non-free backend too — open-pr has no --auto-merge flag of
+    # its own, so this is just the config lookup (no tri-state to layer on top).
+    # load_config()'s own missing/parse warnings print straight to sys.stderr
+    # (same as cli.py's _review_pr, which calls load_config() the same way) —
+    # not redirected to `err` here, since in real usage err IS sys.stderr and
+    # redirecting would only matter for a test-injected stream no test asserts on.
+    auto_merge = resolve_auto_merge(load_config(), repo)
     # The chosen backend's launcher prints its own "where to watch" line (free → a
     # terminal-log link) to stderr, so the actuator's stdout stays the PR URL.
     try:
-        launch_review_loop(pr_number, repo, cwd, out=err, err=err, max_rounds=max_rounds)
+        launch_review_loop(pr_number, repo, cwd, out=err, err=err, max_rounds=max_rounds,
+                           auto_merge=auto_merge)
     except Exception as exc:  # never crash the actuator after the PR is open
         print(f"⚠ could not launch the review loop ({exc}); run it manually: "
               f"python3 -m buddhi_review review-pr {pr_number} --repo {repo} --cwd {cwd}", file=err)

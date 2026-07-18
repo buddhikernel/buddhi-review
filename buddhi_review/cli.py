@@ -37,6 +37,7 @@ from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.backends import launch_review_loop, select_command_backend
 from buddhi_review.config import (
     active_reviewers,
+    auto_merge as resolve_auto_merge,
     has_global_default,
     load_config,
     notifier_channel,
@@ -95,6 +96,21 @@ def _self_check(argv: Optional[List[str]] = None) -> int:
     return 0 if ok else 1
 
 
+def _effective_auto_merge(args: argparse.Namespace, cfg: dict) -> bool:
+    """The auto-merge decision for this run, as a concrete bool.
+
+    Tri-state resolution, fail-closed: an explicit ``--auto-merge`` /
+    ``--no-auto-merge`` flag (``True`` / ``False``) always wins; an UNSET flag
+    (``None``) falls back to the repo's configured ``repos[<repo>].auto_merge``,
+    else off. There is deliberately no global-default tier (the merge is opt-in per
+    repo). Shared by the ``review-pr`` front door and the ``run-loop`` engine so the
+    two never drift, and so a genuinely-unset run with no per-repo config resolves
+    to ``False`` (never auto-merges a PR the operator did not opt into)."""
+    if args.auto_merge is not None:
+        return args.auto_merge
+    return resolve_auto_merge(cfg, args.repo)
+
+
 def _review_pr(args: argparse.Namespace) -> int:
     """The ``review-pr`` front door: route the loop launch through the backend
     dispatcher, then return immediately. With nothing extra installed this runs the
@@ -106,9 +122,19 @@ def _review_pr(args: argparse.Namespace) -> int:
     # Decoration → stderr (the front door's stdout carries the launch's own output);
     # fully fail-open so it never blocks or delays the launch.
     update_banner.maybe_emit_update_banner(cwd=cwd, stream=sys.stderr)
+    # Resolve auto-merge to a concrete bool BEFORE the backend hand-off, so the
+    # resolved value reaches a separately-installed PRO backend as a definite bool
+    # via the argv seam (an unset None would otherwise let per-repo config be lost
+    # at the seam). Resolved again in run-loop for a directly-invoked engine.
+    # Only load config when the flag is unset AND a repo is given: an explicit
+    # --auto-merge/--no-auto-merge never consults cfg, and repo_entry() returns
+    # None for repo=None regardless of cfg — so both cases would pay for I/O and
+    # a possible missing-config warning for a value that's never used.
+    cfg = load_config() if args.auto_merge is None and args.repo else {}
+    effective_auto_merge = _effective_auto_merge(args, cfg)
     return launch_review_loop(
         args.pr, args.repo, cwd,
-        auto_merge=args.auto_merge,
+        auto_merge=effective_auto_merge,
         verify_fixes=args.verify_fixes,
         max_rounds=args.max_rounds,
         test_failure_mode=args.test_failure_mode,
@@ -190,7 +216,10 @@ def _run_loop(args: argparse.Namespace) -> int:
         ),
         max_rounds=args.max_rounds,
         diff_lines=diff_lines,
-        auto_merge=args.auto_merge,
+        # Same tri-state resolution as the review-pr front door (flag > per-repo
+        # config > off), applied again here so a directly-invoked run-loop (or a
+        # front door that forwarded an unset None) still honors the config.
+        auto_merge=_effective_auto_merge(args, cfg),
         rr=args.rr,
         rr_active=args.rr_active,
         rr_none=args.rr_none,
@@ -257,9 +286,14 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("pr")
     p.add_argument("--repo")
     p.add_argument("--cwd")
-    # Default is NO auto-merge; the merge is opt-in.
-    p.add_argument("--auto-merge", action=argparse.BooleanOptionalAction, default=False,
-                   help="squash-merge + delete branch on a clean pass (default: off)")
+    # Tri-state: unset (None) → fall back to the repo's configured auto_merge
+    # (repos[<repo>].auto_merge), else off; an explicit --auto-merge /
+    # --no-auto-merge always wins. Default MUST stay None, never False — a
+    # concrete False would make the per-repo config unreachable (the merge is
+    # opt-in, so the config can only ever turn it ON).
+    p.add_argument("--auto-merge", action=argparse.BooleanOptionalAction, default=None,
+                   help="squash-merge + delete branch on a clean pass (default: "
+                        "unset → the repo's configured auto_merge, else off)")
     p.add_argument("--verify-fixes", choices=VERIFY_MODES, default="auto",
                    help="pre-commit fix verification (tripwire always forces it)")
     # A PR_DESCRIPTION comment auto-rewrites the PR body in place (default: on).
