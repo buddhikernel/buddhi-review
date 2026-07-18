@@ -549,6 +549,31 @@ def test_a_plain_rerun_does_not_erase_the_verdict_at_the_same_tip():
     assert polish_state.read_polish_state(PR, REPO)["bots"] == ["copilot"]
 
 
+def test_forced_rr_clears_a_stale_verdict_so_the_reviewer_is_re_included():
+    # The CONTRAST to the plain rerun above. --rr is an explicit "re-ping everyone":
+    # it clears the in-memory soft exclusions (done/approved/polishing/…) so a
+    # previously-satisfied reviewer is summoned again. The on-disk polish record is the
+    # CROSS-RESTART form of that same soft exclusion, so --rr must drop it too.
+    # Otherwise a --rr run that ends at an unadvanced HEAD with an empty polish set
+    # cannot erase it — the empty no-clobber refuses the same-tip write and --rr never
+    # sets restored_prior — and a later --rr-active restart restores the stale
+    # [copilot], re-skipping the very reviewer --rr was explicitly used to re-include.
+    polish_state.write_polish_state(PR, REPO, "H1", ["copilot"])
+    gh = GhHead(head="H1")                              # HEAD never advances (push off)
+    driver, _ = make_driver([(0, SUBSTANTIVE)], gh=gh, rr=True, max_rounds=1, push=False)
+    driver.run()
+    assert driver.polishing == set()                                     # cleared in memory …
+    assert (polish_state.read_polish_state(PR, REPO) or {}).get("bots") == []   # … and on disk
+
+    # End-to-end: the follow-up --rr-active restart at the same head now restores
+    # nothing, so copilot is summoned again instead of being silently skipped.
+    gh2 = GhHead(head="H1", advance_to="H2")
+    driver2, _ = make_driver([], gh=gh2, rr_active=True, preflight=True, max_rounds=1)
+    driver2.run()
+    assert "copilot" not in driver2.polishing            # no stale verdict restored …
+    assert gh2.matching("requested_reviewers") != []     # … so copilot is re-summoned
+
+
 def test_a_restored_run_may_clear_an_invalidated_verdict_at_the_same_tip():
     # NO-CLOBBER has ONE exception. A run that RESTORED the verdict this tip carries
     # (restored_prior=True, an --rr-active restart) and then legitimately cleared it —

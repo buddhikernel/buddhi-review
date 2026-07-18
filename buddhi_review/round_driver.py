@@ -2524,6 +2524,15 @@ class RoundDriver:
             self.approved.clear()
             self.polishing.clear()
             self.reviewed_no_change.clear()
+            # The on-disk polish record is the CROSS-RESTART form of self.polishing —
+            # a soft exclusion that outlives the process — so drop it too. Otherwise a
+            # --rr run that ends at an unadvanced HEAD with an empty polish set cannot
+            # erase it: write_polish_state's empty no-clobber refuses that same-tip
+            # write, and --rr never sets _polish_restored (it skips both the preflight
+            # and _rr_active_restore that would). The stale verdict would then survive
+            # for a later --rr-active restart to restore — re-skipping the very reviewer
+            # --rr was explicitly used to re-include.
+            polish_state.clear_polish_state(self.pr, self._polish_repo_key())
         # Snapshot the run-start fleet BEFORE preflight folds responders into
         # done/exclusions, so the SAFETY gate still measures the FULL expected
         # fleet: a PR everyone already approved has an empty round-1 expected set
