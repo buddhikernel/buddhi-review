@@ -2357,7 +2357,7 @@ class RoundDriver:
         behaviour, where no comment is filtered — and never crashes the preflight
         fold."""
         try:
-            threads = self.fetch_threads(self.pr, repo=self.repo, cwd=self.cwd)
+            threads = self.fetch_threads(self.pr, repo=self._polish_repo_key(), cwd=self.cwd)
             return {t.root_comment_id for t in threads
                     if t.is_resolved and t.root_comment_id is not None}
         except Exception:
