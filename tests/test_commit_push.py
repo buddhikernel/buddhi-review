@@ -344,6 +344,53 @@ def test_commit_and_push_nothing_to_do(repo):
         str(repo), message="m", notice=_silent_notice) == "nothing"
 
 
+def test_commit_and_push_droppings_only_is_nothing(monkeypatch, repo):
+    """A round that only left an editor/backup dropping (e.g. a failed fixer's
+    `foo.bak`, no real edit) must NOT masquerade as landed progress: `_stage_all`
+    excludes the dropping, nothing is staged/committed, and HEAD already matches
+    upstream — so the push below would ship nothing new. That's "nothing", not
+    "pushed" (which would trick RoundDriver into re-summoning another review
+    round over a no-op)."""
+    monkeypatch.setenv("BUDDHI_TEST_COMMAND", "python3 -c pass")
+    (repo / "foo.bak").write_text("stray")
+    out = commit_push.commit_and_push(
+        str(repo), message="m", notice=_silent_notice)
+    assert out == "nothing"
+    assert (repo / "foo.bak").exists()  # left alone, never swept into a commit
+
+
+def test_commit_and_push_rerun_gate_still_pushes_when_already_committed(monkeypatch, repo):
+    """The final commit block's ``git diff --cached --quiet`` is ALSO clean on the
+    legitimate "I've fixed it" re-run path (answer 3 commits the operator's pending
+    edits mid-gate-loop — see the block above) — that must still push and report
+    "pushed", not get caught by the new droppings-only no-op guard: HEAD is ahead
+    of upstream from the loop's own commit, so `_push_is_noop` correctly says no."""
+    marker = repo / "gate_ok"
+    monkeypatch.setenv(
+        "BUDDHI_TEST_COMMAND",
+        "python3 -c \"import os,sys; sys.exit(0 if os.path.exists('gate_ok') else 1)\"",
+    )
+    (repo / "f.py").write_text("x = 9\n")
+    notifier = FakeNotifier()
+    calls = []
+
+    def answer_wait(n, ask):
+        calls.append(ask)
+        marker.write_text("ok")  # operator "fixed it" — flips the gate green
+        return "3"
+
+    out = commit_push.commit_and_push(
+        str(repo), message="m", notifier=notifier,
+        answer_wait=answer_wait, notice=_silent_notice)
+    assert out == "pushed"
+    assert len(calls) == 1
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo,
+                          capture_output=True, text=True).stdout.strip()
+    upstream = subprocess.run(["git", "rev-parse", "@{u}"], cwd=repo,
+                              capture_output=True, text=True).stdout.strip()
+    assert head == upstream  # actually shipped, not left dangling
+
+
 def test_red_gate_escalates_only_never_edits(monkeypatch, repo):
     """On a red gate the skill asks on the console and stops, unless the
     human explicitly answers 1 (push as-is). It never edits or reverts

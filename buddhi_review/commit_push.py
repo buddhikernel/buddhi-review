@@ -827,11 +827,21 @@ def commit_and_push(
     # operator who committed their own host-side fix — may have already captured
     # the tree; a no-op `git commit` exits nonzero and must NOT be misread as an
     # error (the push below still ships the existing commit).
+    committed_now = False
     if run(["git", "diff", "--cached", "--quiet"], cwd=cwd).returncode != 0:
         head_before = _git_rev_parse(cwd, "HEAD", run=run)
         if run(["git", "commit", "-m", message], cwd=cwd).returncode != 0:
             _diagnose_commit_failure(cwd, head_before, run=run, notice=notice)
             return "error"
+        committed_now = True
+    # Droppings-only round: `_stage_all` above excluded every changed path (all
+    # editor/backup droppings), so nothing was staged/committed here — and if HEAD
+    # already matches the upstream tracking ref, the push below would ship nothing
+    # new either. That is NO progress, not "pushed" (a genuine host-side commit the
+    # operator made before this call still has something ahead of upstream and
+    # takes the push path below as before).
+    if not committed_now and _push_is_noop(cwd, run=run):
+        return "nothing"
     print(flush=True)  # phase break — the push is its own block
     # Push by EXPLICIT refspec (via _push_argv) so a mismatched-named or dangling
     # upstream can't fail the push; falls back to a bare push for a detached HEAD
@@ -858,6 +868,18 @@ def commit_and_push(
 # files + the manual steps), never resolved; a best-effort restore to the
 # pre-rebase state is attempted. It never leaves a half-rebased branch or
 # silently swallows a conflict.
+
+
+def _push_is_noop(cwd: Optional[str], *, run: Run = _default_run) -> bool:
+    """True iff local ``HEAD`` already equals its upstream tracking ref (``@{u}``)
+    — a push from here would ship nothing new. Any ambiguity (no upstream
+    configured, detached HEAD, resolution error) → False, the conservative
+    default that just lets the normal push path run as the fail-safe."""
+    head = _git_rev_parse(cwd, "HEAD", run=run)
+    upstream = _git_rev_parse(cwd, "@{u}", run=run)
+    if head is None or upstream is None:
+        return False
+    return head == upstream
 
 
 def _git_rev_parse(cwd: Optional[str], ref: str, *, run: Run = _default_run) -> Optional[str]:
