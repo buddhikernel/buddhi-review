@@ -42,7 +42,7 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import Callable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from buddhi_review import config, lang_syntax, merge, test_runner
 from buddhi_review.notifier import Ask, ConsoleNotifier, Notifier
@@ -97,6 +97,13 @@ _GATE_HEADLINE_RE = re.compile(r"^\[local-tests\] ✗ gate RED — ")
 _DROPPING_GLOBS: Tuple[str, ...] = (
     "*.bak", "*~", "*.orig", ".#*", "*.swp", "*.swo", ".DS_Store",
 )
+
+# The subset of `_DROPPING_GLOBS` whose backup name is DETERMINISTICALLY the
+# source path plus a fixed suffix — `src.py` -> `src.py.bak`/`src.py~`/
+# `src.py.orig`. `.DS_Store`, `.#*` (emacs lock) and `*.swp`/`*.swo` (vim swap,
+# dot-prefixed) carry no such source-name relationship, so pairing those to a
+# "source" would be a guess, not a fact (see `_backup_source`).
+_BACKUP_SUFFIXES: Tuple[str, ...] = (".bak", "~", ".orig")
 
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
@@ -624,6 +631,15 @@ def _diagnose_commit_failure(
 # guard keeps them out of staging while leaving every legitimate change untouched.
 # It is best-effort and FAIL-OPEN: a status probe that errors just falls back to
 # the plain ``git add -A`` so the guard can never block a commit.
+#
+# One paired case needs more than a plain exclude: a fixer/editor doing an
+# in-place rewrite via backup-then-replace (move ``src.py`` to ``src.py.bak``,
+# write a fresh ``src.py``) that fails BEFORE recreating ``src.py`` leaves the
+# worktree showing ``D src.py`` (deleted, tracked) plus ``?? src.py.bak`` (new,
+# untracked). Excluding only the backup would still let the plain ``git add -A``
+# stage and commit ``src.py``'s deletion — landing a real-file deletion on the PR
+# while its only surviving content sits in the excluded, uncommitted backup. See
+# :func:`_risky_delete_pairs`, which holds the deleted source out of staging too.
 
 
 def _new_to_head(xy: str) -> bool:
@@ -657,19 +673,17 @@ def _iter_porcelain_z(stdout: str) -> Iterator[Tuple[str, str]]:
         i += 1
 
 
-def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
-    """Repo-relative paths in ``cwd``'s worktree that are NEW editor/backup
-    droppings (:func:`_is_dropping`) with no HEAD history (:func:`_new_to_head`)
-    — the only ones ``_stage_all`` may safely hold out of the commit. A dropping
-    that was already tracked (its own modification or deletion) is Git's to
-    record like any other change and is deliberately excluded here, so it stages
-    and commits normally instead of being silently kept alive.
+def _status_entries(cwd: str, *, run: Run = _default_run) -> List[Tuple[str, str]]:
+    """One ``git status --porcelain -z --untracked-files=all`` scan, parsed via
+    :func:`_iter_porcelain_z` — the shared substrate for :func:`_detect_droppings`
+    and :func:`_risky_delete_pairs` so both read the exact same worktree snapshot
+    and can't drift out of sync with each other.
 
     ``--untracked-files=all`` is essential: without it a dropping inside a brand-new
     (otherwise-untracked) directory is hidden under a collapsed ``dir/`` porcelain
-    entry and would slip past both this scan and the exclude pathspec, riding the
-    ``git add -A`` into the commit. Best-effort: any error or a non-zero status →
-    ``[]`` (the caller then stages plainly)."""
+    entry and would slip past both callers' scans, riding the ``git add -A`` into
+    the commit. Best-effort: any error or a non-zero status → ``[]`` (each caller
+    then falls back to its own safe default)."""
     try:
         st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
                  cwd=cwd)
@@ -677,8 +691,50 @@ def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
         return []
     if getattr(st, "returncode", 1) != 0:
         return []
-    return [path for xy, path in _iter_porcelain_z(getattr(st, "stdout", "") or "")
-            if _is_dropping(path) and _new_to_head(xy)]
+    return list(_iter_porcelain_z(getattr(st, "stdout", "") or ""))
+
+
+def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
+    """Repo-relative paths in ``cwd``'s worktree that are NEW editor/backup
+    droppings (:func:`_is_dropping`) with no HEAD history (:func:`_new_to_head`)
+    — the only ones ``_stage_all`` may safely hold out of the commit. A dropping
+    that was already tracked (its own modification or deletion) is Git's to
+    record like any other change and is deliberately excluded here, so it stages
+    and commits normally instead of being silently kept alive."""
+    entries = _status_entries(cwd, run=run)
+    return [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
+
+
+def _backup_source(path: str) -> Optional[str]:
+    """The pre-backup path a suffix-style backup dropping (:data:`_BACKUP_SUFFIXES`)
+    was made FROM — ``src.py.bak`` -> ``src.py`` — or ``None`` when ``path``
+    carries none of those suffixes (including every other :data:`_DROPPING_GLOBS`
+    pattern, which has no deterministic source-name relationship to pair)."""
+    for suf in _BACKUP_SUFFIXES:
+        if path.endswith(suf) and len(path) > len(suf):
+            return path[: -len(suf)]
+    return None
+
+
+def _risky_delete_pairs(entries: Sequence[Tuple[str, str]]) -> Set[str]:
+    """Deleted, non-dropping source paths from ``entries`` (already-parsed
+    ``(xy, path)`` porcelain pairs) that are paired with a fresh backup dropping
+    sitting beside them — a fixer/editor's backup-then-replace rewrite (move
+    ``src.py`` to ``src.py.bak``) that failed before recreating ``src.py``.
+
+    Excluding only the backup (the ordinary dropping path) would still let
+    ``git add -A`` stage and commit the real file's deletion while its only
+    surviving content sits in the excluded, uncommitted backup — a silent data
+    loss. ``_stage_all`` holds these paths out of staging exactly like the
+    backup they are paired with, so both remain uncommitted residue for a human
+    to resolve rather than landing a lossy deletion."""
+    entries = list(entries)
+    deleted = {path for xy, path in entries if "D" in xy[:2] and not _is_dropping(path)}
+    if not deleted:
+        return set()
+    backups = (path for xy, path in entries if _is_dropping(path) and _new_to_head(xy))
+    sources = {src for b in backups if (src := _backup_source(b)) is not None}
+    return deleted & sources
 
 
 def _fmt_droppings(paths: Sequence[str], limit: int = 6) -> str:
@@ -692,38 +748,52 @@ def _stage_all(
     cwd: str, *, run: Run = _default_run,
     notice: Callable[..., str] = automation_notice,
 ) -> "subprocess.CompletedProcess[str]":
-    """``git add -A`` for the round's commit, minus editor/backup droppings.
+    """``git add -A`` for the round's commit, minus editor/backup droppings and
+    any deleted source file paired with one (:func:`_risky_delete_pairs`).
 
     With nothing to exclude this is byte-identical to a plain ``git add -A``.
     Otherwise it stages the whole worktree (``:/`` — the top of the tree, so the
     scope matches a bare ``git add -A`` regardless of ``cwd``) with one
-    ``:(top,exclude,literal)`` pathspec per detected dropping — a repo-root-anchored
+    ``:(top,exclude,literal)`` pathspec per excluded path — a repo-root-anchored
     LITERAL exact-path exclude (not a glob), aligning with the repo-root-relative
     porcelain paths, matching at any depth, and never mis-firing on a legitimate
-    file — and emits ONE ``[auto]`` line naming what was kept out. Returns the ``git
+    file — and emits an ``[auto]`` line naming what was kept out. Returns the ``git
     add`` result unchanged so the caller's return-code check is untouched."""
-    droppings = _detect_droppings(cwd, run=run)
-    if not droppings:
+    entries = _status_entries(cwd, run=run)
+    droppings = [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
+    risky = _risky_delete_pairs(entries)
+    excluded = droppings + sorted(risky)
+    if not excluded:
         return run(["git", "add", "-A"], cwd=cwd)
     # An exclude pathspec only tells ``git add`` NOT to (re-)add a path — it never
     # UNstages one already in the index. A dropping a fixer had itself ``git add``-ed
-    # would otherwise survive the exclude and ride the commit (and be falsely logged
-    # as excluded). Un-stage each first so it is guaranteed out of the index; a reset
-    # on an unstaged path is a harmless no-op, so the common (untracked) case is
-    # unaffected. ``git reset -- <pathspec>`` parses its arguments as pathspecs (not
-    # raw paths), so a dropping name carrying glob metacharacters (``[``/``]``/``*``/
-    # ``?``) could otherwise unstage the WRONG path (or miss its own); wrap each in
-    # ``:(top,literal)`` — an exact, repo-root-anchored match — mirroring the
-    # ``:(top,exclude,literal)`` form already used for the ``git add`` exclude below.
-    resets = [f":(top,literal){p}" for p in droppings]
+    # (or a source deletion a fixer had itself staged) would otherwise survive the
+    # exclude and ride the commit (and be falsely logged as excluded). Un-stage each
+    # first so it is guaranteed out of the index; a reset on an unstaged path is a
+    # harmless no-op, so the common (untracked) case is unaffected. ``git reset --
+    # <pathspec>`` parses its arguments as pathspecs (not raw paths), so a path name
+    # carrying glob metacharacters (``[``/``]``/``*``/``?``) could otherwise unstage
+    # the WRONG path (or miss its own); wrap each in ``:(top,literal)`` — an exact,
+    # repo-root-anchored match — mirroring the ``:(top,exclude,literal)`` form
+    # already used for the ``git add`` exclude below.
+    resets = [f":(top,literal){p}" for p in excluded]
     run(["git", "reset", "-q", "--", *resets], cwd=cwd)
-    excludes = [f":(top,exclude,literal){p}" for p in droppings]
+    excludes = [f":(top,exclude,literal){p}" for p in excluded]
     add = run(["git", "add", "-A", "--", ":/", *excludes], cwd=cwd)
     if getattr(add, "returncode", 1) == 0:
-        notice("stage",
-               f"excluded {len(droppings)} editor/backup dropping(s) from the fix "
-               f"commit: {_fmt_droppings(droppings)}",
-               status="skip")
+        if droppings:
+            notice("stage",
+                   f"excluded {len(droppings)} editor/backup dropping(s) from the fix "
+                   f"commit: {_fmt_droppings(droppings)}",
+                   status="skip")
+        if risky:
+            sorted_risky = sorted(risky)
+            notice("stage",
+                   f"held back {len(risky)} deleted source file(s) paired with an "
+                   f"excluded backup dropping — looks like an in-place rewrite that "
+                   f"failed mid-way (moved to a backup, never recreated); resolve "
+                   f"manually: {_fmt_droppings(sorted_risky)}",
+                   status="stop")
     return add
 
 

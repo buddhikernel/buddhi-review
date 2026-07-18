@@ -173,6 +173,50 @@ def test_detect_droppings_excludes_only_new_droppings_not_tracked_ones(git_repo)
     assert "tracked.bak" not in found
 
 
+# ── _backup_source / _risky_delete_pairs: paired delete+backup detection ───────
+
+@pytest.mark.parametrize("path,expected", [
+    ("src.py.bak", "src.py"),
+    ("src.py~", "src.py"),
+    ("src.py.orig", "src.py"),
+    (".DS_Store", None),   # no deterministic source-name relationship
+    (".#lock", None),
+    (".main.py.swp", None),
+    (".main.py.swo", None),
+])
+def test_backup_source_pairs_only_deterministic_suffixes(path, expected):
+    assert commit_push._backup_source(path) == expected
+
+
+def test_risky_delete_pairs_pairs_a_deleted_source_with_its_fresh_backup():
+    entries = [(" D", "src.py"), ("??", "src.py.bak")]
+    assert commit_push._risky_delete_pairs(entries) == {"src.py"}
+
+
+def test_risky_delete_pairs_ignores_an_unpaired_backup():
+    entries = [("??", "orphan.bak")]
+    assert commit_push._risky_delete_pairs(entries) == set()
+
+
+def test_risky_delete_pairs_ignores_an_unpaired_delete():
+    entries = [(" D", "gone.py")]
+    assert commit_push._risky_delete_pairs(entries) == set()
+
+
+def test_risky_delete_pairs_ignores_a_tracked_droppings_own_deletion():
+    # A previously-committed dropping's own deletion (`_new_to_head` false on
+    # the dropping itself) must not be mistaken for a "fresh backup" pairing.
+    entries = [("D ", "old.bak")]
+    assert commit_push._risky_delete_pairs(entries) == set()
+
+
+def test_risky_delete_pairs_does_not_guess_non_deterministic_droppings():
+    # `.DS_Store`/`.#*`/`.swp`/`.swo` carry no source-name relationship — even
+    # with a same-round deletion present, no pairing is guessed.
+    entries = [(" D", "notes"), ("??", ".DS_Store")]
+    assert commit_push._risky_delete_pairs(entries) == set()
+
+
 def test_stage_all_unstages_an_already_staged_dropping(git_repo):
     # A fixer that itself `git add`-ed a dropping: the exclude pathspec alone would
     # leave the staged copy in the index (git add never removes). The de-stage must
@@ -261,6 +305,32 @@ def test_stage_all_excludes_droppings_keeps_real_files_and_logs(git_repo):
     assert str(len(_ROOT_DROPPINGS + _NESTED_DROPPINGS)) in detail
 
 
+def test_stage_all_holds_back_a_deleted_source_paired_with_its_backup(git_repo):
+    # The reported scenario: a fixer/editor moves `src.py` to `src.py.bak` and
+    # fails before recreating `src.py`. Excluding only the backup would still
+    # stage (and commit) the real deletion — both must be held out of staging.
+    _write(git_repo, "src.py", "original\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "seed src.py")
+    (git_repo / "src.py").rename(git_repo / "src.py.bak")
+    _write(git_repo, "real.py")  # a genuine, unrelated edit this round
+    notices = []
+    out = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert out.returncode == 0
+    staged = set(subprocess.run(["git", "diff", "--cached", "--name-only"],
+                                cwd=git_repo, capture_output=True, text=True)
+                 .stdout.split())
+    assert "real.py" in staged           # the unrelated edit still lands
+    assert "src.py" not in staged        # the deletion is held back, not staged
+    assert "src.py.bak" not in staged
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=git_repo,
+                            capture_output=True, text=True).stdout
+    assert "src.py" in status and "src.py.bak" in status  # both still pending
+    stop_lines = [n for n in notices if n[0] == "stage" and n[2] == "stop"]
+    assert len(stop_lines) == 1
+    assert "src.py" in stop_lines[0][1]
+
+
 def test_stage_all_fail_open_when_status_probe_errors():
     calls = []
 
@@ -327,6 +397,27 @@ def test_deleted_tracked_dropping_reaches_the_commit(monkeypatch, repo):
                                       notice=lambda *a, **k: "")
     assert out == "pushed"
     assert "tracked.orig" not in _committed_files(repo)  # the deletion landed
+
+
+def test_delete_backup_pair_never_lands_the_deletion_end_to_end(monkeypatch, repo):
+    # End-to-end through `commit_and_push`: an unrelated real edit still ships,
+    # but the paired delete+backup never lands a lossy deletion on the PR.
+    monkeypatch.setenv("BUDDHI_TEST_COMMAND", "python3 -c pass")  # green gate
+    _write(repo, "src.py", "original\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "seed src.py")
+    _git(repo, "push", "-q")
+    (repo / "src.py").rename(repo / "src.py.bak")
+    _write(repo, "unrelated.py")
+    notices = []
+    out = commit_push.commit_and_push(str(repo), message="fix: round 1",
+                                      notice=_rec_notice(notices))
+    assert out == "pushed"
+    tracked = _committed_files(repo)
+    assert "unrelated.py" in tracked  # the unrelated edit still ships
+    assert "src.py" in tracked        # the deletion did NOT land
+    assert "src.py.bak" not in tracked
+    assert any(a == "stage" and s == "stop" for a, _d, s in notices)
 
 
 def test_exclusion_log_fires_through_commit_and_push(monkeypatch, repo):
