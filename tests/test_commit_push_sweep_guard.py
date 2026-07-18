@@ -331,6 +331,57 @@ def test_stage_all_holds_back_a_deleted_source_paired_with_its_backup(git_repo):
     assert "src.py" in stop_lines[0][1]
 
 
+@pytest.mark.parametrize("stage_mode", ["git_mv", "mv_then_add"])
+def test_stage_all_holds_back_a_staged_rename_to_a_backup(git_repo, stage_mode):
+    # A fixer that STAGES the backup as a rename — `git mv src.py src.py.bak`, or
+    # `mv` + `git add -A` (Git records both as one `R  src.py.bak` porcelain
+    # record). `R` reads as already-in-HEAD, so without decomposing the rename the
+    # `.bak` would sail past the dropping scan and its `D src.py` half would land a
+    # real-file deletion on the PR. Both halves must be held out of staging.
+    _write(git_repo, "src.py", "original\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "seed src.py")
+    if stage_mode == "git_mv":
+        _git(git_repo, "mv", "src.py", "src.py.bak")
+    else:
+        (git_repo / "src.py").rename(git_repo / "src.py.bak")
+        _git(git_repo, "add", "-A")  # Git detects + stages the rename
+    _write(git_repo, "real.py")  # a genuine, unrelated edit this round
+    notices = []
+    out = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert out.returncode == 0
+    staged = set(subprocess.run(["git", "diff", "--cached", "--name-only"],
+                                cwd=git_repo, capture_output=True, text=True)
+                 .stdout.split())
+    assert "real.py" in staged           # the unrelated edit still lands
+    assert "src.py.bak" not in staged    # the backup dropping is held back
+    assert "src.py" not in staged        # its real-file deletion is held back too
+    # src.py's committed content is untouched (the rename never lands the deletion).
+    assert "original" in subprocess.run(["git", "show", "HEAD:src.py"], cwd=git_repo,
+                                        capture_output=True, text=True).stdout
+    skip_lines = [n for n in notices if n[0] == "stage" and n[2] == "skip"]
+    stop_lines = [n for n in notices if n[0] == "stage" and n[2] == "stop"]
+    assert len(skip_lines) == 1 and "src.py.bak" in skip_lines[0][1]
+    assert len(stop_lines) == 1 and "src.py" in stop_lines[0][1]
+
+
+def test_stage_all_leaves_a_legitimate_rename_staged(git_repo):
+    # Guard rails: only rename destinations that are THEMSELVES droppings get
+    # decomposed. An ordinary rename (`old.py` -> `new.py`) must stage and commit
+    # untouched — the decompose step must never fire on it.
+    _write(git_repo, "old.py", "print(1)\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "seed old.py")
+    _git(git_repo, "mv", "old.py", "new.py")
+    notices = []
+    out = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert out.returncode == 0
+    staged = subprocess.run(["git", "diff", "--cached", "--name-status"], cwd=git_repo,
+                            capture_output=True, text=True).stdout
+    assert "new.py" in staged and "old.py" in staged  # the rename stays staged
+    assert notices == []  # nothing excluded → no log line
+
+
 def test_stage_all_fail_open_when_status_probe_errors():
     calls = []
 

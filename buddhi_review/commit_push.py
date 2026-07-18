@@ -760,6 +760,26 @@ def _stage_all(
     file — and emits an ``[auto]`` line naming what was kept out. Returns the ``git
     add`` result unchanged so the caller's return-code check is untouched."""
     entries = _status_entries(cwd, run=run)
+    # A staged rename whose DESTINATION is a dropping — a fixer that did
+    # ``git mv src.py src.py.bak`` (or ``mv src.py src.py.bak && git add -A``, which
+    # Git records the same way) — arrives as a SINGLE ``R  src.py.bak`` porcelain
+    # record, not the ``?? src.py.bak`` the dropping scan below keys on. Its staged
+    # column is ``R`` (already-in-HEAD per :func:`_new_to_head`), so it would sail
+    # straight past the scan and commit the ``.bak`` — the exact sweep this guard
+    # exists to stop. Un-stage those renames FIRST: that decomposes each back into
+    # its ``D src.py`` (the vanished real file) + ``?? src.py.bak`` (the new backup)
+    # halves, which the dropping scan and :func:`_risky_delete_pairs` below then
+    # handle exactly like a hand-rolled backup-then-replace — holding BOTH the backup
+    # and its now-orphaned source out of the commit. Only rename destinations that
+    # are themselves droppings are touched; a legitimate rename stays staged.
+    rename_droppings = sorted({
+        path for xy, path in entries
+        if (xy[0] in "RC" or xy[1] in "RC") and _is_dropping(path)
+    })
+    if rename_droppings:
+        run(["git", "reset", "-q", "--",
+             *(f":(top,literal){p}" for p in rename_droppings)], cwd=cwd)
+        entries = _status_entries(cwd, run=run)
     droppings = [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
     risky = _risky_delete_pairs(entries)
     excluded = droppings + sorted(risky)
