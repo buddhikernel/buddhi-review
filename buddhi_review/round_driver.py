@@ -1376,8 +1376,14 @@ class RoundDriver:
                         f"marker type={mtype} ignored (the free loop handles "
                         f"rate_limited only)", status="skip")
             return
-        if "claude" in self.done:
-            return  # already concluded this run — nothing to release
+        # No early-return on "claude in done" here. An --rr-active restart re-derives a
+        # PRIOR clean approval into done BEFORE this scan runs (see _rr_active_restore),
+        # and a live marker that post-dates that approval means claude was re-requested
+        # after signing off and hit the usage limit — so the approval is for a head it
+        # never got to re-review. Recording the marker (and un-crowning below) lets the
+        # never-merge-unreviewed gate see claude as PENDING rather than approved. The
+        # stale-marker guard below still drops a marker whose window already reset, so a
+        # genuine post-reset approval (claude cannot approve while rate-limited) is safe.
         epoch = int(m.group("resets_at") or 0)
         until = None
         # Guard the conversion: an implausibly large epoch (a future ms-scale
@@ -1405,6 +1411,18 @@ class RoundDriver:
             until = datetime.min.replace(tzinfo=timezone.utc)
             when = "an unknown time"
             comeback = "retries claude next round (no reset time in the marker)"
+        # A live marker supersedes a sign-off an --rr-active restart (or an earlier
+        # round) already folded into done/approved: un-crown claude so its stale
+        # approval cannot feed reviewed_ever and satisfy the never-merge-unreviewed
+        # gate for a head it never reviewed. The clean-fold in _classify_signal skips a
+        # bot already in _rate_limited_until, so the preflight snapshot does not re-crown
+        # it, and _rr_active_restore's un-crown loop drops it from the local
+        # approved/restored sets so the reviewed_ever fold there does not re-add it.
+        self.done.discard("claude")
+        self.approved.discard("claude")
+        self.polishing.discard("claude")
+        self._reaction_done.discard("claude")
+        self.reviewed_ever.discard("claude")
         self._rate_limited_until["claude"] = until
         self._bot_state("claude").signal = detectors.SIGNAL_RATE_LIMITED
         self.notice("claude-rate-limited",
@@ -1644,14 +1662,17 @@ class RoundDriver:
             return None
         if (not shielded_errored_body
                 and detectors.detect_clean_review(comment.text, llm_json=self.clean_llm)):
-            if superseded:
+            if superseded or bot in self._rate_limited_until:
                 # A stale sign-off that a NEWER message from the same bot supersedes
                 # is not a verdict — and it is not work either. It must RETURN here,
                 # not fall through: an actionable return would put the bot in
                 # _preflight_responders (dropping it from round 1's summon AND poll)
                 # and let the round-end promotion fold it into `done` on the strength
                 # of the very sign-off this flag exists to ignore. Its newer,
-                # substantive message is what the loop acts on.
+                # substantive message is what the loop acts on. A bot already released
+                # rate-limited (a live usage-limit marker that post-dates this sign-off,
+                # so it could not have reviewed the current head) is the same case: the
+                # marker superseded the sign-off, so it must not be re-crowned done here.
                 return None
             self.done.add(bot)
             self.approved.add(bot)  # sticky: a later hard signal must not
@@ -2005,22 +2026,26 @@ class RoundDriver:
             # set to re-request the reviewer for one verification round instead of
             # merging the unverified fix. See _restart_reverify_ids.
             self._restart_reverify_ids = {c.id for c in self._preflight_batch}
-            # A HARD CAUSE always wins over a re-derived verdict. The snapshot reads
-            # every comment through the full exclusion path, so it can hard-exclude
-            # (quota / PR-too-large / errored) a reviewer whose message the re-derive
-            # above read as a sign-off — a failure placeholder states its own zero
-            # output and so reads "clean" on its own text. Un-crown such a reviewer
-            # here, BEFORE the reviewed_ever fold below: a placeholder is a response,
-            # not a review, and counting it would satisfy the never-merge-unreviewed
-            # gate and merge a PR nobody actually looked at.
+            # A HARD CAUSE or a live rate-limit marker always wins over a re-derived
+            # verdict. The snapshot reads every comment through the full exclusion path,
+            # so it can hard-exclude (quota / PR-too-large / errored) a reviewer whose
+            # message the re-derive above read as a sign-off — a failure placeholder
+            # states its own zero output and so reads "clean" on its own text — and
+            # _scan_unavailable_markers can release a reviewer a live usage-limit marker
+            # post-dating its sign-off rate-limited. Un-crown such a reviewer here,
+            # BEFORE the reviewed_ever fold below: a placeholder, or a head claude was
+            # rate-limited out of re-reviewing, is not a review of the current code, and
+            # counting it would satisfy the never-merge-unreviewed gate and merge a PR
+            # nobody actually looked at.
             for bot in sorted(approved | restored):
-                if not self.store.is_excluded(bot):
+                if not (self.store.is_excluded(bot) or bot in self._rate_limited_until):
                     continue
                 approved.discard(bot)
                 restored.discard(bot)
                 self.done.discard(bot)
                 self.approved.discard(bot)
                 self.polishing.discard(bot)
+                self.reviewed_ever.discard(bot)
         fleet = set(self._run_start_fleet)
         # A preserved approval / polish verdict IS a genuine review (restricted to
         # the run-start fleet, mirroring the gate's own universe). Without this fold
@@ -2345,6 +2370,25 @@ class RoundDriver:
                 if (bot is not None or rb in self.done
                         or self.store.is_excluded(rb) or rb in self._rate_limited_until):
                     self._preflight_responders.add(rb)
+        # An --rr-active restart may re-derive a reviewer's LATEST verdict as a clean
+        # approval while OLDER inline findings from it still sit on the PR. `superseded`
+        # gates only the clean-review branch of _classify_signal, so a non-clean older
+        # finding falls through as actionable above and would re-dispatch the fixer
+        # against feedback the reviewer has already withdrawn. Drop those findings here —
+        # AFTER the whole history is folded, so the approval is definitely in
+        # `self.approved` even though the endpoint-ordered loop may fold it AFTER the
+        # finding. Scoped to a bot the restart folded APPROVED, and to a finding its
+        # newest message supersedes: a genuinely fresh finding IS the bot's newest
+        # message (never superseded) and its author never lands in `approved`, so its
+        # re-request slot is left untouched.
+        if restart and self._preflight_batch:
+            kept = []
+            for c in self._preflight_batch:
+                b = detectors.bot_for_login(c.source)
+                if b in self.approved and _supersedes(newest.get(b), c.created_at):
+                    continue  # stale finding under this bot's newer approval — not re-fixed
+                kept.append(c)
+            self._preflight_batch = kept
         # The between-round quota re-check must cover the preflight batch too: a
         # novel-wording quota message already on the PR would otherwise be recorded
         # as a genuine review and satisfy the never-merge gate. Run it BEFORE the
@@ -2683,8 +2727,18 @@ class RoundDriver:
                 and r.classification.label in _REAL_FINDING_LABELS
                 for r, a in zip(results, round_actions)
             )
-            if (round_substantive and (committed_changes or self._worktree_has_changes())) \
-                    or restart_reverify:
+            take_substantive_round = round_substantive and (
+                committed_changes or self._worktree_has_changes())
+            if round_no >= self.max_rounds and restart_reverify:
+                # Final round, but the restart's re-fixed pre-existing finding was never
+                # re-reviewed and no verification round remains. A `continue` here would
+                # only end the for-loop and fall through to the budget-reached clean
+                # exit below, auto-merging the unverified fix. Hand back instead — a
+                # re-run (typically --rr-active) then completes the verification. Never
+                # reached on a standard PR: restart_reverify requires
+                # _restart_reverify_ids, populated only on the --rr-active preflight path.
+                return self._handback("max-rounds", round_no)
+            if take_substantive_round or restart_reverify:
                 continue
             return self._clean_exit(round_no)
 

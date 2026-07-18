@@ -22,6 +22,7 @@ reused.
 """
 import json
 import subprocess
+from datetime import datetime, timezone
 
 from buddhi_review import gh_ingest
 from buddhi_review.adapter import ReviewAdapter
@@ -30,6 +31,7 @@ from buddhi_review.loop import Comment
 from buddhi_review.round_driver import RoundDriver, RoundTimes
 from buddhi_review.seams import ConsoleEscalation
 
+UTC = timezone.utc
 OLD = "2026-07-01T10:00:00Z"
 NEW = "2026-07-02T10:00:00Z"
 
@@ -349,3 +351,79 @@ def test_a_bare_plus_one_sign_off_is_still_re_checked_for_quota():
     assert driver.store.is_excluded("codex")
     assert "codex" not in driver.done and "codex" not in driver.approved
     assert "codex" not in driver.reviewed_ever
+
+
+# ---------------------------------------------------------------------------
+# A live rate-limit marker that post-dates a re-derived approval un-crowns it
+# ---------------------------------------------------------------------------
+
+def test_a_live_rate_limit_marker_supersedes_a_stale_approval_and_blocks_merge():
+    # claude approved an EARLIER head; another reviewer's fix then advanced the PR and
+    # claude, re-requested, hit the usage limit — github-actions[bot] posts a rate-limit
+    # marker NEWER than the approval. The re-derived approval is for a head claude never
+    # re-reviewed, so it must NOT ride reviewed_ever into the auto-merge gate: claude is
+    # un-crowned and released rate-limited, and the claude-only fleet refuses to merge.
+    reset = datetime(2026, 7, 4, 13, 0, tzinfo=UTC)
+    before = datetime(2026, 7, 4, 12, 0, tzinfo=UTC)
+    marker = Comment(
+        id="m", from_issue_channel=True, source="github-actions[bot]", created_at=NEW,
+        text=("<!-- claude-review-unavailable-v1 type=rate_limited "
+              f"resets_at={int(reset.timestamp())} -->"))
+    comments = [
+        _lgtm(cid="ok", when=OLD, from_issue_channel=True),   # stale approval (earlier head)
+        marker,                                                # newer: usage limit on re-request
+    ]
+    driver, clock, gh = make_driver(comments, auto_merge=True, wall_clock=lambda: before)
+    outcome = driver.run()
+    assert "claude" not in driver.approved          # stale approval un-crowned …
+    assert "claude" not in driver.done
+    assert "claude" not in driver.reviewed_ever      # … never counted as a review
+    assert "claude" in driver._rate_limited_until    # released rate-limited instead
+    assert gh.matching("gh", "merge", "--squash") == []
+    assert outcome.merged is False                   # SAFETY gate blocks the merge
+
+
+def test_a_post_reset_approval_after_a_stale_marker_still_folds_and_merges():
+    # The inverse: the marker's window has already RESET (its resets_at is in the past),
+    # and claude has since re-reviewed and approved. The stale marker must NOT un-crown
+    # that genuine approval — a released reviewer that came back merges as usual.
+    reset = datetime(2026, 7, 4, 13, 0, tzinfo=UTC)
+    after = datetime(2026, 7, 4, 14, 0, tzinfo=UTC)      # the window already reset
+    marker = Comment(
+        id="m", from_issue_channel=True, source="github-actions[bot]", created_at=OLD,
+        text=("<!-- claude-review-unavailable-v1 type=rate_limited "
+              f"resets_at={int(reset.timestamp())} -->"))
+    comments = [
+        marker,                                            # older: a since-reset limit
+        _lgtm(cid="ok", when=NEW, from_issue_channel=True),  # newer: the genuine approval
+    ]
+    driver, clock, gh = make_driver(comments, auto_merge=True, wall_clock=lambda: after)
+    outcome = driver.run()
+    assert "claude" in driver.approved and "claude" in driver.reviewed_ever
+    assert "claude" not in driver._rate_limited_until   # the stale marker was ignored
+    assert outcome.merged is True
+
+
+# ---------------------------------------------------------------------------
+# A stale finding under the SAME reviewer's newer approval is not re-fixed
+# ---------------------------------------------------------------------------
+
+def test_a_stale_finding_under_a_newer_approval_is_not_re_dispatched():
+    # An older inline finding + a NEWER clean approval from the SAME reviewer. Its latest
+    # verdict has withdrawn the finding, so the restart must NOT re-dispatch the fixer
+    # against it: `superseded` gates only the clean-review branch of _classify_signal, so
+    # without the preflight drop the stale finding falls through as actionable and re-fixes
+    # feedback already in hand.
+    fixed = []
+    comments = [
+        Comment(id="f", text="this null check is missing", source="claude[bot]",
+                path="x.py", diff_hunk="@@ -1 +1 @@", created_at=OLD),   # older finding
+        _lgtm(cid="ok", when=NEW, from_issue_channel=True),              # newer approval
+    ]
+    driver, clock, gh = make_driver(comments, auto_merge=True)
+    driver.fix_dispatch = lambda c, r: fixed.append(c.id) or FixOutcome(status="applied")
+    outcome = driver.run()
+    assert fixed == []                          # the stale finding was NOT re-fixed
+    assert "claude" in driver.approved          # its newer approval stands …
+    assert gh.matching(SUMMON) == []            # … so it is not re-summoned
+    assert outcome.merged is True               # a genuine review happened → merge

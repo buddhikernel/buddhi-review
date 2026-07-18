@@ -266,6 +266,26 @@ def test_restart_reverifies_a_finding_whose_fix_the_killed_run_already_pushed():
     assert outcome.merged is True
 
 
+def test_reverify_pending_at_the_round_budget_hands_back_instead_of_merging():
+    # Same restart, but --max-rounds 1: there is NO round left to verify the already-
+    # pushed fix. The forced-verify `continue` at the last round would only end the
+    # for-loop and fall through to the budget-reached clean exit, auto-merging a fix no
+    # reviewer ever confirmed. Instead the run must hand back — a re-run then verifies.
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    finding = Comment(id="f1", text="this null check is missing",
+                      source="copilot[bot]", path="y.py", diff_hunk="@@ -5 +5 @@")
+    gh = GhHead(head="H1", advance_to="H2")               # fix already at HEAD; no push
+    driver, clock = make_driver(
+        [(0, finding)], gh=gh, cfg=cfg, rr_active=True, preflight=True,
+        auto_merge=True, max_rounds=1,
+        fix_dispatch=lambda c, r: FixOutcome(status="skipped", detail="already fixed"),
+    )
+    outcome = driver.run()
+    assert outcome.merged is False                    # the unverified fix must NOT merge
+    assert outcome.status == "max-rounds"             # handed back at budget, not clean
+    assert gh.matching("gh", "pr", "merge") == []     # no merge was attempted
+
+
 def test_default_launch_still_dismisses_an_already_fixed_finding():
     # The re-verify carve-out is RESTART-only: a plain launch (no --rr-active) that
     # finds an already-fixed finding still folds its reviewer to reviewed-no-change,

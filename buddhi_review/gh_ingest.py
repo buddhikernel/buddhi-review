@@ -330,6 +330,10 @@ _REVIEW_THREADS_QUERY = """query($owner: String!, $name: String!, $pr: Int!, $cu
         nodes {
           id
           isResolved
+          # 100 comments/thread covers realistic review-thread depth; a thread
+          # with >100 root+reply comments would need a per-thread nested-cursor
+          # follow-up query (GraphQL can't paginate a nested connection in one
+          # page fetch) — not worth the extra round-trips for a case this rare.
           comments(first: 100) { nodes { databaseId } }
         }
       }
