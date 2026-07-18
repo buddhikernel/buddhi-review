@@ -87,6 +87,20 @@ def test_is_dropping_handles_collapsed_untracked_dir_marker():
     assert commit_push._is_dropping("pkg/") is False
 
 
+# ── _new_to_head: only a path with NO HEAD blob is a "new" dropping ────────────
+
+@pytest.mark.parametrize("xy", ["??", "A ", "AM", "AD"])
+def test_new_to_head_true_for_untracked_or_freshly_added(xy):
+    assert commit_push._new_to_head(xy) is True
+
+
+@pytest.mark.parametrize("xy", [" M", " D", "M ", "D ", "R ", "C ", "MM"])
+def test_new_to_head_false_for_paths_with_head_history(xy):
+    # A tracked path's modification/deletion already exists in HEAD — the sweep
+    # guard must not treat it as a "new" dropping to hold out of the commit.
+    assert commit_push._new_to_head(xy) is False
+
+
 # ── _detect_droppings: enumerates droppings at any depth, incl. brand-new dirs ──
 
 def test_detect_droppings_finds_all_patterns_including_new_dirs(git_repo):
@@ -137,6 +151,21 @@ def test_detect_droppings_does_not_misread_a_rename_origin_field():
     assert commit_push._detect_droppings("x", run=run) == ["junk.bak"]
 
 
+def test_detect_droppings_excludes_only_new_droppings_not_tracked_ones(git_repo):
+    # A dropping that was already committed and is now deleted/modified in the
+    # worktree has HEAD history — it must NOT be classified as an exclude-worthy
+    # dropping, or its deletion would never reach the commit (it would look
+    # forever "staged for removal" but excluded from every `git add -A`).
+    _write(git_repo, "tracked.bak")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "tracked dropping")
+    (git_repo / "tracked.bak").unlink()
+    _write(git_repo, "fresh.bak")  # a brand-new dropping, untracked
+    found = commit_push._detect_droppings(str(git_repo))
+    assert "fresh.bak" in found
+    assert "tracked.bak" not in found
+
+
 def test_stage_all_unstages_an_already_staged_dropping(git_repo):
     # A fixer that itself `git add`-ed a dropping: the exclude pathspec alone would
     # leave the staged copy in the index (git add never removes). The de-stage must
@@ -153,6 +182,31 @@ def test_stage_all_unstages_an_already_staged_dropping(git_repo):
     assert "real.py" in staged
     assert "sneaky.bak" not in staged  # de-staged, never reaches the commit
     assert any(a == "stage" and s == "skip" for a, _d, s in notices)  # truthful log
+
+
+def test_stage_all_reset_uses_literal_pathspec(git_repo):
+    # `git reset -- <path>` parses its argument as a PATHSPEC, not a raw path — a
+    # dropping name carrying glob metacharacters (`[`/`]`/`*`/`?`) could otherwise
+    # unstage the WRONG path. The reset must wrap each dropping in `:(top,literal)`,
+    # mirroring the `:(top,exclude,literal)` form already used for the `git add`
+    # exclude below it.
+    _write(git_repo, "odd[1].bak")
+    _git(git_repo, "add", "odd[1].bak")  # already staged, like the sibling test above
+    calls = []
+    real = commit_push._default_run
+
+    def run(argv, *, cwd=None, timeout=commit_push._GIT_TIMEOUT):
+        calls.append(list(argv))
+        return real(argv, cwd=cwd, timeout=timeout)
+
+    out = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert out.returncode == 0
+    reset_call = next(c for c in calls if c[:2] == ["git", "reset"])
+    assert ":(top,literal)odd[1].bak" in reset_call
+    staged = set(subprocess.run(["git", "diff", "--cached", "--name-only"],
+                                cwd=git_repo, capture_output=True, text=True)
+                 .stdout.split())
+    assert "odd[1].bak" not in staged  # still correctly de-staged
 
 
 # ── _stage_all: excludes droppings, keeps legit adds, logs once ────────────────
@@ -239,6 +293,22 @@ def test_droppings_never_ride_the_fix_commit(monkeypatch, repo):
     assert tracked.isdisjoint(_ROOT_DROPPINGS + _NESTED_DROPPINGS)
 
 
+def test_deleted_tracked_dropping_reaches_the_commit(monkeypatch, repo):
+    # A fixer's deletion of a PREVIOUSLY COMMITTED dropping is a real change Git
+    # is supposed to record — the sweep guard must not silently keep it alive by
+    # excluding it from every subsequent `git add -A`.
+    monkeypatch.setenv("BUDDHI_TEST_COMMAND", "python3 -c pass")
+    _write(repo, "tracked.orig")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "tracked dropping")
+    _git(repo, "push", "-q")
+    (repo / "tracked.orig").unlink()
+    out = commit_push.commit_and_push(str(repo), message="fix: drop the .orig",
+                                      notice=lambda *a, **k: "")
+    assert out == "pushed"
+    assert "tracked.orig" not in _committed_files(repo)  # the deletion landed
+
+
 def test_exclusion_log_fires_through_commit_and_push(monkeypatch, repo):
     monkeypatch.setenv("BUDDHI_TEST_COMMAND", "python3 -c pass")
     _write(repo, "real.py")
@@ -296,3 +366,25 @@ def test_residue_tripwire_ignores_a_dropping_alone_in_a_brand_new_dir(git_repo):
     commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(notices2))
     assert any(a == "fix-residue tripwire" and s == "fallback"
                for a, _d, s in notices2)
+
+
+def test_residue_tripwire_recognizes_a_dropping_with_special_characters(git_repo):
+    # Without `-z`, porcelain C-quotes/escapes a path holding a quote or a literal
+    # " -> " (and renders a rename as a single `old -> new` line) — either would
+    # make `_is_dropping` fail to recognize the dropping and wrongly fire the
+    # alarm. `-z` yields it VERBATIM, matching `_detect_droppings`'s parsing, so
+    # the alarm correctly stays silent.
+    weird = 'a" -> b.bak'
+    _write(git_repo, weird)
+    notices = []
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(notices))
+    assert not any(a == "fix-residue tripwire" for a, _d, _s in notices)
+
+
+def test_residue_tripwire_still_flags_a_lost_edit_with_special_characters(git_repo):
+    weird = 'a" -> b.py'  # NOT a dropping — a genuinely lost real edit
+    _write(git_repo, weird)
+    notices = []
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(notices))
+    assert any(a == "fix-residue tripwire" and s == "fallback" and weird in d
+               for a, d, s in notices)

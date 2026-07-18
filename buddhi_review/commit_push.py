@@ -42,7 +42,7 @@ import re
 import shlex
 import subprocess
 import sys
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Sequence, Tuple
 
 from buddhi_review import config, lang_syntax, merge, test_runner
 from buddhi_review.notifier import Ask, ConsoleNotifier, Notifier
@@ -493,24 +493,30 @@ def _assert_clean_after_commit(
     if not cwd:
         return
     try:
+        # ``-z`` for VERBATIM paths (matching :func:`_detect_droppings` — plain
+        # porcelain C-quotes/escapes a path holding a quote, space-arrow, tab, or
+        # non-ASCII byte, and renders a rename as a single ``old -> new`` line,
+        # either of which would make a dropping name evade the filter below) and
         # ``--untracked-files=all`` so a wholly-untracked directory holding only a
         # dropping is enumerated as its individual file (``dir/foo.bak``) rather than
         # collapsed to a ``dir/`` entry whose basename would evade the dropping
         # filter below — matching :func:`_detect_droppings` so the two stay coherent.
-        r = run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=cwd)
+        r = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"], cwd=cwd)
     except Exception:
         return
     if getattr(r, "returncode", 1) != 0:
         return
-    residue = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
-    # The sweep guard (:func:`_stage_all`) deliberately leaves editor/backup
-    # droppings unstaged — they are NOT lost fixer edits, so they must not trip this
-    # "edits are not on the PR" alarm. Filter them out; a genuinely-lost non-dropping
-    # edit still fires the tripwire.
-    residue = [ln for ln in residue if not _is_dropping(ln[3:].strip())]
+    # The sweep guard (:func:`_stage_all`) deliberately leaves a NEW (untracked or
+    # freshly-added) editor/backup dropping unstaged — that's not a lost fixer edit,
+    # so it must not trip this "edits are not on the PR" alarm. A tracked dropping's
+    # own modification/deletion IS staged and committed like any other change (see
+    # :func:`_new_to_head`), so it never shows up here as residue in the first
+    # place. A genuinely-lost non-dropping edit still fires the tripwire.
+    residue = [path for xy, path in _iter_porcelain_z(getattr(r, "stdout", "") or "")
+               if not (_is_dropping(path) and _new_to_head(xy))]
     if not residue:
         return
-    shown = ", ".join(ln[3:].strip() for ln in residue[:8])
+    shown = ", ".join(residue[:8])
     more = f" (+{len(residue) - 8} more)" if len(residue) > 8 else ""
     notice(
         "fix-residue tripwire",
@@ -620,30 +626,24 @@ def _diagnose_commit_failure(
 # the plain ``git add -A`` so the guard can never block a commit.
 
 
-def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
-    """Repo-relative paths in ``cwd``'s worktree that are editor/backup droppings
-    (:func:`_is_dropping`).
+def _new_to_head(xy: str) -> bool:
+    """True iff a porcelain XY status code means the path has NO blob in HEAD yet
+    — brand-new (untracked, ``??``) or freshly ``git add``-ed with nothing to
+    compare against in the last commit (index status ``A``). A tracked dropping
+    that is merely modified or DELETED (``M``/``D``/``R``/…) already exists in
+    HEAD, and the sweep guard must never hold that change back — Git is supposed
+    to record it (in particular, a fixer's deletion of a previously-committed
+    dropping must reach the commit, not be silently kept alive)."""
+    return xy == "??" or xy[:1] == "A"
 
-    ``--untracked-files=all`` is essential: without it a dropping inside a brand-new
-    (otherwise-untracked) directory is hidden under a collapsed ``dir/`` porcelain
-    entry and would slip past both this scan and the exclude pathspec, riding the
-    ``git add -A`` into the commit. ``-z`` (NUL-terminated) yields every path
-    VERBATIM — porcelain otherwise C-quotes and backslash-escapes any name holding a
-    quote, space-arrow (``a -> b``), tab, or non-ASCII byte, which a dropping can
-    inherit from an oddly-named source file; parsing the raw ``-z`` path is the only
-    way the basename match and the later ``:(literal)`` exclude both see the true
-    name. A rename/copy record (``R``/``C``) is followed by its origin path in the
-    NEXT field, which is consumed. Best-effort: any error or a non-zero status →
-    ``[]`` (the caller then stages plainly)."""
-    try:
-        st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
-                 cwd=cwd)
-    except (subprocess.SubprocessError, OSError):
-        return []
-    if getattr(st, "returncode", 1) != 0:
-        return []
-    fields = (getattr(st, "stdout", "") or "").split("\0")
-    droppings: List[str] = []
+
+def _iter_porcelain_z(stdout: str) -> Iterator[Tuple[str, str]]:
+    """Yield ``(xy, path)`` for each entry of ``git status --porcelain -z
+    --untracked-files=all`` output, verbatim (no C-quoting/escaping — porcelain
+    otherwise mangles any name holding a quote, space-arrow (``a -> b``), tab, or
+    non-ASCII byte) and with a rename/copy record's ORIGIN field (the field right
+    after an ``R``/``C`` entry) consumed so it is never misread as its own path."""
+    fields = (stdout or "").split("\0")
     i = 0
     while i < len(fields):
         rec = fields[i]
@@ -653,10 +653,32 @@ def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
         xy, path = rec[:2], rec[3:]  # "XY <path>" (no quoting under -z)
         if xy[0] in "RC" or xy[1] in "RC":
             i += 1  # a rename/copy — the ORIGIN path is the next field; skip it
-        if _is_dropping(path):
-            droppings.append(path)
+        yield xy, path
         i += 1
-    return droppings
+
+
+def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
+    """Repo-relative paths in ``cwd``'s worktree that are NEW editor/backup
+    droppings (:func:`_is_dropping`) with no HEAD history (:func:`_new_to_head`)
+    — the only ones ``_stage_all`` may safely hold out of the commit. A dropping
+    that was already tracked (its own modification or deletion) is Git's to
+    record like any other change and is deliberately excluded here, so it stages
+    and commits normally instead of being silently kept alive.
+
+    ``--untracked-files=all`` is essential: without it a dropping inside a brand-new
+    (otherwise-untracked) directory is hidden under a collapsed ``dir/`` porcelain
+    entry and would slip past both this scan and the exclude pathspec, riding the
+    ``git add -A`` into the commit. Best-effort: any error or a non-zero status →
+    ``[]`` (the caller then stages plainly)."""
+    try:
+        st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                 cwd=cwd)
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if getattr(st, "returncode", 1) != 0:
+        return []
+    return [path for xy, path in _iter_porcelain_z(getattr(st, "stdout", "") or "")
+            if _is_dropping(path) and _new_to_head(xy)]
 
 
 def _fmt_droppings(paths: Sequence[str], limit: int = 6) -> str:
@@ -688,8 +710,13 @@ def _stage_all(
     # would otherwise survive the exclude and ride the commit (and be falsely logged
     # as excluded). Un-stage each first so it is guaranteed out of the index; a reset
     # on an unstaged path is a harmless no-op, so the common (untracked) case is
-    # unaffected.
-    run(["git", "reset", "-q", "--", *droppings], cwd=cwd)
+    # unaffected. ``git reset -- <pathspec>`` parses its arguments as pathspecs (not
+    # raw paths), so a dropping name carrying glob metacharacters (``[``/``]``/``*``/
+    # ``?``) could otherwise unstage the WRONG path (or miss its own); wrap each in
+    # ``:(top,literal)`` — an exact, repo-root-anchored match — mirroring the
+    # ``:(top,exclude,literal)`` form already used for the ``git add`` exclude below.
+    resets = [f":(top,literal){p}" for p in droppings]
+    run(["git", "reset", "-q", "--", *resets], cwd=cwd)
     excludes = [f":(top,exclude,literal){p}" for p in droppings]
     add = run(["git", "add", "-A", "--", ":/", *excludes], cwd=cwd)
     if getattr(add, "returncode", 1) == 0:
