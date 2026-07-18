@@ -42,9 +42,10 @@ def _graphql_page(nodes, *, has_next=False, cursor=None):
     }}}}})
 
 
-def _node(tid, db_id, resolved=False):
-    return {"id": tid, "isResolved": resolved,
-            "comments": {"nodes": ([{"databaseId": db_id}] if db_id is not None else [])}}
+def _node(tid, db_id, resolved=False, replies=()):
+    nodes = ([{"databaseId": db_id}] if db_id is not None else [])
+    nodes += [{"databaseId": r} for r in replies]
+    return {"id": tid, "isResolved": resolved, "comments": {"nodes": nodes}}
 
 
 def _driver_with_gate(actions, ft, *, inline_ids=None, **kw):
@@ -82,6 +83,21 @@ def test_reader_env_seam_parses_raw_nodes(monkeypatch):
         ("PRRT_2", True, "222"),
         ("PRRT_3", False, None),
     ]
+    # comment_ids exposes every comment; a single-comment thread holds just the root.
+    assert [t.comment_ids for t in threads] == [
+        frozenset({"111"}), frozenset({"222"}), frozenset(),
+    ]
+
+
+def test_reader_exposes_all_comment_ids_including_replies(monkeypatch):
+    # A resolved thread with a root (222) and two replies (333, 444): comment_ids
+    # holds every id so a caller can recognise a REPLY, not just the root. The root
+    # stays first for the thread gate's back-compat matching.
+    payload = [_node("PRRT_2", 222, resolved=True, replies=[333, 444])]
+    monkeypatch.setenv(gh_ingest.THREADS_JSON_ENV, json.dumps(payload))
+    (t,) = gh_ingest.fetch_review_threads("7", repo="o/r")
+    assert t.root_comment_id == "222"
+    assert t.comment_ids == frozenset({"222", "333", "444"})
 
 
 def test_reader_paginates_across_pages():

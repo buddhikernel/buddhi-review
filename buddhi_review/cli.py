@@ -321,7 +321,11 @@ def _add_loop_args(p: argparse.ArgumentParser) -> None:
                    help="round 1: re-request EVERY enabled reviewer; clears the soft "
                         "exclusions (voluntarily-done + polish), keeps the hard ones")
     g.add_argument("--rr-active", action="store_true",
-                   help="round 1: only still-active reviewers; exit clean if none")
+                   help="round 1: only still-active reviewers; exit clean if none. "
+                        "The RESTART flag: a reviewer that already approved this PR "
+                        "is skipped, and the polish-only verdicts of the killed run "
+                        "are restored when the PR's HEAD is unchanged — so no "
+                        "reviewer whose verdict is already in hand is re-asked")
     g.add_argument("--rr-none", action="store_true",
                    help="summon NO reviewers: fix/resolve the comments already on "
                         "the PR and merge on a clean exit (if --auto-merge is "

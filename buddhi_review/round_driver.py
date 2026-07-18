@@ -67,7 +67,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from buddhi_review import commit_push, detectors, escalation_wait, gh_ingest, merge
+from buddhi_review import (
+    commit_push, detectors, escalation_wait, gh_ingest, merge, polish_state,
+)
 from buddhi_review.actuators import ActionResult, FixDispatch, act_on_result
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.classify import DISCARD_LABELS
@@ -76,6 +78,7 @@ from buddhi_review.config import (
     load_config, repo_entry,
 )
 from buddhi_review.loop import Comment, CommentResult, process_comments
+from buddhi_review.open_pr import OpenPrError, resolve_repo
 from buddhi_review.transparency import _colour_enabled, automation_notice
 
 
@@ -204,6 +207,17 @@ def _strictly_newer(new: Optional[str], old: Optional[str]) -> bool:
         return n > o
     except TypeError:
         return False
+
+
+def _supersedes(new: Optional[str], old: Optional[str]) -> bool:
+    """True when a message stamped ``new`` is MORE RECENT than one stamped ``old``
+    — strictly newer by the parsed instants, or the first DATED message to meet an
+    undated one (GitHub always stamps; a missing stamp is a degraded payload and
+    never outranks a real one). Equal instants → False, so the first message of a
+    same-instant submission (a review body and its inline comments) is kept."""
+    if _parse_iso(old) is None:
+        return _parse_iso(new) is not None
+    return _strictly_newer(new, old)
 
 
 def _same_instant(new: Optional[str], old: Optional[str]) -> bool:
@@ -648,6 +662,26 @@ def _pr_head_branch(pr, repo, cwd, run) -> Optional[str]:
     return _git_line(argv, cwd, run)
 
 
+# Head-sha seam — the sha in ``$BUDDHI_REVIEW_HEAD_SHA`` short-circuits the gh
+# call, mirroring gh_ingest's COMMENTS_JSON_ENV / REACTIONS_JSON_ENV.
+HEAD_SHA_ENV = "BUDDHI_REVIEW_HEAD_SHA"
+
+
+def _pr_head_sha(pr, repo, cwd, run) -> str:
+    """The PR's tip commit sha via ``gh api``, or ``""`` on ANY failure (missing
+    gh, non-zero exit, empty output). The ONE head-sha reader: the same call
+    stamps the polish state at a round's end and re-checks it on an ``--rr-active``
+    restore, so write and restore can never disagree about what "the tip" is. An
+    empty return is the fail-closed value — the caller never writes a stamp, and
+    never restores against one, on an unknown tip."""
+    seeded = os.environ.get(HEAD_SHA_ENV)
+    if seeded is not None:
+        return seeded.strip()
+    argv = ["gh", "api", f"repos/{repo or '{owner}/{repo}'}/pulls/{pr}",
+            "-q", ".head.sha"]
+    return _git_line(argv, cwd, run) or ""
+
+
 def refuse_primary_checkout(pr, repo, cwd, *, run=None,
                             notice: Callable[..., str] = automation_notice) -> Optional[str]:
     """Refuse to launch when ``cwd`` is the repo's PRIMARY checkout sitting on the
@@ -769,6 +803,18 @@ class RoundDriver:
         self.pr = str(pr)
         self.repo = repo
         self.cwd = cwd or os.getcwd()
+        # Lazily resolved by _polish_repo_key(): the owner/repo polish_state is
+        # keyed on, memoized once per run so a bare (--repo-less) invocation does
+        # not shell out to `gh repo view` on every read/write/clear.
+        self._polish_repo_resolved = False
+        self._polish_repo_cache: Optional[str] = None
+        # True once an --rr-active restart has RESTORED a persisted polish verdict at
+        # the current tip: this run's authority to CLEAR that verdict. A restored
+        # reviewer that later posts a substantive finding is demoted out of
+        # self.polishing (see _update_polishing), so _persist_polish_state must be
+        # allowed to overwrite the now-invalid record with the empty set even on an
+        # unadvanced HEAD — otherwise the stale verdict is restored again next restart.
+        self._polish_restored = False
         self.cfg = cfg if cfg is not None else load_config()
         # An unconfirmed repo (no repos[<repo>] entry) with NO global default to
         # fall back to is running purely on the built-in default fleet. This flag
@@ -855,8 +901,9 @@ class RoundDriver:
         # Whether to snapshot the PR's pre-existing review state before round 1
         # (see _preflight_snapshot). On by default — a launched loop always meets
         # a PR that may already carry reviews. Off only skips that pre-pass; the
-        # round loop is unchanged. The --rr / --rr-active / --rr-none modes skip
-        # preflight regardless (they redefine round 1 themselves).
+        # round loop is unchanged. The --rr / --rr-none modes skip preflight (they
+        # redefine round 1 themselves); --rr-active runs it through
+        # _rr_active_restore, the restart reconstruction.
         self.preflight = preflight
         self.push = push
         self.test_gate = test_gate
@@ -907,6 +954,15 @@ class RoundDriver:
         #   the normal window rather than holding the round open as a never-seen
         #   bot would (matching how a fresh-launch round treats a bot that spoke).
         self._preflight_seen: Set[str] = set()
+        # _restart_reverify_ids: ids of the pre-existing findings folded by the
+        #   --rr-active RESTART snapshot (empty on every other launch). A finding
+        #   here that round 1's fixer reports `skipped-already-fixed` was fixed and
+        #   PUSHED by the killed run but never re-reviewed — its reviewer must be
+        #   re-requested to verify the fixed head, NOT folded to reviewed-no-change
+        #   (which would let the clean exit merge the unverified fix). Round 1 only:
+        #   later rounds carry fresh comment ids, so a reviewer that re-posts the
+        #   same finding still drops to reviewed-no-change normally (no re-ask loop).
+        self._restart_reverify_ids: Set[str] = set()
         # _reaction_baseline: reaction ids considered STALE — captured at
         #   preflight and re-captured before every re-request. A +1 whose id is in
         #   this set was left before the current review round (an earlier commit /
@@ -939,6 +995,15 @@ class RoundDriver:
         #   comeback pops it once the reset instant passes. datetime.min
         #   marks an unknown reset → the plain next-round retry.
         self._rate_limited_until: Dict[str, datetime] = {}
+        # _rederived_approval_stamps: bot → the effective stamp (updated_at or
+        #   created_at) of the DATED sign-off _rederive_prior_approvals folded on
+        #   an --rr-active restart. It is the recency yardstick a rate-limit marker
+        #   with no reset time is measured against in _scan_unavailable_markers: an
+        #   unknown-reset marker that pre-dates this sign-off is stale history (the
+        #   window cleared, claude re-reviewed and approved after it), so it must not
+        #   un-crown the approval. Empty on a default launch and for a bare-+1 fold
+        #   (no dated message to compare) → the marker un-crowns as before.
+        self._rederived_approval_stamps: Dict[str, Optional[str]] = {}
         self.actions: List[ActionResult] = []
 
         # ── F5 run-cumulative review tracking (the SAFETY gate + silent-reviewer
@@ -1301,7 +1366,7 @@ class RoundDriver:
         comeback re-summons it once the reset passes. ``type=credits_exhausted``
         is a paid-tier concept (no billing-mode split here) — logged and ignored,
         so claude falls through to the ordinary silent handling."""
-        newest = None  # (parsed_datetime_or_None, match)
+        newest = None  # (parsed_datetime_or_None, match, created_at_str)
         for c in fresh:
             if c.source != CLAUDE_UNAVAILABLE_MARKER_AUTHOR:
                 continue
@@ -1310,7 +1375,7 @@ class RoundDriver:
                 continue
             key = _parse_iso(c.created_at)
             if newest is None or (key is not None and (newest[0] is None or key > newest[0])):
-                newest = (key, m)
+                newest = (key, m, c.created_at)
         if newest is None:
             return
         m = newest[1]
@@ -1320,8 +1385,14 @@ class RoundDriver:
                         f"marker type={mtype} ignored (the free loop handles "
                         f"rate_limited only)", status="skip")
             return
-        if "claude" in self.done:
-            return  # already concluded this run — nothing to release
+        # No early-return on "claude in done" here. An --rr-active restart re-derives a
+        # PRIOR clean approval into done BEFORE this scan runs (see _rr_active_restore),
+        # and a live marker that post-dates that approval means claude was re-requested
+        # after signing off and hit the usage limit — so the approval is for a head it
+        # never got to re-review. Recording the marker (and un-crowning below) lets the
+        # never-merge-unreviewed gate see claude as PENDING rather than approved. The
+        # stale-marker guard below still drops a marker whose window already reset, so a
+        # genuine post-reset approval (claude cannot approve while rate-limited) is safe.
         epoch = int(m.group("resets_at") or 0)
         until = None
         # Guard the conversion: an implausibly large epoch (a future ms-scale
@@ -1346,9 +1417,39 @@ class RoundDriver:
                             f"elapsed) — ignoring", status="skip")
                 return
         else:
+            # No reset time in the marker, so the stale-window check above cannot
+            # run — fall back to comparing the marker's post time against claude's
+            # re-derived sign-off. An unknown-reset marker that PRE-DATES that
+            # approval is stale history: the window cleared, claude re-reviewed and
+            # signed off AFTER it, and un-crowning would discard a genuine verdict
+            # for a head claude did review. Treat it exactly like the stale-window
+            # marker above — ignore it (no un-crown, no _rate_limited_until entry, so
+            # _rr_active_restore's own un-crown loop leaves the approval intact). A
+            # live marker still un-crowns: one newer than the sign-off, and the poll's
+            # fresh marker (no re-derived sign-off recorded → nothing to compare).
+            # _strictly_newer is conservative (an unparseable/undated stamp on either
+            # side → False → the marker un-crowns), matching the fail-safe direction.
+            sign_off = self._rederived_approval_stamps.get("claude")
+            if _strictly_newer(sign_off, newest[2]):
+                self.notice("claude-rate-limited",
+                            f"stale rate-limit marker (posted {newest[2]}, before "
+                            f"claude's later sign-off {sign_off}) — ignoring", status="skip")
+                return
             until = datetime.min.replace(tzinfo=timezone.utc)
             when = "an unknown time"
             comeback = "retries claude next round (no reset time in the marker)"
+        # A live marker supersedes a sign-off an --rr-active restart (or an earlier
+        # round) already folded into done/approved: un-crown claude so its stale
+        # approval cannot feed reviewed_ever and satisfy the never-merge-unreviewed
+        # gate for a head it never reviewed. The clean-fold in _classify_signal skips a
+        # bot already in _rate_limited_until, so the preflight snapshot does not re-crown
+        # it, and _rr_active_restore's un-crown loop drops it from the local
+        # approved/restored sets so the reviewed_ever fold there does not re-add it.
+        self.done.discard("claude")
+        self.approved.discard("claude")
+        self.polishing.discard("claude")
+        self._reaction_done.discard("claude")
+        self.reviewed_ever.discard("claude")
         self._rate_limited_until["claude"] = until
         self._bot_state("claude").signal = detectors.SIGNAL_RATE_LIMITED
         self.notice("claude-rate-limited",
@@ -1492,6 +1593,7 @@ class RoundDriver:
 
     def _classify_signal(self, comment: Comment, now: float,
                          batch_finding_stamps: Optional[Dict[str, List[Optional[str]]]] = None,
+                         superseded: bool = False,
                          ) -> Optional[str]:
         """Fold one fresh comment into the per-bot state. Returns the bot name
         when the comment is ACTIONABLE (must flow to the kernel), else None.
@@ -1500,7 +1602,15 @@ class RoundDriver:
         the errored record-time check: a review that arrives WITH same-instant
         findings is a completed review, never an error placeholder. Stamps
         (not a bare bot set), so a STALE finding swept up by round 1's
-        full-history first poll can never shield a genuinely NEW placeholder."""
+        full-history first poll can never shield a genuinely NEW placeholder.
+
+        ``superseded`` — a strictly NEWER message from the same bot exists in this
+        batch, so a clean-review verdict in THIS comment is stale and must not fold
+        the bot voluntarily-done. Set only by the preflight snapshot, which ingests
+        the PR's whole history at once in ENDPOINT order (not chronological): a
+        reviewer that said "LGTM" and then posted real findings is still engaged,
+        and an old sign-off must never silence it for the run. The poll never passes
+        it — a comment arriving live IS the bot's latest message."""
         bot = detectors.bot_for_login(comment.source)
         if bot is None:
             return None  # humans and unknown logins don't drive bot state or rounds
@@ -1577,7 +1687,20 @@ class RoundDriver:
             self.notice("exclusion", f"{bot} excluded (errored — retractable on a newer comment)",
                         status="skip")
             return None
-        if not shielded_errored_body and detectors.detect_clean_review(comment.text, llm_json=self.clean_llm):
+        if (not shielded_errored_body
+                and detectors.detect_clean_review(comment.text, llm_json=self.clean_llm)):
+            if superseded or bot in self._rate_limited_until:
+                # A stale sign-off that a NEWER message from the same bot supersedes
+                # is not a verdict — and it is not work either. It must RETURN here,
+                # not fall through: an actionable return would put the bot in
+                # _preflight_responders (dropping it from round 1's summon AND poll)
+                # and let the round-end promotion fold it into `done` on the strength
+                # of the very sign-off this flag exists to ignore. Its newer,
+                # substantive message is what the loop acts on. A bot already released
+                # rate-limited (a live usage-limit marker that post-dates this sign-off,
+                # so it could not have reviewed the current head) is the same case: the
+                # marker superseded the sign-off, so it must not be re-crowned done here.
+                return None
             self.done.add(bot)
             self.approved.add(bot)  # sticky: a later hard signal must not
             st.signal = detectors.SIGNAL_CLEAN  # demote the sign-off's label
@@ -1777,7 +1900,18 @@ class RoundDriver:
         escalation is still pending); CLASSIFICATION_FAILED counts as a real finding
         unconditionally (it rides the escalation exit). A reviewer that went
         voluntarily-done or is hard-excluded (quota / PR-too-large / errored)
-        is never demoted here."""
+        is never demoted here.
+
+        On an ``--rr-active`` restart a deferred responder's pre-existing comments ARE
+        its round-1 verdict, so they demote it exactly like any round: cosmetic-only →
+        polish (left alone next round), dismissed real findings → reviewed-no-change,
+        a surviving finding → keeps its slot and is re-requested by ``expected_bots()``.
+        That is how the restart needs no separate summon debt. The ONE exception is a
+        pre-existing finding the fixer reports ``skipped-already-fixed`` (its id is in
+        ``self._restart_reverify_ids``): the killed run had already pushed that fix but
+        the reviewer never re-reviewed it, so it is kept SURVIVING (re-requested to
+        verify the fixed head) rather than dismissed — otherwise the clean exit would
+        merge a fix no reviewer ever confirmed."""
         commented: Set[str] = set()
         surviving: Set[str] = set()   # ≥1 real finding still standing
         dismissed: Set[str] = set()   # ≥1 real finding reassessed away
@@ -1790,8 +1924,19 @@ class RoundDriver:
             label = r.classification.label
             if label not in _REAL_FINDING_LABELS:
                 continue
+            final = finals.get(c.id)
+            # An --rr-active restart re-fixing a pre-existing finding whose fix the
+            # killed run already pushed reports `skipped-already-fixed`, but the
+            # reviewer never re-reviewed the fixed head. Keep it SURVIVING so
+            # expected_bots() re-requests the reviewer to verify — folding it to
+            # reviewed-no-change here would let the clean exit merge the unverified
+            # fix. Scoped to the restart's round-1 findings (see _restart_reverify_ids),
+            # so a re-posted finding next round still dismisses normally.
+            restart_reverify = (final == "skipped-already-fixed"
+                                and c.id in self._restart_reverify_ids)
             if (label != "CLASSIFICATION_FAILED"
-                    and finals.get(c.id) in ("skipped-invalid", "skipped-already-fixed")):
+                    and final in ("skipped-invalid", "skipped-already-fixed")
+                    and not restart_reverify):
                 dismissed.add(bot)
             else:
                 surviving.add(bot)
@@ -1805,6 +1950,14 @@ class RoundDriver:
                       f"reassessment)")
             else:
                 self.polishing.add(bot)
+        # A bot with a SURVIVING finding this round must never stay parked in
+        # self.polishing: an --rr-active restore can restore a polish verdict
+        # stamped BEFORE the bot's later substantive comment on that same HEAD (the
+        # disk state only proves the tip matches, not that no newer comment
+        # arrived since the stamp was written). Without this discard, expected_bots()
+        # would keep filtering the bot out forever even though this round just
+        # dispatched a genuine fix for it that still needs verification.
+        self.polishing -= surviving
 
     def _worktree_has_changes(self) -> bool:
         """True when ``git status --porcelain`` reports any change in the loop's
@@ -1819,9 +1972,308 @@ class RoundDriver:
             return False
         return bool((getattr(proc, "stdout", "") or "").strip())
 
+    # --------------------------------------------------- --rr-active restart
+
+    def _head_sha(self) -> str:
+        """This PR's live tip sha, or ``""`` when it cannot be read."""
+        return _pr_head_sha(self.pr, self.repo, self.cwd, self.gh_run)
+
+    def _polish_repo_key(self) -> Optional[str]:
+        """The ``owner/repo`` :mod:`polish_state` keys its per-PR file on: ``self.repo``
+        when explicit, else inferred from ``self.cwd``'s GitHub remote (mirroring
+        :func:`open_pr.resolve_repo`), memoized for the run.
+
+        A bare CLI invocation (``--repo`` omitted) leaves ``self.repo`` as ``None``;
+        keying polish_state on that directly would fall back to a shared "local" file
+        that collides across every repo run the same way, and would never match a
+        state file a run with ``--repo`` explicitly passed had written for the SAME
+        PR. Resolving here keeps the key consistent across restarts regardless of
+        whether a given invocation happened to pass ``--repo``.
+
+        Falls back to ``self.repo`` (possibly ``None``) when the cwd has no readable
+        GitHub remote — polish_state's own repo+PR re-verify on read still keeps that
+        fallback safe (it reads as "no state" rather than another repo's verdict)."""
+        if not self._polish_repo_resolved:
+            try:
+                self._polish_repo_cache = resolve_repo(self.cwd, self.repo, self.gh_run)
+            except OpenPrError:
+                self._polish_repo_cache = self.repo
+            self._polish_repo_resolved = True
+        return self._polish_repo_cache
+
+    def _rr_active_restore(self) -> None:
+        """Reconstruct, before round 1, every verdict an ``--rr-active`` restart
+        already holds — so the loop never spends a summon, a register delay, and a
+        poll window re-asking a reviewer it has already heard from.
+
+        Three verdicts are recovered, in this order:
+
+        * **approved** — a reviewer whose LATEST message on the PR is a clean
+          review, or that signed off with a bare ``+1``, is folded voluntarily-done
+          (which alone suppresses both its summon and its poll). Re-derived from
+          GitHub, never from disk: approvals live on the PR. This MUST precede the
+          preflight snapshot below, whose reaction baseline stamps every
+          pre-existing ``+1`` stale.
+        * **polish-only** — restored from the persisted per-PR state, and ONLY when
+          the PR's live HEAD still equals the tip that state was stamped against
+          (see :mod:`buddhi_review.polish_state`).
+        * **already-responded** — the preflight snapshot folds the comments already on
+          the PR, so a responder is
+          neither re-summoned nor polled in round 1; its pre-existing comments are
+          processed as its round-1 verdict instead. After that NOTHING is special: the
+          existing ``expected_bots()`` + end-of-round rules decide round 2 — a
+          substantive finding re-requests its bot to verify the fix, a cosmetic one
+          lands in ``self.polishing`` and is left alone, an approval is done. There is
+          no summon debt; the correct behaviour falls out of the rules the loop already
+          runs.
+
+        The restored / re-derived reviewers are folded into ``reviewed_ever``: they
+        genuinely reviewed this PR, so a restart of an all-approved / all-polish PR
+        must still clear the never-merge-unreviewed gate and auto-merge."""
+        approved = self._rederive_prior_approvals()
+        restored = self._restore_polish_state()
+        deferred: Set[str] = set()
+        # Run the restart snapshot at EVERY max_rounds — it is what defers a
+        # verdict-in-hand bot out of round 1's summon and poll. The restart principle
+        # ("round 1 summons only active bots whose verdict is not in hand") carries no
+        # round-budget condition: at max_rounds == 1, summoning a deferred bot would
+        # only re-review the OLD head anyway (round 1 is the last round), so deferring
+        # is strictly more efficient with no safety change, and the reconstruction runs
+        # unconditionally on the restart path. After the snapshot NOTHING is
+        # special: expected_bots() and the round-end rules decide any further round — a
+        # substantive comment re-requests its bot (it is in none of the exclusion sets),
+        # a cosmetic one lands in self.polishing and is left alone, an approval is done.
+        # No summon debt.
+        if self.preflight:
+            self._preflight_snapshot(restart=True)
+            deferred = set(self._preflight_responders)
+            # The pre-existing findings this restart just folded. If round 1's fixer
+            # reports one `skipped-already-fixed` (the killed run had already pushed
+            # its fix), _update_polishing + the substantive-progress gate consult this
+            # set to re-request the reviewer for one verification round instead of
+            # merging the unverified fix. See _restart_reverify_ids.
+            self._restart_reverify_ids = {c.id for c in self._preflight_batch}
+            # A HARD CAUSE or a live rate-limit marker always wins over a re-derived
+            # verdict. The snapshot reads every comment through the full exclusion path,
+            # so it can hard-exclude (quota / PR-too-large / errored) a reviewer whose
+            # message the re-derive above read as a sign-off — a failure placeholder
+            # states its own zero output and so reads "clean" on its own text — and
+            # _scan_unavailable_markers can release a reviewer a live usage-limit marker
+            # post-dating its sign-off rate-limited. Un-crown such a reviewer here,
+            # BEFORE the reviewed_ever fold below: a placeholder, or a head claude was
+            # rate-limited out of re-reviewing, is not a review of the current code, and
+            # counting it would satisfy the never-merge-unreviewed gate and merge a PR
+            # nobody actually looked at.
+            for bot in sorted(approved | restored):
+                if not (self.store.is_excluded(bot) or bot in self._rate_limited_until):
+                    continue
+                approved.discard(bot)
+                restored.discard(bot)
+                self.done.discard(bot)
+                self.approved.discard(bot)
+                self.polishing.discard(bot)
+                self.reviewed_ever.discard(bot)
+        fleet = set(self._run_start_fleet)
+        # A preserved approval / polish verdict IS a genuine review (restricted to
+        # the run-start fleet, mirroring the gate's own universe). Without this fold
+        # an all-approved restart reaches the clean exit with an empty reviewed_ever
+        # and the SAFETY gate would block the very auto-merge it should allow.
+        self.reviewed_ever |= (approved | restored) & fleet
+        # Remember that this run restored a polish verdict (post hard-cause un-crown):
+        # if a restored reviewer later posts a substantive finding and is demoted, the
+        # end-of-round persist must be allowed to clear the invalidated record at this
+        # same tip rather than being blocked by write_polish_state's empty no-clobber.
+        self._polish_restored = bool(restored)
+        parts = []
+        if approved:
+            parts.append(f"approved={sorted(approved)}")
+        if restored:
+            parts.append(f"polish-only={sorted(restored)}")
+        if deferred:
+            parts.append(f"already-responded={sorted(deferred)}")
+        if parts:
+            self.notice("rr-active-restore",
+                        f"PR #{self.pr}: not re-asking reviewers whose verdict is "
+                        f"already in hand — {'; '.join(parts)}", status="skip",
+                        hint="re-run with --rr to re-ping every reviewer anyway")
+
+    def _rederive_prior_approvals(self) -> Set[str]:
+        """Fold every reviewer that has ALREADY signed off into voluntarily-done,
+        re-derived live from GitHub. Returns the set folded here.
+
+        **Latest message wins.** A reviewer's most-recent message across all three
+        channels (inline comments, review bodies, PR conversation) decides: only a
+        LATEST message that is a clean review folds it. A stale LGTM followed by
+        substantive feedback — including an inline comment, the channel a
+        conversation-only scan would miss — must NOT silence a reviewer that is
+        still engaged. A bare ``+1`` (the sign-off of a reviewer that posts no
+        message at all) folds on its own; a ``+1`` alongside a substantive latest
+        message does not (reactions carry no timestamp, so they can never outrank a
+        message that does).
+
+        Deliberately NOT ``_fold_reactions``: that reads ``+1`` reactions only, and
+        fails closed while the reaction baseline is unset — which it is here, since
+        this runs BEFORE the preflight snapshot captures it. Fail-soft on a reader
+        error: whatever could not be read simply is not folded (the reviewer is
+        re-summoned — the safe direction), with a warning naming the source."""
+        fleet = set(self._run_start_fleet)
+        if not fleet:
+            return set()
+        failures: List[str] = []
+        latest: Dict[str, Tuple[Optional[str], str]] = {}   # bot -> (effective stamp, text)
+        comments_read = True
+        try:
+            comments = self.fetch(self.pr, repo=self.repo, cwd=self.cwd)
+        except Exception:
+            comments = []
+            comments_read = False
+            failures.append("comments")
+        for c in comments:
+            bot = detectors.bot_for_login(c.source)
+            if bot is None:
+                continue
+            # updated_at-then-created_at (the same effective-stamp rule the errored
+            # comeback and the preflight snapshot's newest map both use): an inline
+            # finding EDITED after an older LGTM must prove its recency by its edit
+            # time, or the LGTM's created_at would still read as this bot's latest
+            # message and wrongly fold it voluntarily-done while the edited finding
+            # is still outstanding.
+            stamp = c.updated_at or c.created_at
+            known = latest.get(bot)
+            if known is None or _supersedes(stamp, known[0]):
+                latest[bot] = (stamp, c.text or "")
+        plus_one: Set[str] = set()
+        try:
+            for r in self.fetch_reactions(self.pr, repo=self.repo, cwd=self.cwd):
+                if r.content != "+1":
+                    continue
+                b = detectors.bot_for_login(r.source)
+                if b is not None:
+                    plus_one.add(b)
+        except Exception:
+            failures.append("reactions")
+        if failures:
+            self.notice("rr-active-restore",
+                        f"could not read {' + '.join(failures)} — a prior approval "
+                        f"from that source is not preserved; the reviewer is "
+                        f"re-summoned", status="fallback")
+        folded: Set[str] = set()
+        for bot in sorted(fleet):
+            st = self._bot_state(bot)
+            # Defer to any recorded state, exactly like the clean-review path: a
+            # hard cause (quota / PR-too-large / errored) or an existing sign-off
+            # is never overwritten by this fold.
+            if st.signal is not None or bot in self.done or self.store.is_excluded(bot):
+                continue
+            newest = latest.get(bot)
+            if newest is None:
+                # A bare +1 signs off only when the loop KNOWS the bot posted no
+                # message — i.e. the comment read succeeded. If that read FAILED,
+                # "no message" is ignorance, not evidence: the unread message could
+                # be a failure placeholder or a fresh finding, and a +1 must never
+                # crown such a reviewer "Approved" (which would satisfy the
+                # never-merge-unreviewed gate). Fail closed → it is re-summoned.
+                signed_off = comments_read and bot in plus_one
+            else:
+                signed_off = self._is_sign_off(newest[1])
+            if not signed_off:
+                continue
+            self.done.add(bot)
+            self.approved.add(bot)
+            st.signal = detectors.SIGNAL_CLEAN
+            self.responded_ever.add(bot)
+            if newest is not None:
+                # Record the sign-off's effective stamp so a no-reset-time
+                # rate-limit marker can test whether it pre-dates this approval
+                # before un-crowning it (see _scan_unavailable_markers). A bare +1
+                # (newest is None) carries no timestamp, so none is recorded and the
+                # marker un-crowns conservatively.
+                self._rederived_approval_stamps[bot] = newest[0]
+            if newest is None:
+                # Folded on a bare +1, so NO text of this bot was ever quota-checked.
+                # Mark it reaction-done exactly as the poll's own +1 fold does, so the
+                # between-rounds quota re-check still reconsiders anything it posts
+                # later: a novel-wording quota message must be able to evict this
+                # sign-off rather than ride it into the merge gate.
+                self._reaction_done.add(bot)
+            folded.add(bot)
+            print(f"[rr-active] {bot}: already approved this PR — not re-requesting")
+        return folded
+
+    def _is_sign_off(self, text: str) -> bool:
+        """True only for a message that is a GENUINE clean review — the same
+        signal-first precedence ``_classify_signal`` applies, with the same
+        classification context, and for the same reason: a FAILURE placeholder states
+        its own zero output ("the review run failed; no comments were posted", "I've
+        used all of my requests for this month, so no comments were generated") and
+        therefore reads CLEAN to the clean-review detector on its own. A placeholder
+        is a response, not a review — crowning it "Approved" would satisfy the
+        never-merge-unreviewed gate and auto-merge a PR nobody reviewed.
+
+        The quota model tier (``quota_llm``) and the PR subject are passed exactly as
+        the poll passes them: the deterministic regexes miss real quota wordings that
+        only the model tier catches, and a detector that is BLINDER here than the one
+        the preflight snapshot uses would crown a bot the snapshot then hard-excludes.
+        Any hard signal (quota / PR-too-large / errored), or the "wasn't able to
+        review" apology those regexes do not catch, is therefore NOT a sign-off."""
+        if self.quota_llm is not None:
+            pr_title, pr_body = self._fetch_pr_title_body()
+        else:
+            pr_title, pr_body = None, None
+        if detectors.detect_signal(text, quota_llm=self.quota_llm,
+                                   pr_title=pr_title, pr_body=pr_body) is not None:
+            return False
+        if _NOT_A_REVIEW_RE.search(text or ""):
+            return False
+        return detectors.detect_clean_review(text, llm_json=self.clean_llm)
+
+    def _restore_polish_state(self) -> Set[str]:
+        """Restore the persisted polish-only reviewers, but ONLY when the PR's live
+        HEAD still equals the tip they were stamped against. Returns the set
+        restored (empty when the tip is unknown, no state exists, the state is
+        unreadable, or HEAD has moved).
+
+        HEAD-guarded because the polish verdict is tied to the diff the reviewer
+        actually saw: once HEAD advances past it (a human's commit, a rebase, a
+        fix from a run whose stamp never landed) the reviewer may have real
+        findings on the new code, so it is re-summoned rather than restored."""
+        head = self._head_sha()
+        if not head:
+            return set()   # unknown live HEAD → never restore (fail-closed)
+        state = polish_state.read_polish_state(self.pr, self._polish_repo_key())
+        if not state or state.get("tip_sha") != head:
+            return set()
+        # Restricted to the run-start fleet: a stale file must never resurrect a
+        # reviewer the operator has since disabled, nor override a hard exclusion.
+        restored = {b for b in state["bots"]
+                    if b in self._run_start_fleet and b not in self.done
+                    and self._bot_state(b).signal is None
+                    and not self.store.is_excluded(b)}
+        self.polishing |= restored
+        for bot in sorted(restored):
+            print(f"[rr-active] {bot}: polish-only at this HEAD — not re-requesting")
+        return restored
+
+    def _persist_polish_state(self) -> None:
+        """Stamp the run's CURRENT polish-only set against the tip this round
+        leaves behind — called at every round end, AFTER the round's fixes are
+        pushed, so the tip is the one the loop carries into the next round (and the
+        one a restart would meet as live HEAD). Fail-closed: an unreadable tip
+        writes nothing, so a later restore can never match a stamp taken on an
+        unknown head. Best-effort — a failed write only costs a re-summon."""
+        tip = self._head_sha()
+        if not tip:
+            return
+        # restored_prior lets an --rr-active run that restored then legitimately cleared
+        # a verdict overwrite it with the empty set at the same unadvanced tip; a run
+        # that restored nothing keeps write_polish_state's empty no-clobber guard.
+        polish_state.write_polish_state(
+            self.pr, self._polish_repo_key(), tip, sorted(self.polishing),
+            restored_prior=self._polish_restored)
+
     # ------------------------------------------------------------------- run
 
-    def _preflight_snapshot(self) -> None:
+    def _preflight_snapshot(self, restart: bool = False) -> None:
         """Before round 1, ingest every review/comment already on the PR and fold
         it through the SAME classification path the poll uses, so the loop starts
         already knowing who responded. Seeds ``self.done`` / ``self.approved``
@@ -1833,10 +2285,37 @@ class RoundDriver:
         every responding bot is recorded in ``self._preflight_responders`` so
         round 1 neither re-summons nor waits on a reviewer that already spoke.
 
-        Runs ONLY on a default launch — the ``--rr`` / ``--rr-active`` / ``--rr-none``
-        modes keep their existing round-1 semantics untouched. ``processed_ids``
-        de-dup guarantees the round-1 poll never re-processes a folded comment, and
-        the marker scan here fires at most once across preflight + poll."""
+        Runs on a default launch AND on the ``--rr-active`` RESTART path (through
+        ``_rr_active_restore``, at every ``max_rounds``) — there its responders are
+        deferred out of round 1's summon and poll, but never out of the RUN: their
+        pre-existing comments are processed as their round-1 verdict, and the existing
+        end-of-round re-request rules then decide round 2 (a substantive finding →
+        re-requested to verify the fix, a cosmetic one → polish, an approval → done).
+        ``--rr`` and ``--rr-none`` skip it and keep their round-1 semantics untouched.
+        ``processed_ids`` de-dup guarantees the round-1 poll never re-processes a folded
+        comment, and the marker scan here fires at most once across preflight + poll.
+
+        ``restart`` — the ``--rr-active`` RESTART reading of the PR's history, and the
+        ONLY caller that gets the two rules below. A default launch is left exactly as
+        it was, deliberately: both rules depend on round 1 actually SUMMONING the
+        reviewer they release, which only ``--rr`` / ``--rr-active`` do (a default
+        round 1 summons ``auto_on_open: false`` reviewers only, so an ``auto_on_open``
+        reviewer released here would be polled-but-never-asked — silently silent for a
+        whole round).
+
+        * **Already-resolved inline findings are skipped.** On a restart they are
+          FINISHED work, not a fresh verdict: folding them would defer their author
+          out of round 1, re-fix its stale comments to "already fixed", demote it to
+          reviewed-no-change, and drop it from re-request for the whole run — the
+          reviewer would never be asked at all.
+        * **Latest message wins for the clean fold** (``superseded``). Preflight reads
+          the whole history at once in ENDPOINT order, which is not chronological, so
+          an old "LGTM" could otherwise crown a reviewer voluntarily-done even though
+          it has since posted real findings. A finding wins a TIE, too: a sign-off body
+          sharing its instant with an inline finding from the same bot (one review
+          submission stamps its body and inline comments alike) is that review's
+          summary, not proof the finding is resolved, so it never crowns the bot while
+          its own same-submission finding is still outstanding."""
         now = self.clock()
         fresh = self._ingest_new()
         # Establish the stale-reaction baseline: every reaction already on the PR
@@ -1844,6 +2323,14 @@ class RoundDriver:
         self._capture_reaction_baseline()
         if not fresh:
             return
+        # RESTART only (see the docstring): skipping a resolved root keeps its author
+        # OUT of the responder set, and round 1 under --rr-active summons the whole
+        # expected fleet — so the reviewer is genuinely asked about the current head
+        # rather than replaying finished work. A default launch does NOT summon an
+        # auto_on_open reviewer in round 1, so releasing it there would leave it
+        # polled-but-never-asked; that path keeps its existing fold.
+        resolved_comment_ids = self._resolved_thread_comment_ids() if restart else set()
+        skipped_resolved = 0
         # Honour a pre-existing rate-limit marker BEFORE round 1 (so claude is
         # released ahead of the poll, not first seen inside it). Same fresh batch,
         # so _ingest_new's processed_ids de-dup makes it fire exactly once.
@@ -1851,14 +2338,68 @@ class RoundDriver:
         # Per-bot inline-finding stamps (identical to the poll) for the errored
         # record-time completed-review check.
         finding_stamps: Dict[str, List[Optional[str]]] = {}
+        # Each bot's most-recent stamp in this batch — the RESTART-only
+        # LATEST-MESSAGE-WINS rule for the clean fold (see the docstring).
+        newest: Dict[str, Optional[str]] = {}
         for c in fresh:
+            b = detectors.bot_for_login(c.source)
+            if b is None:
+                continue
             if c.path or c.diff_hunk:
-                b = detectors.bot_for_login(c.source)
-                if b is not None:
-                    finding_stamps.setdefault(b, []).append(c.created_at)
+                finding_stamps.setdefault(b, []).append(c.created_at)
+            # updated_at-then-created_at (the same effective-stamp rule the errored
+            # comeback and the approval re-derive path below both use): an inline
+            # finding EDITED after an older LGTM must prove its recency by its edit
+            # time, or the LGTM's created_at would still win "newest" and wrongly
+            # fold the bot voluntarily-done while the edited finding is processed
+            # as actionable in the same preflight batch.
+            effective = c.updated_at or c.created_at
+            if restart and _supersedes(effective, newest.get(b)):
+                newest[b] = effective
         for c in fresh:
+            # Only INLINE comments (thread roots AND their replies) live in review
+            # threads, so only they can match the resolved set — which now holds
+            # EVERY comment id in a resolved thread, not just the root, so a resolved
+            # thread's follow-up reply is skipped too rather than re-folded as fresh
+            # work. A review body / issue-channel comment (a clean sentinel, a quota
+            # marker) has no thread and folds normally — no sign-off, exclusion, or
+            # reviewed_ever seeding is lost.
+            if c.path and c.id in resolved_comment_ids:
+                skipped_resolved += 1
+                # Resolution ends the FINDING, not the reviewer's stated inability to
+                # review: a quota / PR-too-large placeholder is still true after
+                # someone ticks its thread resolved. Fold the hard signal (which
+                # excludes the bot) but never the work — the comment itself is done.
+                self._fold_hard_signal(c)
+                continue
             rb = detectors.bot_for_login(c.source)
-            bot = self._classify_signal(c, now, batch_finding_stamps=finding_stamps)
+            # A body sign-off (no path/diff_hunk) that shares its instant with an inline
+            # finding from the SAME bot is one review submission's SUMMARY, not a verdict
+            # that the finding is resolved: GitHub stamps a review body and its inline
+            # comments with the same created_at, and ``_supersedes`` reads equal instants
+            # as a tie (False), so the strictly-newer rule below never demotes such a
+            # body. The finding must win that tie — fold the body as superseded so a
+            # same-submission "LGTM" never crowns the bot voluntarily-done while its own
+            # finding is still outstanding. Without this the finding is fixed in round 1
+            # but its author lands in ``done``, is dropped from ``expected_bots()``, and
+            # the fixed head is never re-requested for verification — the stale approval
+            # then satisfies the auto-merge review gate. Only a BODY yields here: the
+            # finding comment itself is actionable regardless of this flag (``superseded``
+            # gates only the clean-review branch of ``_classify_signal``).
+            same_submission_finding = (
+                rb is not None and not (c.path or c.diff_hunk)
+                and any(_same_instant(stamp, c.created_at)
+                        for stamp in finding_stamps.get(rb, ())))
+            # _supersedes, NOT _strictly_newer — the same predicate that BUILT
+            # ``newest``, so the rule is symmetric. It differs in exactly one case:
+            # an UNDATED comment (a degraded payload — GitHub always stamps). There a
+            # dated message must still win, or an undated stale "LGTM" would fold its
+            # author voluntarily-done, and the reviewer whose newest message is a real
+            # finding would never be summoned at all.
+            bot = self._classify_signal(
+                c, now, batch_finding_stamps=finding_stamps,
+                superseded=rb is not None and (
+                    _supersedes(newest.get(rb), c.created_at) or same_submission_finding))
             if bot is not None:
                 self._preflight_batch.append(c)
             if rb is not None:
@@ -1877,6 +2418,30 @@ class RoundDriver:
                 if (bot is not None or rb in self.done
                         or self.store.is_excluded(rb) or rb in self._rate_limited_until):
                     self._preflight_responders.add(rb)
+        # An --rr-active restart may re-derive a reviewer's LATEST verdict as a clean
+        # approval while OLDER inline findings from it still sit on the PR. `superseded`
+        # gates only the clean-review branch of _classify_signal, so a non-clean older
+        # finding falls through as actionable above and would re-dispatch the fixer
+        # against feedback the reviewer has already withdrawn. Drop those findings here —
+        # AFTER the whole history is folded, so the approval is definitely in
+        # `self.approved` even though the endpoint-ordered loop may fold it AFTER the
+        # finding. Scoped to a bot the restart folded APPROVED, and to a finding its
+        # newest message supersedes: a genuinely fresh finding IS the bot's newest
+        # message (never superseded) and its author never lands in `approved`, so its
+        # re-request slot is left untouched.
+        if restart and self._preflight_batch:
+            kept = []
+            for c in self._preflight_batch:
+                b = detectors.bot_for_login(c.source)
+                # updated_at-then-created_at (the same effective-stamp rule the errored
+                # comeback uses): an EDITED finding must prove its recency by its edit
+                # time, or a stale approval posted between its original post and its
+                # edit would still crown it "newer" and this finding would be dropped as
+                # stale even though the edit postdates the approval.
+                if b in self.approved and _supersedes(newest.get(b), c.updated_at or c.created_at):
+                    continue  # stale finding under this bot's newer approval — not re-fixed
+                kept.append(c)
+            self._preflight_batch = kept
         # The between-round quota re-check must cover the preflight batch too: a
         # novel-wording quota message already on the PR would otherwise be recorded
         # as a genuine review and satisfy the never-merge gate. Run it BEFORE the
@@ -1891,9 +2456,66 @@ class RoundDriver:
         # round-1 fast exit — empty fleet — skips that reset).
         for st in self.bots.values():
             st.last_seen = None
+        if skipped_resolved:
+            print(f"[preflight] {skipped_resolved} already-resolved comment(s) "
+                  f"skipped — their reviewers are summoned normally")
         if self._preflight_batch:
             print(f"[preflight] {len(self._preflight_batch)} pre-existing comment(s) "
                   f"to process in round 1 without waiting")
+
+    def _fold_hard_signal(self, comment: Comment) -> None:
+        """Apply ONLY the hard-cause exclusions (quota / PR-too-large) from a comment
+        whose WORK is finished — an inline finding on a RESOLVED review thread, which
+        the preflight fold skips. The exclusion outlives the resolution: a reviewer
+        that said it was out of quota is still out of quota, and re-summoning it would
+        burn a round on a bot that cannot answer.
+
+        ERRORED is deliberately not recordable here, exactly as in ``_classify_signal``:
+        an INLINE comment IS review output, so a body that trips the errored regex on a
+        thread root is a finding, never a failure placeholder — and only inline roots
+        reach this method."""
+        bot = detectors.bot_for_login(comment.source)
+        if bot is None:
+            return
+        st = self._bot_state(bot)
+        if st.signal is not None or self.store.is_excluded(bot):
+            return  # a cause is already recorded — never overwrite it
+        if self.quota_llm is not None:
+            pr_title, pr_body = self._fetch_pr_title_body()
+        else:
+            pr_title, pr_body = None, None
+        signal = detectors.detect_signal(
+            comment.text, quota_llm=self.quota_llm, pr_title=pr_title, pr_body=pr_body)
+        if signal == detectors.SIGNAL_QUOTA:
+            self.store.exclude_quota(bot)
+            st.signal = signal
+            self.notice("exclusion", f"{bot} excluded for the run: quota exhausted",
+                        status="skip")
+        elif signal == detectors.SIGNAL_PR_TOO_LARGE:
+            self.store.exclude_pr_too_large(bot)
+            st.signal = signal
+            self.notice("exclusion", f"{bot} excluded for the run: PR too large",
+                        status="skip")
+
+    def _resolved_thread_comment_ids(self) -> Set[str]:
+        """Every comment id — root AND replies — in every review thread GitHub reports
+        RESOLVED. A resolved thread is FINISHED work: the root finding is done and so is
+        every follow-up reply inside it, so on a restart NONE of its comments should be
+        re-folded as fresh work. Matching only the root would leave a reply looking
+        active — making its author a preflight responder, reprocessing the stale reply,
+        and dropping it from round 1's summon (exactly the skip this guard exists for).
+        Fail-SOFT: any reader error (a gh/GraphQL blip, no owner/repo configured, a
+        malformed node) degrades to an empty set — i.e. exactly today's behaviour, where
+        no comment is filtered — and never crashes the preflight fold."""
+        try:
+            threads = self.fetch_threads(self.pr, repo=self._polish_repo_key(), cwd=self.cwd)
+            ids: Set[str] = set()
+            for t in threads:
+                if t.is_resolved:
+                    ids |= set(t.comment_ids)
+            return ids
+        except Exception:
+            return set()
 
     def _populate_repo_gate(self) -> None:
         """Populate ``self._repo_gate_excluded`` ONCE, before round 1, from the
@@ -1936,6 +2558,15 @@ class RoundDriver:
             self.approved.clear()
             self.polishing.clear()
             self.reviewed_no_change.clear()
+            # The on-disk polish record is the CROSS-RESTART form of self.polishing —
+            # a soft exclusion that outlives the process — so drop it too. Otherwise a
+            # --rr run that ends at an unadvanced HEAD with an empty polish set cannot
+            # erase it: write_polish_state's empty no-clobber refuses that same-tip
+            # write, and --rr never sets _polish_restored (it skips both the preflight
+            # and _rr_active_restore that would). The stale verdict would then survive
+            # for a later --rr-active restart to restore — re-skipping the very reviewer
+            # --rr was explicitly used to re-include.
+            polish_state.clear_polish_state(self.pr, self._polish_repo_key())
         # Snapshot the run-start fleet BEFORE preflight folds responders into
         # done/exclusions, so the SAFETY gate still measures the FULL expected
         # fleet: a PR everyone already approved has an empty round-1 expected set
@@ -1944,6 +2575,13 @@ class RoundDriver:
         self._run_start_fleet = set(self.expected_bots())
         if self.preflight and not (self.rr or self.rr_active or self.rr_none):
             self._preflight_snapshot()
+        elif self.preflight and self.rr_active:
+            # --rr-active is the RESTART flag: reconstruct what the killed run
+            # already knew, so no reviewer whose verdict is already in hand is
+            # re-asked. Runs strictly AFTER the run-start fleet snapshot above —
+            # folding first would shrink the fleet and silently weaken the
+            # never-merge-unreviewed SAFETY gate at the clean exit.
+            self._rr_active_restore()
         try:
             outcome = self._run_loop()
             # On a manual-landing hand-back, rebase the loop's OWN branch onto the
@@ -2047,6 +2685,12 @@ class RoundDriver:
                       + (f" — {a.detail}" if a.detail else ""))
             # A summary-only genuine review (zero findings) is done for the run —
             # decided AFTER classification, BEFORE the table renders its status.
+            # A deferred responder's pre-existing comments ARE its round-1 verdict on
+            # the restart path, so they drive these demotions like any round's: a
+            # cosmetic-only responder lands in self.polishing and is left alone next
+            # round (the whole point — the loop already knows not to re-ask a polish
+            # bot), and a substantive one is re-requested by expected_bots() to verify
+            # the fix. That is why the deferral needs no summon debt.
             self._promote_reviewed_no_findings(actionable, results)
             # Round-end demotions BEFORE the table renders, so a reviewer about
             # to be dropped shows its actual next-round disposition (Polish-only
@@ -2063,10 +2707,10 @@ class RoundDriver:
                 if any(k.startswith("fix-") and (v or "").strip() == "3"
                        for k, v in answers.items()):
                     print("[round] operator chose stop on a failed-fix escalation")
-                    return RunOutcome("stopped", round_no, False, self.actions)
+                    return self._handback("stopped", round_no)
                 if any(v is None for v in answers.values()):
                     print("[round] unanswered escalation(s) — handing over for manual review")
-                    return RunOutcome("needs-human", round_no, False, self.actions)
+                    return self._handback("needs-human", round_no)
 
             # Poisoned-worktree gate (orthogonal to disposition): if ANY fix this
             # round could not prove a clean rollback, un-rolled-back residue may be
@@ -2080,8 +2724,7 @@ class RoundDriver:
                 print("[round] a fixer rollback could not be proven clean — "
                       "poisoned worktree, halting before push for manual review")
                 # Bucket C: a poisoned worktree must never be rebased/force-pushed.
-                return RunOutcome("needs-human", round_no, False, self.actions,
-                                  rebase_skip=True)
+                return self._handback("needs-human", round_no, rebase_skip=True)
 
             committed_changes = False
             if any(a.final == "fixed" for a in round_actions) and self.push:
@@ -2099,15 +2742,21 @@ class RoundDriver:
                 if pushed == "stopped":
                     # Stopped on a red gate with uncommitted/unpushed round residue
                     # → Bucket C: do not rebase/force-push an unverified tree.
-                    return RunOutcome("stopped", round_no, False, self.actions,
-                                      rebase_skip=True)
+                    return self._handback("stopped", round_no, rebase_skip=True)
                 if pushed == "error":
                     # push failed: local commit exists but remote never got it;
                     # continuing could lead to squash_merge on stale remote code.
                     # Bucket C: local/remote diverged — never rebase/force-push it.
-                    return RunOutcome("needs-human", round_no, False, self.actions,
-                                      rebase_skip=True)
+                    return self._handback("needs-human", round_no, rebase_skip=True)
                 committed_changes = (pushed == "pushed")
+
+            # Persist this round's polish-only verdicts against the tip the loop
+            # now carries — AFTER the fixes are pushed, so the stamp names the head
+            # a restart would meet. A polish-only reviewer is sticky within a run
+            # (never re-summoned even as later fixes advance HEAD), so stamping the
+            # POST-fix tip and restoring only at that tip reproduces exactly that
+            # stickiness across a restart; a PRE-fix stamp would never match.
+            self._persist_polish_state()
 
             # ── Substantive-progress gate ─────────────────────────────────────
             # Request another review round ONLY when this round produced real
@@ -2126,7 +2775,32 @@ class RoundDriver:
                 r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
                 for r, a in zip(results, round_actions)
             )
-            if round_substantive and (committed_changes or self._worktree_has_changes()):
+            # An --rr-active restart re-fixed a pre-existing finding whose fix the
+            # killed run already pushed and the reviewer never re-reviewed: the fixer
+            # reports `skipped-already-fixed`, so NO new fix landed this round and the
+            # substantive gate above would clean-exit and merge the unverified fix.
+            # Take one more round instead — _update_polishing kept the reviewer in
+            # expected_bots, so it is re-requested to verify the fixed head. Scoped to
+            # the restart's round-1 findings (later rounds carry fresh ids), so a
+            # re-posted finding still exits normally next round (no re-ask loop).
+            restart_reverify = any(
+                a.final == "skipped-already-fixed"
+                and a.comment_id in self._restart_reverify_ids
+                and r.classification.label in _REAL_FINDING_LABELS
+                for r, a in zip(results, round_actions)
+            )
+            take_substantive_round = round_substantive and (
+                committed_changes or self._worktree_has_changes())
+            if round_no >= self.max_rounds and restart_reverify:
+                # Final round, but the restart's re-fixed pre-existing finding was never
+                # re-reviewed and no verification round remains. A `continue` here would
+                # only end the for-loop and fall through to the budget-reached clean
+                # exit below, auto-merging the unverified fix. Hand back instead — a
+                # re-run (typically --rr-active) then completes the verification. Never
+                # reached on a standard PR: restart_reverify requires
+                # _restart_reverify_ids, populated only on the --rr-active preflight path.
+                return self._handback("max-rounds", round_no)
+            if take_substantive_round or restart_reverify:
                 continue
             return self._clean_exit(round_no)
 
@@ -2140,6 +2814,18 @@ class RoundDriver:
         print(f"[round] round budget ({self.max_rounds}) reached with the final "
               f"round clean — routing through the clean-exit gates")
         return self._clean_exit(self.max_rounds)
+
+    def _handback(self, status: str, rounds: int, *, rebase_skip: bool = False) -> RunOutcome:
+        """A NON-clean hand-back (operator stop, unanswered escalation, poisoned
+        worktree, failed push). Stamps the run's polish-only verdicts before
+        returning: every one of these exits is followed by the operator fixing
+        something and re-running — most often ``--rr-active`` right after answering an
+        escalated question — and a verdict this run genuinely reached must survive
+        that, or the restart re-summons the very reviewers it should skip. Stamped
+        against the LIVE PR head, which is the head the restart will meet (these exits
+        fire before, or instead of, the round's push)."""
+        self._persist_polish_state()
+        return RunOutcome(status, rounds, False, self.actions, rebase_skip=rebase_skip)
 
     def _clean_exit(self, rounds: int) -> RunOutcome:
         print("[round] clean — every expected reviewer is done/excluded and "
@@ -2210,7 +2896,7 @@ class RoundDriver:
                 self.pr, repo=self.repo, enabled=True, cwd=self.cwd,
                 run=self.gh_run, notice=self.notice,
             )
-            return RunOutcome("clean", rounds, merged, self.actions)
+            return self._merged_outcome(rounds, merged)
         # ── auto-merge OFF ──────────────────────────────────────────────────────
         # #g9b: when running attended (a TTY), offer an interactive squash-merge
         # after confirming GitHub would accept it; a headless run (nohup / CI,
@@ -2218,12 +2904,36 @@ class RoundDriver:
         # leaves the PR open for the operator to land.
         if sys.stdin.isatty():
             merged = self._interactive_merge_prompt()
-            return RunOutcome("clean", rounds, merged, self.actions)
+            return self._merged_outcome(rounds, merged)
         merged = merge.squash_merge(
             self.pr, repo=self.repo, enabled=False, cwd=self.cwd,
             run=self.gh_run, notice=self.notice,
         )
+        return self._merged_outcome(rounds, merged)
+
+    def _merged_outcome(self, rounds: int, merged: bool) -> RunOutcome:
+        """The clean-exit outcome + the landed-PR cleanup: once the PR is merged its
+        persisted polish state is dead, so drop the file. A PR handed BACK (blocked
+        gate, red CI, an unresolved thread) keeps its state — that is the restart the
+        state exists for.
+
+        A PR the loop did not merge itself may still have LANDED — the operator merged
+        it by hand while the run was finishing, or GitHub's own auto-merge did. Probe
+        for that (best-effort; an unreadable state simply keeps the stamp) so a landed
+        PR never leaves a stamp behind to age out."""
+        if merged or self._pr_is_merged():
+            polish_state.clear_polish_state(self.pr, self._polish_repo_key())
         return RunOutcome("clean", rounds, merged, self.actions)
+
+    def _pr_is_merged(self) -> bool:
+        """True only when GitHub CONFIRMS the PR is merged. Any failure (no gh, a
+        non-zero exit, unreadable output) → False: an unconfirmed state keeps the
+        polish stamp, which costs nothing but a stale file."""
+        state = _git_line(
+            ["gh", "pr", "view", str(self.pr), "--json", "state", "-q", ".state"]
+            + (["-R", self.repo] if self.repo else []),
+            self.cwd, self.gh_run)
+        return (state or "").strip().upper() == "MERGED"
 
     def _thread_gate_ok(self) -> bool:
         """Pre-merge review-thread gate. Returns True iff the merge may proceed on
