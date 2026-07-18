@@ -58,21 +58,33 @@ def state_path(pr, repo=None) -> str:
     """``<dir>/<owner__repo>-PR<pr>.json`` — keyed on the FULL ``owner/repo`` (the
     ``/`` becomes ``__``), so same-named repos under different owners never share a
     file. The one derivation for write, read, AND clear: all three call this, so
-    the key can never drift between them."""
+    the key can never drift between them.
+
+    Case-FOLDED before slugging: GitHub treats ``owner/repo`` case-insensitively, but
+    two runs can observe different casing for the SAME repo — an explicit ``--repo``
+    carries whatever casing the caller typed, while inference (``gh repo view``) returns
+    GitHub's canonical casing — so without folding, ``Owner/Repo`` and ``owner/repo``
+    would key two different files for one PR."""
     full = str(repo or "local") or "local"
-    slug = _UNSAFE_RE.sub("_", full.replace("/", "__"))
+    slug = _UNSAFE_RE.sub("_", full.lower().replace("/", "__"))
     return os.path.join(state_dir(), f"{slug}-PR{pr}.json")
 
 
-def _matches(stored, wanted) -> bool:
+def _matches(stored, wanted, *, casefold: bool = False) -> bool:
     """True when a stored key component identifies the requested one. ``None`` NEVER
     matches — not even another ``None``. A caller that could not infer a repo has no
     identity to key on: every unknown-repo run shares the one ``local-PR<pr>.json``
     file, so two forks with the same PR number and (fork-shared) head SHA would
     otherwise restore each other's polish verdict. Fail CLOSED on the unknown repo —
-    a re-summon is the correct, safe cost of not knowing which repo the state is for."""
+    a re-summon is the correct, safe cost of not knowing which repo the state is for.
+
+    ``casefold`` case-insensitively compares (for the ``owner/repo`` slug, which
+    GitHub treats case-insensitively — see :func:`state_path`); PR-number comparisons
+    leave it off since casing is not a dimension there."""
     if wanted is None or stored is None:
         return False
+    if casefold:
+        return str(stored).lower() == str(wanted).lower()
     return str(stored) == str(wanted)
 
 
@@ -170,7 +182,7 @@ def read_polish_state(pr, repo=None) -> Optional[Dict]:
         return None
     if not obj.get("tip_sha"):
         return None
-    if not _matches(obj.get("pr"), pr) or not _matches(obj.get("repo"), repo):
+    if not _matches(obj.get("pr"), pr) or not _matches(obj.get("repo"), repo, casefold=True):
         return None
     # ``bots`` must be a LIST. A hand-edited / truncated record could carry a string
     # (which would iterate into characters), a dict (into keys), or an int (which

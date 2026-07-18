@@ -142,11 +142,11 @@ def make_driver(timeline, *, gh, cfg=None, clock=None, repo=REPO, **kw):
     kw.setdefault("threads_fetch", lambda pr, repo=None, cwd=None: [])
     kw.setdefault("resolve_thread", lambda thread_id, cwd=None: True)
     kw.setdefault("answer_waiter", lambda esc, **k: {})
+    kw.setdefault("fix_dispatch", lambda c, r: FixOutcome(status="applied"))
     driver = RoundDriver(
         PR, repo=repo, cwd="/nonexistent", cfg=cfg or FLEET,
         adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),
         classify_runner=classify,
-        fix_dispatch=lambda c, r: FixOutcome(status="applied"),
         fetch=fetch, reactions_fetch=lambda pr, repo=None, cwd=None: [],
         gh_run=gh, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
         times=RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
@@ -233,6 +233,54 @@ def test_new_finding_evicts_a_restored_polish_verdict_so_the_fix_is_reverified()
     # it to verify the fix — proof it is no longer stuck in self.polishing, which
     # would have filtered it out of expected_bots() for the rest of the run.
     assert gh.matching("requested_reviewers")
+
+
+# ---------------------------------------------------------------------------
+# The "killed AFTER the push, BEFORE verification" restart: the prior run fixed
+# and pushed a finding but died before the reviewer re-reviewed and before its
+# thread was resolved. On the restart the finding is still on the PR with an
+# unresolved thread, so it is re-processed — and the fixer, seeing the fix already
+# in the tree, reports `skipped-already-fixed`. That must NOT fold the reviewer to
+# reviewed-no-change and merge the unverified fix: the reviewer is re-requested to
+# verify the fixed head first.
+# ---------------------------------------------------------------------------
+
+def test_restart_reverifies_a_finding_whose_fix_the_killed_run_already_pushed():
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    finding = Comment(id="f1", text="this null check is missing",
+                      source="copilot[bot]", path="y.py", diff_hunk="@@ -5 +5 @@")
+    gh = GhHead(head="H1", advance_to="H2")               # fix already at HEAD; no push
+    driver, clock = make_driver(
+        [(0, finding)], gh=gh, cfg=cfg, rr_active=True, preflight=True,
+        auto_merge=True, max_rounds=3,
+        fix_dispatch=lambda c, r: FixOutcome(status="skipped", detail="already fixed"),
+    )
+    outcome = driver.run()
+    # The already-fixed finding is NOT a dismissal on the restart — its reviewer
+    # never confirmed the pushed fix, so it keeps its re-request slot …
+    assert "copilot" not in driver.reviewed_no_change
+    # … and round 1 does not clean-exit: round 2 re-requests copilot to verify.
+    assert gh.matching("requested_reviewers")
+    # Once verified (copilot posts nothing new → clean), the PR merges — the fix
+    # inserts one verification round, it does not wedge the auto-restart.
+    assert outcome.merged is True
+
+
+def test_default_launch_still_dismisses_an_already_fixed_finding():
+    # The re-verify carve-out is RESTART-only: a plain launch (no --rr-active) that
+    # finds an already-fixed finding still folds its reviewer to reviewed-no-change,
+    # exactly as before — _restart_reverify_ids stays empty off the restart path.
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": False}}
+    finding = Comment(id="f1", text="this null check is missing",
+                      source="copilot[bot]", path="y.py", diff_hunk="@@ -5 +5 @@")
+    gh = GhHead(head="H1", advance_to="H2")
+    driver, clock = make_driver(
+        [(0, finding)], gh=gh, cfg=cfg, preflight=True, auto_merge=True, max_rounds=3,
+        fix_dispatch=lambda c, r: FixOutcome(status="skipped", detail="already fixed"),
+    )
+    driver.run()
+    assert driver._restart_reverify_ids == set()          # never populated off-restart
+    assert "copilot" in driver.reviewed_no_change          # dismissed as before
 
 
 # ---------------------------------------------------------------------------

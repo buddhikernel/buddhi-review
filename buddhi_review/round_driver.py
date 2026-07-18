@@ -954,6 +954,15 @@ class RoundDriver:
         #   the normal window rather than holding the round open as a never-seen
         #   bot would (matching how a fresh-launch round treats a bot that spoke).
         self._preflight_seen: Set[str] = set()
+        # _restart_reverify_ids: ids of the pre-existing findings folded by the
+        #   --rr-active RESTART snapshot (empty on every other launch). A finding
+        #   here that round 1's fixer reports `skipped-already-fixed` was fixed and
+        #   PUSHED by the killed run but never re-reviewed — its reviewer must be
+        #   re-requested to verify the fixed head, NOT folded to reviewed-no-change
+        #   (which would let the clean exit merge the unverified fix). Round 1 only:
+        #   later rounds carry fresh comment ids, so a reviewer that re-posts the
+        #   same finding still drops to reviewed-no-change normally (no re-ask loop).
+        self._restart_reverify_ids: Set[str] = set()
         # _reaction_baseline: reaction ids considered STALE — captured at
         #   preflight and re-captured before every re-request. A +1 whose id is in
         #   this set was left before the current review round (an earlier commit /
@@ -1849,7 +1858,12 @@ class RoundDriver:
         its round-1 verdict, so they demote it exactly like any round: cosmetic-only →
         polish (left alone next round), dismissed real findings → reviewed-no-change,
         a surviving finding → keeps its slot and is re-requested by ``expected_bots()``.
-        That is how the restart needs no separate summon debt."""
+        That is how the restart needs no separate summon debt. The ONE exception is a
+        pre-existing finding the fixer reports ``skipped-already-fixed`` (its id is in
+        ``self._restart_reverify_ids``): the killed run had already pushed that fix but
+        the reviewer never re-reviewed it, so it is kept SURVIVING (re-requested to
+        verify the fixed head) rather than dismissed — otherwise the clean exit would
+        merge a fix no reviewer ever confirmed."""
         commented: Set[str] = set()
         surviving: Set[str] = set()   # ≥1 real finding still standing
         dismissed: Set[str] = set()   # ≥1 real finding reassessed away
@@ -1862,8 +1876,19 @@ class RoundDriver:
             label = r.classification.label
             if label not in _REAL_FINDING_LABELS:
                 continue
+            final = finals.get(c.id)
+            # An --rr-active restart re-fixing a pre-existing finding whose fix the
+            # killed run already pushed reports `skipped-already-fixed`, but the
+            # reviewer never re-reviewed the fixed head. Keep it SURVIVING so
+            # expected_bots() re-requests the reviewer to verify — folding it to
+            # reviewed-no-change here would let the clean exit merge the unverified
+            # fix. Scoped to the restart's round-1 findings (see _restart_reverify_ids),
+            # so a re-posted finding next round still dismisses normally.
+            restart_reverify = (final == "skipped-already-fixed"
+                                and c.id in self._restart_reverify_ids)
             if (label != "CLASSIFICATION_FAILED"
-                    and finals.get(c.id) in ("skipped-invalid", "skipped-already-fixed")):
+                    and final in ("skipped-invalid", "skipped-already-fixed")
+                    and not restart_reverify):
                 dismissed.add(bot)
             else:
                 surviving.add(bot)
@@ -1974,6 +1999,12 @@ class RoundDriver:
         if self.preflight:
             self._preflight_snapshot(restart=True)
             deferred = set(self._preflight_responders)
+            # The pre-existing findings this restart just folded. If round 1's fixer
+            # reports one `skipped-already-fixed` (the killed run had already pushed
+            # its fix), _update_polishing + the substantive-progress gate consult this
+            # set to re-request the reviewer for one verification round instead of
+            # merging the unverified fix. See _restart_reverify_ids.
+            self._restart_reverify_ids = {c.id for c in self._preflight_batch}
             # A HARD CAUSE always wins over a re-derived verdict. The snapshot reads
             # every comment through the full exclusion path, so it can hard-exclude
             # (quota / PR-too-large / errored) a reviewer whose message the re-derive
@@ -2232,7 +2263,7 @@ class RoundDriver:
         # rather than replaying finished work. A default launch does NOT summon an
         # auto_on_open reviewer in round 1, so releasing it there would leave it
         # polled-but-never-asked; that path keeps its existing fold.
-        resolved_roots = self._resolved_thread_roots() if restart else set()
+        resolved_comment_ids = self._resolved_thread_comment_ids() if restart else set()
         skipped_resolved = 0
         # Honour a pre-existing rate-limit marker BEFORE round 1 (so claude is
         # released ahead of the poll, not first seen inside it). Same fresh batch,
@@ -2253,11 +2284,14 @@ class RoundDriver:
             if restart and _supersedes(c.created_at, newest.get(b)):
                 newest[b] = c.created_at
         for c in fresh:
-            # Only INLINE comments are review-thread roots, so only they can be
-            # matched against the resolved set. A review body / issue-channel
-            # comment (a clean sentinel, a quota marker) has no thread and folds
-            # normally — no sign-off, exclusion, or reviewed_ever seeding is lost.
-            if c.path and c.id in resolved_roots:
+            # Only INLINE comments (thread roots AND their replies) live in review
+            # threads, so only they can match the resolved set — which now holds
+            # EVERY comment id in a resolved thread, not just the root, so a resolved
+            # thread's follow-up reply is skipped too rather than re-folded as fresh
+            # work. A review body / issue-channel comment (a clean sentinel, a quota
+            # marker) has no thread and folds normally — no sign-off, exclusion, or
+            # reviewed_ever seeding is lost.
+            if c.path and c.id in resolved_comment_ids:
                 skipped_resolved += 1
                 # Resolution ends the FINDING, not the reviewer's stated inability to
                 # review: a quota / PR-too-large placeholder is still true after
@@ -2366,16 +2400,23 @@ class RoundDriver:
             self.notice("exclusion", f"{bot} excluded for the run: PR too large",
                         status="skip")
 
-    def _resolved_thread_roots(self) -> Set[str]:
-        """The root-comment ids of every review thread GitHub reports RESOLVED.
-        Fail-SOFT: any reader error (a gh/GraphQL blip, no owner/repo configured,
-        a malformed node) degrades to an empty set — i.e. exactly today's
-        behaviour, where no comment is filtered — and never crashes the preflight
-        fold."""
+    def _resolved_thread_comment_ids(self) -> Set[str]:
+        """Every comment id — root AND replies — in every review thread GitHub reports
+        RESOLVED. A resolved thread is FINISHED work: the root finding is done and so is
+        every follow-up reply inside it, so on a restart NONE of its comments should be
+        re-folded as fresh work. Matching only the root would leave a reply looking
+        active — making its author a preflight responder, reprocessing the stale reply,
+        and dropping it from round 1's summon (exactly the skip this guard exists for).
+        Fail-SOFT: any reader error (a gh/GraphQL blip, no owner/repo configured, a
+        malformed node) degrades to an empty set — i.e. exactly today's behaviour, where
+        no comment is filtered — and never crashes the preflight fold."""
         try:
             threads = self.fetch_threads(self.pr, repo=self._polish_repo_key(), cwd=self.cwd)
-            return {t.root_comment_id for t in threads
-                    if t.is_resolved and t.root_comment_id is not None}
+            ids: Set[str] = set()
+            for t in threads:
+                if t.is_resolved:
+                    ids |= set(t.comment_ids)
+            return ids
         except Exception:
             return set()
 
@@ -2628,7 +2669,22 @@ class RoundDriver:
                 r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
                 for r, a in zip(results, round_actions)
             )
-            if round_substantive and (committed_changes or self._worktree_has_changes()):
+            # An --rr-active restart re-fixed a pre-existing finding whose fix the
+            # killed run already pushed and the reviewer never re-reviewed: the fixer
+            # reports `skipped-already-fixed`, so NO new fix landed this round and the
+            # substantive gate above would clean-exit and merge the unverified fix.
+            # Take one more round instead — _update_polishing kept the reviewer in
+            # expected_bots, so it is re-requested to verify the fixed head. Scoped to
+            # the restart's round-1 findings (later rounds carry fresh ids), so a
+            # re-posted finding still exits normally next round (no re-ask loop).
+            restart_reverify = any(
+                a.final == "skipped-already-fixed"
+                and a.comment_id in self._restart_reverify_ids
+                and r.classification.label in _REAL_FINDING_LABELS
+                for r, a in zip(results, round_actions)
+            )
+            if (round_substantive and (committed_changes or self._worktree_has_changes())) \
+                    or restart_reverify:
                 continue
             return self._clean_exit(round_no)
 

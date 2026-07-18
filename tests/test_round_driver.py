@@ -69,9 +69,13 @@ class FakeThreads:
         self.resolved = []          # thread ids passed to resolve(), in order
         self.fetches = 0            # number of fetch() calls (re-query counting)
 
-    def thread(self, id, root_comment_id, is_resolved=False):
+    def thread(self, id, root_comment_id, is_resolved=False, replies=()):
+        # Mirror the real reader: comment_ids holds the root AND every reply, so a
+        # test can model a resolved thread with follow-up comments via `replies`.
+        ids = ([root_comment_id] if root_comment_id is not None else []) + list(replies)
         self._threads[id] = gh_ingest.ReviewThread(
-            id=id, is_resolved=is_resolved, root_comment_id=root_comment_id)
+            id=id, is_resolved=is_resolved, root_comment_id=root_comment_id,
+            comment_ids=frozenset(ids))
         return self
 
     def fetch(self, pr, repo=None, cwd=None):
@@ -1914,6 +1918,40 @@ def test_rr_active_preflight_resummons_bot_with_only_resolved_comments():
     assert fixed == []                                   # resolved work is not re-fixed
     assert outcome.actions == []
     assert driver._preflight_responders == set()         # not a responder …
+    assert driver._preflight_seen == set()
+    assert gh.matching("@claude review")                 # … so round 1 summons it
+    assert "claude" not in driver.reviewed_no_change     # never silently dropped
+
+
+def test_rr_active_preflight_skips_a_reply_in_a_resolved_thread():
+    # A resolved thread holds a ROOT finding ("a") AND a follow-up REPLY ("b"), both
+    # finished work. resolved_roots used to carry only the root id, so the reply stayed
+    # "active": folding it made claude a deferred responder, re-fixed the stale reply to
+    # "already fixed", demoted it to reviewed-no-change, and dropped it from round 1's
+    # summon — the exact skip this guard exists for. The WHOLE thread's comment ids are
+    # now skipped, so claude is summoned normally.
+    fixed = []
+
+    def fix(c, r):
+        fixed.append(c.id)
+        return FixOutcome(status="applied")
+
+    threads = FakeThreads().thread("T1", root_comment_id="a", is_resolved=True,
+                                   replies=["b"])
+    timeline = [
+        (0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@")),
+        (0, Comment(id="b", text="and tmp2 could be clearer too", source="claude[bot]",
+                    path="x.py", diff_hunk="@@ -1 +1 @@")),
+    ]
+    driver, clock, gh = make_driver(
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        rr_active=True, preflight=True, threads_fetch=threads.fetch,
+        resolve_thread=threads.resolve, answer_waiter=lambda esc, **k: {})
+    outcome = driver.run()
+    assert fixed == []                                   # neither root nor reply re-fixed
+    assert outcome.actions == []
+    assert driver._preflight_responders == set()         # the reply did not make it a responder
     assert driver._preflight_seen == set()
     assert gh.matching("@claude review")                 # … so round 1 summons it
     assert "claude" not in driver.reviewed_no_change     # never silently dropped

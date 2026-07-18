@@ -23,7 +23,7 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
-from typing import Callable, Iterable, List, Optional, Sequence
+from typing import Callable, FrozenSet, Iterable, List, Optional, Sequence
 
 from buddhi.stage0.conditioning import RawItem
 
@@ -284,33 +284,42 @@ def _decode_concatenated(text: str) -> Iterable[dict]:
 @dataclass(frozen=True)
 class ReviewThread:
     """One GitHub review thread on the PR. ``id`` is the GraphQL node id needed
-    to resolve it; ``is_resolved`` is GitHub's own resolved flag; and
-    ``root_comment_id`` is the databaseId (stringified) of the thread's FIRST
-    comment — the key that ties a thread back to a :class:`Comment` the loop
-    ingested and handled (a :class:`Comment` built from ``pulls/<pr>/comments``
-    carries the same stringified databaseId as ``id``). ``root_comment_id`` is
-    None when the thread carries no comments (never expected in practice —
-    tolerated so a malformed node can never crash the read)."""
+    to resolve it; ``is_resolved`` is GitHub's own resolved flag; ``root_comment_id``
+    is the databaseId (stringified) of the thread's FIRST comment; and ``comment_ids``
+    is the stringified databaseId of EVERY comment in the thread (root + replies).
+
+    ``root_comment_id`` ties a resolved/handled thread back to the ONE :class:`Comment`
+    the loop treats as the finding (a :class:`Comment` built from ``pulls/<pr>/comments``
+    carries the same stringified databaseId as ``id``). ``comment_ids`` additionally
+    exposes the thread's REPLIES: a resolved thread's follow-up comment shares the
+    thread's resolution but carries its OWN id, so a caller that wants to treat every
+    comment in a resolved thread as finished must match the whole set, not just the
+    root. ``root_comment_id`` is None (and ``comment_ids`` empty) when the thread
+    carries no comments (never expected in practice — tolerated so a malformed node
+    can never crash the read)."""
     id: str
     is_resolved: bool
     root_comment_id: Optional[str]
+    comment_ids: FrozenSet[str] = frozenset()
 
 
 def _review_thread_from_raw(raw: dict) -> Optional[ReviewThread]:
     """Map one raw ``reviewThreads`` node → :class:`ReviewThread`, or None when
-    it has no usable GraphQL node id."""
+    it has no usable GraphQL node id. Collects EVERY comment's databaseId (root +
+    replies); ``root_comment_id`` stays the first for back-compat."""
     tid = raw.get("id")
     if not isinstance(tid, str) or not tid:
         return None
     comments = raw.get("comments")
     nodes = comments.get("nodes") if isinstance(comments, dict) else None
-    root: Optional[str] = None
-    if isinstance(nodes, list) and nodes:
-        first = nodes[0]
-        if isinstance(first, dict) and first.get("databaseId") is not None:
-            root = str(first["databaseId"])
+    ids: List[str] = []
+    if isinstance(nodes, list):
+        for n in nodes:
+            if isinstance(n, dict) and n.get("databaseId") is not None:
+                ids.append(str(n["databaseId"]))
+    root = ids[0] if ids else None
     return ReviewThread(id=tid, is_resolved=bool(raw.get("isResolved")),
-                        root_comment_id=root)
+                        root_comment_id=root, comment_ids=frozenset(ids))
 
 
 _REVIEW_THREADS_QUERY = """query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
@@ -321,7 +330,7 @@ _REVIEW_THREADS_QUERY = """query($owner: String!, $name: String!, $pr: Int!, $cu
         nodes {
           id
           isResolved
-          comments(first: 1) { nodes { databaseId } }
+          comments(first: 100) { nodes { databaseId } }
         }
       }
     }
