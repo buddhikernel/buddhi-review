@@ -21,6 +21,18 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.6.0](https://github.com/buddhikernel/buddhi-review/compare/v0.5.0...v0.6.0) (2026-07-18)
+
+
+### Features
+
+* **cli:** L2 — honor the wizard's per-repo auto_merge (tri-state the flag) ([#86](https://github.com/buddhikernel/buddhi-review/issues/86)) ([fbd5ae8](https://github.com/buddhikernel/buddhi-review/commit/fbd5ae8bbdcadaa19043025cbefd89b3ac5d7eac))
+
+
+### Bug Fixes
+
+* **cli:** F3 — raise the low fix timeout 120→300s ([#88](https://github.com/buddhikernel/buddhi-review/issues/88)) ([d2761ea](https://github.com/buddhikernel/buddhi-review/commit/d2761ea42efdaa7fcd1c1ab013579e7731074890))
+
 ## [0.5.0](https://github.com/buddhikernel/buddhi-review/compare/v0.4.0...v0.5.0) (2026-07-17)
 
 
