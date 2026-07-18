@@ -36,6 +36,7 @@ The console panels and phase-break spacing honour ``NO_COLOR`` /
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import shlex
@@ -87,6 +88,16 @@ _PYTEST_PROGRESS_RE = re.compile(r"^[.FExsX\s]+(?:\[\s*\d+%\])?\s*$")
 # must survive the excerpt regardless of where the real failure detail falls.
 _GATE_HEADLINE_RE = re.compile(r"^\[local-tests\] ✗ gate RED — ")
 
+# Editor/backup droppings a fixer can leave in the worktree mid-round — a stray
+# ``foo.bak`` from an in-place rewrite, an emacs ``.#lock`` lock file, a vim
+# ``.swp``/``.swo`` swap, a macOS ``.DS_Store``. The per-round commit's ``git add
+# -A`` must never sweep these into the PR (it happened once in the reference
+# pipeline and two such files reached a repo's ``main``). Matched on the whole
+# BASENAME, never a substring, so a real source file named ``bakery.py`` is safe.
+_DROPPING_GLOBS: Tuple[str, ...] = (
+    "*.bak", "*~", "*.orig", ".#*", "*.swp", "*.swo", ".DS_Store",
+)
+
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
@@ -96,6 +107,14 @@ def _default_run(argv: Sequence[str], *, cwd: Optional[str] = None,
         list(argv), capture_output=True, text=True, timeout=timeout,
         stdin=subprocess.DEVNULL, cwd=cwd,
     )
+
+
+def _is_dropping(path: str) -> bool:
+    """True iff ``path``'s basename matches a known editor/backup dropping glob
+    (:data:`_DROPPING_GLOBS`). A trailing ``/`` (a collapsed untracked dir in
+    porcelain) is stripped first so it is judged by its directory name, not ``""``."""
+    base = os.path.basename(path.rstrip("/"))
+    return any(fnmatch.fnmatchcase(base, g) for g in _DROPPING_GLOBS)
 
 
 def _rerun_limit() -> int:
@@ -474,12 +493,21 @@ def _assert_clean_after_commit(
     if not cwd:
         return
     try:
-        r = run(["git", "status", "--porcelain"], cwd=cwd)
+        # ``--untracked-files=all`` so a wholly-untracked directory holding only a
+        # dropping is enumerated as its individual file (``dir/foo.bak``) rather than
+        # collapsed to a ``dir/`` entry whose basename would evade the dropping
+        # filter below — matching :func:`_detect_droppings` so the two stay coherent.
+        r = run(["git", "status", "--porcelain", "--untracked-files=all"], cwd=cwd)
     except Exception:
         return
     if getattr(r, "returncode", 1) != 0:
         return
     residue = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+    # The sweep guard (:func:`_stage_all`) deliberately leaves editor/backup
+    # droppings unstaged — they are NOT lost fixer edits, so they must not trip this
+    # "edits are not on the PR" alarm. Filter them out; a genuinely-lost non-dropping
+    # edit still fires the tripwire.
+    residue = [ln for ln in residue if not _is_dropping(ln[3:].strip())]
     if not residue:
         return
     shown = ", ".join(ln[3:].strip() for ln in residue[:8])
@@ -584,6 +612,94 @@ def _diagnose_commit_failure(
             status="stop", hint="a local pre-commit hook or git-level failure blocked the commit")
 
 
+# ── Fix-commit sweep guard ───────────────────────────────────────────────────────
+# The per-round commit stages with ``git add -A``, which would sweep any editor/
+# backup dropping (:data:`_DROPPING_GLOBS`) a fixer left behind into the PR. This
+# guard keeps them out of staging while leaving every legitimate change untouched.
+# It is best-effort and FAIL-OPEN: a status probe that errors just falls back to
+# the plain ``git add -A`` so the guard can never block a commit.
+
+
+def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
+    """Repo-relative paths in ``cwd``'s worktree that are editor/backup droppings
+    (:func:`_is_dropping`).
+
+    ``--untracked-files=all`` is essential: without it a dropping inside a brand-new
+    (otherwise-untracked) directory is hidden under a collapsed ``dir/`` porcelain
+    entry and would slip past both this scan and the exclude pathspec, riding the
+    ``git add -A`` into the commit. ``-z`` (NUL-terminated) yields every path
+    VERBATIM — porcelain otherwise C-quotes and backslash-escapes any name holding a
+    quote, space-arrow (``a -> b``), tab, or non-ASCII byte, which a dropping can
+    inherit from an oddly-named source file; parsing the raw ``-z`` path is the only
+    way the basename match and the later ``:(literal)`` exclude both see the true
+    name. A rename/copy record (``R``/``C``) is followed by its origin path in the
+    NEXT field, which is consumed. Best-effort: any error or a non-zero status →
+    ``[]`` (the caller then stages plainly)."""
+    try:
+        st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                 cwd=cwd)
+    except (subprocess.SubprocessError, OSError):
+        return []
+    if getattr(st, "returncode", 1) != 0:
+        return []
+    fields = (getattr(st, "stdout", "") or "").split("\0")
+    droppings: List[str] = []
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        if len(rec) < 4:  # trailing empty field / malformed entry
+            i += 1
+            continue
+        xy, path = rec[:2], rec[3:]  # "XY <path>" (no quoting under -z)
+        if xy[0] in "RC" or xy[1] in "RC":
+            i += 1  # a rename/copy — the ORIGIN path is the next field; skip it
+        if _is_dropping(path):
+            droppings.append(path)
+        i += 1
+    return droppings
+
+
+def _fmt_droppings(paths: Sequence[str], limit: int = 6) -> str:
+    """A compact, bounded rendering of the excluded paths for the log line."""
+    shown = ", ".join(paths[:limit])
+    extra = len(paths) - limit
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _stage_all(
+    cwd: str, *, run: Run = _default_run,
+    notice: Callable[..., str] = automation_notice,
+) -> "subprocess.CompletedProcess[str]":
+    """``git add -A`` for the round's commit, minus editor/backup droppings.
+
+    With nothing to exclude this is byte-identical to a plain ``git add -A``.
+    Otherwise it stages the whole worktree (``:/`` — the top of the tree, so the
+    scope matches a bare ``git add -A`` regardless of ``cwd``) with one
+    ``:(top,exclude,literal)`` pathspec per detected dropping — a repo-root-anchored
+    LITERAL exact-path exclude (not a glob), aligning with the repo-root-relative
+    porcelain paths, matching at any depth, and never mis-firing on a legitimate
+    file — and emits ONE ``[auto]`` line naming what was kept out. Returns the ``git
+    add`` result unchanged so the caller's return-code check is untouched."""
+    droppings = _detect_droppings(cwd, run=run)
+    if not droppings:
+        return run(["git", "add", "-A"], cwd=cwd)
+    # An exclude pathspec only tells ``git add`` NOT to (re-)add a path — it never
+    # UNstages one already in the index. A dropping a fixer had itself ``git add``-ed
+    # would otherwise survive the exclude and ride the commit (and be falsely logged
+    # as excluded). Un-stage each first so it is guaranteed out of the index; a reset
+    # on an unstaged path is a harmless no-op, so the common (untracked) case is
+    # unaffected.
+    run(["git", "reset", "-q", "--", *droppings], cwd=cwd)
+    excludes = [f":(top,exclude,literal){p}" for p in droppings]
+    add = run(["git", "add", "-A", "--", ":/", *excludes], cwd=cwd)
+    if getattr(add, "returncode", 1) == 0:
+        notice("stage",
+               f"excluded {len(droppings)} editor/backup dropping(s) from the fix "
+               f"commit: {_fmt_droppings(droppings)}",
+               status="skip")
+    return add
+
+
 def commit_and_push(
     cwd: str,
     *,
@@ -666,7 +782,7 @@ def commit_and_push(
                 # committed tree, or a rejected commit just means nothing new
                 # lands here and the re-run gate is the arbiter (the final push
                 # ships whatever commit is present).
-                if run(["git", "add", "-A"], cwd=cwd).returncode == 0:
+                if _stage_all(cwd, run=run, notice=notice).returncode == 0:
                     run(["git", "commit", "-m", message], cwd=cwd)
                 continue
             # "2" / None / anything else → stop (the default).
@@ -678,7 +794,7 @@ def commit_and_push(
                hint="re-enable: --test-failure-mode escalate")
 
     print(flush=True)  # phase break — the commit step is its own block
-    if run(["git", "add", "-A"], cwd=cwd).returncode != 0:
+    if _stage_all(cwd, run=run, notice=notice).returncode != 0:
         return "error"
     # Commit only when something is staged. The "I've fixed it" path — or an
     # operator who committed their own host-side fix — may have already captured
