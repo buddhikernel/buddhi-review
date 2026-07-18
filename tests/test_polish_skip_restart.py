@@ -479,3 +479,34 @@ def test_a_plain_rerun_does_not_erase_the_verdict_at_the_same_tip():
     driver.run()
     assert driver.polishing == set()                                    # nothing restored
     assert polish_state.read_polish_state(PR, REPO)["bots"] == ["copilot"]
+
+
+def test_a_restored_run_may_clear_an_invalidated_verdict_at_the_same_tip():
+    # NO-CLOBBER has ONE exception. A run that RESTORED the verdict this tip carries
+    # (restored_prior=True, an --rr-active restart) and then legitimately cleared it —
+    # the reviewer posted a later substantive finding and was demoted on the same
+    # unadvanced HEAD — holds the AUTHORITATIVE empty set. Refusing it would strand the
+    # invalidated verdict on disk for the next restart to restore again.
+    assert polish_state.write_polish_state(PR, REPO, "H1", ["copilot"]) is True
+    assert polish_state.write_polish_state(PR, REPO, "H1", []) is False               # no-clobber
+    assert polish_state.write_polish_state(PR, REPO, "H1", [], restored_prior=True) is True
+    assert polish_state.read_polish_state(PR, REPO)["bots"] == []                     # cleared
+
+
+def test_restored_verdict_evicted_without_a_push_is_cleared_from_disk():
+    # The end-to-end shape: an --rr-active restart RESTORES copilot's polish verdict at
+    # H1, but copilot then posts a REAL finding on that same commit. With pushing off
+    # HEAD never advances, so the round-end persist writes its (now empty) polish set at
+    # the SAME tip H1. Without the restored-run exception the empty write is refused and
+    # the stale [copilot] survives — so the NEXT restart would restore copilot as
+    # polish-only and never re-ask it, even though its verdict was invalidated.
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    polish_state.write_polish_state(PR, REPO, "H1", ["copilot"])
+    new_finding = Comment(id="c2", text="this null check is missing",
+                          source="copilot[bot]", path="y.py", diff_hunk="@@ -5 +5 @@")
+    gh = GhHead(head="H1")                              # HEAD never advances (push off)
+    driver, clock = make_driver([(0, new_finding)], gh=gh, cfg=cfg, push=False,
+                                rr_active=True, preflight=True, max_rounds=1)
+    driver.run()
+    assert "copilot" not in driver.polishing           # the finding evicted the verdict …
+    assert polish_state.read_polish_state(PR, REPO)["bots"] == []   # … and disk was cleared

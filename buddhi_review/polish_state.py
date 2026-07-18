@@ -76,7 +76,8 @@ def _matches(stored, wanted) -> bool:
     return str(stored) == str(wanted)
 
 
-def write_polish_state(pr, repo, tip_sha, bots: Iterable[str]) -> bool:
+def write_polish_state(pr, repo, tip_sha, bots: Iterable[str],
+                       restored_prior: bool = False) -> bool:
     """Persist the polish-only verdict ``bots`` for (``repo``, ``pr``) as reached at
     PR HEAD ``tip_sha``. Returns True on success.
 
@@ -87,11 +88,17 @@ def write_polish_state(pr, repo, tip_sha, bots: Iterable[str]) -> bool:
     "could not read HEAD" can never persist a stamp a later restore might match.
 
     NO-CLOBBER: an EMPTY ``bots`` set never overwrites a NON-empty record at the SAME
-    ``tip_sha``. Only ``--rr-active`` restores the verdict, so any other run mode (a
-    plain re-run, ``--rr-none``) reaches its round end with an empty set purely
-    because it never read the record — and would otherwise erase, at the very commit
-    it is describing, a verdict another run legitimately reached. A moved tip always
-    writes: that is a different commit, so the old record no longer speaks for it.
+    ``tip_sha`` — UNLESS ``restored_prior`` says this run RESTORED that record. A run
+    that did NOT read the record (a plain re-run, ``--rr-none``, a default launch)
+    reaches its round end with an empty set purely because it never restored the
+    verdict, and would otherwise erase — at the very commit it is describing — a verdict
+    another run legitimately reached, so its empty write is refused. But a run that
+    restored the verdict this tip carries (``restored_prior=True``, an ``--rr-active``
+    restart) and then legitimately CLEARED it — the restored reviewer posted a later
+    substantive finding and was demoted out of the polish set on the SAME unadvanced
+    HEAD — holds the authoritative empty set: refusing it would strand the now-invalid
+    verdict on disk for the next restart to restore again. A moved tip always writes:
+    that is a different commit, so the old record no longer speaks for it.
 
     Best-effort otherwise: any OS error returns False and the caller carries on (a
     missed stamp only costs a re-summon on the next restart)."""
@@ -100,7 +107,7 @@ def write_polish_state(pr, repo, tip_sha, bots: Iterable[str]) -> bool:
         return False
     path = state_path(pr, repo)
     names: List[str] = sorted({str(b) for b in (bots or []) if b})
-    if not names:
+    if not names and not restored_prior:
         prior = read_polish_state(pr, repo)
         if prior and prior.get("tip_sha") == tip and prior.get("bots"):
             return False

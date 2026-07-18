@@ -808,6 +808,13 @@ class RoundDriver:
         # not shell out to `gh repo view` on every read/write/clear.
         self._polish_repo_resolved = False
         self._polish_repo_cache: Optional[str] = None
+        # True once an --rr-active restart has RESTORED a persisted polish verdict at
+        # the current tip: this run's authority to CLEAR that verdict. A restored
+        # reviewer that later posts a substantive finding is demoted out of
+        # self.polishing (see _update_polishing), so _persist_polish_state must be
+        # allowed to overwrite the now-invalid record with the empty set even on an
+        # unadvanced HEAD — otherwise the stale verdict is restored again next restart.
+        self._polish_restored = False
         self.cfg = cfg if cfg is not None else load_config()
         # An unconfirmed repo (no repos[<repo>] entry) with NO global default to
         # fall back to is running purely on the built-in default fleet. This flag
@@ -1989,6 +1996,11 @@ class RoundDriver:
         # an all-approved restart reaches the clean exit with an empty reviewed_ever
         # and the SAFETY gate would block the very auto-merge it should allow.
         self.reviewed_ever |= (approved | restored) & fleet
+        # Remember that this run restored a polish verdict (post hard-cause un-crown):
+        # if a restored reviewer later posts a substantive finding and is demoted, the
+        # end-of-round persist must be allowed to clear the invalidated record at this
+        # same tip rather than being blocked by write_polish_state's empty no-clobber.
+        self._polish_restored = bool(restored)
         parts = []
         if approved:
             parts.append(f"approved={sorted(approved)}")
@@ -2155,8 +2167,12 @@ class RoundDriver:
         tip = self._head_sha()
         if not tip:
             return
+        # restored_prior lets an --rr-active run that restored then legitimately cleared
+        # a verdict overwrite it with the empty set at the same unadvanced tip; a run
+        # that restored nothing keeps write_polish_state's empty no-clobber guard.
         polish_state.write_polish_state(
-            self.pr, self._polish_repo_key(), tip, sorted(self.polishing))
+            self.pr, self._polish_repo_key(), tip, sorted(self.polishing),
+            restored_prior=self._polish_restored)
 
     # ------------------------------------------------------------------- run
 
