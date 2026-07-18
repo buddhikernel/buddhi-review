@@ -995,6 +995,15 @@ class RoundDriver:
         #   comeback pops it once the reset instant passes. datetime.min
         #   marks an unknown reset → the plain next-round retry.
         self._rate_limited_until: Dict[str, datetime] = {}
+        # _rederived_approval_stamps: bot → the effective stamp (updated_at or
+        #   created_at) of the DATED sign-off _rederive_prior_approvals folded on
+        #   an --rr-active restart. It is the recency yardstick a rate-limit marker
+        #   with no reset time is measured against in _scan_unavailable_markers: an
+        #   unknown-reset marker that pre-dates this sign-off is stale history (the
+        #   window cleared, claude re-reviewed and approved after it), so it must not
+        #   un-crown the approval. Empty on a default launch and for a bare-+1 fold
+        #   (no dated message to compare) → the marker un-crowns as before.
+        self._rederived_approval_stamps: Dict[str, Optional[str]] = {}
         self.actions: List[ActionResult] = []
 
         # ── F5 run-cumulative review tracking (the SAFETY gate + silent-reviewer
@@ -1357,7 +1366,7 @@ class RoundDriver:
         comeback re-summons it once the reset passes. ``type=credits_exhausted``
         is a paid-tier concept (no billing-mode split here) — logged and ignored,
         so claude falls through to the ordinary silent handling."""
-        newest = None  # (parsed_datetime_or_None, match)
+        newest = None  # (parsed_datetime_or_None, match, created_at_str)
         for c in fresh:
             if c.source != CLAUDE_UNAVAILABLE_MARKER_AUTHOR:
                 continue
@@ -1366,7 +1375,7 @@ class RoundDriver:
                 continue
             key = _parse_iso(c.created_at)
             if newest is None or (key is not None and (newest[0] is None or key > newest[0])):
-                newest = (key, m)
+                newest = (key, m, c.created_at)
         if newest is None:
             return
         m = newest[1]
@@ -1408,6 +1417,24 @@ class RoundDriver:
                             f"elapsed) — ignoring", status="skip")
                 return
         else:
+            # No reset time in the marker, so the stale-window check above cannot
+            # run — fall back to comparing the marker's post time against claude's
+            # re-derived sign-off. An unknown-reset marker that PRE-DATES that
+            # approval is stale history: the window cleared, claude re-reviewed and
+            # signed off AFTER it, and un-crowning would discard a genuine verdict
+            # for a head claude did review. Treat it exactly like the stale-window
+            # marker above — ignore it (no un-crown, no _rate_limited_until entry, so
+            # _rr_active_restore's own un-crown loop leaves the approval intact). A
+            # live marker still un-crowns: one newer than the sign-off, and the poll's
+            # fresh marker (no re-derived sign-off recorded → nothing to compare).
+            # _strictly_newer is conservative (an unparseable/undated stamp on either
+            # side → False → the marker un-crowns), matching the fail-safe direction.
+            sign_off = self._rederived_approval_stamps.get("claude")
+            if _strictly_newer(sign_off, newest[2]):
+                self.notice("claude-rate-limited",
+                            f"stale rate-limit marker (posted {newest[2]}, before "
+                            f"claude's later sign-off {sign_off}) — ignoring", status="skip")
+                return
             until = datetime.min.replace(tzinfo=timezone.utc)
             when = "an unknown time"
             comeback = "retries claude next round (no reset time in the marker)"
@@ -2155,6 +2182,13 @@ class RoundDriver:
             self.approved.add(bot)
             st.signal = detectors.SIGNAL_CLEAN
             self.responded_ever.add(bot)
+            if newest is not None:
+                # Record the sign-off's effective stamp so a no-reset-time
+                # rate-limit marker can test whether it pre-dates this approval
+                # before un-crowning it (see _scan_unavailable_markers). A bare +1
+                # (newest is None) carries no timestamp, so none is recorded and the
+                # marker un-crowns conservatively.
+                self._rederived_approval_stamps[bot] = newest[0]
             if newest is None:
                 # Folded on a bare +1, so NO text of this bot was ever quota-checked.
                 # Mark it reaction-done exactly as the poll's own +1 fold does, so the

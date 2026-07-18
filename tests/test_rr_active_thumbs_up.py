@@ -405,6 +405,49 @@ def test_a_post_reset_approval_after_a_stale_marker_still_folds_and_merges():
     assert outcome.merged is True
 
 
+def test_a_stale_unknown_reset_marker_does_not_uncrown_a_later_approval():
+    # An UNKNOWN-reset marker (resets_at=0 / no reset time) has no window for the
+    # stale-window check above to test, so an OLDER one that pre-dates a later genuine
+    # approval used to un-crown it anyway — dropping reviewed_ever and blocking the
+    # merge a real review earned. The recency guard now compares the marker's post
+    # time against the re-derived sign-off: a marker older than the approval is stale
+    # history (claude came back and approved after the limit cleared) and is ignored.
+    marker = Comment(
+        id="m", from_issue_channel=True, source="github-actions[bot]", created_at=OLD,
+        text="<!-- claude-review-unavailable-v1 type=rate_limited resets_at=0 -->")
+    comments = [
+        marker,                                              # older: unknown-reset limit
+        _lgtm(cid="ok", when=NEW, from_issue_channel=True),  # newer: the genuine approval
+    ]
+    driver, clock, gh = make_driver(comments, auto_merge=True)
+    outcome = driver.run()
+    assert "claude" in driver.approved and "claude" in driver.reviewed_ever
+    assert "claude" not in driver._rate_limited_until   # the stale marker was ignored
+    assert gh.matching(SUMMON) == []                    # never re-asked
+    assert outcome.merged is True
+
+
+def test_a_newer_unknown_reset_marker_still_uncrowns_a_stale_approval():
+    # The guard is RECENCY-aware, not a blanket skip: an unknown-reset marker that
+    # POST-DATES the sign-off is still live (claude was re-requested after approving an
+    # earlier head and hit the limit), so it must un-crown as before. SAFETY: the
+    # claude-only fleet must not ride a stale approval into the merge gate.
+    marker = Comment(
+        id="m", from_issue_channel=True, source="github-actions[bot]", created_at=NEW,
+        text="<!-- claude-review-unavailable-v1 type=rate_limited resets_at=0 -->")
+    comments = [
+        _lgtm(cid="ok", when=OLD, from_issue_channel=True),  # stale approval (earlier head)
+        marker,                                              # newer: usage limit on re-request
+    ]
+    driver, clock, gh = make_driver(comments, auto_merge=True)
+    outcome = driver.run()
+    assert "claude" not in driver.approved          # stale approval un-crowned …
+    assert "claude" not in driver.done
+    assert "claude" not in driver.reviewed_ever     # … never counted as a review
+    assert gh.matching("gh", "merge", "--squash") == []
+    assert outcome.merged is False                  # SAFETY gate blocks the merge
+
+
 # ---------------------------------------------------------------------------
 # A stale finding under the SAME reviewer's newer approval is not re-fixed
 # ---------------------------------------------------------------------------
