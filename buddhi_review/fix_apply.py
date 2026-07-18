@@ -89,8 +89,10 @@ TRIPWIRE_REGION_WINDOW = 60
 # the fixer attempt timeout — there is no second copy to drift against. `medium`
 # is 600s: a substantive fix on a large file routinely needs more than 5 minutes,
 # and a too-short budget abandons the thread to a timeout (which a same-model
-# retry then just repeats).
-EFFORT_TIMEOUTS: Dict[str, int] = {"low": 120, "medium": 600, "high": 900}
+# retry then just repeats). `low` is 300s (was 120s): empirical haiku timeouts on
+# real cosmetic fixes tripped `>120s` repeatedly — mirrors the same raise in the
+# reference tree.
+EFFORT_TIMEOUTS: Dict[str, int] = {"low": 300, "medium": 600, "high": 900}
 _GIT_TIMEOUT = 30
 
 # ---------------------------------------------------------------------------

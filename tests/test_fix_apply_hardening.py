@@ -30,13 +30,15 @@ def repo(tmp_path):
 
 
 # ===========================================================================
-# single-source EFFORT_TIMEOUTS (medium 300→600s); broad same-model retry
+# single-source EFFORT_TIMEOUTS (medium 300→600s, low 120→300s); broad
+# same-model retry
 # ===========================================================================
 
 def test_effort_timeouts_single_source_medium_bumped():
     # The one table the fixer reads; medium bumped 300→600s so a substantive fix
-    # on a large file is not abandoned to a too-short budget.
-    assert fix_apply.EFFORT_TIMEOUTS == {"low": 120, "medium": 600, "high": 900}
+    # on a large file is not abandoned to a too-short budget, and low bumped
+    # 120→300s after real cosmetic haiku fixes tripped `>120s` repeatedly.
+    assert fix_apply.EFFORT_TIMEOUTS == {"low": 300, "medium": 600, "high": 900}
 
 
 def test_apply_fix_nonzero_exit_retries_within_bound_then_escalates(repo):
