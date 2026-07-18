@@ -36,12 +36,13 @@ The console panels and phase-break spacing honour ``NO_COLOR`` /
 """
 from __future__ import annotations
 
+import fnmatch
 import os
 import re
 import shlex
 import subprocess
 import sys
-from typing import Callable, List, Optional, Sequence, Tuple
+from typing import Callable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from buddhi_review import config, lang_syntax, merge, test_runner
 from buddhi_review.notifier import Ask, ConsoleNotifier, Notifier
@@ -87,6 +88,23 @@ _PYTEST_PROGRESS_RE = re.compile(r"^[.FExsX\s]+(?:\[\s*\d+%\])?\s*$")
 # must survive the excerpt regardless of where the real failure detail falls.
 _GATE_HEADLINE_RE = re.compile(r"^\[local-tests\] ✗ gate RED — ")
 
+# Editor/backup droppings a fixer can leave in the worktree mid-round — a stray
+# ``foo.bak`` from an in-place rewrite, an emacs ``.#lock`` lock file, a vim
+# ``.swp``/``.swo`` swap, a macOS ``.DS_Store``. The per-round commit's ``git add
+# -A`` must never sweep these into the PR (it happened once in the reference
+# pipeline and two such files reached a repo's ``main``). Matched on the whole
+# BASENAME, never a substring, so a real source file named ``bakery.py`` is safe.
+_DROPPING_GLOBS: Tuple[str, ...] = (
+    "*.bak", "*~", "*.orig", ".#*", "*.swp", "*.swo", ".DS_Store",
+)
+
+# The subset of `_DROPPING_GLOBS` whose backup name is DETERMINISTICALLY the
+# source path plus a fixed suffix — `src.py` -> `src.py.bak`/`src.py~`/
+# `src.py.orig`. `.DS_Store`, `.#*` (emacs lock) and `*.swp`/`*.swo` (vim swap,
+# dot-prefixed) carry no such source-name relationship, so pairing those to a
+# "source" would be a guess, not a fact (see `_backup_source`).
+_BACKUP_SUFFIXES: Tuple[str, ...] = (".bak", "~", ".orig")
+
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
@@ -96,6 +114,14 @@ def _default_run(argv: Sequence[str], *, cwd: Optional[str] = None,
         list(argv), capture_output=True, text=True, timeout=timeout,
         stdin=subprocess.DEVNULL, cwd=cwd,
     )
+
+
+def _is_dropping(path: str) -> bool:
+    """True iff ``path``'s basename matches a known editor/backup dropping glob
+    (:data:`_DROPPING_GLOBS`). A trailing ``/`` (a collapsed untracked dir in
+    porcelain) is stripped first so it is judged by its directory name, not ``""``."""
+    base = os.path.basename(path.rstrip("/"))
+    return any(fnmatch.fnmatchcase(base, g) for g in _DROPPING_GLOBS)
 
 
 def _rerun_limit() -> int:
@@ -474,15 +500,30 @@ def _assert_clean_after_commit(
     if not cwd:
         return
     try:
-        r = run(["git", "status", "--porcelain"], cwd=cwd)
+        # ``-z`` for VERBATIM paths (matching :func:`_detect_droppings` — plain
+        # porcelain C-quotes/escapes a path holding a quote, space-arrow, tab, or
+        # non-ASCII byte, and renders a rename as a single ``old -> new`` line,
+        # either of which would make a dropping name evade the filter below) and
+        # ``--untracked-files=all`` so a wholly-untracked directory holding only a
+        # dropping is enumerated as its individual file (``dir/foo.bak``) rather than
+        # collapsed to a ``dir/`` entry whose basename would evade the dropping
+        # filter below — matching :func:`_detect_droppings` so the two stay coherent.
+        r = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"], cwd=cwd)
     except Exception:
         return
     if getattr(r, "returncode", 1) != 0:
         return
-    residue = [ln for ln in (r.stdout or "").splitlines() if ln.strip()]
+    # The sweep guard (:func:`_stage_all`) deliberately leaves a NEW (untracked or
+    # freshly-added) editor/backup dropping unstaged — that's not a lost fixer edit,
+    # so it must not trip this "edits are not on the PR" alarm. A tracked dropping's
+    # own modification/deletion IS staged and committed like any other change (see
+    # :func:`_new_to_head`), so it never shows up here as residue in the first
+    # place. A genuinely-lost non-dropping edit still fires the tripwire.
+    residue = [path for xy, path in _iter_porcelain_z(getattr(r, "stdout", "") or "")
+               if not (_is_dropping(path) and _new_to_head(xy))]
     if not residue:
         return
-    shown = ", ".join(ln[3:].strip() for ln in residue[:8])
+    shown = ", ".join(residue[:8])
     more = f" (+{len(residue) - 8} more)" if len(residue) > 8 else ""
     notice(
         "fix-residue tripwire",
@@ -584,6 +625,198 @@ def _diagnose_commit_failure(
             status="stop", hint="a local pre-commit hook or git-level failure blocked the commit")
 
 
+# ── Fix-commit sweep guard ───────────────────────────────────────────────────────
+# The per-round commit stages with ``git add -A``, which would sweep any editor/
+# backup dropping (:data:`_DROPPING_GLOBS`) a fixer left behind into the PR. This
+# guard keeps them out of staging while leaving every legitimate change untouched.
+# It is best-effort and FAIL-OPEN: a status probe that errors just falls back to
+# the plain ``git add -A`` so the guard can never block a commit.
+#
+# One paired case needs more than a plain exclude: a fixer/editor doing an
+# in-place rewrite via backup-then-replace (move ``src.py`` to ``src.py.bak``,
+# write a fresh ``src.py``) that fails BEFORE recreating ``src.py`` leaves the
+# worktree showing ``D src.py`` (deleted, tracked) plus ``?? src.py.bak`` (new,
+# untracked). Excluding only the backup would still let the plain ``git add -A``
+# stage and commit ``src.py``'s deletion — landing a real-file deletion on the PR
+# while its only surviving content sits in the excluded, uncommitted backup. See
+# :func:`_risky_delete_pairs`, which holds the deleted source out of staging too.
+
+
+def _new_to_head(xy: str) -> bool:
+    """True iff a porcelain XY status code means the path has NO blob in HEAD yet
+    — brand-new (untracked, ``??``) or freshly introduced in either porcelain
+    column (``A ``/`` A``/``AM``/…). A tracked dropping that is merely modified
+    or DELETED (``M``/``D``/``R``/…) already exists in HEAD, and the sweep guard
+    must never hold that change back — Git is supposed to record it (in
+    particular, a fixer's deletion of a previously-committed dropping must reach
+    the commit, not be silently kept alive)."""
+    return xy == "??" or "A" in xy[:2]
+
+
+def _iter_porcelain_z(stdout: str) -> Iterator[Tuple[str, str]]:
+    """Yield ``(xy, path)`` for each entry of ``git status --porcelain -z
+    --untracked-files=all`` output, verbatim (no C-quoting/escaping — porcelain
+    otherwise mangles any name holding a quote, space-arrow (``a -> b``), tab, or
+    non-ASCII byte) and with a rename/copy record's ORIGIN field (the field right
+    after an ``R``/``C`` entry) consumed so it is never misread as its own path."""
+    fields = (stdout or "").split("\0")
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        if len(rec) < 4:  # trailing empty field / malformed entry
+            i += 1
+            continue
+        xy, path = rec[:2], rec[3:]  # "XY <path>" (no quoting under -z)
+        if xy[0] in "RC" or xy[1] in "RC":
+            i += 1  # a rename/copy — the ORIGIN path is the next field; skip it
+        yield xy, path
+        i += 1
+
+
+def _status_entries(cwd: str, *, run: Run = _default_run) -> List[Tuple[str, str]]:
+    """One ``git status --porcelain -z --untracked-files=all`` scan, parsed via
+    :func:`_iter_porcelain_z` — the shared substrate for :func:`_detect_droppings`
+    and :func:`_risky_delete_pairs` so both read the exact same worktree snapshot
+    and can't drift out of sync with each other.
+
+    ``--untracked-files=all`` is essential: without it a dropping inside a brand-new
+    (otherwise-untracked) directory is hidden under a collapsed ``dir/`` porcelain
+    entry and would slip past both callers' scans, riding the ``git add -A`` into
+    the commit. Best-effort: any error or a non-zero status → ``[]`` (each caller
+    then falls back to its own safe default)."""
+    try:
+        st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                 cwd=cwd)
+    except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
+        return []
+    if getattr(st, "returncode", 1) != 0:
+        return []
+    return list(_iter_porcelain_z(getattr(st, "stdout", "") or ""))
+
+
+def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
+    """Repo-relative paths in ``cwd``'s worktree that are NEW editor/backup
+    droppings (:func:`_is_dropping`) with no HEAD history (:func:`_new_to_head`)
+    — the only ones ``_stage_all`` may safely hold out of the commit. A dropping
+    that was already tracked (its own modification or deletion) is Git's to
+    record like any other change and is deliberately excluded here, so it stages
+    and commits normally instead of being silently kept alive."""
+    entries = _status_entries(cwd, run=run)
+    return [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
+
+
+def _backup_source(path: str) -> Optional[str]:
+    """The pre-backup path a suffix-style backup dropping (:data:`_BACKUP_SUFFIXES`)
+    was made FROM — ``src.py.bak`` -> ``src.py`` — or ``None`` when ``path``
+    carries none of those suffixes (including every other :data:`_DROPPING_GLOBS`
+    pattern, which has no deterministic source-name relationship to pair)."""
+    for suf in _BACKUP_SUFFIXES:
+        if path.endswith(suf) and len(path) > len(suf):
+            return path[: -len(suf)]
+    return None
+
+
+def _risky_delete_pairs(entries: Sequence[Tuple[str, str]]) -> Set[str]:
+    """Deleted, non-dropping source paths from ``entries`` (already-parsed
+    ``(xy, path)`` porcelain pairs) that are paired with a fresh backup dropping
+    sitting beside them — a fixer/editor's backup-then-replace rewrite (move
+    ``src.py`` to ``src.py.bak``) that failed before recreating ``src.py``.
+
+    Excluding only the backup (the ordinary dropping path) would still let
+    ``git add -A`` stage and commit the real file's deletion while its only
+    surviving content sits in the excluded, uncommitted backup — a silent data
+    loss. ``_stage_all`` holds these paths out of staging exactly like the
+    backup they are paired with, so both remain uncommitted residue for a human
+    to resolve rather than landing a lossy deletion."""
+    entries = list(entries)
+    deleted = {path for xy, path in entries if "D" in xy[:2] and not _is_dropping(path)}
+    if not deleted:
+        return set()
+    backups = (path for xy, path in entries if _is_dropping(path) and _new_to_head(xy))
+    sources = {src for b in backups if (src := _backup_source(b)) is not None}
+    return deleted & sources
+
+
+def _fmt_droppings(paths: Sequence[str], limit: int = 6) -> str:
+    """A compact, bounded rendering of the excluded paths for the log line."""
+    shown = ", ".join(paths[:limit])
+    extra = len(paths) - limit
+    return f"{shown} (+{extra} more)" if extra > 0 else shown
+
+
+def _stage_all(
+    cwd: str, *, run: Run = _default_run,
+    notice: Callable[..., str] = automation_notice,
+) -> "subprocess.CompletedProcess[str]":
+    """``git add -A`` for the round's commit, minus editor/backup droppings and
+    any deleted source file paired with one (:func:`_risky_delete_pairs`).
+
+    With nothing to exclude this is byte-identical to a plain ``git add -A``.
+    Otherwise it stages the whole worktree (``:/`` — the top of the tree, so the
+    scope matches a bare ``git add -A`` regardless of ``cwd``) with one
+    ``:(top,exclude,literal)`` pathspec per excluded path — a repo-root-anchored
+    LITERAL exact-path exclude (not a glob), aligning with the repo-root-relative
+    porcelain paths, matching at any depth, and never mis-firing on a legitimate
+    file — and emits an ``[auto]`` line naming what was kept out. Returns the ``git
+    add`` result unchanged so the caller's return-code check is untouched."""
+    entries = _status_entries(cwd, run=run)
+    # A staged rename whose DESTINATION is a dropping — a fixer that did
+    # ``git mv src.py src.py.bak`` (or ``mv src.py src.py.bak && git add -A``, which
+    # Git records the same way) — arrives as a SINGLE ``R  src.py.bak`` porcelain
+    # record, not the ``?? src.py.bak`` the dropping scan below keys on. Its staged
+    # column is ``R`` (already-in-HEAD per :func:`_new_to_head`), so it would sail
+    # straight past the scan and commit the ``.bak`` — the exact sweep this guard
+    # exists to stop. Un-stage those renames FIRST: that decomposes each back into
+    # its ``D src.py`` (the vanished real file) + ``?? src.py.bak`` (the new backup)
+    # halves, which the dropping scan and :func:`_risky_delete_pairs` below then
+    # handle exactly like a hand-rolled backup-then-replace — holding BOTH the backup
+    # and its now-orphaned source out of the commit. Only rename destinations that
+    # are themselves droppings are touched; a legitimate rename stays staged.
+    rename_droppings = sorted({
+        path for xy, path in entries
+        if (xy[0] in "RC" or xy[1] in "RC") and _is_dropping(path)
+    })
+    if rename_droppings:
+        run(["git", "reset", "-q", "--",
+             *(f":(top,literal){p}" for p in rename_droppings)], cwd=cwd)
+        entries = _status_entries(cwd, run=run)
+    droppings = [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
+    risky = _risky_delete_pairs(entries)
+    excluded = droppings + sorted(risky)
+    if not excluded:
+        return run(["git", "add", "-A"], cwd=cwd)
+    # An exclude pathspec only tells ``git add`` NOT to (re-)add a path — it never
+    # UNstages one already in the index. A dropping a fixer had itself ``git add``-ed
+    # (or a source deletion a fixer had itself staged) would otherwise survive the
+    # exclude and ride the commit (and be falsely logged as excluded). Un-stage each
+    # first so it is guaranteed out of the index; a reset on an unstaged path is a
+    # harmless no-op, so the common (untracked) case is unaffected. ``git reset --
+    # <pathspec>`` parses its arguments as pathspecs (not raw paths), so a path name
+    # carrying glob metacharacters (``[``/``]``/``*``/``?``) could otherwise unstage
+    # the WRONG path (or miss its own); wrap each in ``:(top,literal)`` — an exact,
+    # repo-root-anchored match — mirroring the ``:(top,exclude,literal)`` form
+    # already used for the ``git add`` exclude below.
+    resets = [f":(top,literal){p}" for p in excluded]
+    run(["git", "reset", "-q", "--", *resets], cwd=cwd)
+    excludes = [f":(top,exclude,literal){p}" for p in excluded]
+    add = run(["git", "add", "-A", "--", ":/", *excludes], cwd=cwd)
+    if getattr(add, "returncode", 1) == 0:
+        if droppings:
+            notice("stage",
+                   f"excluded {len(droppings)} editor/backup dropping(s) from the fix "
+                   f"commit: {_fmt_droppings(droppings)}",
+                   status="skip")
+        if risky:
+            sorted_risky = sorted(risky)
+            notice("stage",
+                   f"held back {len(risky)} deleted source file(s) paired with an "
+                   f"excluded backup dropping — looks like an in-place rewrite that "
+                   f"failed mid-way (moved to a backup, never recreated); resolve "
+                   f"manually: {_fmt_droppings(sorted_risky)}",
+                   status="stop")
+    return add
+
+
 def commit_and_push(
     cwd: str,
     *,
@@ -666,7 +899,7 @@ def commit_and_push(
                 # committed tree, or a rejected commit just means nothing new
                 # lands here and the re-run gate is the arbiter (the final push
                 # ships whatever commit is present).
-                if run(["git", "add", "-A"], cwd=cwd).returncode == 0:
+                if _stage_all(cwd, run=run, notice=notice).returncode == 0:
                     run(["git", "commit", "-m", message], cwd=cwd)
                 continue
             # "2" / None / anything else → stop (the default).
@@ -678,17 +911,27 @@ def commit_and_push(
                hint="re-enable: --test-failure-mode escalate")
 
     print(flush=True)  # phase break — the commit step is its own block
-    if run(["git", "add", "-A"], cwd=cwd).returncode != 0:
+    if _stage_all(cwd, run=run, notice=notice).returncode != 0:
         return "error"
     # Commit only when something is staged. The "I've fixed it" path — or an
     # operator who committed their own host-side fix — may have already captured
     # the tree; a no-op `git commit` exits nonzero and must NOT be misread as an
     # error (the push below still ships the existing commit).
+    committed_now = False
     if run(["git", "diff", "--cached", "--quiet"], cwd=cwd).returncode != 0:
         head_before = _git_rev_parse(cwd, "HEAD", run=run)
         if run(["git", "commit", "-m", message], cwd=cwd).returncode != 0:
             _diagnose_commit_failure(cwd, head_before, run=run, notice=notice)
             return "error"
+        committed_now = True
+    # Droppings-only round: `_stage_all` above excluded every changed path (all
+    # editor/backup droppings), so nothing was staged/committed here — and if HEAD
+    # already matches the upstream tracking ref, the push below would ship nothing
+    # new either. That is NO progress, not "pushed" (a genuine host-side commit the
+    # operator made before this call still has something ahead of upstream and
+    # takes the push path below as before).
+    if not committed_now and _push_is_noop(cwd, run=run):
+        return "nothing"
     print(flush=True)  # phase break — the push is its own block
     # Push by EXPLICIT refspec (via _push_argv) so a mismatched-named or dangling
     # upstream can't fail the push; falls back to a bare push for a detached HEAD
@@ -715,6 +958,18 @@ def commit_and_push(
 # files + the manual steps), never resolved; a best-effort restore to the
 # pre-rebase state is attempted. It never leaves a half-rebased branch or
 # silently swallows a conflict.
+
+
+def _push_is_noop(cwd: Optional[str], *, run: Run = _default_run) -> bool:
+    """True iff local ``HEAD`` already equals its upstream tracking ref (``@{u}``)
+    — a push from here would ship nothing new. Any ambiguity (no upstream
+    configured, detached HEAD, resolution error) → False, the conservative
+    default that just lets the normal push path run as the fail-safe."""
+    head = _git_rev_parse(cwd, "HEAD", run=run)
+    upstream = _git_rev_parse(cwd, "@{u}", run=run)
+    if head is None or upstream is None:
+        return False
+    return head == upstream
 
 
 def _git_rev_parse(cwd: Optional[str], ref: str, *, run: Run = _default_run) -> Optional[str]:
