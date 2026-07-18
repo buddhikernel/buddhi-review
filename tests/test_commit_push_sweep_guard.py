@@ -89,7 +89,7 @@ def test_is_dropping_handles_collapsed_untracked_dir_marker():
 
 # ── _new_to_head: only a path with NO HEAD blob is a "new" dropping ────────────
 
-@pytest.mark.parametrize("xy", ["??", "A ", "AM", "AD"])
+@pytest.mark.parametrize("xy", ["??", "A ", " A", "AM", "AD"])
 def test_new_to_head_true_for_untracked_or_freshly_added(xy):
     assert commit_push._new_to_head(xy) is True
 
@@ -118,6 +118,13 @@ def test_detect_droppings_finds_all_patterns_including_new_dirs(git_repo):
 def test_detect_droppings_fail_open_on_status_error():
     def run(argv, *, cwd=None, timeout=None):
         return subprocess.CompletedProcess(list(argv), 128, "", "fatal: boom")
+    assert commit_push._detect_droppings("x", run=run) == []
+
+
+def test_detect_droppings_fail_open_on_decode_error():
+    def run(argv, *, cwd=None, timeout=None):
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
     assert commit_push._detect_droppings("x", run=run) == []
 
 
@@ -291,6 +298,19 @@ def test_droppings_never_ride_the_fix_commit(monkeypatch, repo):
     assert "pkg/impl.py" in tracked
     assert set(_DECOYS).issubset(tracked)          # bakery.py & friends survive
     assert tracked.isdisjoint(_ROOT_DROPPINGS + _NESTED_DROPPINGS)
+
+
+def test_intent_to_add_dropping_never_rides_the_fix_commit(monkeypatch, repo):
+    monkeypatch.setenv("BUDDHI_TEST_COMMAND", "python3 -c pass")
+    _write(repo, "real.py")
+    _write(repo, "sneaky.bak")
+    _git(repo, "add", "-N", "sneaky.bak")
+    out = commit_push.commit_and_push(str(repo), message="fix: round 1",
+                                      notice=lambda *a, **k: "")
+    assert out == "pushed"
+    tracked = _committed_files(repo)
+    assert "real.py" in tracked
+    assert "sneaky.bak" not in tracked
 
 
 def test_deleted_tracked_dropping_reaches_the_commit(monkeypatch, repo):

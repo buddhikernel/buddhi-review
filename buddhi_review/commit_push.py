@@ -628,13 +628,13 @@ def _diagnose_commit_failure(
 
 def _new_to_head(xy: str) -> bool:
     """True iff a porcelain XY status code means the path has NO blob in HEAD yet
-    — brand-new (untracked, ``??``) or freshly ``git add``-ed with nothing to
-    compare against in the last commit (index status ``A``). A tracked dropping
-    that is merely modified or DELETED (``M``/``D``/``R``/…) already exists in
-    HEAD, and the sweep guard must never hold that change back — Git is supposed
-    to record it (in particular, a fixer's deletion of a previously-committed
-    dropping must reach the commit, not be silently kept alive)."""
-    return xy == "??" or xy[:1] == "A"
+    — brand-new (untracked, ``??``) or freshly introduced in either porcelain
+    column (``A ``/`` A``/``AM``/…). A tracked dropping that is merely modified
+    or DELETED (``M``/``D``/``R``/…) already exists in HEAD, and the sweep guard
+    must never hold that change back — Git is supposed to record it (in
+    particular, a fixer's deletion of a previously-committed dropping must reach
+    the commit, not be silently kept alive)."""
+    return xy == "??" or "A" in xy[:2]
 
 
 def _iter_porcelain_z(stdout: str) -> Iterator[Tuple[str, str]]:
@@ -673,7 +673,7 @@ def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
     try:
         st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
                  cwd=cwd)
-    except (subprocess.SubprocessError, OSError):
+    except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
         return []
     if getattr(st, "returncode", 1) != 0:
         return []
