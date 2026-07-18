@@ -175,6 +175,21 @@ def label_gated_ci(cfg: Dict[str, Any], repo: Optional[str] = None) -> bool:
     return v if isinstance(v, bool) else DEFAULT_LABEL_GATED_CI
 
 
+def auto_merge(cfg: Dict[str, Any], repo: Optional[str] = None) -> bool:
+    """Whether a clean pass auto-merges (squash-merge + delete branch) the PR for
+    ``repo``. A CONFIRMED repo's per-repo ``auto_merge`` (a ``repos[<repo>]`` entry
+    carrying a **bool** key) enables it; otherwise OFF (fail-closed). Unlike
+    :func:`label_gated_ci` there is deliberately NO global-default tier — the merge
+    is opt-in PER REPO (the wizard's ``step_repo_auto_merge`` is the only writer),
+    so this consults ONLY ``repos[<repo>]`` and never a top-level key. A non-bool
+    per-repo value falls to OFF, never on. ``repo=None`` → OFF. The per-run
+    ``--auto-merge`` / ``--no-auto-merge`` flag, when explicitly set, always wins
+    over this (resolved at the CLI: flag > this config value > off)."""
+    entry = repo_entry(cfg, repo)
+    v = entry.get("auto_merge") if entry is not None else None
+    return v if isinstance(v, bool) else False
+
+
 def test_command(cfg: Dict[str, Any], repo: Optional[str] = None) -> Optional[str]:
     """The configured test-gate command STRING for ``repo``: a CONFIRMED repo's
     non-blank per-repo ``test_command`` (a ``repos[<repo>]`` entry carrying the
