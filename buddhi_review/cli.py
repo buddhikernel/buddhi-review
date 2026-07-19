@@ -15,6 +15,9 @@ Subcommands:
   ``setup``      — the interactive onboarding wizard (plan, repo, reviewer fleet).
   ``status``     — print per-repo setup status as JSON (``repo_confirmed`` /
                    ``has_global_default``) for the SKILL.md gate to shell out to.
+  ``install-skills`` — copy the bundled ``/review-pr`` + ``/open-pr`` skills into Claude
+                   Code's skills dir, provenance-safe: idempotent, skips unmodified/current
+                   files, refuses to clobber a user edit without ``--force``.
 
 Any other command word is not one of ours: it is routed to a separately-installed
 backend that CLAIMS it (which runs it), or — the normal free-only state, and equally
@@ -280,6 +283,72 @@ def _status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _install_skills(args: argparse.Namespace) -> int:
+    """Install (or update / uninstall) the bundled ``/review-pr`` + ``/open-pr`` skills
+    into Claude Code's skills directory, provenance-safe. Idempotent and safe to re-run:
+    it skips unmodified/current files and refuses to clobber a user edit unless
+    ``--force`` is given. Prints a per-file summary + the target path; exits non-zero
+    only on a real error (a preserved CONFLICT is an expected, safe outcome → exit 0)."""
+    from buddhi_review import skill_install
+
+    try:
+        summary = skill_install.install_skills(
+            force=args.force, dry_run=args.dry_run, uninstall=args.uninstall,
+        )
+    except skill_install.SkillInstallError as exc:
+        print(f"install-skills: {exc}", file=sys.stderr)
+        return 1
+
+    verb = "Uninstalling" if summary.uninstall else "Installing"
+    prefix = "[dry-run] " if summary.dry_run else ""
+    arrow = "from" if summary.uninstall else "→"
+    print(f"{prefix}{verb} Buddhi skills {arrow} {summary.target_root}\n")
+
+    # Per-file lines, grouped by skill, in a stable order.
+    glyph = {
+        skill_install.INSTALL: "✓ installed",
+        skill_install.UPDATE: "✓ updated",
+        skill_install.NOOP: "· unchanged",
+        skill_install.REMOVED: "✓ removed",
+        skill_install.CONFLICT: "⚠ conflict",
+        skill_install.ERROR: "✗ error",
+    }
+    last_skill = None
+    for f in summary.files:
+        if f.skill != last_skill:
+            print(f"  {f.skill}")
+            last_skill = f.skill
+        label = glyph.get(f.action, f.action)
+        name = f.rel or "(directory)"
+        line = f"    {label:14} {name}"
+        if f.detail:
+            line += f"  — {f.detail}"
+        print(line)
+
+    counts = summary.counts()
+    # (action, singular, plural) — "installed"/"updated"/"unchanged"/"removed" read fine
+    # at any count; only the noun forms need pluralising.
+    order = [
+        (skill_install.INSTALL, "installed", "installed"),
+        (skill_install.UPDATE, "updated", "updated"),
+        (skill_install.NOOP, "unchanged", "unchanged"),
+        (skill_install.REMOVED, "removed", "removed"),
+        (skill_install.CONFLICT, "conflict", "conflicts"),
+        (skill_install.ERROR, "error", "errors"),
+    ]
+    parts = [f"{counts[a]} {sing if counts[a] == 1 else plur}"
+             for a, sing, plur in order if counts.get(a)]
+    print(f"\nSummary: {', '.join(parts) if parts else 'nothing to do'}.")
+    if not summary.dry_run:
+        print(f"Provenance: {summary.sidecar_path}")
+    if any(f.action == skill_install.CONFLICT for f in summary.files):
+        print("Conflicts were left untouched. Re-run with --force to overwrite them "
+              "(each is backed up to a .bak-<timestamp> sidecar first).", file=sys.stderr)
+    if not summary.uninstall and not summary.dry_run and counts.get(skill_install.INSTALL, 0) + counts.get(skill_install.UPDATE, 0):
+        print("\nRestart Claude Code so it loads the skills.")
+    return 1 if summary.had_error else 0
+
+
 def _add_loop_args(p: argparse.ArgumentParser) -> None:
     """The review-loop flags, shared by ``review-pr`` (the front door) and
     ``run-loop`` (the detached engine) so they never drift."""
@@ -474,6 +543,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     stp = sub.add_parser("status", help="print per-repo setup status as JSON (for the skill gate)")
     stp.add_argument("--repo", required=True, help="owner/repo to report on")
+
+    isk = sub.add_parser("install-skills",
+                         help="install the bundled /review-pr + /open-pr skills into "
+                              "Claude Code (idempotent; safe to re-run after an upgrade)")
+    isk.add_argument("--dry-run", action="store_true",
+                     help="show every per-file action but write nothing")
+    isk.add_argument("--force", action="store_true",
+                     help="overwrite user-modified/foreign files (each backed up to "
+                          ".bak-<timestamp> first); the only way to clobber a conflict")
+    isk.add_argument("--uninstall", action="store_true",
+                     help="remove the installed skills (unmodified ones; add --force to "
+                          "remove modified/foreign ones and a stale legacy create-pr)")
     return p
 
 
@@ -587,6 +668,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _setup(args)
     if args.command == "status":
         return _status(args)
+    if args.command == "install-skills":
+        return _install_skills(args)
     parser.print_help()
     return 0
 
