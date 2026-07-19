@@ -394,6 +394,34 @@ def test_force_uninstall_removes_legacy_createpr_with_backup(env):
     assert list(env.target.glob("create-pr.bak-*"))  # dir backed up before removal
 
 
+def test_install_reports_legacy_createpr_without_force(env):
+    # The documented upgrade path is a plain re-run of install-skills (no --uninstall).
+    # A stale create-pr dir left by the old manual snippet must surface there too.
+    skill_install.install_skills()
+    legacy = env.target / "create-pr"
+    legacy.mkdir()
+    (legacy / "SKILL.md").write_text("stale legacy skill\n", encoding="utf-8")
+
+    summary = skill_install.install_skills()
+    legacy_outcomes = [f for f in summary.files if f.skill == "create-pr"]
+    assert legacy_outcomes and legacy_outcomes[0].action == skill_install.CONFLICT
+    assert legacy.exists()  # left in place without --force
+    assert (env.target / "open-pr" / "SKILL.md").exists()  # current skills still installed
+
+
+def test_force_install_removes_legacy_createpr_with_backup(env):
+    skill_install.install_skills()
+    legacy = env.target / "create-pr"
+    legacy.mkdir()
+    (legacy / "SKILL.md").write_text("stale legacy skill\n", encoding="utf-8")
+
+    summary = skill_install.install_skills(force=True)
+    legacy_outcomes = [f for f in summary.files if f.skill == "create-pr"]
+    assert legacy_outcomes and legacy_outcomes[0].action == skill_install.REMOVED
+    assert not legacy.exists()
+    assert list(env.target.glob("create-pr.bak-*"))  # dir backed up before removal
+
+
 # ── Per-file error isolation (atomic; one failure doesn't block the rest) ─────────
 
 def test_write_error_is_isolated_not_fatal(env):
@@ -408,6 +436,21 @@ def test_write_error_is_isolated_not_fatal(env):
     assert acts[("review-pr", "SKILL.md")] == skill_install.INSTALL
     assert summary.had_error
     assert (env.target / "review-pr" / "SKILL.md").exists()  # safe files still written
+
+
+def test_sidecar_write_failure_is_reported_not_raised(env):
+    # $XDG_CONFIG_HOME/buddhi is an existing FILE (not a dir) — _write_sidecar's
+    # mkdir(parents=True) can never succeed. Files must still install; the sidecar
+    # failure must come back as an ERROR outcome, never an uncaught exception.
+    env.sidecar.parent.parent.mkdir(parents=True, exist_ok=True)
+    env.sidecar.parent.write_text("not the buddhi config dir\n", encoding="utf-8")
+
+    summary = skill_install.install_skills()  # must not raise
+    prov = [f for f in summary.files if f.skill == "(provenance)"]
+    assert prov and prov[0].action == skill_install.ERROR
+    assert summary.had_error
+    assert (env.target / "review-pr" / "SKILL.md").exists()  # files installed regardless
+    assert not env.sidecar.exists()  # provenance genuinely was not recorded
 
 
 # ── CLI subcommand ────────────────────────────────────────────────────────────────

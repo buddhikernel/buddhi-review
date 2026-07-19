@@ -55,8 +55,9 @@ from buddhi_review.skill_provenance import apply_transforms, content_hash, packa
 
 # Legacy skill directory names the current tree no longer bundles but an older manual
 # install snippet may have left behind. ``open-pr`` was once called ``create-pr``; a
-# stale ``create-pr`` directory is cleaned up by ``--uninstall`` (see the uninstall path
-# for why plain uninstall only reports it — there is no provenance to prove it unmodified).
+# stale ``create-pr`` directory is reported (and, with ``--force``, backed up + removed)
+# by BOTH plain install and ``--uninstall`` via :func:`_handle_legacy_dirs` — there is no
+# provenance to prove one unmodified, so neither path clobbers it without ``--force``.
 LEGACY_SKILL_NAMES: Tuple[str, ...] = ("create-pr",)
 
 # The sidecar is a single global file (honouring ``XDG_CONFIG_HOME``); records are keyed
@@ -191,6 +192,22 @@ def _write_sidecar(path: Path, records: Dict[str, dict]) -> None:
         raise
 
 
+def _flush_sidecar(sc_path: Path, records: Dict[str, dict]) -> List[FileOutcome]:
+    """Call :func:`_write_sidecar`, turning a failure (unwritable/occupied config dir)
+    into a per-run ``ERROR`` outcome instead of an uncaught exception. By the time this
+    runs the skill files are already written, so a sidecar failure must be reported, not
+    raised — an uncaught exception here would skip the CLI's summary entirely and leave
+    the user with a bare traceback and no indication their install has no provenance."""
+    try:
+        _write_sidecar(sc_path, records)
+        return []
+    except OSError as exc:
+        return [FileOutcome(
+            "(provenance)", sc_path.name, sc_path, ERROR,
+            f"install/uninstall succeeded but the provenance sidecar failed to write "
+            f"— re-run to retry recording it: {exc}")]
+
+
 # ── Low-level filesystem helpers ──────────────────────────────────────────────────
 
 def _timestamp() -> str:
@@ -261,6 +278,35 @@ def _backup(path: Path) -> Path:
         i += 1
     os.replace(path, bak)
     return bak
+
+
+def _handle_legacy_dirs(*, root: Path, force: bool, dry_run: bool) -> List[FileOutcome]:
+    """Report (or, with ``--force``, back up + remove) stale legacy skill dirs (e.g.
+    ``create-pr``) left by the old manual install snippet. These carry NO provenance, so
+    the safe default cannot prove one unmodified and LEAVES it (reporting how to remove
+    it); ``--force`` backs the whole dir up and removes it — same never-clobber-without-
+    force convention as a regular file conflict. Shared by install (so a plain upgrade
+    surfaces the stale dir instead of only ``--uninstall`` ever mentioning it) and
+    uninstall."""
+    outcomes: List[FileOutcome] = []
+    for legacy in LEGACY_SKILL_NAMES:
+        ldir = root / legacy
+        if not (ldir.exists() or ldir.is_symlink()):
+            continue
+        kind = "symlink" if ldir.is_symlink() else "directory"
+        if force:
+            if dry_run:
+                outcomes.append(FileOutcome(legacy, "", ldir, REMOVED, f"would back up + remove legacy {kind}"))
+            else:
+                try:
+                    bak = _backup(ldir)
+                    outcomes.append(FileOutcome(legacy, "", ldir, REMOVED, f"legacy {kind} backed up to {bak.name}"))
+                except OSError as exc:
+                    outcomes.append(FileOutcome(legacy, "", ldir, ERROR, str(exc)))
+        else:
+            outcomes.append(FileOutcome(legacy, "", ldir, CONFLICT,
+                                        f"legacy {kind}, no provenance — left (pass --force to remove)"))
+    return outcomes
 
 
 def _prune_empty_dir(d: Path, stop: Path) -> None:
@@ -367,8 +413,14 @@ def _install(
             except OSError as exc:
                 outcomes.append(FileOutcome(skill, rel, dest, ERROR, str(exc)))
 
+    # A stale legacy skill dir (e.g. create-pr) is never part of the currently bundled
+    # tree, so the loop above never sees it. Report it here too — not just under
+    # ``--uninstall`` — so the documented upgrade path (a plain re-run of install-skills)
+    # actually surfaces it instead of leaving it installed and invocable forever.
+    outcomes.extend(_handle_legacy_dirs(root=root, force=force, dry_run=dry_run))
+
     if changed and not dry_run:
-        _write_sidecar(sc_path, records)
+        outcomes.extend(_flush_sidecar(sc_path, records))
     return outcomes
 
 
@@ -447,26 +499,8 @@ def _uninstall(
             outcomes.append(FileOutcome(skill, rel, dest, CONFLICT,
                                         "modified or foreign — left (pass --force to remove)"))
 
-    # 2) Stale legacy skill dirs (e.g. create-pr) left by the old manual snippet. These
-    #    carry NO provenance, so plain uninstall cannot prove them unmodified and LEAVES
-    #    them (reporting how to remove); --force backs the whole dir up and removes it.
-    for legacy in LEGACY_SKILL_NAMES:
-        ldir = root / legacy
-        if not (ldir.exists() or ldir.is_symlink()):
-            continue
-        kind = "symlink" if ldir.is_symlink() else "directory"
-        if force:
-            if dry_run:
-                outcomes.append(FileOutcome(legacy, "", ldir, REMOVED, f"would back up + remove legacy {kind}"))
-            else:
-                try:
-                    bak = _backup(ldir)
-                    outcomes.append(FileOutcome(legacy, "", ldir, REMOVED, f"legacy {kind} backed up to {bak.name}"))
-                except OSError as exc:
-                    outcomes.append(FileOutcome(legacy, "", ldir, ERROR, str(exc)))
-        else:
-            outcomes.append(FileOutcome(legacy, "", ldir, CONFLICT,
-                                        f"legacy {kind}, no provenance — left (pass --force to remove)"))
+    # 2) Stale legacy skill dirs (e.g. create-pr) left by the old manual snippet.
+    outcomes.extend(_handle_legacy_dirs(root=root, force=force, dry_run=dry_run))
 
     # 3) Prune skill dirs emptied by the removals above.
     if not dry_run:
@@ -474,7 +508,7 @@ def _uninstall(
             _prune_empty_dir(d, root)
 
     if changed and not dry_run:
-        _write_sidecar(sc_path, records)
+        outcomes.extend(_flush_sidecar(sc_path, records))
     return outcomes
 
 

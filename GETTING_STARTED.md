@@ -47,6 +47,10 @@ are already current, updates ones it installed earlier, and refuses to overwrite
 file you have edited yourself (pass `--force` to overwrite, which backs up the existing
 file first). Run `buddhi-review install-skills --uninstall` to remove them again.
 
+Re-run `buddhi-review install-skills` after every `pip install -U buddhi-review` — it
+copies the skill files rather than linking them, so upgrading the package alone does not
+refresh `~/.claude/skills/`.
+
 Restart Claude Code to load the new skills. Each skill is installed under
 `~/.claude/skills/<name>/SKILL.md`. If a slash command with the same name already
 exists, the skill takes precedence.
