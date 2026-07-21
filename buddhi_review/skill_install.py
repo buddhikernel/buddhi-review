@@ -146,15 +146,22 @@ def sidecar_path() -> Path:
 # ── Source discovery ──────────────────────────────────────────────────────────────
 
 def _skill_dirs(src_root: Path) -> List[str]:
-    """The bundled skill names (immediate sub-directories of the source tree), sorted."""
+    """The bundled skill names (immediate sub-directories of the source tree), sorted.
+
+    ``is_dir()`` follows symlinks, so a symlinked entry is excluded explicitly rather
+    than trusted as a real skill directory — the bundled tree ships from a package
+    archive and must never be walked through a link to content outside it."""
     if not src_root.is_dir():
         return []
-    return sorted(p.name for p in src_root.iterdir() if p.is_dir())
+    return sorted(p.name for p in src_root.iterdir() if not p.is_symlink() and p.is_dir())
 
 
 def _skill_files(skill_src: Path) -> List[Path]:
-    """Every regular file under one bundled skill dir (recursive), sorted."""
-    return sorted(p for p in skill_src.rglob("*") if p.is_file())
+    """Every regular file under one bundled skill dir (recursive), sorted.
+
+    ``is_file()`` follows symlinks; excluded for the same provenance reason as
+    :func:`_skill_dirs` above."""
+    return sorted(p for p in skill_src.rglob("*") if not p.is_symlink() and p.is_file())
 
 
 # ── Sidecar I/O ───────────────────────────────────────────────────────────────────
@@ -297,6 +304,26 @@ def _backup(path: Path) -> Path:
     return bak
 
 
+def _backup_outside_root(path: Path, root: Path) -> Path:
+    """Like :func:`_backup`, but lands the backup as a sibling of ``root`` itself (e.g.
+    ``~/.claude/create-pr.bak-<ts>`` rather than ``~/.claude/skills/create-pr.bak-<ts>``).
+    A legacy skill DIRECTORY backed up in place with :func:`_backup` would still be a
+    top-level directory containing an unmodified ``SKILL.md`` under the skills root —
+    Claude Code discovers skills by scanning that root, so the stale skill would remain
+    selectable under its backup name. Moving one level up removes it from that scan while
+    keeping the same recoverable, collision-avoiding, no-clobber semantics as
+    :func:`_backup`. Regular per-file conflict backups stay in place via :func:`_backup` —
+    those are individual files beside an untouched ``SKILL.md``, not a duplicate of it."""
+    ts = _timestamp()
+    bak = root.parent / f"{path.name}.bak-{ts}"
+    i = 1
+    while os.path.lexists(bak):
+        bak = root.parent / f"{path.name}.bak-{ts}-{i}"
+        i += 1
+    os.replace(path, bak)
+    return bak
+
+
 def _handle_legacy_dirs(*, root: Path, force: bool, dry_run: bool) -> List[FileOutcome]:
     """Report (or, with ``--force``, back up + remove) stale legacy skill dirs (e.g.
     ``create-pr``) left by the old manual install snippet. These carry NO provenance, so
@@ -313,11 +340,13 @@ def _handle_legacy_dirs(*, root: Path, force: bool, dry_run: bool) -> List[FileO
         kind = "symlink" if ldir.is_symlink() else "directory"
         if force:
             if dry_run:
-                outcomes.append(FileOutcome(legacy, "", ldir, REMOVED, f"would back up + remove legacy {kind}"))
+                outcomes.append(FileOutcome(legacy, "", ldir, REMOVED,
+                                            f"would back up (outside skills root) + remove legacy {kind}"))
             else:
                 try:
-                    bak = _backup(ldir)
-                    outcomes.append(FileOutcome(legacy, "", ldir, REMOVED, f"legacy {kind} backed up to {bak.name}"))
+                    bak = _backup_outside_root(ldir, root)
+                    outcomes.append(FileOutcome(legacy, "", ldir, REMOVED,
+                                                f"legacy {kind} backed up to {bak}"))
                 except OSError as exc:
                     outcomes.append(FileOutcome(legacy, "", ldir, ERROR, str(exc)))
         else:

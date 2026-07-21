@@ -430,7 +430,10 @@ def test_force_uninstall_removes_legacy_createpr_with_backup(env):
     legacy_outcomes = [f for f in summary.files if f.skill == "create-pr"]
     assert legacy_outcomes and legacy_outcomes[0].action == skill_install.REMOVED
     assert not legacy.exists()
-    assert list(env.target.glob("create-pr.bak-*"))  # dir backed up before removal
+    # Backed up OUTSIDE the skills root, not as a sibling — a sibling dir would still
+    # contain SKILL.md under the root Claude Code scans and stay discoverable there.
+    assert not list(env.target.glob("create-pr.bak-*"))
+    assert list(env.target.parent.glob("create-pr.bak-*"))
 
 
 def test_install_reports_legacy_createpr_without_force(env):
@@ -458,7 +461,10 @@ def test_force_install_removes_legacy_createpr_with_backup(env):
     legacy_outcomes = [f for f in summary.files if f.skill == "create-pr"]
     assert legacy_outcomes and legacy_outcomes[0].action == skill_install.REMOVED
     assert not legacy.exists()
-    assert list(env.target.glob("create-pr.bak-*"))  # dir backed up before removal
+    # Backed up OUTSIDE the skills root, not as a sibling — a sibling dir would still
+    # contain SKILL.md under the root Claude Code scans and stay discoverable there.
+    assert not list(env.target.glob("create-pr.bak-*"))
+    assert list(env.target.parent.glob("create-pr.bak-*"))
 
 
 # ── Per-file error isolation (atomic; one failure doesn't block the rest) ─────────
