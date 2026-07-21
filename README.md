@@ -53,29 +53,21 @@ This pulls the kernel ([`buddhikernel`](https://github.com/buddhikernel/buddhi))
 `PyYAML`, and installs the `buddhi-review` command. The package also includes two
 Claude Code skills: `/review-pr`, which reviews an open PR, and `/open-pr`, which
 opens and then reviews a PR. They are included in the package but are not added to
-Claude Code automatically. Install them by copying each skill to
-`~/.claude/skills/<name>/SKILL.md`:
-
-<details markdown="1">
-<summary><b>Install the /review-pr and /open-pr skills</b></summary>
+Claude Code automatically. Install them with one command:
 
 ```bash
-SKILLS=$(python3 -c "import buddhi_review, os; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'skills'))" 2>/dev/null)
-if [ -d "$SKILLS" ]; then
-  mkdir -p ~/.claude/skills/
-  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/open-pr ~/.claude/skills/create-pr
-  cp -R "$SKILLS"/review-pr "$SKILLS"/open-pr ~/.claude/skills/
-  echo "✓ Skills installed to ~/.claude/skills/ — restart Claude Code to load them"
-else
-  echo "✗ Error: Could not locate buddhi_review skills. Ensure buddhi-review is installed in the active Python environment."
-fi
+buddhi-review install-skills
 ```
 
-**Re-run this block after every `pip install -U buddhi-review`** — it copies the
-skill files rather than linking them, so upgrading the package alone does not
-refresh `~/.claude/skills/`.
+This copies each skill into `~/.claude/skills/<name>/` (or `$CLAUDE_CONFIG_DIR/skills`
+if that is set). It is idempotent and safe to re-run at any time: it skips files that
+are already current, updates ones it installed earlier, and refuses to overwrite a skill
+file you have edited yourself (pass `--force` to overwrite, which backs up the existing
+file first). Run `buddhi-review install-skills --uninstall` to remove them again.
 
-</details>
+Re-run `buddhi-review install-skills` after every `pip install -U buddhi-review` — it
+copies the skill files rather than linking them, so upgrading the package alone does not
+refresh `~/.claude/skills/`.
 
 **Restart Claude Code** so it loads the new skills, then run **`/review-pr setup`**
 once to onboard (see [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)).

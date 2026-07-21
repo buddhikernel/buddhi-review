@@ -35,24 +35,21 @@ pip install buddhi-review
 
 This installs the `buddhi-review` command, the
 [Buddhi kernel](https://github.com/buddhikernel/buddhi), and the bundled `/review-pr`
-and `/create-pr` skills. Install the two bundled skills in Claude Code by copying them
-to its skills directory:
+and `/open-pr` skills. Install the two bundled skills in Claude Code with one command:
 
 ```bash
-SKILLS=$(python3 -c "import buddhi_review, os; print(os.path.join(os.path.dirname(buddhi_review.__file__), 'skills'))" 2>/dev/null)
-if [ -d "$SKILLS" ]; then
-  mkdir -p ~/.claude/skills/
-  rm -rf ~/.claude/skills/review-pr ~/.claude/skills/open-pr ~/.claude/skills/create-pr
-  cp -R "$SKILLS"/review-pr "$SKILLS"/open-pr ~/.claude/skills/
-  echo "✓ Skills installed to ~/.claude/skills/ — restart Claude Code to load them"
-else
-  echo "✗ Error: Could not locate buddhi_review skills. Ensure buddhi-review is installed in the active Python environment."
-fi
+buddhi-review install-skills
 ```
 
-Re-run this block after every `pip install -U buddhi-review`; it copies the skill
-files rather than linking them, so upgrading the package alone does not refresh
-`~/.claude/skills/`.
+This copies each skill into `~/.claude/skills/<name>/` (or `$CLAUDE_CONFIG_DIR/skills`
+if that is set). It is idempotent and safe to re-run at any time: it skips files that
+are already current, updates ones it installed earlier, and refuses to overwrite a skill
+file you have edited yourself (pass `--force` to overwrite, which backs up the existing
+file first). Run `buddhi-review install-skills --uninstall` to remove them again.
+
+Re-run `buddhi-review install-skills` after every `pip install -U buddhi-review` — it
+copies the skill files rather than linking them, so upgrading the package alone does not
+refresh `~/.claude/skills/`.
 
 Restart Claude Code to load the new skills. Each skill is installed under
 `~/.claude/skills/<name>/SKILL.md`. If a slash command with the same name already
@@ -256,7 +253,7 @@ repository configuration. Otherwise, it hands the PR back to you for merging.
 
 ## 6. Advanced: drive the CLI directly
 
-Most first-time users stay with `/review-pr` and `/create-pr`. To skip the slash
+Most first-time users stay with `/review-pr` and `/open-pr`. To skip the slash
 commands and drive the loop yourself:
 
 ```bash
