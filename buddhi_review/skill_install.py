@@ -161,14 +161,22 @@ def _skill_files(skill_src: Path) -> List[Path]:
 def _load_sidecar(path: Path) -> Dict[str, dict]:
     """Return the ``{abs_path: {"version", "hash"}}`` records. A missing OR corrupt
     sidecar reads as empty — which is SAFE: with no record every existing file is a
-    CONFLICT and is left untouched, never clobbered on a bad-parse."""
+    CONFLICT and is left untouched, never clobbered on a bad-parse. A ``schema`` that
+    is present but does not match ``_SIDECAR_SCHEMA`` is a future incompatible layout
+    bump — read as empty too, rather than misinterpreting its records under today's
+    shape."""
     if not path.exists():
         return {}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return {}
-    files = data.get("files") if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return {}
+    schema = data.get("schema")
+    if schema is not None and schema != _SIDECAR_SCHEMA:
+        return {}
+    files = data.get("files")
     if not isinstance(files, dict):
         return {}
     # Keep only well-formed records.
@@ -187,9 +195,12 @@ def _write_sidecar(path: Path, records: Dict[str, dict]) -> None:
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".installed-skills-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = None  # os.fdopen took ownership; don't double-close below
             fh.write(text)
         os.replace(tmp, path)
     except BaseException:
+        if fd is not None:
+            os.close(fd)
         _silent_unlink(tmp)
         raise
 
@@ -261,9 +272,12 @@ def _atomic_write(dest: Path, text: str) -> None:
     fd, tmp = tempfile.mkstemp(dir=str(dest.parent), prefix=".buddhi-skill-", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+            fd = None  # os.fdopen took ownership; don't double-close below
             fh.write(text)
         os.replace(tmp, dest)
     except BaseException:
+        if fd is not None:
+            os.close(fd)
         _silent_unlink(tmp)
         raise
 
@@ -413,6 +427,7 @@ def _install(
                 outcomes.append(FileOutcome(skill, rel, dest, shown, detail))
                 continue
 
+            bak = None
             try:
                 if action == NOOP:
                     pass  # bytes on disk already match; only the record is refreshed below
@@ -428,7 +443,23 @@ def _install(
                 shown = UPDATE if action == CONFLICT else action
                 outcomes.append(FileOutcome(skill, rel, dest, shown, detail))
             except OSError as exc:
-                outcomes.append(FileOutcome(skill, rel, dest, ERROR, str(exc)))
+                if bak is None:
+                    outcomes.append(FileOutcome(skill, rel, dest, ERROR, str(exc)))
+                else:
+                    # The backup succeeded but the replacement write then failed (e.g.
+                    # ENOSPC) — restore the backed-up original so a failed forced
+                    # overwrite never leaves the destination missing, matching the
+                    # never-clobber-without-a-recoverable-copy guarantee.
+                    try:
+                        os.replace(bak, dest)
+                        outcomes.append(FileOutcome(
+                            skill, rel, dest, ERROR,
+                            f"write failed, original restored from backup: {exc}"))
+                    except OSError as restore_exc:
+                        outcomes.append(FileOutcome(
+                            skill, rel, dest, ERROR,
+                            f"write failed AND restoring backup {bak.name} failed — "
+                            f"original is at {bak.name}: {exc}; {restore_exc}"))
 
     # A stale legacy skill dir (e.g. create-pr) is never part of the currently bundled
     # tree, so the loop above never sees it. Report it here too — not just under
