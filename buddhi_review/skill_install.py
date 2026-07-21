@@ -17,6 +17,11 @@ Design invariants (why this module is careful):
     existing file to a ``.bak-<ts>`` sidecar first. There is no interactive prompt path:
     ``force`` is the sole signal, so a non-interactive re-sync (the upgrade path) that
     passes ``force=False`` is always safe, in a TTY or a pipe alike.
+  * **One verdict per file per run.** The no-longer-bundled prune only ever considers a
+    destination the install loop did NOT handle. A record that names a currently bundled
+    file — under any spelling: a non-canonical path, a case variant on a case-insensitive
+    filesystem, a hard link — is skipped there, so no run can both keep a file and delete
+    it.
   * **Per file, not per directory.** State is decided and acted on one file at a time; a
     conflict on one file never blocks updating the safe files beside it, and a whole
     skill directory is never moved aside (that would touch conflicts).
@@ -172,12 +177,21 @@ def _load_sidecar(path: Path) -> Dict[str, dict]:
     CONFLICT and is left untouched, never clobbered on a bad-parse. A ``schema`` that
     is present but does not match ``_SIDECAR_SCHEMA`` is a future incompatible layout
     bump — read as empty too, rather than misinterpreting its records under today's
-    shape."""
-    if not path.exists():
-        return {}
+    shape.
+
+    The existence check lives INSIDE the guard on purpose: ``Path.exists()`` itself
+    raises ``PermissionError`` when the config directory lacks the search bit (a
+    ``chmod 000 ~/.config/buddhi``), and an uncaught raise there would abort the whole
+    install with a bare traceback and no summary. This is a pre-write read, so failing
+    safe (empty → every existing file is a CONFLICT) can never clobber."""
     try:
+        if not path.exists():
+            return {}
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
+        # RecursionError: json.loads hits the interpreter's limit on deeply nested input,
+        # and it is neither an OSError nor a ValueError — without it a structurally corrupt
+        # sidecar still aborts the run with the traceback this guard exists to prevent.
         return {}
     if not isinstance(data, dict):
         return {}
@@ -405,7 +419,9 @@ def _install(
     version = package_version()
     outcomes: List[FileOutcome] = []
     changed = False
-    current_keys: set = set()
+    # Destinations the loop below handles, in the SAME normalized form the prune derives
+    # its targets in (see the prune's skip check for why raw strings are not comparable).
+    current_dests: set = set()
 
     for skill in _skill_dirs(src_root):
         skill_src = src_root / skill
@@ -413,7 +429,7 @@ def _install(
             rel = src_file.relative_to(skill_src).as_posix()
             dest = root / skill / Path(rel)
             key = str(dest)
-            current_keys.add(key)
+            current_dests.add(os.path.normpath(key))
 
             try:
                 raw = src_file.read_text(encoding="utf-8")
@@ -508,13 +524,47 @@ def _install(
     # is pruned automatically; a modified/foreign file is left as a CONFLICT — the same
     # never-clobber default as every other path in this module — and ``--force`` removes
     # it, backed up first, exactly like a regular uninstall.
+    #
+    # Second half of the "never prune a live file" guard. Lexical normalization alone is
+    # not enough: on a case-INSENSITIVE filesystem (APFS/HFS+ by default, and NTFS)
+    # ``…/OPEN-PR/SKILL.md`` is a different STRING but the very same file, and a hard link
+    # gives a live file a second name that no amount of normalizing reveals. So we also
+    # match on filesystem identity. ``os.lstat`` (never ``stat``) so a record that is a
+    # SYMLINK is not matched by its target's identity — a symlink keeps its own, symlink-
+    # safe handling below (backed up, never written or unlinked through).
+    # ``ValueError`` is caught alongside ``OSError`` in both lstat calls below: a sidecar
+    # key is untrusted input and a raw ``os.lstat`` — unlike ``Path.exists()`` /
+    # ``Path.is_symlink()``, which swallow both — raises ValueError on an embedded NUL and
+    # UnicodeEncodeError (a ValueError) on a lone surrogate. Letting either escape would
+    # abort the whole run, even ``--dry-run``, with a bare traceback and no summary.
+    current_ids: set = set()
+    for d in current_dests:
+        try:
+            st = os.lstat(d)
+        except (OSError, ValueError):
+            continue  # not written this run (dry-run, or a per-file error above)
+        current_ids.add((st.st_dev, st.st_ino))
+
     touched_dirs: set = set()
     for key in list(records):
-        if key in current_keys:
-            continue
         dest = _normalized_dest_if_under(key, root)
         if dest is None:
             continue  # a different config root's record; not ours this run
+        # NORMALIZE BEFORE THE SKIP. The prune acts on the NORMALIZED path, so the
+        # "is this still bundled?" test has to be made in the same form: a record whose
+        # key is a non-canonical spelling of a live file (``…/open-pr/./SKILL.md``, a
+        # doubled slash, a ``x/../`` hop) survives a raw string compare, normalizes back
+        # onto that live file, matches its recorded hash, and would be unlinked here with
+        # no backup — while the loop above kept the very same file. One run, two
+        # contradictory actions, and a currently-bundled skill silently deleted.
+        if str(dest) in current_dests:
+            continue
+        try:
+            st = os.lstat(dest)
+        except (OSError, ValueError):
+            st = None  # unreadable, absent, or an unusable key — fall through, never raise
+        if st is not None and (st.st_dev, st.st_ino) in current_ids:
+            continue  # a case-variant / hard-linked alias of a file we just installed
         skill = _skill_of(dest, root)
         rel = _rel_within_skill(dest, root)
         rec_hash = records[key].get("hash")
@@ -540,6 +590,24 @@ def _install(
                 outcomes.append(FileOutcome(
                     skill, rel, dest, CONFLICT,
                     "no longer bundled; symlink — left (pass --force to remove)"))
+            continue
+
+        # Records only ever name FILES. A key naming a directory is corruption, and acting
+        # on it would move a whole directory — under ``--force`` that is ``_backup``-ing a
+        # live skill dir (with the user's own files in it) to a ``.bak-<ts>`` sibling that
+        # Claude Code still scans. Same rule as ``_decide_action``'s "a directory where a
+        # file belongs", and it keeps the module's per-file-not-per-directory invariant.
+        if dest.is_dir():
+            # The record can only ever have named a FILE, so a directory here proves the
+            # record itself is dead (e.g. upstream renamed ``notes.md`` to ``notes/``).
+            # Retire it, or the same CONFLICT line repeats on every future upgrade with
+            # no way — not even ``--force`` — for the user to clear it.
+            if not dry_run:
+                del records[key]; changed = True
+            outcomes.append(FileOutcome(
+                skill, rel, dest, CONFLICT,
+                "no longer bundled; the record names a directory, not a file — "
+                "left untouched (stale record dropped)"))
             continue
 
         if not dest.exists():
@@ -626,6 +694,17 @@ def _uninstall(
                 outcomes.append(FileOutcome(skill, rel, dest, CONFLICT, "symlink — left (pass --force to remove)"))
             continue
 
+        # A record naming a directory is corruption; never move a whole directory aside
+        # (see the identical guard in :func:`_install`'s prune).
+        if dest.is_dir():
+            if not dry_run:
+                del records[key]; changed = True
+            outcomes.append(FileOutcome(
+                skill, rel, dest, CONFLICT,
+                "the record names a directory, not a file — left untouched "
+                "(stale record dropped)"))
+            continue
+
         if not dest.exists():
             # Already gone — just forget it (no file to remove).
             if not dry_run:
@@ -669,10 +748,6 @@ def _uninstall(
     return outcomes
 
 
-def _is_under(path: Path, root: Path) -> bool:
-    return path == root or root in path.parents
-
-
 def _rel_within_skill(dest: Path, root: Path) -> str:
     try:
         parts = dest.relative_to(root).parts
@@ -691,15 +766,21 @@ def _skill_of(dest: Path, root: Path) -> str:
 
 def _normalized_dest_if_under(key: str, root: Path) -> Optional[Path]:
     """A sidecar record ``key`` is untrusted: a corrupted or hand-edited sidecar could
-    contain ``..`` segments that pass ``_is_under``'s literal-string-parents check on the
-    RAW path while the path actually resolves outside ``root`` on disk. Normalize
-    lexically (``os.path.normpath`` — never ``Path.resolve()``, which would follow
-    symlinks and defeat ``_under_symlinked_dir``'s later check) before the containment
-    test, and hand back that SAME normalized path for every subsequent use — never the
-    raw key. Returns ``None`` if the normalized path is not under ``root`` at all (a
-    different config root's record, or a traversal attempt)."""
+    contain ``..`` segments that pass a literal-string-parents check on the RAW path
+    while the path actually resolves outside ``root`` on disk. Normalize lexically
+    (``os.path.normpath`` — never ``Path.resolve()``, which would follow symlinks and
+    defeat ``_under_symlinked_dir``'s later check) before the containment test, and hand
+    back that SAME normalized path for every subsequent use — never the raw key.
+
+    Containment is STRICT (``root in dest.parents``): a key equal to the skills root
+    itself is not actionable. A real skill file always lives at least two components
+    below the root, so nothing legitimate is lost — while a key of exactly ``root``
+    would otherwise let ``--force`` back up the ENTIRE skills tree in one move.
+
+    Returns ``None`` if the normalized path is not strictly under ``root`` (a different
+    config root's record, the root itself, or a traversal attempt)."""
     dest = Path(os.path.normpath(key))
-    return dest if _is_under(dest, root) else None
+    return dest if root in dest.parents else None
 
 
 # ── Public entry point ────────────────────────────────────────────────────────────
