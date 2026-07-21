@@ -77,7 +77,8 @@ class SkillInstallError(RuntimeError):
 # ── Result types (pure data; the CLI does the printing) ───────────────────────────
 
 # Per-file actions the installer reports. INSTALL/UPDATE/NOOP/CONFLICT are the install
-# verbs; REMOVED/absent-noop the uninstall verbs; ERROR a per-file failure.
+# verbs; REMOVED/absent-noop the uninstall verbs (REMOVED/NOOP also appear during a
+# plain install's no-longer-bundled prune, see ``_install``); ERROR a per-file failure.
 INSTALL = "install"
 UPDATE = "update"
 NOOP = "noop"
@@ -375,6 +376,7 @@ def _install(
     version = package_version()
     outcomes: List[FileOutcome] = []
     changed = False
+    current_keys: set = set()
 
     for skill in _skill_dirs(src_root):
         skill_src = src_root / skill
@@ -382,6 +384,7 @@ def _install(
             rel = src_file.relative_to(skill_src).as_posix()
             dest = root / skill / Path(rel)
             key = str(dest)
+            current_keys.add(key)
 
             try:
                 raw = src_file.read_text(encoding="utf-8")
@@ -467,6 +470,84 @@ def _install(
     # actually surfaces it instead of leaving it installed and invocable forever.
     outcomes.extend(_handle_legacy_dirs(root=root, force=force, dry_run=dry_run))
 
+    # A destination recorded under THIS root that the loop above never touched has a
+    # source that is no longer part of the bundled tree (a file removed, or a whole
+    # skill renamed/dropped upstream — the loop only ever walks what IS still bundled).
+    # Without pruning these, the documented "just re-run install-skills to upgrade" flow
+    # would never actually refresh what an upgrade removed upstream, unlike the old
+    # ``rm -rf``/``cp -R`` snippet this command replaced. Only an ours-unmodified match
+    # is pruned automatically; a modified/foreign file is left as a CONFLICT — the same
+    # never-clobber default as every other path in this module — and ``--force`` removes
+    # it, backed up first, exactly like a regular uninstall.
+    touched_dirs: set = set()
+    for key in list(records):
+        if key in current_keys:
+            continue
+        dest = _normalized_dest_if_under(key, root)
+        if dest is None:
+            continue  # a different config root's record; not ours this run
+        skill = _skill_of(dest, root)
+        rel = _rel_within_skill(dest, root)
+        rec_hash = records[key].get("hash")
+
+        if _under_symlinked_dir(dest, root):
+            outcomes.append(FileOutcome(
+                skill, rel, dest, CONFLICT,
+                "no longer bundled; a parent directory is a symlink — left untouched "
+                "(remove the symlinked directory manually)"))
+            continue
+
+        if dest.is_symlink():
+            if force and not dry_run:
+                bak = _backup(dest)
+                del records[key]; changed = True
+                touched_dirs.add(dest.parent)
+                outcomes.append(FileOutcome(
+                    skill, rel, dest, REMOVED, f"no longer bundled; symlink backed up to {bak.name}"))
+            elif force and dry_run:
+                outcomes.append(FileOutcome(
+                    skill, rel, dest, REMOVED, "no longer bundled; would back up + remove symlink"))
+            else:
+                outcomes.append(FileOutcome(
+                    skill, rel, dest, CONFLICT,
+                    "no longer bundled; symlink — left (pass --force to remove)"))
+            continue
+
+        if not dest.exists():
+            if not dry_run:
+                del records[key]; changed = True
+            outcomes.append(FileOutcome(skill, rel, dest, NOOP, "no longer bundled; already absent"))
+            continue
+
+        h_disk = _hash_on_disk(dest)
+        ours_unmodified = h_disk is not None and rec_hash is not None and h_disk == rec_hash
+        if ours_unmodified or force:
+            if dry_run:
+                detail = "no longer bundled; would remove" + (
+                    "" if ours_unmodified else " (--force; backing up modified file first)")
+                outcomes.append(FileOutcome(skill, rel, dest, REMOVED, detail))
+                continue
+            try:
+                if ours_unmodified:
+                    dest.unlink()
+                    detail = "no longer bundled"
+                else:
+                    bak = _backup(dest)
+                    detail = f"no longer bundled; modified — backed up to {bak.name}"
+                del records[key]; changed = True
+                touched_dirs.add(dest.parent)
+                outcomes.append(FileOutcome(skill, rel, dest, REMOVED, detail))
+            except OSError as exc:
+                outcomes.append(FileOutcome(skill, rel, dest, ERROR, str(exc)))
+        else:
+            outcomes.append(FileOutcome(
+                skill, rel, dest, CONFLICT,
+                "no longer bundled; modified or foreign — left (pass --force to remove)"))
+
+    if not dry_run:
+        for d in sorted(touched_dirs, key=lambda p: len(p.parts), reverse=True):
+            _prune_empty_dir(d, root)
+
     if changed and not dry_run:
         outcomes.extend(_flush_sidecar(sc_path, records))
     return outcomes
@@ -482,16 +563,15 @@ def _uninstall(
     changed = False
     touched_dirs: set = set()
 
-    def skill_of(dest: Path) -> str:
-        try:
-            return dest.relative_to(root).parts[0]
-        except (ValueError, IndexError):
-            return "?"
-
-    # 1) Our recorded files under THIS run's target root.
-    for key in [k for k in records if _is_under(Path(k), root)]:
-        dest = Path(key)
-        skill = skill_of(dest)
+    # 1) Our recorded files under THIS run's target root. Each key is normalized (but
+    # never symlink-resolved) via :func:`_normalized_dest_if_under` before the
+    # containment check and before deriving skill/rel — see that function's docstring
+    # for why a raw, un-normalized key is not safe to trust here.
+    for key in list(records):
+        dest = _normalized_dest_if_under(key, root)
+        if dest is None:
+            continue
+        skill = _skill_of(dest, root)
         rel = _rel_within_skill(dest, root)
         rec_hash = records[key].get("hash")
 
@@ -570,6 +650,27 @@ def _rel_within_skill(dest: Path, root: Path) -> str:
         return Path(*parts[1:]).as_posix() if len(parts) > 1 else dest.name
     except ValueError:
         return dest.name
+
+
+def _skill_of(dest: Path, root: Path) -> str:
+    """The top-level skill name for a destination under ``root`` (e.g. ``"open-pr"``)."""
+    try:
+        return dest.relative_to(root).parts[0]
+    except (ValueError, IndexError):
+        return "?"
+
+
+def _normalized_dest_if_under(key: str, root: Path) -> Optional[Path]:
+    """A sidecar record ``key`` is untrusted: a corrupted or hand-edited sidecar could
+    contain ``..`` segments that pass ``_is_under``'s literal-string-parents check on the
+    RAW path while the path actually resolves outside ``root`` on disk. Normalize
+    lexically (``os.path.normpath`` — never ``Path.resolve()``, which would follow
+    symlinks and defeat ``_under_symlinked_dir``'s later check) before the containment
+    test, and hand back that SAME normalized path for every subsequent use — never the
+    raw key. Returns ``None`` if the normalized path is not under ``root`` at all (a
+    different config root's record, or a traversal attempt)."""
+    dest = Path(os.path.normpath(key))
+    return dest if _is_under(dest, root) else None
 
 
 # ── Public entry point ────────────────────────────────────────────────────────────
