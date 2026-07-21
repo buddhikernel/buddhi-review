@@ -145,6 +145,45 @@ def test_foreign_is_conflict(env):
     assert dest.read_text(encoding="utf-8") == "someone else's file\n"
 
 
+def test_legacy_manual_copy_is_adopted(env):
+    """A raw ``cp -R`` copy left by the pre-F2 README (unstamped bytes, no sidecar record)
+    is provably unmodified, so a plain re-run adopts it: stamped, recorded, no --force."""
+    root = skill_install.bundled_skills_root()
+    for skill, rel, src in _src_files():
+        dest = env.target / skill / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")  # raw, unstamped
+
+    summary = skill_install.install_skills()
+    assert not summary.had_error
+    # Stamped files are adopted via UPDATE; a file the transform leaves alone (no YAML
+    # frontmatter) is already byte-current, so it lands as NOOP — recorded either way.
+    assert set(_actions(summary).values()) <= {skill_install.UPDATE, skill_install.NOOP}
+    assert _actions(summary)[("review-pr", "SKILL.md")] == skill_install.UPDATE
+    recs = json.loads(env.sidecar.read_text())["files"]
+    for skill, rel, src in _src_files():
+        dest = env.target / skill / rel
+        assert content_hash(dest.read_text(encoding="utf-8")) == _expected_hash(src)
+        assert recs[str(dest)] == {"version": package_version(), "hash": _expected_hash(src)}
+        assert not list(dest.parent.glob(f"{dest.name}.bak-*"))  # adoption is not a clobber
+    # And the adopted tree reads back as a clean NOOP on the next run.
+    assert set(_actions(skill_install.install_skills()).values()) == {skill_install.NOOP}
+    assert root.is_dir()
+
+
+def test_edited_legacy_copy_still_conflicts(env):
+    """Adoption is byte-exact: a legacy copy the user then EDITED is still a CONFLICT."""
+    src = skill_install.bundled_skills_root() / "review-pr" / "SKILL.md"
+    dest = env.target / "review-pr" / "SKILL.md"
+    dest.parent.mkdir(parents=True)
+    edited = src.read_text(encoding="utf-8") + "\n# my own edit\n"
+    dest.write_text(edited, encoding="utf-8")
+
+    summary = skill_install.install_skills()
+    assert _actions(summary)[("review-pr", "SKILL.md")] == skill_install.CONFLICT
+    assert dest.read_text(encoding="utf-8") == edited  # untouched
+
+
 def test_symlink_is_conflict_not_followed(env):
     outside = env.tmp / "secret.txt"
     outside.write_text("do not touch\n", encoding="utf-8")

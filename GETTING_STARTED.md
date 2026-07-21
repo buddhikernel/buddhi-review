@@ -253,7 +253,7 @@ repository configuration. Otherwise, it hands the PR back to you for merging.
 
 ## 6. Advanced: drive the CLI directly
 
-Most first-time users stay with `/review-pr` and `/create-pr`. To skip the slash
+Most first-time users stay with `/review-pr` and `/open-pr`. To skip the slash
 commands and drive the loop yourself:
 
 ```bash

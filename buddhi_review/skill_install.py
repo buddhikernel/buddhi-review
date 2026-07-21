@@ -11,7 +11,9 @@ Design invariants (why this module is careful):
 
   * **The safe default never clobbers.** A destination that does not hash-match anything
     we recorded — a user edit, a foreign file, or a symlink — is a CONFLICT and is left
-    exactly as-is. ``force=True`` is the ONLY way to overwrite one, and it moves the
+    exactly as-is. The one exception is *adoption*: a file byte-equal to the PRISTINE
+    bundled source (the raw, unstamped bytes the pre-F2 README's ``cp -R`` snippet left
+    behind) is provably unmodified, so it is restamped and recorded rather than flagged. ``force=True`` is the ONLY way to overwrite one, and it moves the
     existing file to a ``.bak-<ts>`` sidecar first. There is no interactive prompt path:
     ``force`` is the sole signal, so a non-interactive re-sync (the upgrade path) that
     passes ``force=False`` is always safe, in a TTY or a pipe alike.
@@ -128,7 +130,7 @@ def target_root() -> Path:
     """Where skills install: ``$CLAUDE_CONFIG_DIR/skills`` if that env var is set, else
     ``~/.claude/skills``. Resolved ONCE per run so every sidecar key shares one root."""
     override = os.environ.get("CLAUDE_CONFIG_DIR")
-    base = Path(override) if override else Path.home() / ".claude"
+    base = Path(override).expanduser().resolve() if override else Path.home() / ".claude"
     return base / "skills"
 
 
@@ -136,7 +138,7 @@ def sidecar_path() -> Path:
     """The global provenance sidecar: ``$XDG_CONFIG_HOME/buddhi/installed-skills.json``
     if that env var is set, else ``~/.config/buddhi/installed-skills.json``."""
     xdg = os.environ.get("XDG_CONFIG_HOME")
-    base = Path(xdg) if xdg else Path.home() / ".config"
+    base = Path(xdg).expanduser().resolve() if xdg else Path.home() / ".config"
     return base / "buddhi" / "installed-skills.json"
 
 
@@ -322,7 +324,8 @@ def _prune_empty_dir(d: Path, stop: Path) -> None:
 
 # ── The install / update path ─────────────────────────────────────────────────────
 
-def _decide_action(dest: Path, root: Path, h_cur: str, h_rec: Optional[str]) -> str:
+def _decide_action(dest: Path, root: Path, h_cur: str, h_rec: Optional[str],
+                   h_raw: Optional[str] = None) -> str:
     """The 3-way state for one destination (see the module docstring)."""
     if dest.is_symlink() or _under_symlinked_dir(dest, root):
         return CONFLICT
@@ -336,6 +339,17 @@ def _decide_action(dest: Path, root: Path, h_cur: str, h_rec: Optional[str]) -> 
     if h_disk == h_cur:
         return NOOP
     if h_rec is not None and h_disk == h_rec:
+        return UPDATE
+    # ADOPTION: the pre-F2 README told users to ``cp -R`` the bundled skills straight into
+    # ~/.claude/skills, which leaves the RAW (pre-transform, unstamped) bundled bytes on
+    # disk and no sidecar record at all. Such a file matches neither ``h_cur`` (stamped)
+    # nor ``h_rec`` (absent), so without this branch the documented upgrade — a plain
+    # ``install-skills`` — would report it as a conflict and never take it under
+    # provenance unless the user found ``--force``. Byte-equality with the pristine
+    # bundled source PROVES the file is unmodified, so restamping it is not a clobber:
+    # only the version-stamp line changes. A legacy copy of an OLDER release whose content
+    # has since changed matches nothing provable and stays a CONFLICT, by design.
+    if h_raw is not None and h_disk == h_raw:
         return UPDATE
     return CONFLICT
 
@@ -363,8 +377,11 @@ def _install(
             written = apply_transforms(raw, ctx={"version": version})
             h_cur = content_hash(written)
             h_rec = (records.get(key) or {}).get("hash")
+            # Hash of the UNtransformed bundled source — the fingerprint of a legacy
+            # manual ``cp -R`` copy; see the adoption branch in :func:`_decide_action`.
+            h_raw = content_hash(raw)
 
-            action = _decide_action(dest, root, h_cur, h_rec)
+            action = _decide_action(dest, root, h_cur, h_rec, h_raw)
             detail = ""
 
             # A CONFLICT caused by a symlinked ANCESTOR directory can never be resolved by
