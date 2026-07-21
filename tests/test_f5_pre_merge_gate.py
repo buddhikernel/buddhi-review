@@ -45,8 +45,7 @@ class CiGh(GhRecorder):
         if argv[:3] == ["gh", "pr", "checks"]:
             payload = "" if self._rows is None else json.dumps(self._rows)
             return subprocess.CompletedProcess(argv, 0, stdout=payload, stderr="")
-        out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        return self._reply(argv)
 
 
 LABEL_CI = {"active_reviewers": ["claude"], "auto_on_open": {"claude": False},
@@ -494,8 +493,7 @@ def _mergeable_gh(view_payload, *, checks_seq=None, view_seq=None):
             box["poll"] += 1
             return subprocess.CompletedProcess(
                 argv, 0, stdout=json.dumps(checks_seq[i]), stderr="")
-        out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        return GhRecorder._reply(argv)
     return run
 
 
@@ -621,8 +619,7 @@ def test_nonlabel_gate_is_fail_soft_on_gh_error():
             joined = " ".join(argv)
             if argv[:3] == ["gh", "pr", "view"] and "mergeable" in joined:
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="gh boom")
-            out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
-            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+            return self._reply(argv)
 
     gh = _ViewErrGh()
     driver, clock, _ = make_driver(timeline, cfg=CLAUDE_ONLY, gh=gh, auto_merge=True)
@@ -710,8 +707,7 @@ class _ClaudeSummonFailGh(GhRecorder):
         self.calls.append(list(argv))
         if argv[:3] == ["gh", "pr", "comment"] and any("@claude" in a for a in argv):
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no perms")
-        out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
-        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        return self._reply(argv)
 
 
 _CLAUDE_AND_COPILOT = {"active_reviewers": ["claude", "copilot"],

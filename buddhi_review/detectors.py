@@ -372,6 +372,26 @@ def bot_for_login(login: str) -> Optional[str]:
     return None
 
 
+def is_placeholder_review_body(body: Optional[str]) -> bool:
+    """Regex-only (LLM-free), FAIL-CLOSED test: does ``body`` read as a can't-review
+    PLACEHOLDER — quota exhausted / PR too large / a transient review error — rather
+    than a genuine review of its commit?
+
+    Used by the head-aware merge gate (:func:`round_driver._genuine_review_shas_by_bot`)
+    to refuse a commit-sha credit for a placeholder body: a quota / PR-too-large /
+    transient-error top-level review is a RESPONSE, not a review of the commit it
+    carries. Deliberately the RAW cause regexes (not :func:`detect_signal`'s
+    disambiguated path) and LLM-free by design — the gate must stay I/O-free and must
+    OVER-block: a body that merely ECHOES placeholder vocabulary drops its sha, so a
+    false match yields a recoverable handback, NEVER a false credit of an unreviewed
+    head as reviewed. Empty / None → False (an empty body is handled by the caller's
+    APPROVED-state check, not here)."""
+    if not body:
+        return False
+    return bool(QUOTA_RE.search(body) or PR_TOO_LARGE_RE.search(body)
+                or ERRORED_RE.search(body))
+
+
 def is_clean_review(text: str) -> bool:
     """Tier 1 — deterministic: a clean pattern matches AND no actionable review
     prose follows the matched sentence.

@@ -526,12 +526,20 @@ def squash_merge(
     repo: Optional[str] = None,
     enabled: bool = False,
     cwd: Optional[str] = None,
+    match_head: Optional[str] = None,
     run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
     notice: Callable[..., str] = automation_notice,
 ) -> bool:
     """Squash-merge ``pr`` + delete its branch, iff opted in. Returns True only
     on a completed merge. Never rebases, never force-pushes — a dirty/behind PR
-    simply fails the merge and is reported as a fallback."""
+    simply fails the merge and is reported as a fallback.
+
+    ``match_head`` (the head-aware merge gate's verified reviewed head): when set,
+    ``gh pr merge --match-head-commit <sha>`` makes GitHub ABORT the merge if the PR
+    head has moved past that commit between the gate and the merge — so an unreviewed
+    push that lands in that window can never be the merged head. A rejected pin is
+    reported as a fallback (the loop hands the PR back rather than merging a head no
+    reviewer signed off on)."""
     if not enabled:
         notice(
             "squash-merge", f"PR #{pr} left open",
@@ -545,6 +553,8 @@ def squash_merge(
     notice("squash-merge", f"landing PR #{pr} — squash-merge + delete branch", status="do",
            hint="disable: --no-auto-merge")
     argv = ["gh", "pr", "merge", str(pr), "--squash", "--delete-branch"]
+    if match_head:
+        argv += ["--match-head-commit", match_head]
     if repo:
         argv += ["-R", repo]
     try:
@@ -554,6 +564,14 @@ def squash_merge(
         return False
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()[:200]
+        low = detail.lower()
+        if match_head and ("match-head-commit" in low or "head branch was modified" in low
+                           or "not the most recent" in low):
+            notice("squash-merge",
+                   f"merge aborted: PR #{pr} head moved past the reviewed commit "
+                   f"{match_head[:7]} (--match-head-commit guard) — a push landed after "
+                   f"the review; handing back", status="fallback")
+            return False
         notice("squash-merge", f"merge failed: {detail}", status="fallback")
         return False
     notice("squash-merge", f"PR #{pr} landed — squash-merged, branch deleted", status="done")

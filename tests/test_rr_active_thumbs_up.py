@@ -24,7 +24,7 @@ import json
 import subprocess
 from datetime import datetime, timezone
 
-from buddhi_review import gh_ingest
+from buddhi_review import detectors, gh_ingest
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.fix_apply import FixOutcome
 from buddhi_review.loop import Comment
@@ -70,12 +70,22 @@ class FakeNotifier:
         pass
 
 
+# The constant local HEAD this restart harness reports. Every restored approval
+# and every seeded review anchors to it (staleness is out of scope for these
+# tests — the head does not move), so the F2 head-aware gate resolves cleanly.
+HEAD_SHA = "restarthead0000"
+
+
 class Gh:
     def __init__(self):
         self.calls = []
 
     def __call__(self, argv, *, cwd=None, timeout=None):
         self.calls.append(list(argv))
+        if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
+            return subprocess.CompletedProcess(argv, 0, stdout=HEAD_SHA + "\n", stderr="")
+        if argv[:2] == ["git", "merge-base"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
@@ -94,6 +104,14 @@ def make_driver(comments, *, reactions=(), cfg=None, **kw):
         fix_dispatch=lambda c, r: FixOutcome(status="applied"),
         fetch=lambda pr, repo=None, cwd=None: list(comments),
         reactions_fetch=lambda pr, repo=None, cwd=None: list(reactions),
+        # F2 head-aware gate: model the raw pulls/<pr>/reviews payload — each seeded
+        # comment is a review anchored to the current head (a bare +1 / issue-channel
+        # sentinel is sha-less and rides the restore's clean-signal anchor instead).
+        reviews_fetch=lambda pr, repo=None, cwd=None: [
+            {"user": {"login": c.source}, "commit_id": HEAD_SHA,
+             "body": c.text, "state": "COMMENTED"} for c in comments
+            if detectors.bot_for_login(c.source) is not None],
+        inline_fetch=lambda pr, repo=None, cwd=None: [],
         threads_fetch=lambda pr, repo=None, cwd=None: [],
         resolve_thread=lambda thread_id, cwd=None: True,
         gh_run=gh, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",

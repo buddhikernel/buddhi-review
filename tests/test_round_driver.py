@@ -38,14 +38,39 @@ class FakeNotifier:
         pass
 
 
+# The constant local HEAD the default gh fake reports for `git rev-parse HEAD`.
+# The head-aware merge gate (F2) reads the merged head + the substantive boundary
+# from local git and anchors reviews to commit shas; with a single constant head
+# every review a reviewed PR carries anchors to it and the gate passes exactly
+# where the old name-based gate did. Tests that exercise STALENESS use their own
+# multi-sha gh fake + reviews_fetch/inline_fetch (see test_head_aware_merge_gate).
+HEAD_SHA = "headsha00000000"
+
+
 class GhRecorder:
-    """Records every gh/git/test spawn; answers `git status` with a dirty tree."""
+    """Records every gh/git/test spawn; answers `git status` with a dirty tree,
+    `git rev-parse HEAD` with the constant :data:`HEAD_SHA`, and
+    `git merge-base --is-ancestor` as satisfied (rc 0) — so the F2 head-aware
+    merge gate resolves a stable single-commit head in the network-free harness.
+
+    A subclass that overrides ``__call__`` for its own gh answers should record the
+    call itself and fall through to :meth:`_reply` (NOT ``super().__call__``, which
+    would re-record) so the F2 git reads still get answered."""
     def __init__(self):
         self.calls = []
-    def __call__(self, argv, *, cwd=None, timeout=None):
-        self.calls.append(list(argv))
+    @staticmethod
+    def _reply(argv):
+        """The canned reply for the common git reads (F2 gate + round loop),
+        WITHOUT recording — the caller has already appended to ``self.calls``."""
+        if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
+            return subprocess.CompletedProcess(argv, 0, stdout=HEAD_SHA + "\n", stderr="")
+        if argv[:2] == ["git", "merge-base"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+    def __call__(self, argv, *, cwd=None, timeout=None):
+        self.calls.append(list(argv))
+        return self._reply(argv)
     def matching(self, *needles):
         return [c for c in self.calls if all(any(n in a for a in c) for n in needles)]
 
@@ -104,6 +129,18 @@ def make_driver(timeline, *, cfg, clock=None, gh=None, times=None, classify=None
         return [c for t, c in timeline if t <= clock.t]
     def fetch_reactions(pr, repo=None, cwd=None):
         return [r for t, r in (reactions or []) if t <= clock.t]
+    def reviews_fetch(pr, repo=None, cwd=None):
+        # F2 head-aware gate: model the raw pulls/<pr>/reviews payload. Every
+        # visible bot comment is a review anchored to the current head (HEAD_SHA);
+        # a placeholder body is still dropped by the gate, a clean / actionable
+        # body credits the bot at the merged head. Reactions + issue-channel
+        # sentinels are sha-less and ride the driver's own clean-signal anchor.
+        return [{"user": {"login": c.source}, "commit_id": HEAD_SHA,
+                 "body": c.text, "state": "COMMENTED"}
+                for t, c in timeline
+                if t <= clock.t and detectors.bot_for_login(c.source) is not None]
+    def inline_fetch(pr, repo=None, cwd=None):
+        return []
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier()))
     # make_driver models a FRESH launch — the timeline's comments arrive DURING
     # the round (after a summon), so preflight (the pre-round-1 snapshot of a PR's
@@ -115,6 +152,10 @@ def make_driver(timeline, *, cfg, clock=None, gh=None, times=None, classify=None
     # its own threads_fetch / resolve_thread (e.g. a FakeThreads) via **kw.
     kw.setdefault("threads_fetch", lambda pr, repo=None, cwd=None: [])
     kw.setdefault("resolve_thread", lambda thread_id, cwd=None: True)
+    # F2 head-aware merge-gate seams: default to the timeline-derived raw reviews
+    # above (reviewed PR → reviewed at HEAD_SHA); a staleness test overrides them.
+    kw.setdefault("reviews_fetch", reviews_fetch)
+    kw.setdefault("inline_fetch", inline_fetch)
     driver = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg, adapter=adapter,
         classify_runner=classify or label_runner("INVALID"),

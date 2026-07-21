@@ -24,7 +24,7 @@ import subprocess
 
 import pytest
 
-from buddhi_review import polish_state, round_driver
+from buddhi_review import detectors, polish_state, round_driver
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.fix_apply import FixOutcome
 from buddhi_review.loop import Comment
@@ -102,10 +102,21 @@ class GhHead:
         out = ""
         if argv[:3] == ["git", "status", "--porcelain"]:
             out = " M x.py\n"
-        elif ".head.sha" in argv:
+        elif ".head.sha" in argv or (argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD"):
+            # Both the polish tip guard (`gh api …/pulls -q .head.sha`) and the F2
+            # head-aware gate (`git rev-parse HEAD`) read the SAME moving tip here.
             if self.head_fails:
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
             out = self.head + "\n"
+        elif argv[:2] == ["git", "merge-base"]:
+            # --is-ancestor <a> <b>: rc 0 iff a is an ancestor of (or ==) b. Model
+            # the H0 < H1 tip order by the numeric suffix, so a review anchored to
+            # the pre-fix head H0 no longer lies in [H1, H1] after a substantive push.
+            a, b = argv[-2], argv[-1]
+            def _n(h):
+                return int(h[1:]) if h[:1] == "H" and h[1:].isdigit() else -1
+            return subprocess.CompletedProcess(argv, 0 if _n(a) <= _n(b) else 1,
+                                               stdout="", stderr="")
         elif argv[:3] == ["gh", "repo", "view"]:
             if self.name_with_owner is None:
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="no remote")
@@ -135,14 +146,34 @@ def classify(prompt):
 def make_driver(timeline, *, gh, cfg=None, clock=None, repo=REPO, **kw):
     clock = clock or FakeClock()
 
-    def fetch(pr, repo=None, cwd=None):
+    def _visible():
         return [c for t, c in timeline if t <= clock.t]
+
+    def fetch(pr, repo=None, cwd=None):
+        return _visible()
+
+    def reviews_fetch(pr, repo=None, cwd=None):
+        # F2 head-aware gate: a review-body comment (no inline path) is a review
+        # anchored to the CURRENT tip (gh.head — which advances H0→H1 on a push),
+        # so a finding a reviewer posted on an earlier head reads as reviewing that
+        # head, not the post-fix one.
+        return [{"user": {"login": c.source}, "commit_id": gh.head,
+                 "body": c.text, "state": "COMMENTED"}
+                for c in _visible()
+                if not c.path and detectors.bot_for_login(c.source) is not None]
+
+    def inline_fetch(pr, repo=None, cwd=None):
+        return [{"user": {"login": c.source}, "original_commit_id": gh.head}
+                for c in _visible()
+                if c.path and detectors.bot_for_login(c.source) is not None]
 
     kw.setdefault("preflight", False)
     kw.setdefault("threads_fetch", lambda pr, repo=None, cwd=None: [])
     kw.setdefault("resolve_thread", lambda thread_id, cwd=None: True)
     kw.setdefault("answer_waiter", lambda esc, **k: {})
     kw.setdefault("fix_dispatch", lambda c, r: FixOutcome(status="applied"))
+    kw.setdefault("reviews_fetch", reviews_fetch)
+    kw.setdefault("inline_fetch", inline_fetch)
     driver = RoundDriver(
         PR, repo=repo, cwd="/nonexistent", cfg=cfg or FLEET,
         adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),

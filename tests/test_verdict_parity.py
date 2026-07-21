@@ -41,6 +41,7 @@ from pathlib import Path
 
 import pytest
 
+from buddhi_review import detectors
 from buddhi_review.actuators import FixDispatch
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.classify import classify_comment
@@ -158,13 +159,26 @@ class _FakeNotifier:
         pass
 
 
+# The constant local HEAD this harness reports for `git rev-parse HEAD`. Every
+# review a fixture's reviewer posts anchors to it, so the F2 head-aware merge gate
+# resolves a stable single-commit head (staleness is out of scope for parity).
+_HEAD_SHA = "headsha00000000"
+
+
 class _GhRecorder:
     """Answers every gh/git/test spawn with rc=0; a dirty `git status` so a
-    commit path (unused here, push=False) would have something to add."""
+    commit path (unused here, push=False) would have something to add;
+    `git rev-parse HEAD` → :data:`_HEAD_SHA` and `git merge-base --is-ancestor`
+    → satisfied, so the F2 head-aware merge gate resolves the merged head."""
 
     def __call__(self, argv, *, cwd=None, timeout=None):
-        out = " M x.py\n" if list(argv)[:3] == ["git", "status", "--porcelain"] else ""
-        return subprocess.CompletedProcess(list(argv), 0, stdout=out, stderr="")
+        argv = list(argv)
+        if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
+            return subprocess.CompletedProcess(argv, 0, stdout=_HEAD_SHA + "\n", stderr="")
+        if argv[:2] == ["git", "merge-base"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
+        return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
 
 def _body_keyed_runner(fixture: dict):
@@ -246,6 +260,14 @@ def _drive(fixture: dict):
     def fetch(pr, repo=None, cwd=None):
         return [c for t, c in timeline if t <= clock.t]
 
+    def reviews_fetch(pr, repo=None, cwd=None):
+        # F2 head-aware gate: model the raw pulls/<pr>/reviews payload — each
+        # visible bot comment is a review anchored to the current head (_HEAD_SHA).
+        return [{"user": {"login": c.source}, "commit_id": _HEAD_SHA,
+                 "body": c.text, "state": "COMMENTED"}
+                for t, c in timeline
+                if t <= clock.t and detectors.bot_for_login(c.source) is not None]
+
     auto_actions = set()
 
     def notice(action, detail="", *, status="do", hint=None, stream=None):
@@ -262,6 +284,8 @@ def _drive(fixture: dict):
         classify_runner=_body_keyed_runner(fixture),
         fix_dispatch=_fix_dispatch(fixture),
         fetch=fetch,
+        reviews_fetch=reviews_fetch,
+        inline_fetch=lambda pr, repo=None, cwd=None: [],
         # Network-free thread-gate seams: no threads → the pre-merge thread gate is
         # a silent no-op, so the parity grade stays the verdict-level auto-action
         # SET (merge + exclusion), free of gh/GraphQL spawns.
