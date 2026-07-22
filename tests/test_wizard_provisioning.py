@@ -833,9 +833,58 @@ def test_set_claude_secret_present_and_probe_cant_tell_stays_present(monkeypatch
     assert status == "present"
 
 
+def test_set_claude_secret_both_present_and_401_enters_remint(monkeypatch):
+    # A co-present ANTHROPIC_API_KEY is NOT cover for an expired OAuth token: the
+    # bundled workflow passes anthropic_api_key ONLY when CLAUDE_CODE_OAUTH_TOKEN is
+    # empty, so a repo holding BOTH still runs its reviews on the OAuth token alone.
+    # A 401 there must enter the re-mint flow, not report "present" while the reviews
+    # stay red.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, _ = _recorder(_exists_router(
+        owner_type="User",
+        repo_secrets=["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    probe_calls = {"n": 0}
+
+    def probe(repo, **k):
+        probe_calls["n"] += 1
+        assert repo == "alice/widgets"
+        return True
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "", pal=pal, stream=buf, auth_probe=probe,
+        single_select=_consenting_select())
+    assert status == "skipped"          # entered the mint flow; a blank paste → by-hand
+    assert probe_calls["n"] == 1
+    out = buf.getvalue()
+    assert "failing" in out and "re-mint" in out
+
+
+def test_set_claude_secret_both_present_and_clean_stays_present(monkeypatch):
+    # The companion guard: probing a repo that holds BOTH must not disturb the skip
+    # when the stored OAuth token is working — no mint, no paste, no secret set.
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    run, calls = _recorder(_exists_router(
+        owner_type="User",
+        repo_secrets=["CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]))
+    pal, buf = wizard._Palette(False), io.StringIO()
+    getpass_calls = {"n": 0}
+
+    def gp(*a):
+        getpass_calls["n"] += 1
+        return "tok"
+    status = wizard._set_claude_secret(
+        "alice/widgets", run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=gp, pal=pal, stream=buf, auth_probe=lambda repo, **k: False)
+    assert status == "present"
+    assert getpass_calls["n"] == 0
+    assert not any(c["argv"][:3] == ["gh", "secret", "set"] for c in calls)
+
+
 def test_set_claude_secret_anthropic_present_never_probes(monkeypatch):
-    # ADVERSARIAL CLAIM #2 guard: a working ANTHROPIC_API_KEY backs the repo → keep
-    # the skip WITHOUT probing (the probe only knows the OAuth token's 401).
+    # ADVERSARIAL CLAIM #2 guard: with ANTHROPIC_API_KEY the SOLE credential there is
+    # no stored OAuth token to probe or re-mint — the key is what the workflow uses —
+    # so keep the skip WITHOUT probing (the probe only knows the OAuth token's 401).
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     run, _ = _recorder(_exists_router(owner_type="User",
                                       repo_secrets=["ANTHROPIC_API_KEY"]))

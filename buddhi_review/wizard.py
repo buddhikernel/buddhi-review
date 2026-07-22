@@ -1868,11 +1868,14 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     it, validating it BEFORE the store, and RE-MINTING a stored one that has gone
     bad. Returns a short status string.
 
-    Dual-credential (FREE): either credential satisfies the workflow — the
-    pay-as-you-go ``ANTHROPIC_API_KEY`` or the subscription
-    ``CLAUDE_CODE_OAUTH_TOKEN`` — and the bundled template accepts both, so the
-    prompt is SKIPPED when EITHER is already present. The existence check is
-    org-aware: an org-set secret won't appear in ``gh secret list --repo``.
+    Dual-credential (FREE): the bundled template authenticates off either the
+    subscription ``CLAUDE_CODE_OAUTH_TOKEN`` or the pay-as-you-go
+    ``ANTHROPIC_API_KEY``, so the mint prompt is SKIPPED when EITHER is already
+    present. The two are NOT interchangeable at RUNTIME, though: the template passes
+    ``anthropic_api_key`` only when the OAuth secret renders EMPTY, so the API key is
+    a fallback for repos that lack OAuth — never a backstop for a stored OAuth token
+    that has gone bad (see Part B). The existence check is org-aware: an org-set
+    secret won't appear in ``gh secret list --repo``.
 
     Part A — verify-before-store (``validate_fn``, defaulting to
     :func:`_validate_claude_token`, injectable for tests). A freshly-pasted token is
@@ -1885,12 +1888,16 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     Part B — re-mint a stored-but-broken token (``auth_probe``, defaulting to
     :func:`detectors.latest_run_token_auth_failed`). GitHub Actions secrets are
     write-only, so a stored token can't be read to test it; the only evidence is the
-    runtime signal. When the OAuth secret already EXISTS (and no working
-    ANTHROPIC_API_KEY backs it), this probes ``repo``'s latest claude-code-review run
-    for a token-401. A 401 → the stored token is broken → enter the re-mint flow
-    (Part A's paste+validate+store, framed as a re-mint). Clean / no run / couldn't
-    tell → keep the skip (``"present"``) — a working or UNKNOWN token is NEVER
-    blind-re-minted. The probe is best-effort and never raises.
+    runtime signal. Whenever the OAuth secret EXISTS — with or without an
+    ANTHROPIC_API_KEY beside it — this probes ``repo``'s latest claude-code-review
+    run for a token-401. A co-present API key is deliberately NOT taken as cover,
+    because the workflow suppresses it while the OAuth secret is set: the stored
+    OAuth token is the credential every review actually runs on, so an expired one
+    fails those reviews even on a repo that also holds a working key. A 401 → the
+    stored token is broken → enter the re-mint flow (Part A's paste+validate+store,
+    framed as a re-mint). Clean / no run / couldn't tell → keep the skip
+    (``"present"``) — a working or UNKNOWN token is NEVER blind-re-minted. The probe
+    is best-effort and never raises.
 
     Safe scoping: the new secret is set on THIS repo only by default (least blast
     radius). When ``repo``'s owner is an Organization an EXPLICIT, separately-
@@ -1907,15 +1914,20 @@ def _set_claude_secret(repo: str, *, run, spawn_command, getpass_fn, pal, stream
     anthropic_present = _gh_secret_exists(repo, "ANTHROPIC_API_KEY", org=org, run=run) is True
     remint = False
     if claude_present or anthropic_present:
-        # Part B — re-mint detection. Probe ONLY when the OAuth token is the sole
-        # credential:
-        # ANTHROPIC_API_KEY satisfies the workflow on its own and is NOT the token
-        # that 401s here, so a working pay-as-you-go key backing the repo keeps the
-        # skip. A token-401 on the latest review run → the stored OAuth token is
-        # broken → fall through to the re-mint flow. Clean / no run / couldn't-tell →
-        # keep the skip (never blind-re-mint a working or unknown token). The probe
-        # is best-effort and never raises.
-        if claude_present and not anthropic_present:
+        # Part B — re-mint detection. Probe whenever the OAuth secret EXISTS, with or
+        # without an ANTHROPIC_API_KEY beside it. A co-present API key is NOT cover:
+        # the bundled template renders `anthropic_api_key` to '' unless
+        # CLAUDE_CODE_OAUTH_TOKEN is empty, so the stored OAuth token is the credential
+        # every review actually runs on. Gating this probe on `not anthropic_present`
+        # would report "present" for a repo holding both while its expired OAuth token
+        # kept the reviews red — the key never gets a chance to serve. With NO OAuth
+        # secret there is nothing to probe or re-mint (the API key is then the
+        # credential in use), so that case keeps the plain skip.
+        # A token-401 on the latest review run → the stored OAuth token is broken →
+        # fall through to the re-mint flow. Clean / no run / couldn't-tell → keep the
+        # skip (never blind-re-mint a working or unknown token). The probe is
+        # best-effort and never raises.
+        if claude_present:
             probe = auth_probe or detectors.latest_run_token_auth_failed
             try:
                 remint = bool(probe(repo, run=run))
