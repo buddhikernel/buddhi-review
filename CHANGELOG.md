@@ -21,6 +21,19 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.7.0](https://github.com/buddhikernel/buddhi-review/compare/v0.6.0...v0.7.0) (2026-07-22)
+
+
+### Features
+
+* **cli:** F2 — provenance-safe install-skills subcommand + doc swap ([#91](https://github.com/buddhikernel/buddhi-review/issues/91)) ([8606087](https://github.com/buddhikernel/buddhi-review/commit/8606087adc121d14d10d8b1eb44cd0a96f17ce2a))
+
+
+### Bug Fixes
+
+* **loop:** F1 — --rr-active re-asks only reviewers without a verdict in hand; persist the polish verdict ([#85](https://github.com/buddhikernel/buddhi-review/issues/85)) ([9f29c66](https://github.com/buddhikernel/buddhi-review/commit/9f29c661b3df4b58465d18d39f0d85ed01ba9185))
+* **loop:** F4 — fix commits no longer sweep editor/backup droppings ([#89](https://github.com/buddhikernel/buddhi-review/issues/89)) ([013e488](https://github.com/buddhikernel/buddhi-review/commit/013e48866c8c8f49db5b11f08bba867fb3af1332))
+
 ## [0.6.0](https://github.com/buddhikernel/buddhi-review/compare/v0.5.0...v0.6.0) (2026-07-18)
 
 
