@@ -1,10 +1,13 @@
+# buddhi-managed-version: 3
+# ^ Buddhi tracks this file's version so `review-pr setup` can offer to update an
+#   outdated installed copy (the old one stays in the update PR's git history).
 name: Claude Code Review
-# buddhi-managed-version: 4
-# Subscription-quota PR reviewer. Auth is CLAUDE_CODE_OAUTH_TOKEN (a
-# subscription Agent SDK credential from `claude setup-token`), NOT
-# ANTHROPIC_API_KEY — so review usage bills to the Claude subscription, never
-# pay-as-you-go API. The token has a 365-day lifetime; a yearly Telegram
-# reminder (see check-claude-token-expiry.sh) flags rotation before it 401s.
+# PR reviewer powered by Claude. Auth uses whichever credential the repo has set:
+# CLAUDE_CODE_OAUTH_TOKEN (a `claude setup-token` subscription credential, so review
+# usage bills to the Claude subscription) or ANTHROPIC_API_KEY (a pay-as-you-go API
+# key). Either works; the job passes both inputs and the action uses whichever
+# secret is set. A subscription OAuth token has a 365-day lifetime; rotate it before
+# it silently 401s (track the issue date and set a calendar reminder ~11 months out).
 on:
   issue_comment:
     types: [created]
@@ -23,7 +26,7 @@ permissions:
 
 jobs:
   review:
-    # Mention-driven only: a human's or review_loop.py's "@claude" comment is
+    # Mention-driven only: a human's or the review loop's "@claude" comment is
     # the sole trigger. Deliberately no `pull_request: synchronize` trigger —
     # otherwise every loop fix-commit push would fire Claude twice (once on the
     # push, once on the loop's own "@claude review" nudge) and race the loop.
@@ -34,7 +37,7 @@ jobs:
     # issue), so ordinary-issue "@claude" mentions never run this job; the
     # `pull_request_review_comment` branch covers review-comment events. The
     # `contains('@claude')` match is intentionally loose (not an exact phrase /
-    # actor allowlist) so BOTH a human and review_loop.py's "@claude review"
+    # actor allowlist) so BOTH a human and the review loop's "@claude review"
     # nudge trigger it; unauthorized-actor protection is already provided by
     # claude-code-action's built-in write-access permission gate.
     if: ${{ contains(github.event.comment.body, '@claude') && (github.event.issue.pull_request || github.event_name == 'pull_request_review_comment') }}
@@ -47,66 +50,61 @@ jobs:
           # changed files rather than stale base-branch contents.
           ref: refs/pull/${{ github.event.issue.number || github.event.pull_request.number }}/head
       - uses: anthropics/claude-code-action@v1
+        # Stable step id so the auth-failure guard below can read this step's
+        # `execution_file` output (the on-disk JSON log of SDK messages).
         id: claude_review
         with:
           # Surface the SDK's per-tool transcript in the Actions log. Without
           # this the SDK redacts everything past the init banner ("Running
           # Claude Code via SDK (full output hidden for security)"), so a
-          # silent-give-up like PR #110 run 26455227886 — `success` with
-          # `permission_denials_count: 1` and zero comments posted — gives no
-          # way to identify which tool was denied. Safe on this repo: the
-          # prompt carries no secrets, and the only env var threaded in is the
-          # OAuth token, which the SDK never echoes.
-          show_full_output: true
-          # Auth: pass the subscription OAuth token as an explicit input.
-          # claude-code-action@v1 no longer reads CLAUDE_CODE_OAUTH_TOKEN from
-          # the step's env: block — runs fail at "Environment variable
-          # validation failed" before reaching the model. The token still has
-          # to be the `claude setup-token` subscription credential (not
-          # ANTHROPIC_API_KEY) so usage bills to the Claude subscription.
+          # silent-give-up — `success` with `permission_denials_count: 1` and
+          # zero comments posted — gives no way to identify which tool was
+          # denied. Defaulting to false here because this is a shipped template:
+          # on a private repo, full output logs every file the SDK reads, which
+          # can expose repository content to anyone with Actions log access.
+          # Set to true temporarily when diagnosing silent tool-denial failures.
+          show_full_output: false
+          # Auth: pass BOTH credentials as explicit inputs and let the action use
+          # whichever secret the repo has set. An unset secret renders to an empty
+          # input, which the action ignores, so a repo that holds only one of the
+          # two still authenticates. claude-code-action@v1 no longer reads the token
+          # from the step's env: block (runs fail at "Environment variable validation
+          # failed" before reaching the model), so both must be explicit inputs.
+          # CLAUDE_CODE_OAUTH_TOKEN (a `claude setup-token` subscription credential)
+          # bills to the Claude subscription; ANTHROPIC_API_KEY bills pay-as-you-go.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          # Three load-bearing prompt contracts the loop depends on:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # Three load-bearing prompt contracts the review loop depends on:
           #
-          # 1. Findings MUST be inline review comments. review_loop.py only
-          #    adds INLINE review comments to its fix batch (poll_and_yield_
-          #    comments' inline branch); top-level review bodies and PR-level
-          #    issue comments are scanned only for clean/quota/error signals,
-          #    never fixed. A substantive finding placed in the top-level
-          #    comment would be ignored and merged past. So the prompt forces
-          #    every finding inline and reserves the top-level comment for the
-          #    clean sentinel alone.
+          # 1. Findings MUST be inline review comments. The review loop only
+          #    processes inline review comments in its fix batch; top-level
+          #    review bodies and PR-level issue comments are scanned only for
+          #    clean/quota/error signals, never fixed. A substantive finding
+          #    placed in the top-level comment would be ignored and merged past.
+          #    So the prompt forces every finding inline and reserves the
+          #    top-level comment for the clean sentinel alone.
           # 2. The trailing "No issues found." sentinel is load-bearing: it
-          #    matches review_loop.py's existing CLEAN_REVIEW_PATTERNS[0]
+          #    matches the review loop's clean-review detector pattern
           #    (r"no (issues?|...) (found|detected|to report)") with no
-          #    "but/however", so the loop's generic clean-review detector flips
-          #    Claude to voluntarily-done with zero Claude-specific regexes.
-          #    CLEAN_REVIEW_PATTERNS[0] has no mixed-feedback negative
-          #    lookahead, so contract 1 (findings never share the top-level
-          #    comment with the sentinel) is what keeps a dirty review from
-          #    being misread as clean.
-          #    Strengthened 2026-06-14 after PR #277 run 27500576358: on a clean
-          #    RE-review (round 2, prior findings now resolved) Claude reviewed
-          #    fine (success, 15 turns, $1.35, result text literally said "No
-          #    issues found.") but only NARRATED the sentinel in its final
-          #    message instead of POSTING it — zero comments on the PR. The loop
-          #    sees only POSTED comments, so it stayed "waiting on claude" for
-          #    the full 30-min MAX_WAIT_TOTAL ceiling each round. The prompt now
-          #    makes the POST a mandatory, operational FINAL action and spells
-          #    out that an unposted sentinel is invisible. A workflow POST-STEP
-          #    posting the sentinel was rejected: review_loop's bot_key credits
-          #    the clean signal ONLY to login `claude[bot]` (the Claude GitHub
-          #    App), and a plain step authenticates as `github-actions[bot]`,
-          #    which the loop never maps to claude — so only Claude posting it
-          #    (or a re-invocation of THIS action) authors it correctly.
+          #    "but/however", so the loop flips Claude to voluntarily-done with
+          #    zero Claude-specific regexes. The detector has no mixed-feedback
+          #    negative lookahead, so contract 1 (findings never share the
+          #    top-level comment with the sentinel) is what keeps a dirty review
+          #    from being misread as clean.
+          #    The sentinel only counts when POSTED as a PR comment: the review
+          #    loop reads comments on the PR, never the action's final message,
+          #    so the prompt below makes posting it a mandatory FINAL action.
+          #    A narrated-but-unposted sentinel reads as "no review" and stalls
+          #    the loop until it times out. This holds on a clean re-review too:
+          #    nothing left to flag still requires POSTING the sentinel.
           # 3. The PR number is PINNED into the prompt via GitHub Actions
           #    expression interpolation. Without this, claude-code-action@v1
           #    no longer auto-injects "you are reviewing PR #N" context, and
           #    Claude runs `gh pr list`, sees multiple open PRs, and bails out
           #    by calling the built-in AskUserQuestion tool — which in a
           #    headless Actions runner is a silent-give-up: the action exits
-          #    `success` with zero comments posted. Observed on PRs #122 and
-          #    #123 (runs 26571387658 / 26571013791 on 2026-05-28). Paired
-          #    with `--disallowedTools "AskUserQuestion"` in claude_args below,
+          #    `success` with zero comments posted. Paired with
+          #    `--disallowedTools "AskUserQuestion"` in claude_args below,
           #    which removes the escape hatch so any prompt ambiguity surfaces
           #    as a tool denial in the log rather than a silent no-op.
           #    For `issue_comment` events, the PR number is at
@@ -114,17 +112,6 @@ jobs:
           #    `pull_request_review_comment`, it's at
           #    `github.event.pull_request.number`. One of those is always set
           #    given the `on:` triggers above.
-          #
-          # The "classify changed files" rubric in the prompt below names this
-          # repo's own buddhi/ and buddhi-*/ paths. It is INTENTIONALLY retained
-          # in this workflow and in the copy the setup wizard installs into a
-          # user's repo as their .github/workflows/claude-code-review.yml.
-          # It is INERT for any repo that has no buddhi/ or buddhi-*/ files: that
-          # branch of the rubric never matches, so every changed file falls
-          # through to the standard code-review criteria — a third-party install
-          # is not silently down-graded. Keep this rubric block in every installed
-          # copy so a one-click install ships the same reviewer behavior; a
-          # round-1 removal of it was reverted and round 2 kept it.
           prompt: >-
             You are reviewing pull request
             #${{ github.event.issue.number || github.event.pull_request.number }}
@@ -164,75 +151,70 @@ jobs:
             until you have POSTED the sentinel.
 
 
-            Before reviewing, classify changed files. This repo has two
-            disjoint halves (see README.md and CLAUDE.md). If ANY changed file
-            lies under `buddhi/` (EXCEPT files under `buddhi/roadmap/`, which
-            carry the one acknowledged exception — the roadmap renderer is
-            executable Python) OR under an adapter sibling folder (`buddhi-*/`,
-            e.g. `buddhi-review/`, `buddhi-n8n/`), apply design-review
-            criteria to those files: these folders are design-only — do NOT
-            suggest adding tests, implementations, refactors, or type hints for
-            those files; DO check naming/routing-table consistency,
-            canonical-home cross-reference discipline, and that internal-only
-            folders (`buddhi/monetization/`, `buddhi/ip-and-legal/`,
-            `buddhi/meta/`, and all `buddhi-*/` adapter siblings) are not being
-            re-exposed in public-facing indexes or links. For files outside
-            `buddhi/` and `buddhi-*/` AND for files under `buddhi/roadmap/`,
-            apply standard code-review criteria from `CLAUDE.md` and
-            `docs/architecture/review-loop-flags.md` (flag contracts, `/tmp`
-            path convention via `tmp_paths.py`, test coverage in `tests/` for
-            business-logic changes). Mixed PRs apply both rubrics file-by-file.
+            Before reviewing, classify each changed file by the part of the
+            codebase it belongs to and apply the repository's own conventions.
+            If the repo documents review or contribution standards (for example
+            in README.md, CONTRIBUTING.md, or an agent-instruction file such as
+            CLAUDE.md or AGENTS.md), read them and apply them alongside the
+            standard criteria above. Review documentation-only and
+            design/planning files for clarity, naming, and cross-reference
+            consistency rather than for test coverage or implementation detail;
+            give code files the full logic, security, and test-coverage review.
+            Mixed PRs apply both rubrics file-by-file.
           # claude_args: explicit allowlist is REQUIRED. Without it the SDK
-          # denies every GitHub tool call (observed on PR #79 run
-          # 26262677561: 16 permission_denials, zero comments posted, SDK
-          # still exits "success"). Tools mirror anthropics/claude-code-action's
-          # own examples/pr-review-*.yml:
+          # denies every GitHub tool call (permission_denials, zero comments
+          # posted, SDK still exits "success"). Tools mirror
+          # anthropics/claude-code-action's own examples/pr-review-*.yml:
           #   - mcp__github_inline_comment__create_inline_comment: the MCP
           #     tool the action ships for posting inline review comments
-          #     (the only finding channel the local review loop consumes).
+          #     (the only finding channel the review loop consumes).
           #   - Bash(gh pr comment:*): needed so Claude can post the
-          #     load-bearing top-level "No issues found." sentinel that
-          #     CLEAN_REVIEW_PATTERNS[0] matches on a clean review.
+          #     load-bearing top-level "No issues found." sentinel that the
+          #     clean-review detector matches on a clean review.
           #   - Bash(gh pr diff:*) / Bash(gh pr view:*): read-only context
           #     fetches Claude uses while reviewing.
           #   - Read / Glob / Grep: read-only filesystem access so Claude can
           #     open individual changed files for full context on multi-file
-          #     PRs. Without these, observed on PR #83 (15 files): 12
-          #     permission_denials, Claude gave up without posting EITHER
-          #     inline findings OR the "No issues found." sentinel, and the
-          #     loop's quiet-bot ask gate kept re-poking. Safe because the job
-          #     already has `contents: read` and no write tools.
-          # Added 2026-05-27 after PR #110 run 26455227886 silent-give-up:
+          #     PRs. Without these, Claude gave up without posting EITHER
+          #     inline findings OR the "No issues found." sentinel on large
+          #     PRs, and the loop's quiet-bot ask gate kept re-poking. Safe
+          #     because the job already has `contents: read` and no write tools.
           #   - Bash(gh pr review:*): Claude reaches for `gh pr review --comment`
           #     as a natural alternative to `gh pr comment` for the top-level
           #     sentinel; without it the model gives up after the denial
           #     instead of falling back to `gh pr comment`.
-          #   - Bash(gh api:*): on large PRs (110 had 36 changed files) Claude
-          #     pages `gh api repos/.../pulls/<n>/files` for full per-file diff
-          #     context past `gh pr diff`'s default. The job's GITHUB_TOKEN
-          #     still gates writes (contents: read), so this stays read-only
-          #     for repo contents.
-          # Added 2026-05-28 after PR #122 / #123 silent-give-up (runs
-          # 26571387658 / 26571013791): the built-in AskUserQuestion tool is
-          # implicitly available to the SDK and was Claude's escape hatch when
-          # the prompt didn't pin a PR — Claude called it, the headless runner
-          # could never answer, and the action terminated `success` with zero
-          # comments posted. Pairs with the PR-pin in the prompt above:
-          # belt-and-suspenders, so any future prompt ambiguity surfaces as a
-          # tool denial in the log rather than another silent no-op.
+          # --disallowedTools "AskUserQuestion": the built-in AskUserQuestion
+          # tool is implicitly available to the SDK and was Claude's escape
+          # hatch when the prompt didn't pin a PR — Claude called it, the
+          # headless runner could never answer, and the action terminated
+          # `success` with zero comments posted. Pairs with the PR-pin in the
+          # prompt above: belt-and-suspenders, so any future prompt ambiguity
+          # surfaces as a tool denial in the log rather than a silent no-op.
+          #
+          # Note: Bash(gh pr list:*) and Bash(gh api:*) are intentionally
+          # omitted. The prompt already forbids `gh pr list` to choose a PR,
+          # and `gh api:*` with the job's `issues: write`/`pull-requests: write`
+          # permissions would allow write operations (add labels, close PRs,
+          # etc.) beyond the reviewer's intended scope. Read/Glob/Grep plus
+          # `gh pr view`/`gh pr diff` are sufficient for full review context.
+          #
+          # --model opus pins the reviewer to Opus via the `opus` ALIAS, not a
+          # versioned literal — the alias auto-resolves to the latest Opus the
+          # OAuth token authenticates against, so the reviewer tracks new Opus
+          # releases without a workflow edit.
           claude_args: >-
             --model opus
             --disallowedTools "AskUserQuestion"
-            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*),Bash(gh api:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(wc:*),Bash(cat:*),Bash(echo:*),Bash(printenv:*),Bash(env:*),Read,Glob,Grep"
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(wc:*),Bash(cat:*),Bash(echo:*),Read,Glob,Grep"
       # Make a silent Claude auth failure RED instead of green-success. An
       # invalid/expired CLAUDE_CODE_OAUTH_TOKEN makes the model call 401: the
-      # action above posts ZERO comments yet still concludes `success`, so to
-      # the review loop and the operator it looks exactly like "Claude reviewed
-      # and found nothing" — and the loop waits its full silent-review window
-      # each round on a non-response. This post-step inspects the action's
-      # execution output and fails the check on the token-invalid signature so
-      # the failure is visible. Fully self-contained (inline jq + grep, no repo
-      # files) because this workflow is copied verbatim into third-party repos.
+      # action above posts ZERO comments yet still concludes `success`, so to the
+      # review loop and the operator it looks exactly like "Claude reviewed and
+      # found nothing" — and the loop waits its full silent-review window each
+      # round on a non-response. This post-step inspects the action's execution
+      # output and fails the check on the token-invalid signature so the failure
+      # is visible. Fully self-contained (inline jq + grep, no repo files)
+      # because this workflow is copied verbatim into third-party repos.
       - name: Fail the check on a Claude authentication error
         # if: always() is load-bearing: the action concludes `success` on a 401,
         # so a success()-gated step would be skipped and the failure would stay
@@ -291,26 +273,22 @@ jobs:
           fi
           echo "No Claude authentication failure detected."
           exit 0
+
       # Surface a usage-limit silence as a machine-readable PR marker comment.
       # A rate-limited Claude run (subscription 5-hour/weekly window exhausted,
       # or Agent-SDK credit balance empty) dies in <1s with is_error:true and
       # ZERO comments posted, while the action still concludes `success` — on
       # the PR it is indistinguishable from a misconfigured reviewer, and the
-      # local review loop burned its full silent-review window on exactly this
-      # (PR #476 run 28703770264, 2026-07-04: rate_limit_event five_hour,
-      # "You've hit your session limit · resets 1pm (UTC)", 498 ms, 0 output
-      # tokens, green job, no comment). This step greps the execution file for
-      # the two usage-limit signatures and posts ONE marker comment the loop
-      # parses:
+      # local review loop burned its full silent-review window on exactly this.
+      # This step greps the execution file for the two usage-limit signatures
+      # and posts ONE marker comment the loop parses:
       #   <!-- claude-review-unavailable-v1 type=rate_limited resets_at=<epoch> -->
       #   <!-- claude-review-unavailable-v1 type=credits_exhausted -->
-      # The loop (review_loop.py) releases Claude from its wait immediately,
-      # labels the round accordingly, and — per its claude_p_billing mode —
-      # either re-summons after resets_at passes (subscription) or excludes
-      # Claude for the rest of the run (agent_sdk_credit). resets_at comes from
-      # the SDK's rate_limit_event.rate_limit_info.resetsAt epoch; when that
-      # message is absent, resets_at=0 and the loop degrades to its
-      # errored-style next-round comeback instead of a timed one.
+      # The loop releases Claude from its wait immediately, labels the round
+      # "Rate-limited", and re-summons Claude in the first round after
+      # resets_at passes; resets_at comes from the SDK's rejected
+      # rate_limit_event.rate_limit_info.resetsAt epoch, and when it is absent
+      # resets_at=0 and the loop retries Claude next round instead of timing it.
       #
       # The comment authenticates as github-actions[bot] — deliberately NOT a
       # claude[bot] review signal (the loop's bot_key never maps it to claude,
