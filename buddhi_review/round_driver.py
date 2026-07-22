@@ -1667,7 +1667,7 @@ class RoundDriver:
         The anchor is the round-review head, and the signal must be shown to have
         actually reviewed it. A signal may only be anchored to a commit it demonstrably reviewed; crediting
         an older signal would merge code no reviewer ever saw (the stale-approval /
-        crash-restart hole this gate exists to close). Without ``at`` that is shown by:
+        crash-restart hole this gate exists to close). Without it, that is shown by:
 
         * a ``stamp`` at/after the CUTOFF — the LATER of the head's committer date and
           the instant this round SUMMONED reviewers against it. The committer date
@@ -3691,6 +3691,18 @@ class RoundDriver:
             return False
         if answer not in ("yes", "y"):
             print("Merge skipped — run `gh pr merge` when ready.")
+            return False
+        if not verified_head:
+            # The gate could not resolve a local head to pin the merge to (its
+            # own git read failed) — an unpinned squash_merge here would let a
+            # push racing this very prompt land under the operator's "yes"
+            # with no --match-head-commit guard at all. Hand back instead of
+            # merging blind.
+            self.notice("merge-prompt",
+                        f"PR #{self.pr} — could not resolve a local head to pin "
+                        f"the merge to; not merging unpinned",
+                        status="skip",
+                        hint="verify the head yourself, then `gh pr merge` when ready")
             return False
         return merge.squash_merge(
             self.pr, repo=self.repo, enabled=True, cwd=self.cwd,

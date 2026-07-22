@@ -842,3 +842,25 @@ def test_tty_prompt_never_offers_merge_of_an_unreviewed_pr(monkeypatch):
     assert not (driver._run_start_fleet & driver.reviewed_ever)   # nobody reviewed
     assert outcome.merged is False
     assert gh.matching("gh", "merge", "--squash") == []
+
+
+def test_tty_prompt_unpinnable_head_does_not_merge_unpinned(monkeypatch):
+    # The head-aware gate can report [gate-unverified] with NO verified head (its
+    # own local git read failed) while the name-based backstop still says "yes,
+    # someone reviewed this PR at some point" — a reviewed PR, blocked gate. The
+    # interactive path must not fall back to an UNPINNED squash_merge (omitting
+    # --match-head-commit) under the operator's "yes": a push racing the prompt
+    # could then land under that confirmation with no guard at all. It must hand
+    # the PR back instead.
+    monkeypatch.setattr(round_driver.sys, "stdin", _FakeStdin(True))
+    monkeypatch.setattr("builtins.input", lambda *a, **k: "yes")
+    timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]"))]
+    gh = _RecordingRun(_mergeable_gh(
+        {"mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN", "isDraft": False}))
+    driver, clock, _ = make_driver(timeline, cfg=CLAUDE_ONLY, gh=gh, auto_merge=False)
+    monkeypatch.setattr(
+        driver, "_head_aware_merge_gate",
+        lambda *a, **k: (True, "[gate-unverified] local head unresolved", None))
+    outcome = driver.run()
+    assert outcome.merged is False
+    assert gh.matching("gh", "merge", "--squash") == []
