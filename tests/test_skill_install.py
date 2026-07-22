@@ -8,6 +8,9 @@ nothing here ever touches the real ``~/.claude`` or ``~/.config``.
 from __future__ import annotations
 
 import json
+import os
+import signal
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -598,8 +601,7 @@ def test_hardlinked_alias_key_never_prunes_a_bundled_file(env):
     dest = env.target / "open-pr" / "SKILL.md"
     installed = dest.read_text(encoding="utf-8")
     alias = env.target / "open-pr" / "alias.md"
-    import os as _os
-    _os.link(dest, alias)  # same inode, second name
+    os.link(dest, alias)  # same inode, second name
     _record(env, str(alias), content_hash(installed))
 
     summary = skill_install.install_skills()
@@ -707,6 +709,104 @@ def test_sidecar_key_equal_to_root_is_not_actionable(env):
     assert env.target.is_dir()
     assert not list(env.target.parent.glob(f"{env.target.name}.bak-*"))
     assert not any(f.path == env.target for f in summary.files)
+
+
+# Every mode, so a key that upsets a filesystem probe cannot abort ANY of them — least of
+# all --dry-run, which is documented to write nothing and merely report.
+_ALL_MODES = [{}, {"force": True}, {"dry_run": True}, {"uninstall": True}]
+_MODE_IDS = ["plain", "force", "dry-run", "uninstall"]
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_overlong_sidecar_key_completes_normally(env, kwargs):
+    """An overlong final component makes ``os.lstat`` fail ENAMETOOLONG — which
+    ``Path.exists()`` / ``is_symlink()`` re-raise rather than swallow. The run must still
+    report the record instead of dying with a bare traceback."""
+    skill_install.install_skills()
+    key = f"{env.target}/open-pr/{'x' * 5000}"
+    _record(env, key, content_hash("x\n"))
+
+    summary = skill_install.install_skills(**kwargs)  # must not raise
+    outs = [f for f in summary.files if str(f.path) == key]
+    assert len(outs) == 1 and outs[0].action == skill_install.NOOP  # provably absent
+    assert not summary.had_error
+
+
+class _Blocked(BaseException):
+    """Raised by :func:`_no_blocking`. A BaseException on purpose: the code under test
+    swallows ``OSError``, and the root conftest breaker raises ``TimeoutError`` — an
+    OSError subclass — so a hang there is caught by ``_hash_on_disk`` and silently becomes
+    a SLOW PASS instead of a failure. This one cannot be absorbed."""
+
+
+@contextmanager
+def _no_blocking(seconds: int = 5):
+    """Fail — do not merely delay — if the wrapped call blocks. It also replaces the outer
+    per-test breaker for its duration, restoring the previous handler on the way out."""
+    def _fire(signum, frame):
+        raise _Blocked(f"install_skills blocked for more than {seconds}s")
+
+    old = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_fifo_record_completes_without_hanging(env, kwargs):
+    """A record naming a FIFO must never be opened: reading one with no writer blocks the
+    whole run forever. It is not a regular file, so it is reported and left alone."""
+    skill_install.install_skills()
+    fifo = env.target / "open-pr" / "pipe.md"
+    os.mkfifo(fifo)
+    _record(env, str(fifo), content_hash("x\n"))
+
+    with _no_blocking(5):  # must not raise AND must not block
+        summary = skill_install.install_skills(**kwargs)
+    assert [f.action for f in summary.files if f.path == fifo] == [skill_install.CONFLICT]
+    assert fifo.is_fifo()          # never opened, never moved aside
+    assert not list(fifo.parent.glob("pipe.md.bak-*"))
+
+
+def test_unreadable_record_keeps_its_provenance(env):
+    """When a probe cannot tell what is at a recorded path, the record is KEPT and the
+    failure reported — dropping it would orphan a file that may still be on disk."""
+    skill_install.install_skills()
+    stale_dir = env.target / "open-pr" / "old"
+    stale_dir.mkdir()
+    stale = stale_dir / "gone.md"
+    stale.write_text("still here\n", encoding="utf-8")
+    _record(env, str(stale), content_hash("still here\n"))
+    stale_dir.chmod(0o000)  # no search bit → lstat fails EACCES
+    try:
+        summary = skill_install.install_skills()  # must not raise
+        outs = [f for f in summary.files if f.path == stale]
+        assert len(outs) == 1 and outs[0].action == skill_install.ERROR
+        assert str(stale) in json.loads(env.sidecar.read_text())["files"]
+    finally:
+        stale_dir.chmod(0o700)
+    assert stale.read_text(encoding="utf-8") == "still here\n"
+
+
+def test_dry_run_alias_key_is_skipped_lexically(env):
+    """The LEXICAL half of the prune's skip is load-bearing exactly where the destination
+    has no inode yet: in a --dry-run first install nothing is on disk, so the (dev, ino)
+    identity guard has nothing to match on and only the normalized-string compare keeps a
+    currently-bundled destination out of the prune. Without it the same run reports two
+    contradictory verdicts for one file — install, and 'no longer bundled'."""
+    env.sidecar.parent.mkdir(parents=True, exist_ok=True)
+    env.sidecar.write_text(json.dumps({"schema": 1, "files": {
+        f"{env.target}/open-pr/./SKILL.md": {"version": "0.0.1", "hash": content_hash("x\n")},
+    }}), encoding="utf-8")
+    dest = env.target / "open-pr" / "SKILL.md"
+
+    summary = skill_install.install_skills(dry_run=True)
+    assert [f.action for f in summary.files if f.path == dest] == [skill_install.INSTALL]
+    assert not any("no longer bundled" in f.detail for f in summary.files)
+    assert not env.target.exists()  # --dry-run still wrote nothing
 
 
 # ── Unreadable config dir: the sidecar read fails SAFE, never raises ──────────────
