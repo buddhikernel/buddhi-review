@@ -692,6 +692,25 @@ def test_unusable_sidecar_key_never_raises(env, bad):
     assert isinstance(skill_install.install_skills(uninstall=True), skill_install.InstallSummary)
 
 
+@pytest.mark.parametrize("bad", ["\x00", "\ud800"])
+def test_unusable_sidecar_key_outcome_is_printable(env, bad):
+    """Not raising inside :mod:`skill_install` isn't enough on its own: the CLI prints
+    ``f.skill``/``f.rel`` straight to stdout, so a lone surrogate (or NUL) surviving into
+    those fields crashes the run one layer up with ``UnicodeEncodeError`` even though
+    ``install_skills`` itself returned cleanly. Every outcome's ``skill``/``rel`` must
+    round-trip through UTF-8 unchanged."""
+    skill_install.install_skills()
+    key = f"{env.target}/open{bad}-pr/SKILL.md"
+    _record(env, key, content_hash("x\n"))
+
+    summary = skill_install.install_skills()
+    matches = [f for f in summary.files if bad in str(f.path)]
+    assert matches
+    for f in matches:
+        f.skill.encode("utf-8")  # must not raise UnicodeEncodeError
+        f.rel.encode("utf-8")
+
+
 def test_sidecar_key_equal_to_root_is_not_actionable(env):
     """A corrupt record naming the skills ROOT itself is rejected outright — otherwise
     --force would back up (i.e. move away) the ENTIRE skills tree in one step."""

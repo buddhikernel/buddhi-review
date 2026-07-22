@@ -612,6 +612,15 @@ def _install(
         rel = _rel_within_skill(dest, root)
         rec_hash = records[key].get("hash")
 
+        # Checked BEFORE probe_err, deliberately: a symlinked ancestor is refused
+        # unconditionally, so it stays the reported reason even when ``dest`` itself
+        # also has a probe error (e.g. an EACCES hit while resolving through that same
+        # symlink) — the specific "parent directory is a symlink" outcome is more
+        # actionable than a generic "could not inspect it". This cannot raise on an
+        # untrusted key either: ``_under_symlinked_dir`` walks ancestors with
+        # ``Path.is_symlink()``, and pathlib's ``is_symlink()`` already swallows
+        # ``ValueError`` (embedded NUL / lone surrogates) the same way it swallows an
+        # ignorable ``OSError`` — verified empirically on 3.9-3.13.
         if _under_symlinked_dir(dest, root):
             outcomes.append(FileOutcome(
                 skill, rel, dest, CONFLICT,
@@ -740,6 +749,12 @@ def _uninstall(
         # Never unlink or back up THROUGH a symlinked ancestor directory — that would
         # follow the link and delete/move files inside its target. Left untouched in every
         # mode (even --force); the user removes the symlinked directory manually.
+        #
+        # Checked before probe_err for the same reason as :func:`_install`'s twin: the
+        # symlink-ancestor reason is unconditional and more actionable than a generic
+        # probe-error message, and it cannot raise on an untrusted key — pathlib's
+        # ``is_symlink()`` already swallows ``ValueError`` (embedded NUL / lone
+        # surrogates), verified empirically on 3.9-3.13.
         if _under_symlinked_dir(dest, root):
             outcomes.append(FileOutcome(
                 skill, rel, dest, CONFLICT,
@@ -826,20 +841,32 @@ def _uninstall(
     return outcomes
 
 
+def _printable(s: str) -> str:
+    """Round-trip ``s`` through UTF-8, escaping anything that cannot survive the trip
+    (a lone surrogate decoded from a corrupt sidecar key's ``\\uXXXX`` escape, e.g.).
+    :func:`_skill_of` and :func:`_rel_within_skill` derive their result from an untrusted
+    sidecar key, and the caller prints that result straight to stdout (``cli.py``) — an
+    unencodable character reaching there raises ``UnicodeEncodeError`` on a UTF-8 stream
+    and crashes the run AFTER the summary was otherwise built successfully."""
+    return s.encode("utf-8", "backslashreplace").decode("utf-8")
+
+
 def _rel_within_skill(dest: Path, root: Path) -> str:
     try:
         parts = dest.relative_to(root).parts
-        return Path(*parts[1:]).as_posix() if len(parts) > 1 else dest.name
+        rel = Path(*parts[1:]).as_posix() if len(parts) > 1 else dest.name
     except ValueError:
-        return dest.name
+        rel = dest.name
+    return _printable(rel)
 
 
 def _skill_of(dest: Path, root: Path) -> str:
     """The top-level skill name for a destination under ``root`` (e.g. ``"open-pr"``)."""
     try:
-        return dest.relative_to(root).parts[0]
+        skill = dest.relative_to(root).parts[0]
     except (ValueError, IndexError):
         return "?"
+    return _printable(skill)
 
 
 def _normalized_dest_if_under(key: str, root: Path) -> Optional[Path]:
