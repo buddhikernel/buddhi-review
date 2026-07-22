@@ -65,9 +65,10 @@ TIMEOUT = "timeout"
 #: class can never leak into the gate without a matching mapping.
 OUTCOMES = frozenset({PASSED, FAILED, NO_TESTS, COMPILE_ERROR, ENV_ERROR, TIMEOUT})
 
-#: The classes that RED the gate but must NEVER be fed to failing-id parsing (P3
-#: reads this to route them away from triage). `failed`/`timeout` red too, but they
-#: MAY carry ids.
+#: The two RED classes that carry no per-test outcome at all: the run never got as
+#: far as executing tests, so there is nothing test-level to report and the gate
+#: names the class itself in its RED headline (`compile error` / `missing
+#: dependency`). `failed`/`timeout` red too, but those DID reach the tests.
 NON_TRIAGE_RED = frozenset({COMPILE_ERROR, ENV_ERROR})
 
 
@@ -105,14 +106,14 @@ DART = "dart"
 FLUTTER = "flutter"
 UNKNOWN = "unknown"
 
-#: Recognized runners for which a per-runner test id can be extracted AND an
-#: exact-subset re-run is feasible (P1's "scopable iff argv AND recognized" rule).
-#: A best-effort forward hint for P3 — P2 does not itself consume `scopable`. The
-#: Tier-B wrappers/whole-suite-degrade runners are deliberately excluded.
+#: The complement of the runners that report per-test identities an exact-subset
+#: re-run could address (a runner is scopable only when it was recognized from argv).
+#: Nothing here consumes `scopable`; it is recorded as a property of the runner, and
+#: the Tier-B wrappers / whole-suite-only runners are deliberately excluded from it.
 _NON_SCOPABLE = frozenset({
     UNKNOWN, TOX, NOX, CARGO, JASMINE, KARMA, AVA, NODE_TEST, MINITEST,
-    # Tier-C runtimes: detect + gate only (no P4–P9 triage adapter → whole-suite
-    # degrade), so never advertised as scopable.
+    # Tier-C runtimes: detected and gated, but they report one whole-suite result,
+    # so they are never advertised as scopable.
     BUN, DENO,
 })
 
@@ -123,9 +124,11 @@ class RunnerInfo(NamedTuple):
     runner       — one of the runner-id constants above, or UNKNOWN for an opaque
                    wrapper (`bash -lc`, `./run-tests.sh`, `make`) we cannot see
                    through.
-    scopable     — best-effort hint: is this a recognized, scoped-rerun-capable
-                   runner? (P1's rule; consumed by P3, not P2.) UNKNOWN and the
-                   Tier-B wrappers are never scopable.
+    scopable     — best-effort hint: is this a recognized runner whose tests could
+                   be addressed individually, rather than only as a whole suite?
+                   Recorded by detection as a property of the runner; the gate here
+                   runs the whole suite either way. UNKNOWN and the Tier-B wrappers
+                   are never scopable.
     source       — how it was identified, for logging/tests. A runner FOUND is
                    tagged by where: `"argv"` (recognized at argv[0]), `"shell"` (read
                    out of a `bash -lc` string), `"npm-script"` (unwrapped through a
@@ -142,11 +145,11 @@ class RunnerInfo(NamedTuple):
                    an npm/yarn/pnpm/bun package-script unwrap (P10) exposes
                    `["cross-env", "SPECIAL=1", "pytest", "-c", "custom.ini"]` behind
                    a `["npm", "test"]` gate. None when the detected-from argv
-                   already IS the invoking command (argv-detected, marker-detected)
-                   — the caller then binds the adapter to that original argv. The
-                   binding seam (`triage_adapter_for`) uses this INSTEAD of the raw
-                   argv so a scoped re-run inherits the script's own env/launcher/
-                   config flags rather than a bare reconstruction that bypasses them.
+                   already IS the invoking command (argv-detected, marker-detected),
+                   which the caller then uses as-is. Anything that needs to re-derive
+                   how the runner is actually invoked reads THIS rather than the raw
+                   gate argv, so it inherits the script's own env / launcher / config
+                   flags instead of a bare reconstruction that bypasses them.
     script_name  — for a package-script unwrap (P10), the name of the `scripts.<name>`
                    entry the runner was found behind — the TERMINAL one when the
                    script re-indirects (`"test": "npm run test:ci"` → `"test:ci"`),
@@ -2364,5 +2367,5 @@ _CLASSIFIERS = {
 # ---- module boundary ------------------------------------------------------------
 # Detection + classification is this module's ENTIRE surface, and the byte-parity
 # envelope shared across the product trees ends at this line. The failure-triage
-# layer other trees carry below it (failing-id extraction, scoped re-run — P3+) is
+# layer other trees carry below it (failing-id extraction, scoped re-run) is
 # deliberately absent here: this free skill's gate escalates on red, nothing more.
