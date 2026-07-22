@@ -262,25 +262,38 @@ def _silent_unlink(p) -> None:
 
 # ``os.lstat`` errnos that PROVE the path cannot exist, so the caller may treat them as
 # plain absence. Everything else (EACCES, EIO, ELOOP …) means we could not tell.
-_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR, errno.ENAMETOOLONG})
+#
+# ENAMETOOLONG is deliberately NOT here. It is a limit on the path handed to the SYSCALL,
+# not a statement about existence: a file created through a relative path from a deep
+# working directory exists, and opens fine relatively, while its absolute path is too long
+# to ``lstat``. Reading that as absence would retire the record and orphan a file that is
+# still on disk — exactly what the absent/could-not-tell split exists to prevent.
+_ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
 
 
 def _lstat_probe(dest) -> Tuple[Optional[os.stat_result], Optional[str]]:
     """One ``os.lstat`` that NEVER raises — the single source of truth about a recorded
-    destination for both record loops.
+    destination for the two RECORD loops (:func:`_install`'s no-longer-bundled prune and
+    :func:`_uninstall`'s).
 
-    A sidecar key is untrusted input, and every pathlib probe the loops would otherwise
+    A sidecar key is untrusted input, and every pathlib probe those loops would otherwise
     reach for (``exists`` / ``is_symlink`` / ``is_dir``) swallows only ENOENT, ENOTDIR,
-    EBADF and ELOOP: an overlong component (ENAMETOOLONG), an unsearchable parent (EACCES)
-    or an unusable key (an embedded NUL raises ValueError) escapes and aborts the whole
-    run — ``--dry-run`` included — with a bare traceback and no summary. Asking once, here,
-    also lets the caller confirm the destination is a REGULAR file before opening it, so a
-    record naming a FIFO can never block the run forever on a read that has no writer.
+    EBADF and ELOOP: an overlong path (ENAMETOOLONG), an unsearchable parent (EACCES) or
+    an unusable key (an embedded NUL raises ValueError) escapes and aborts the whole run —
+    ``--dry-run`` included — with a bare traceback and no summary. Asking once, here, also
+    lets the caller confirm the destination is a REGULAR file before opening it, so a
+    RECORDED FIFO never blocks the run on a read that has no writer.
+
+    SCOPE — this covers the record loops ONLY. The bundled-tree loop still probes through
+    pathlib (:func:`_decide_action`, :func:`_handle_legacy_dirs`), so a FIFO sitting at a
+    BUNDLED destination still hangs the run (plain, ``--force`` and ``--dry-run`` alike)
+    and an unsearchable installed skill directory still raises PermissionError out of
+    :func:`install_skills`. Closing that is step F9's job, not this helper's.
 
     Returns ``(st, None)`` when the path exists (as a link, directory, regular or special
     file), ``(None, None)`` when it provably does not, and ``(None, "<error>")`` when we
     could not tell. That third case must NOT be read as absence: dropping a record for a
-    file that is merely unreadable right now would orphan a file still on disk, which no
+    file that is merely unreachable right now would orphan a file still on disk, which no
     later run could clean up.
     """
     try:
@@ -617,7 +630,15 @@ def _install(
 
         if st is not None and stat.S_ISLNK(st.st_mode):
             if force and not dry_run:
-                bak = _backup(dest)
+                # Guarded exactly like the regular-file removal below: moving the link
+                # aside needs write permission on its PARENT, which the user may not have
+                # (a read-only skill dir). A per-file failure is an ERROR outcome, never a
+                # raise, and the record stays so a later run can retry.
+                try:
+                    bak = _backup(dest)
+                except OSError as exc:
+                    outcomes.append(FileOutcome(skill, rel, dest, ERROR, str(exc)))
+                    continue
                 del records[key]; changed = True
                 touched_dirs.add(dest.parent)
                 outcomes.append(FileOutcome(
@@ -735,7 +756,12 @@ def _uninstall(
 
         if st is not None and stat.S_ISLNK(st.st_mode):
             if force and not dry_run:
-                bak = _backup(dest)
+                # Same guard as the regular-file removal below — see :func:`_install`.
+                try:
+                    bak = _backup(dest)
+                except OSError as exc:
+                    outcomes.append(FileOutcome(skill, rel, dest, ERROR, str(exc)))
+                    continue
                 del records[key]; changed = True
                 touched_dirs.add(dest.parent)
                 outcomes.append(FileOutcome(skill, rel, dest, REMOVED, f"symlink backed up to {bak.name}"))

@@ -719,17 +719,22 @@ _MODE_IDS = ["plain", "force", "dry-run", "uninstall"]
 
 @pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
 def test_overlong_sidecar_key_completes_normally(env, kwargs):
-    """An overlong final component makes ``os.lstat`` fail ENAMETOOLONG — which
-    ``Path.exists()`` / ``is_symlink()`` re-raise rather than swallow. The run must still
-    report the record instead of dying with a bare traceback."""
+    """An overlong path makes ``os.lstat`` fail ENAMETOOLONG — which ``Path.exists()`` /
+    ``is_symlink()`` re-raise rather than swallow. The run must still report the record
+    instead of dying with a bare traceback.
+
+    ENAMETOOLONG is a limit on the path given to the syscall, NOT proof of absence (a file
+    reached relatively from a deep working directory exists while its absolute path cannot
+    be stat'ed), so the record is reported as an error and KEPT, never retired."""
     skill_install.install_skills()
     key = f"{env.target}/open-pr/{'x' * 5000}"
     _record(env, key, content_hash("x\n"))
 
     summary = skill_install.install_skills(**kwargs)  # must not raise
     outs = [f for f in summary.files if str(f.path) == key]
-    assert len(outs) == 1 and outs[0].action == skill_install.NOOP  # provably absent
-    assert not summary.had_error
+    assert len(outs) == 1 and outs[0].action == skill_install.ERROR
+    assert "record kept" in outs[0].detail
+    assert key in json.loads(env.sidecar.read_text())["files"]  # never silently retired
 
 
 class _Blocked(BaseException):
@@ -771,9 +776,12 @@ def test_fifo_record_completes_without_hanging(env, kwargs):
     assert not list(fifo.parent.glob("pipe.md.bak-*"))
 
 
-def test_unreadable_record_keeps_its_provenance(env):
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_unreadable_record_keeps_its_provenance(env, kwargs):
     """When a probe cannot tell what is at a recorded path, the record is KEPT and the
-    failure reported — dropping it would orphan a file that may still be on disk."""
+    failure reported — dropping it would orphan a file that may still be on disk. Both
+    record loops must behave this way, so every mode is exercised (``--uninstall`` reaches
+    :func:`_uninstall`'s loop, the rest reach the prune in :func:`_install`)."""
     skill_install.install_skills()
     stale_dir = env.target / "open-pr" / "old"
     stale_dir.mkdir()
@@ -782,13 +790,37 @@ def test_unreadable_record_keeps_its_provenance(env):
     _record(env, str(stale), content_hash("still here\n"))
     stale_dir.chmod(0o000)  # no search bit → lstat fails EACCES
     try:
-        summary = skill_install.install_skills()  # must not raise
+        summary = skill_install.install_skills(**kwargs)  # must not raise
         outs = [f for f in summary.files if f.path == stale]
         assert len(outs) == 1 and outs[0].action == skill_install.ERROR
+        assert "could not inspect it — record kept" in outs[0].detail
         assert str(stale) in json.loads(env.sidecar.read_text())["files"]
     finally:
         stale_dir.chmod(0o700)
     assert stale.read_text(encoding="utf-8") == "still here\n"
+
+
+@pytest.mark.parametrize("uninstall", [False, True], ids=["install", "uninstall"])
+def test_symlink_record_backup_failure_is_reported_not_raised(env, uninstall):
+    """``--force`` on a recorded SYMLINK moves the link aside, which needs write permission
+    on its parent. A read-only skill dir must yield an ERROR outcome — the same treatment
+    the regular-file branch beside it already gives — never a raise."""
+    skill_install.install_skills()
+    legacy = env.target / "legacy-skill"
+    legacy.mkdir()
+    link = legacy / "NOTES.md"
+    link.symlink_to("/etc/hosts")
+    _record(env, str(link), content_hash("x\n"))
+    legacy.chmod(0o500)  # searchable, NOT writable → _backup's os.replace fails EACCES
+    try:
+        summary = skill_install.install_skills(force=True, uninstall=uninstall)  # no raise
+        outs = [f for f in summary.files if f.path == link]
+        assert len(outs) == 1 and outs[0].action == skill_install.ERROR
+        assert str(link) in json.loads(env.sidecar.read_text())["files"]  # record kept
+    finally:
+        legacy.chmod(0o700)
+    assert link.is_symlink()                       # the link itself is untouched
+    assert not list(legacy.glob("NOTES.md.bak-*"))
 
 
 def test_dry_run_alias_key_is_skipped_lexically(env):
