@@ -380,16 +380,22 @@ def is_placeholder_review_body(body: Optional[str]) -> bool:
     Used by the head-aware merge gate (:func:`round_driver._genuine_review_shas_by_bot`)
     to refuse a commit-sha credit for a placeholder body: a quota / PR-too-large /
     transient-error top-level review is a RESPONSE, not a review of the commit it
-    carries. Deliberately the RAW cause regexes (not :func:`detect_signal`'s
-    disambiguated path) and LLM-free by design — the gate must stay I/O-free and must
-    OVER-block: a body that merely ECHOES placeholder vocabulary drops its sha, so a
-    false match yields a recoverable handback, NEVER a false credit of an unreviewed
-    head as reviewed. Empty / None → False (an empty body is handled by the caller's
-    APPROVED-state check, not here)."""
+    carries. LLM-free by design — the gate stays I/O-free — and biased to OVER-block:
+    a body that ECHOES placeholder vocabulary drops its sha, so a false match yields a
+    recoverable handback, NEVER a false credit of an unreviewed head as reviewed.
+
+    The errored cause goes through :func:`_errored_outside_quotes`, NOT a raw
+    ``ERRORED_RE`` search, so error vocabulary contained ENTIRELY inside a quoted /
+    fenced / inline-code span stays documentary (buddhi-review #470): a genuine
+    review whose prose CITES placeholder copy — e.g. "the test asserts
+    ``Review run failed.`` yields the errored signal" — is a real review of its
+    commit and must keep its sha. Quota / PR-too-large keep the raw regexes (their
+    own guards are the disambiguation, matching the reference loop). Empty / None →
+    False (an empty body is handled by the caller's APPROVED-state check, not here)."""
     if not body:
         return False
     return bool(QUOTA_RE.search(body) or PR_TOO_LARGE_RE.search(body)
-                or ERRORED_RE.search(body))
+                or _errored_outside_quotes(body))
 
 
 def is_clean_review(text: str) -> bool:

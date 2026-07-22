@@ -32,6 +32,12 @@ from buddhi_review.round_driver import RoundDriver, RoundTimes
 from buddhi_review.seams import ConsoleEscalation
 
 UTC = timezone.utc
+# The head this restart meets was committed BEFORE every seeded sign-off below, so
+# each one provably post-dates the commit it is credited with reviewing — the F2
+# freshness cutoff. (These suites model a restart at the head the reviewers actually
+# approved; a sign-off OLDER than the head is the stale case, covered explicitly in
+# test_head_aware_merge_gate.)
+HEAD_TIME = "2026-06-30T00:00:00+00:00"
 OLD = "2026-07-01T10:00:00Z"
 NEW = "2026-07-02T10:00:00Z"
 EVEN_NEWER = "2026-07-03T10:00:00Z"
@@ -84,6 +90,9 @@ class Gh:
         self.calls.append(list(argv))
         if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
             return subprocess.CompletedProcess(argv, 0, stdout=HEAD_SHA + "\n", stderr="")
+        if argv[:3] == ["git", "show", "-s"]:
+            # The head's committer date — F2's freshness cutoff for sha-less signals.
+            return subprocess.CompletedProcess(argv, 0, stdout=HEAD_TIME + "\n", stderr="")
         if argv[:2] == ["git", "merge-base"]:
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
@@ -104,9 +113,11 @@ def make_driver(comments, *, reactions=(), cfg=None, **kw):
         fix_dispatch=lambda c, r: FixOutcome(status="applied"),
         fetch=lambda pr, repo=None, cwd=None: list(comments),
         reactions_fetch=lambda pr, repo=None, cwd=None: list(reactions),
-        # F2 head-aware gate: model the raw pulls/<pr>/reviews payload — each seeded
-        # comment is a review anchored to the current head (a bare +1 / issue-channel
-        # sentinel is sha-less and rides the restore's clean-signal anchor instead).
+        # F2 head-aware gate: model the raw pulls/<pr>/reviews payload. Each seeded
+        # comment is anchored to the commit it was posted against — this restart
+        # harness holds the tip constant, so that is HEAD_SHA for every one. A bare
+        # +1 / issue-channel sentinel is sha-less and rides the restore's
+        # clean-signal anchor (date-checked against HEAD_TIME) instead.
         reviews_fetch=lambda pr, repo=None, cwd=None: [
             {"user": {"login": c.source}, "commit_id": HEAD_SHA,
              "body": c.text, "state": "COMMENTED"} for c in comments
@@ -124,8 +135,13 @@ def make_driver(comments, *, reactions=(), cfg=None, **kw):
     return driver, clock, gh
 
 
-def _plus_one(source="claude[bot]", rid="rx1"):
-    return gh_ingest.Reaction(id=rid, content="+1", source=source)
+def _plus_one(source="claude[bot]", rid="rx1", created_at=NEW):
+    # created_at defaults FRESH (post-dates HEAD_TIME): a bare +1 is the sign-off
+    # that carries neither a commit_id nor a message, so its reaction timestamp is
+    # the only thing that can date-anchor it for the head-aware gate. Pass
+    # created_at=OLD (or None) to model the stale / undated — unanchorable — case.
+    return gh_ingest.Reaction(id=rid, content="+1", source=source,
+                              created_at=created_at)
 
 
 def _lgtm(cid="ok", when=OLD, **kw):
@@ -275,6 +291,34 @@ def test_bare_plus_one_with_no_messages_is_an_approval():
     assert driver.expected_bots() == []         # nothing left to ask
     assert outcome.merged is True
     assert clock.t == 0                          # no poll window was ever opened
+
+
+def test_a_stale_bare_plus_one_is_folded_but_never_merges():
+    # F2: the SAME fold — codex is still approved and never re-asked — but the +1
+    # PRE-dates the commit now at HEAD, so it approved an EARLIER head. It cannot be
+    # anchored to the head being merged, and the head-aware gate hands the PR back
+    # rather than landing a commit nobody demonstrably reviewed.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    stale = _plus_one(source="codex[bot]", created_at="2026-06-29T00:00:00Z")  # < HEAD_TIME
+    driver, clock, gh = make_driver([], reactions=[stale], cfg=cfg, auto_merge=True)
+    outcome = driver.run()
+    assert "codex" in driver.approved            # the verdict is still in hand …
+    assert driver.expected_bots() == []          # … so it is not re-summoned
+    assert driver._clean_signal_head == {}       # … but it anchors to no head
+    assert outcome.merged is False               # → handback, not an unreviewed merge
+    assert gh.matching("gh", "merge", "--squash") == []
+
+
+def test_an_undated_bare_plus_one_is_unanchorable_and_never_merges():
+    # A +1 whose payload carried no timestamp cannot be dated against ANY head →
+    # unanchorable → fail closed.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    undated = _plus_one(source="codex[bot]", created_at=None)
+    driver, clock, gh = make_driver([], reactions=[undated], cfg=cfg, auto_merge=True)
+    outcome = driver.run()
+    assert "codex" in driver.approved
+    assert driver._clean_signal_head == {}
+    assert outcome.merged is False
 
 
 def test_a_bot_with_no_signal_at_all_is_still_summoned():

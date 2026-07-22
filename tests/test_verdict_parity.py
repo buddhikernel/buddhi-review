@@ -163,6 +163,10 @@ class _FakeNotifier:
 # review a fixture's reviewer posts anchors to it, so the F2 head-aware merge gate
 # resolves a stable single-commit head (staleness is out of scope for parity).
 _HEAD_SHA = "headsha00000000"
+# Its committer date — the F2 freshness cutoff. Fixtures carry no comment
+# timestamps, so sha-less anchoring never fires here; every reviewer is credited
+# through its real per-commit review above.
+_HEAD_TIME = "2026-01-01T00:00:00+00:00"
 
 
 class _GhRecorder:
@@ -175,6 +179,10 @@ class _GhRecorder:
         argv = list(argv)
         if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
             return subprocess.CompletedProcess(argv, 0, stdout=_HEAD_SHA + "\n", stderr="")
+        if argv[:3] == ["git", "show", "-s"]:
+            # The head's committer date — F2's freshness cutoff for sha-less signals.
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=_HEAD_TIME + "\n", stderr="")
         if argv[:2] == ["git", "merge-base"]:
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
@@ -260,10 +268,17 @@ def _drive(fixture: dict):
     def fetch(pr, repo=None, cwd=None):
         return [c for t, c in timeline if t <= clock.t]
 
+    # F2 head-aware gate: anchor each review to the commit it was ACTUALLY posted
+    # against — memoised on first sighting rather than read at fetch time — so the
+    # harness can observe invariant 4 instead of re-anchoring every comment onto
+    # whatever the tip happens to be when the gate runs. (This harness holds the tip
+    # constant, so the memo equals _HEAD_SHA today; it is correct-by-construction if
+    # a fixture ever moves the head.)
+    posted_against = {}
+
     def reviews_fetch(pr, repo=None, cwd=None):
-        # F2 head-aware gate: model the raw pulls/<pr>/reviews payload — each
-        # visible bot comment is a review anchored to the current head (_HEAD_SHA).
-        return [{"user": {"login": c.source}, "commit_id": _HEAD_SHA,
+        return [{"user": {"login": c.source},
+                 "commit_id": posted_against.setdefault(c.id, _HEAD_SHA),
                  "body": c.text, "state": "COMMENTED"}
                 for t, c in timeline
                 if t <= clock.t and detectors.bot_for_login(c.source) is not None]

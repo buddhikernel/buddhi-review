@@ -45,6 +45,10 @@ class FakeNotifier:
 # where the old name-based gate did. Tests that exercise STALENESS use their own
 # multi-sha gh fake + reviews_fetch/inline_fetch (see test_head_aware_merge_gate).
 HEAD_SHA = "headsha00000000"
+# Its committer date — the freshness cutoff a sha-less clean signal must post-date
+# before the head-aware gate will anchor it to HEAD_SHA. Deliberately early so any
+# dated sign-off in a suite reads as fresh for this head.
+HEAD_TIME = "2020-01-01T00:00:00+00:00"
 
 
 class GhRecorder:
@@ -64,6 +68,11 @@ class GhRecorder:
         WITHOUT recording — the caller has already appended to ``self.calls``."""
         if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
             return subprocess.CompletedProcess(argv, 0, stdout=HEAD_SHA + "\n", stderr="")
+        if argv[:3] == ["git", "show", "-s"]:
+            # The head's committer date — F2's freshness cutoff. Dated BEFORE the
+            # comment stamps these suites use, so a seeded sign-off post-dates the
+            # commit it is credited with reviewing.
+            return subprocess.CompletedProcess(argv, 0, stdout=HEAD_TIME + "\n", stderr="")
         if argv[:2] == ["git", "merge-base"]:
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""

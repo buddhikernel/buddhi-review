@@ -57,10 +57,17 @@ class Reaction:
     """One reaction on the PR body (issues/<pr>/reactions). ``content`` is the
     GitHub reaction name (``+1``, ``eyes``, …); ``source`` is the reacting login.
     Only bot-authored reactions are ever constructed — a human's +1 must never
-    read as a reviewer sign-off."""
+    read as a reviewer sign-off.
+
+    ``created_at`` is GitHub's reaction timestamp. It is what date-anchors a bare
+    ``+1`` — the reviewer sign-off that carries no commit_id and no message — for
+    the head-aware merge gate: a ``+1`` that PRE-dates the commit being merged
+    reviewed an older head and must not be credited to it. ``None`` when the
+    payload omits it, which the gate treats as UNANCHORABLE (fail-closed)."""
     id: str
     content: str
     source: str
+    created_at: Optional[str] = None
 
 
 def _default_run(argv: Sequence[str], *, cwd: Optional[str] = None) -> "subprocess.CompletedProcess[str]":
@@ -219,7 +226,9 @@ def _reaction_from_raw(raw: dict) -> Optional[Reaction]:
     is_bot = login.endswith("[bot]") or user.get("type") == "Bot"
     if not login or not is_bot:
         return None
-    return Reaction(id=str(rid), content=content, source=login)
+    created = raw.get("created_at")
+    return Reaction(id=str(rid), content=content, source=login,
+                    created_at=str(created) if isinstance(created, str) and created else None)
 
 
 def fetch_reactions(

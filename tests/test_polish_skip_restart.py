@@ -74,6 +74,14 @@ class FakeNotifier:
         pass
 
 
+def _head_time(head):
+    """The committer date modelled for head ``H<n>`` — successive hours, so a
+    comment posted against H0 is provably older than H1's commit. Unknown heads get
+    the epoch base (never fresh for anything later)."""
+    n = int(head[1:]) if head[:1] == "H" and head[1:].isdigit() else 0
+    return f"2026-01-01T{n:02d}:00:00+00:00"
+
+
 class GhHead:
     """Records every spawn and models the PR's moving tip: ``gh api …/pulls/<n>
     -q .head.sha`` answers with the CURRENT head, and a ``git push`` advances it
@@ -108,6 +116,13 @@ class GhHead:
             if self.head_fails:
                 return subprocess.CompletedProcess(argv, 1, stdout="", stderr="boom")
             out = self.head + "\n"
+        elif argv[:3] == ["git", "show", "-s"]:
+            # Committer date of the requested head — the F2 freshness cutoff. H0 < H1
+            # < H2 map to successive hours so "posted against H0" is provably older
+            # than H1's commit.
+            ref = argv[-1]
+            ref = self.head if ref == "HEAD" else ref
+            out = _head_time(ref) + "\n"
         elif argv[:2] == ["git", "merge-base"]:
             # --is-ancestor <a> <b>: rc 0 iff a is an ancestor of (or ==) b. Model
             # the H0 < H1 tip order by the numeric suffix, so a review anchored to
@@ -143,27 +158,53 @@ def classify(prompt):
     return json.dumps({"label": label, "reason": "t"})
 
 
+# A comment's server-set commit anchor is a property of the COMMENT, fixed by GitHub
+# when it was created — NOT of the run observing it. Module-scoped (and reset per test)
+# so a SECOND run over the same PR still sees the ORIGINAL anchor. A per-driver map
+# would silently re-anchor a killed run's old comments onto the restart's head, which
+# is precisely the credit the head-aware gate exists to refuse — and would make a
+# restart suite pass no matter how broken the gate was.
+POSTED_AGAINST = {}
+
+
 def make_driver(timeline, *, gh, cfg=None, clock=None, repo=REPO, **kw):
     clock = clock or FakeClock()
 
     def _visible():
-        return [c for t, c in timeline if t <= clock.t]
+        out = [c for t, c in timeline if t <= clock.t]
+        # Stamp each comment with the tip that was current when it FIRST became
+        # visible — i.e. at POLL time. Recording it lazily in the raw fetches would
+        # be useless: those are only called at the merge gate, by which point the
+        # round's fix has already advanced the tip, so every finding would be
+        # re-anchored onto the post-fix head — the exact credit the gate must refuse.
+        for c in out:
+            posted_against.setdefault(c.id, gh.head)
+        return out
 
     def fetch(pr, repo=None, cwd=None):
         return _visible()
 
+    # F2 head-aware gate: each review must anchor to the commit it was ACTUALLY
+    # posted against — the tip that was current when the comment first became
+    # visible — NOT the tip at fetch time. Anchoring to the moving `gh.head` would
+    # re-anchor a round-1 finding onto the POST-fix head, i.e. hand the gate exactly
+    # the credit it exists to refuse, and the suite would stay green with the gate
+    # broken. Memoised on first sighting so a later push cannot move it.
+    posted_against = POSTED_AGAINST
+
+    def _anchor_for(c):
+        # Populated at poll time by _visible(); the fallback covers a comment the
+        # gate somehow sees first.
+        return posted_against.setdefault(c.id, gh.head)
+
     def reviews_fetch(pr, repo=None, cwd=None):
-        # F2 head-aware gate: a review-body comment (no inline path) is a review
-        # anchored to the CURRENT tip (gh.head — which advances H0→H1 on a push),
-        # so a finding a reviewer posted on an earlier head reads as reviewing that
-        # head, not the post-fix one.
-        return [{"user": {"login": c.source}, "commit_id": gh.head,
+        return [{"user": {"login": c.source}, "commit_id": _anchor_for(c),
                  "body": c.text, "state": "COMMENTED"}
                 for c in _visible()
                 if not c.path and detectors.bot_for_login(c.source) is not None]
 
     def inline_fetch(pr, repo=None, cwd=None):
-        return [{"user": {"login": c.source}, "original_commit_id": gh.head}
+        return [{"user": {"login": c.source}, "original_commit_id": _anchor_for(c)}
                 for c in _visible()
                 if c.path and detectors.bot_for_login(c.source) is not None]
 
@@ -189,8 +230,10 @@ def make_driver(timeline, *, gh, cfg=None, clock=None, repo=REPO, **kw):
 
 @pytest.fixture(autouse=True)
 def _state_dir(tmp_path, monkeypatch):
-    """Every test gets its own polish-state home — never the operator's cache."""
+    """Every test gets its own polish-state home — never the operator's cache — and a
+    fresh comment→anchor map, so anchors never leak between tests."""
     monkeypatch.setenv(polish_state.STATE_DIR_ENV, str(tmp_path / "polish-state"))
+    POSTED_AGAINST.clear()
     return tmp_path
 
 
@@ -231,9 +274,17 @@ def test_mixed_round_polish_verdict_survives_a_kill_and_restart():
     assert "copilot" in driver2.polishing                  # verdict restored …
     assert gh2.matching("requested_reviewers") == []       # … so it is never re-asked
     assert "copilot" in driver2.reviewed_ever              # and it still counts as reviewed
-    assert outcome.merged is True                          # SAFETY gate satisfied → merge
-    # A merged PR's state is dead — the file is dropped.
-    assert not os.path.exists(polish_state.state_path(PR, REPO))
+    # This test's SUBJECT — the polish verdict surviving the kill — is unchanged above.
+    # The merge outcome is not: copilot's verdict was reached against H0, and the
+    # killed run's fix (H1) plus the restart's re-applied fix (H2) are commits NO
+    # reviewer has ever seen. That is the D4 crash-restart case the head-aware gate
+    # exists to refuse, so the run hands back for a re-review instead of merging.
+    # (It formerly read as a merge only because the harness re-anchored every finding
+    # onto the post-fix head — the blindness this suite's fetches no longer have.)
+    assert outcome.merged is False
+    assert gh2.matching("gh", "merge", "--squash") == []
+    # Not merged → the polish verdict is still live for the next restart.
+    assert os.path.exists(polish_state.state_path(PR, REPO))
 
 
 # ---------------------------------------------------------------------------
@@ -450,14 +501,26 @@ def test_absent_state_file_is_not_an_error():
 # The auto-merge regression this must not cause
 # ---------------------------------------------------------------------------
 
-def test_all_polish_restart_still_auto_merges():
+def test_all_polish_restart_auto_merges_when_the_killed_run_pushed_nothing():
     # Every reviewer is polish-only at this head → the round-1 expected set is EMPTY.
     # The restored verdicts must be folded into reviewed_ever, or the
     # never-merge-unreviewed gate reads "nobody reviewed" and blocks the merge the
-    # operator is entitled to.
+    # operator is entitled to. Scoped by the name: this is the case where the killed
+    # run pushed NOTHING after those comments, so the head they anchor to IS the head
+    # being merged. When it DID push, the restart correctly hands back instead — see
+    # test_restored_polish_never_merges_a_head_it_did_not_review.
+    # The comments were written against H1: the verdict was REACHED at H1
+    # (no substantive fix moved the head after they looked), so the head-aware gate
+    # anchors them to H1 and the merge is the one the operator is entitled to.
     polish_state.write_polish_state(PR, REPO, "H1", ["claude", "copilot"])
     gh = GhHead(head="H1")
-    driver, clock = make_driver([], gh=gh, rr_active=True, preflight=True,
+    # Their cosmetic comments are still on the PR, anchored (by GitHub) to H1 — the
+    # head they were written against. THAT is what credits them at the merge gate; no
+    # synthetic anchor is involved, so nothing can drift.
+    claude_cosmetic = Comment(id="cc", text="rename tmp for clarity",
+                              source="claude[bot]", path="a.py", diff_hunk="@@ -1 +1 @@")
+    driver, clock = make_driver([(0, claude_cosmetic), (0, COSMETIC)], gh=gh,
+                                rr_active=True, preflight=True,
                                 auto_merge=True, max_rounds=3)
     outcome = driver.run()
     assert driver.polishing == {"claude", "copilot"}
@@ -466,6 +529,26 @@ def test_all_polish_restart_still_auto_merges():
     assert outcome.merged is True
     assert gh.matching("@claude review") == []               # nobody re-asked
     assert not os.path.exists(polish_state.state_path(PR, REPO))   # cleared on merge
+
+
+def test_restored_polish_never_merges_a_head_it_did_not_review():
+    # The regression the polish stamp invites: the verdict was reached against H0, but
+    # ANOTHER bot's substantive fix advanced the head, so the stamp names the POST-push
+    # tip H1. "HEAD has not moved since the stamp" is NOT "this reviewer reviewed HEAD"
+    # — copilot never saw H1. Anchoring the restore to the recorded reviewed head (H0)
+    # lets the gate see that a substantive fix sits on top, and it hands back.
+    polish_state.write_polish_state(PR, REPO, "H1", ["copilot"])
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    gh = GhHead(head="H1")
+    driver, clock = make_driver([], gh=gh, cfg=cfg, rr_active=True, preflight=True,
+                                auto_merge=True, max_rounds=3)
+    outcome = driver.run()
+    assert "copilot" in driver.polishing                  # the verdict is still restored
+    assert driver._clean_signal_head == {}                # …but it fabricates no anchor
+    assert outcome.merged is False                        # → handback, not a false merge
+    assert gh.matching("gh", "merge", "--squash") == []
+
+
 
 
 def test_polish_state_is_kept_when_the_run_hands_back_without_merging():

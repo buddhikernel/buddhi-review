@@ -1119,6 +1119,11 @@ class RoundDriver:
         #   un-crown the approval. Empty on a default launch and for a bare-+1 fold
         #   (no dated message to compare) → the marker un-crowns as before.
         self._rederived_approval_stamps: Dict[str, Optional[str]] = {}
+        # _restore_signal_stamps: bot → the timestamp the head-aware gate date-anchors
+        #   an --rr-active re-derived sign-off on (its latest message's effective
+        #   stamp, or a bare +1's reaction time). None → UNANCHORABLE: the gate will
+        #   not credit that sign-off with reviewing the current head.
+        self._restore_signal_stamps: Dict[str, Optional[str]] = {}
         self.actions: List[ActionResult] = []
 
         # ── F5 run-cumulative review tracking (the SAFETY gate + silent-reviewer
@@ -1160,9 +1165,23 @@ class RoundDriver:
         #   issue-channel "no findings" sentinel — no commit_id) anchors here, to the
         #   commit the bot was actually asked to review.
         self._round_review_head: Optional[str] = None
-        # _clean_signal_head: bot → the head a sha-less clean signal reviewed. The
-        #   gate applies it ONLY for a bot with no real per-commit review (a stale
-        #   real review must never be synthesized onto the current head).
+        # _round_review_head_time: the COMMITTER DATE of _round_review_head — the
+        #   FRESHNESS CUTOFF a sha-less clean signal must post-date before it may be
+        #   anchored to that commit. A signal older than the commit reviewed an
+        #   EARLIER head, so crediting it would merge code nobody reviewed. None
+        #   (unreadable) → nothing can be date-anchored to this head (fail-closed).
+        self._round_review_head_time: Optional[str] = None
+        # _round_summon_time: wall-clock instant this round SUMMONED reviewers against
+        #   _round_review_head. The second half of the freshness cutoff: a commit
+        #   exists (and is committer-dated) before it is pushed and before anyone is
+        #   asked to review it, so a sign-off must post-date the SUMMON, not merely the
+        #   commit, to be a response to it. None before any summon (preflight /
+        #   restore), where the committer date alone is the cutoff.
+        self._round_summon_time: Optional[datetime] = None
+        # _clean_signal_head: bot → the head a PROVABLY-FRESH sha-less clean signal
+        #   reviewed. Freshness (not "has no earlier real review") is the
+        #   discriminator; the gate then setdefault-UNIONs these with the raw
+        #   per-commit shas, exactly like the reference loop.
         self._clean_signal_head: Dict[str, str] = {}
         # _premerge_ci_red: set when the pre-merge CI gate failed at a clean exit
         #   (the label-gated poll went red/never-settled, OR the non-label
@@ -1585,6 +1604,11 @@ class RoundDriver:
         self.polishing.discard("claude")
         self._reaction_done.discard("claude")
         self.reviewed_ever.discard("claude")
+        # …and its head-aware anchor: a rate-limited claude did not review the current
+        # head. The gate's reviewed_ever filter already excludes it, but dropping the
+        # anchor here means a later genuine re-review cannot silently re-admit a STALE
+        # one alongside it.
+        self._clean_signal_head.pop("claude", None)
         self._rate_limited_until["claude"] = until
         self._bot_state("claude").signal = detectors.SIGNAL_RATE_LIMITED
         self.notice("claude-rate-limited",
@@ -1627,20 +1651,85 @@ class RoundDriver:
             return
         self._reaction_baseline = {r.id for r in reactions}
 
-    def _anchor_clean_signal(self, bot: str) -> None:
+    def _anchor_clean_signal(self, bot: str, *, stamp: Optional[str] = None,
+                             proven_fresh: bool = False) -> None:
         """Record, for the head-aware merge gate, the head a bot's sha-less clean
         signal reviewed — an approval ``+1`` reaction, an issue-channel "No issues
         found." sentinel, or an --rr-active restored verdict — none of which carries
-        a commit_id the raw review fetch could anchor. Anchored to the round-review
-        head (== the remote head the bot was asked to review this round; the run-start
-        head during preflight / restore). The gate applies this anchor ONLY for a bot
-        with NO real per-commit review this run (invariant 4), so a bot with a real
-        (possibly STALE) review keeps only its real commit_id and is never synthesized
-        onto the current head. Durable boundary persistence across a crash (a stale
-        sha-less approval on a moved head) is the deferred D15 corner and out of
-        scope — this matches the pre-F2 name-based restore, which also credited it."""
-        if self._round_review_head:
-            self._clean_signal_head[bot] = self._round_review_head
+        a commit_id the raw review fetch could anchor.
+
+        The anchor is the round-review head, and the signal must be shown to have
+        actually reviewed it. A signal may only be anchored to a commit it demonstrably reviewed; crediting
+        an older signal would merge code no reviewer ever saw (the stale-approval /
+        crash-restart hole this gate exists to close). Without ``at`` that is shown by:
+
+        * a ``stamp`` at/after the CUTOFF — the LATER of the head's committer date and
+          the instant this round SUMMONED reviewers against it. The committer date
+          alone is not enough: a commit exists before it is pushed and before anyone is
+          asked to look at it, so a sign-off computed against the PREVIOUS head but
+          posted after the new commit was authored would otherwise be credited to a
+          head it never saw. A sign-off predating the summon cannot be a response to it.
+        * ``proven_fresh=True`` — a STRUCTURAL proof, which SHORT-CIRCUITS the date
+          test: the reaction baseline (a ``+1`` whose id was absent from the snapshot
+          taken immediately before this round's summon must have arrived after it).
+          That is a clock-free ORDERING fact observed locally, and it is strictly
+          stronger than the date test, which compares a GitHub ``created_at`` against a
+          LOCAL ``git`` committer date and a LOCAL wall clock. Letting that cross-clock
+          comparison veto the ordering proof would refuse an anchor to a genuinely
+          fresh ``+1`` purely because GitHub's clock trails ours — i.e. the SAME signal
+          would be accepted with no timestamp and refused with one, so more evidence
+          would yield the worse outcome.
+
+        An UNDATED signal with no structural proof is UNANCHORABLE and dropped, as is
+        any signal when the head, its commit time, or the comparison is unusable.
+        Dropping merely costs a handback; crediting it would cost an unreviewed merge.
+
+        ACCEPTED RESIDUAL — a date is evidence, not proof. Post-dating the cutoff shows
+        a signal COULD have reviewed this head, never that it DID, and the exposure
+        differs by CALLER:
+
+        * IN-ROUND folds (a summon floor is set): a reviewer run that started against
+          the previous head and posts only after this round's trigger — a review in
+          flight across the round boundary — is indistinguishable by any timestamp from
+          a genuine response, and is credited. Bounded by needing a reviewer slower than
+          a full fix+push+summon cycle, and the head in question is one this run just
+          built.
+        * PREFLIGHT / --rr-active RESTORE (no summon has happened, so no floor): the
+          only bar is the head's COMMITTER DATE (``git show -s --format=%cI``), and the
+          head is whatever local git points at — which may be an OUTSIDE commit (a human
+          push, a rebase) the loop did not build. Any sha-less sign-off newer than that
+          committer date is credited, and for an outside commit the commit→visible gap
+          is unbounded.
+
+        Note also that every date test here is CROSS-CLOCK — a GitHub ``created_at``
+        against a local committer date and a local wall clock — so clock skew shifts
+        the bar in both directions. It can only ever cost an anchor (a handback), never
+        grant one, because a skew that matters makes the stamp look OLDER.
+
+        Closing either would require refusing sha-less signals outright on any head the
+        run advanced to, which is precisely the loop's MAINLINE — every actionable
+        finding is inline, so a findings bot's later clean sign-off is sha-less by
+        construction — and would hand back nearly every PR that ever had a finding. A
+        reviewer that posts a COMMIT-ANCHORED review instead is unaffected either way:
+        the raw fetch reads its sha directly and no inference is involved."""
+        head = self._round_review_head
+        if not head:
+            return
+        if not proven_fresh:
+            ts = _parse_iso(stamp)
+            if ts is None:
+                return              # undated and unproven → unanchorable
+            cutoff = _parse_iso(self._round_review_head_time)
+            if cutoff is None:
+                return              # cannot establish what the head's own date is
+            try:
+                if self._round_summon_time is not None:
+                    cutoff = max(cutoff, self._round_summon_time)
+                if ts < cutoff:
+                    return          # predates the head / the summon → not a response
+            except TypeError:
+                return              # naive-vs-aware mix → unanchorable, fail closed
+        self._clean_signal_head[bot] = head
 
     def _fold_reactions(self, now: float) -> bool:
         """Fetch the PR's reactions and fold every FRESH ``+1`` (id not in the
@@ -1676,7 +1765,10 @@ class RoundDriver:
             self.approved.add(bot)          # hard causes (quota/errored/PR-too-large) can still evict this
             st.signal = detectors.SIGNAL_CLEAN
             self.reviewed_ever.add(bot)     # a +1 IS a genuine clean review
-            self._anchor_clean_signal(bot)  # sha-less: anchor to the round-review head
+            # Sha-less, but STRUCTURALLY fresh: this +1's id was absent from the
+            # pre-summon baseline, so it arrived during THIS round and therefore saw
+            # this round's head. That is a stronger proof than its timestamp.
+            self._anchor_clean_signal(bot, stamp=r.created_at, proven_fresh=True)
             self.responded_ever.add(bot)
             if bot in self.silent_dropped:
                 self.silent_dropped.discard(bot)
@@ -1735,6 +1827,9 @@ class RoundDriver:
                 # mis-recorded so it can never satisfy the never-merge gate, even
                 # when the bot is already excluded for another comment this batch.
                 self.reviewed_ever.discard(bot)
+                # Drop its head-aware anchor too — same reason as the rate-limit
+                # release: a quota message is not a review of any head.
+                self._clean_signal_head.pop(bot, None)
                 self.done.discard(bot)           # quota hard-cause evicts any prior clean fold
                 self.approved.discard(bot)       # quota hard-cause wins over any prior +1 fold
                 self._reaction_done.discard(bot)  # keep in sync with done
@@ -1860,9 +1955,12 @@ class RoundDriver:
             # with zero comments still merges; the critical no-false-positive case).
             self.reviewed_ever.add(bot)
             # An issue-channel sentinel carries no commit_id, so anchor its reviewed
-            # head for the head-aware gate (a review-channel clean review is also
-            # anchored by the raw fetch, whose real commit_id then takes precedence).
-            self._anchor_clean_signal(bot)
+            # head for the head-aware gate — but ONLY if it POST-DATES that head's
+            # commit. Round 1's first poll (and the preflight snapshot) ingest the
+            # PR's WHOLE history, so a sign-off left on an EARLIER head arrives here
+            # too; date-anchoring is what stops it being credited with reviewing the
+            # current head and merging an unreviewed fix.
+            self._anchor_clean_signal(bot, stamp=comment.created_at)
             print(f"[clean-review] {bot}: nothing to flag — voluntarily done")
             return None
         # The PR conversation channel (issues/<pr>/comments) is scanned for the
@@ -2141,6 +2239,17 @@ class RoundDriver:
         BLOCKS (fail-closed), never degrades to the weaker name-based check."""
         return _git_line(["git", "rev-parse", "HEAD"], self.cwd, self.gh_run)
 
+    def _local_head_commit_time(self, sha: Optional[str] = None) -> Optional[str]:
+        """The COMMITTER DATE (strict ISO-8601) of ``sha`` (default ``HEAD``), read
+        from LOCAL git, or None on any failure. This is the FRESHNESS CUTOFF the
+        head-aware gate anchors sha-less clean signals against: a signal must
+        post-date the commit it is credited with reviewing. Read from local git —
+        the same source as the merged head and the substantive boundary — so a
+        transient ``gh`` blip can never move it, and None simply means nothing can
+        be date-anchored to that commit (fail-closed)."""
+        return _git_line(["git", "show", "-s", "--format=%cI", sha or "HEAD"],
+                         self.cwd, self.gh_run)
+
     def _is_ancestor(self, ancestor_sha: Optional[str],
                      descendant_sha: Optional[str]) -> bool:
         """True iff ``ancestor_sha`` is an ancestor of OR equal to
@@ -2210,23 +2319,32 @@ class RoundDriver:
                       "re-run with /review-pr <repo> --rr, or review + merge by hand.")
             return True, reason, merged_head
         shas = _genuine_review_shas_by_bot(reviews, inline)
-        # Sha-less clean signals (approval reaction / issue-channel "no findings"
-        # sentinel / restored polish) carry no commit_id — anchor each to the head
-        # the bot actually reviewed, but ONLY for a bot with NO real per-commit
-        # review this run: a bot with a real (possibly STALE) review keeps only its
-        # real commit_id, so a stale review is never synthesized onto the current
-        # head (invariant 4).
-        real_review_bots = set(shas)
+        # Admit the sha-less clean signals (approval reaction / issue-channel "no
+        # findings" sentinel / restored verdict), each already anchored — at FOLD
+        # time, against that head's commit date — to the head the bot actually
+        # reviewed. setdefault-UNION, unconditionally: a bot that ALSO posted a
+        # server-anchored review keeps BOTH shas. That union is load-bearing on the
+        # loop's mainline path — every actionable finding is an INLINE comment (so a
+        # findings bot always has a real sha) while its later clean sign-off arrives
+        # sha-less on the issue channel, and dropping the sign-off would hand back
+        # every PR that had a round-1 finding. Staleness is handled where it belongs,
+        # by the freshness check in _anchor_clean_signal — NOT by "does this bot also
+        # have an earlier real review", which is not the same question.
         for bot, anchor in self._clean_signal_head.items():
-            if anchor and bot not in real_review_bots:
+            if anchor:
                 shas.setdefault(bot, set()).add(anchor)
         # Restrict to the loop's authoritative GENUINE-reviewer set: reviewed_ever
         # already dropped every placeholder — including a novel-wording quota the
         # regex filter above cannot catch but the LLM between-rounds re-check did
         # (and discarded). The raw fetch would otherwise re-credit that unreviewable
-        # bot at its commit. Purely a STRENGTHENING — reviewed_ever NARROWS the
-        # reviewed set, never grants a pass (a bot in reviewed_ever with only a STALE
-        # sha still blocks; invariant 2). The head-aware commit logic then decides.
+        # bot at its commit. This can only NARROW (it is a key-filter on a dict, and
+        # both pass conditions are monotone in the reviewed set), so it can never
+        # grant a pass — a bot in reviewed_ever with only a STALE sha still blocks.
+        # RESIDUAL, accepted: it is not a PURE strengthening. A bot that genuinely
+        # reviewed the merged head and is LATER un-crowned (a rate-limit release, the
+        # between-rounds LLM quota re-check, an --rr-active hard cause) loses its sha
+        # here and blocks where the reference loop merges — an over-block that hands
+        # back, never an unreviewed merge.
         shas = {b: s for b, s in shas.items() if b in self.reviewed_ever}
         blocked = _head_reviewed_blocks_merge(
             clean_exit, fleet, shas, merged_head, self._last_substantive_head,
@@ -2354,12 +2472,31 @@ class RoundDriver:
         # an all-approved restart reaches the clean exit with an empty reviewed_ever
         # and the SAFETY gate would block the very auto-merge it should allow.
         self.reviewed_ever |= (approved | restored) & fleet
-        # F2: a restored approval / polish verdict is sha-less (no live commit-bearing
-        # review the raw fetch could anchor), so anchor it to the run-start head for
-        # the head-aware gate. Applied at the gate ONLY for a bot with no real review
-        # (a bot whose live review the raw fetch DOES anchor keeps its real commit_id).
-        for bot in (approved | restored) & fleet:
-            self._anchor_clean_signal(bot)
+        # F2: a restored verdict is sha-less, so anchor it to the run-start head for
+        # the head-aware gate — but only when its FRESHNESS is established, since a
+        # restart is exactly where a stale approval would otherwise be credited with
+        # reviewing a head a prior run pushed past.
+        #   * restored POLISH gets NO synthetic anchor. A polish verdict is formed from
+        #     ACTIONABLE comments, which are never issue-channel, so every one carries a
+        #     server-set commit id and the raw fetch anchors it to the exact head that
+        #     reviewer saw — authoritative, needing no date or provenance inference, and
+        #     (unlike a persisted head) unable to drift forward as later rounds
+        #     re-process the same comments against a newer tip.
+        #     CONSEQUENCE, deliberate: those comments anchor to the PRE-fix head, while
+        #     a restart's boundary is the POST-fix tip the verdict was stamped against.
+        #     So a restored verdict reliably suppresses the RE-SUMMON (its whole point),
+        #     but it only clears the MERGE gate when the killed run pushed nothing after
+        #     those comments. If it did push, that commit is unknown-provenance and
+        #     nobody reviewed it, so the handback is correct — synthesising an anchor at
+        #     the tip to merge anyway is exactly the false credit this removal kills.
+        #   * a re-derived APPROVAL is date-anchored on the sign-off's own timestamp
+        #     (its latest message, or the bare +1's reaction time). An approval with
+        #     NO usable timestamp is UNANCHORABLE and is dropped — the merge then
+        #     hands back rather than landing a head nobody demonstrably reviewed.
+        # (approved and restored are disjoint by construction: _restore_polish_state
+        # skips any bot already in self.done, which _rederive_prior_approvals fills.)
+        for bot in approved & fleet:
+            self._anchor_clean_signal(bot, stamp=self._restore_signal_stamps.get(bot))
         # Remember that this run restored a polish verdict (post hard-cause un-crown):
         # if a restored reviewer later posts a substantive finding and is demoted, the
         # end-of-round persist must be allowed to clear the invalidated record at this
@@ -2401,7 +2538,12 @@ class RoundDriver:
         if not fleet:
             return set()
         failures: List[str] = []
-        latest: Dict[str, Tuple[Optional[str], str]] = {}   # bot -> (effective stamp, text)
+        # bot -> (effective ordering stamp, text, created_at). The ordering stamp is
+        # updated_at-or-created_at (an EDIT proves recency for "which message is
+        # latest"); created_at is kept separately because the merge gate must date a
+        # sign-off by when it was WRITTEN — an edit re-dates a message without
+        # re-reviewing anything.
+        latest: Dict[str, Tuple[Optional[str], str, Optional[str]]] = {}
         comments_read = True
         try:
             comments = self.fetch(self.pr, repo=self.repo, cwd=self.cwd)
@@ -2422,15 +2564,18 @@ class RoundDriver:
             stamp = c.updated_at or c.created_at
             known = latest.get(bot)
             if known is None or _supersedes(stamp, known[0]):
-                latest[bot] = (stamp, c.text or "")
-        plus_one: Set[str] = set()
+                latest[bot] = (stamp, c.text or "", c.created_at)
+        # bot → the +1's reaction timestamp (None when the payload omits it). The
+        # timestamp is what date-anchors a bare +1 sign-off for the head-aware gate;
+        # membership alone still drives the voluntarily-done fold below.
+        plus_one: Dict[str, Optional[str]] = {}
         try:
             for r in self.fetch_reactions(self.pr, repo=self.repo, cwd=self.cwd):
                 if r.content != "+1":
                     continue
                 b = detectors.bot_for_login(r.source)
-                if b is not None:
-                    plus_one.add(b)
+                if b is not None and (b not in plus_one or plus_one[b] is None):
+                    plus_one[b] = r.created_at
         except Exception:
             failures.append("reactions")
         if failures:
@@ -2470,6 +2615,17 @@ class RoundDriver:
                 # (newest is None) carries no timestamp, so none is recorded and the
                 # marker un-crowns conservatively.
                 self._rederived_approval_stamps[bot] = newest[0]
+            # F2: the timestamp the head-aware gate date-anchors this sign-off on —
+            # the latest message's effective stamp, or (for a bare +1) the reaction's
+            # own time. None → UNANCHORABLE, so the gate refuses to credit it with
+            # reviewing the current head. Kept separate from
+            # _rederived_approval_stamps, whose rate-limit-marker semantics
+            # deliberately record nothing for a bare +1.
+            # created_at, NOT the updated_at-or-created_at ORDERING stamp: an EDIT
+            # re-dates a message without re-reviewing anything, so an old sign-off
+            # edited after the current head would otherwise read as fresh for it.
+            self._restore_signal_stamps[bot] = (
+                newest[2] if newest is not None else plus_one.get(bot))
             if newest is None:
                 # Folded on a bare +1, so NO text of this bot was ever quota-checked.
                 # Mark it reaction-done exactly as the poll's own +1 fold does, so the
@@ -2862,6 +3018,10 @@ class RoundDriver:
         self._process_start_head = self._local_head_sha()
         self._last_substantive_head = self._process_start_head
         self._round_review_head = self._process_start_head
+        # The freshness cutoff preflight / restore signals are date-anchored against:
+        # a sign-off older than the run-start commit reviewed an EARLIER head.
+        self._round_review_head_time = self._local_head_commit_time(
+            self._process_start_head)
         if self.preflight and not (self.rr or self.rr_active or self.rr_none):
             self._preflight_snapshot()
         elif self.preflight and self.rr_active:
@@ -2891,6 +3051,12 @@ class RoundDriver:
             # fresh sha-less clean signal folded this round anchors to it — the
             # commit the bot was actually asked to review, never a mid-round head.
             self._round_review_head = self._local_head_sha() or self._process_start_head
+            # …and its commit time, the cutoff a sha-less clean signal folded THIS
+            # round must post-date. Re-read per round: the head advances on each
+            # substantive push, so a sign-off written against the PREVIOUS head is
+            # stale for this one and must not be credited with reviewing it.
+            self._round_review_head_time = self._local_head_commit_time(
+                self._round_review_head)
             expected = _canonical(self.expected_bots())
             # Round 1 consumes the preflight batch — actionable comments already on
             # the PR, folded through _classify_signal at run start. Consumed once;
@@ -2932,6 +3098,14 @@ class RoundDriver:
             # Snapshot the stale-reaction set before re-requesting: a +1 already on
             # the PR is stale; one arriving after the re-request is a fresh signal.
             self._capture_reaction_baseline()
+            # The instant reviewers are asked to look at _round_review_head — captured
+            # BEFORE _summon, which ends by sleeping out the register delay. Taking it
+            # after would put the floor a full register_delay AFTER the trigger landed
+            # and refuse an anchor to every sign-off arriving in that window, blocking
+            # a fully-reviewed PR. A sign-off predating the TRIGGER cannot be a response
+            # to it; one arriving just after falls inside the accepted in-flight
+            # residual documented on _anchor_clean_signal.
+            self._round_summon_time = self.wall_clock()
             self._summon(round_no, poll_expected)
             # A chatter-only preflight bot that is still polled this round was seen
             # before it (it spoke at preflight), so it must not hold the round open
@@ -3208,6 +3382,14 @@ class RoundDriver:
             # the gate, blocking if the new head is unreviewed. (The --match-head-commit
             # pin below is the second guard: GitHub aborts the merge if the head moved
             # past the verified head.)
+            #
+            # DELIBERATE: unlike the reference loop there is no content-PRESERVING
+            # branch here (which would merely re-pin after a clean, zero-conflict
+            # rebase). OSS pushes and rebases NOTHING between the gate and the merge,
+            # so any move in this window is an OUTSIDE push of unknown provenance and
+            # must read as substantive — fail-closed. If a future change ever pushes
+            # in this window (a fix-on-red-CI, a base-sync rebase), this becomes a
+            # hard over-block and needs the content-preserving branch added.
             cur_head = self._local_head_sha()
             if cur_head and verified_merge_head and cur_head != verified_merge_head:
                 # Advance the boundary to the head we just read AND re-gate against
@@ -3467,6 +3649,16 @@ class RoundDriver:
                         f"offering an interactive merge; handing it back",
                         status="skip")
             return False
+        # The HEAD-AWARE gate guards the ATTENDED path too. The name-based backstop
+        # above only asks whether anyone EVER reviewed; it would happily prompt a
+        # human to merge a head carrying substantive changes nobody reviewed, with no
+        # indication. So run the real gate, surface its reason BEFORE the prompt (the
+        # human decides, but never blind), and PIN the merge to the head the gate
+        # verified so an unreviewed push cannot land under the operator's "yes".
+        gate_blocked, gate_reason, verified_head = self._head_aware_merge_gate(
+            clean_exit=True)
+        if gate_blocked:
+            print(f"\n⚠️  {gate_reason}")
         try:
             suffix = f" ({self.repo})" if self.repo else ""
             answer = input(f"Merge PR #{self.pr}{suffix} now? (yes/no): ").strip().lower()
@@ -3478,7 +3670,7 @@ class RoundDriver:
             return False
         return merge.squash_merge(
             self.pr, repo=self.repo, enabled=True, cwd=self.cwd,
-            run=self.gh_run, notice=self.notice)
+            match_head=verified_head, run=self.gh_run, notice=self.notice)
 
     def _maybe_warn_claude_never_reviewed(self) -> None:
         """#g9a NOTIFICATION (never a block): the loop's primary reviewer (@claude)
