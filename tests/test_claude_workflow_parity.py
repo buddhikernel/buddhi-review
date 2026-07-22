@@ -254,9 +254,16 @@ def test_guard_is_self_contained_and_publish_clean() -> None:
 
 def test_credential_inputs_unchanged_and_runs_on_standard_runner() -> None:
     """F9 only ADDS detection — it must not weaken the dual-credential inputs and
-    must keep the free standard runner."""
+    must keep the free standard runner. anthropic_api_key is deliberately
+    conditional (only passed when CLAUDE_CODE_OAUTH_TOKEN is unset): Claude Code's
+    documented auth precedence always prefers ANTHROPIC_API_KEY over
+    CLAUDE_CODE_OAUTH_TOKEN in non-interactive mode, so passing both unconditionally
+    would silently flip a subscription-backed repo to pay-as-you-go billing."""
     with_ = _action_step()["with"]
     assert with_.get("claude_code_oauth_token") == "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}"
-    assert with_.get("anthropic_api_key") == "${{ secrets.ANTHROPIC_API_KEY }}"
+    assert (
+        with_.get("anthropic_api_key")
+        == "${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}"
+    )
     doc = yaml.safe_load(_workflow_text())
     assert doc["jobs"]["review"]["runs-on"] == "ubuntu-latest"
