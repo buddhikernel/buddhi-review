@@ -46,7 +46,7 @@ _REV_LOCK = _ROOT / "tests" / "data" / "claude_code_review_rev.json"
 # here, NOT derived from the lock or TEMPLATE, so a half-update that bumps the
 # lock's sha256+version together (but skips a real version increment) still
 # reds this test. Bumping it is a separate, deliberate edit to this file.
-_REV_LOCKED_VERSION = 3
+_REV_LOCKED_VERSION = 4
 
 
 def _step(path: Path):
@@ -72,7 +72,7 @@ def test_step_present_runs_always_self_contained(path):
 @pytest.mark.parametrize("path", _COPIES, ids=_IDS)
 def test_marker_contract_and_version(path):
     text = path.read_text(encoding="utf-8")
-    assert "# buddhi-managed-version: 3" in text
+    assert "# buddhi-managed-version: 4" in text
     assert "claude-review-unavailable-v1" in text
     assert "type=rate_limited resets_at=" in text
     assert "type=credits_exhausted" in text

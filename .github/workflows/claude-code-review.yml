@@ -1,13 +1,14 @@
-# buddhi-managed-version: 3
+# buddhi-managed-version: 4
 # ^ Buddhi tracks this file's version so `review-pr setup` can offer to update an
 #   outdated installed copy (the old one stays in the update PR's git history).
 name: Claude Code Review
-# PR reviewer powered by Claude. Auth uses whichever credential the repo has set:
-# CLAUDE_CODE_OAUTH_TOKEN (a `claude setup-token` subscription credential, so review
-# usage bills to the Claude subscription) or ANTHROPIC_API_KEY (a pay-as-you-go API
-# key). Either works; the job passes both inputs and the action uses whichever
-# secret is set. A subscription OAuth token has a 365-day lifetime; rotate it before
-# it silently 401s (track the issue date and set a calendar reminder ~11 months out).
+# PR reviewer powered by Claude. Auth prefers CLAUDE_CODE_OAUTH_TOKEN (a
+# `claude setup-token` subscription credential, so review usage bills to the
+# Claude subscription) and falls back to ANTHROPIC_API_KEY (a pay-as-you-go API
+# key) only when no OAuth token secret is set — see the `with:` block below for
+# why that order is load-bearing. A subscription OAuth token has a 365-day
+# lifetime; rotate it before it silently 401s (track the issue date and set a
+# calendar reminder ~11 months out).
 on:
   issue_comment:
     types: [created]
@@ -64,16 +65,25 @@ jobs:
           # can expose repository content to anyone with Actions log access.
           # Set to true temporarily when diagnosing silent tool-denial failures.
           show_full_output: false
-          # Auth: pass BOTH credentials as explicit inputs and let the action use
-          # whichever secret the repo has set. An unset secret renders to an empty
-          # input, which the action ignores, so a repo that holds only one of the
-          # two still authenticates. claude-code-action@v1 no longer reads the token
-          # from the step's env: block (runs fail at "Environment variable validation
-          # failed" before reaching the model), so both must be explicit inputs.
+          # Auth: pass CLAUDE_CODE_OAUTH_TOKEN unconditionally, and ANTHROPIC_API_KEY
+          # ONLY when the OAuth secret is absent. This order is load-bearing: per
+          # Claude Code's documented auth precedence
+          # (https://code.claude.com/docs/en/authentication#authentication-precedence),
+          # ANTHROPIC_API_KEY outranks CLAUDE_CODE_OAUTH_TOKEN, and "in non-interactive
+          # mode (-p), the key is always used when present" — the mode this action
+          # always runs in. Passing both unconditionally would silently switch a
+          # subscription-backed repo to pay-as-you-go billing (or fail outright on a
+          # disabled API org) the instant ANTHROPIC_API_KEY is set for an unrelated
+          # workflow in the same repo. An unset secret renders to an empty string, so
+          # the `== ''` guard below correctly detects "OAuth secret not configured"
+          # and falls back to the API key for repos that hold only that one.
+          # claude-code-action@v1 no longer reads the token from the step's env:
+          # block (runs fail at "Environment variable validation failed" before
+          # reaching the model), so both must be explicit inputs.
           # CLAUDE_CODE_OAUTH_TOKEN (a `claude setup-token` subscription credential)
           # bills to the Claude subscription; ANTHROPIC_API_KEY bills pay-as-you-go.
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
           # Three load-bearing prompt contracts the review loop depends on:
           #
           # 1. Findings MUST be inline review comments. The review loop only
@@ -178,7 +188,11 @@ jobs:
           #     PRs. Without these, Claude gave up without posting EITHER
           #     inline findings OR the "No issues found." sentinel on large
           #     PRs, and the loop's quiet-bot ask gate kept re-poking. Safe
-          #     because the job already has `contents: read` and no write tools.
+          #     because Read/Glob/Grep only add read-only filesystem access —
+          #     they don't expand the job's GitHub write surface beyond the
+          #     comment/review posting already granted via `pull-requests:
+          #     write` / `issues: write` and the gh pr comment/review/inline-
+          #     comment tools above.
           #   - Bash(gh pr review:*): Claude reaches for `gh pr review --comment`
           #     as a natural alternative to `gh pr comment` for the top-level
           #     sentinel; without it the model gives up after the denial
