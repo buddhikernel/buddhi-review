@@ -5,13 +5,16 @@ sign-off lives on GitHub, but the loop reconstructed nothing, so an approved bot
 was summoned, waited on for a register delay, and polled for a full window — for a
 verdict already in hand.
 
-The approval is now re-derived live from GitHub, and **the reviewer's LATEST
-message wins**. A stale "LGTM" must NOT silence a bot that has since posted real
-feedback — including feedback posted as an INLINE review comment, the channel a
+The approval is now re-derived live from GitHub, and **the LATEST signal wins**.
+A stale "LGTM" must NOT silence a bot that has since posted real feedback —
+including feedback posted as an INLINE review comment, the channel a
 conversation-only scan would miss entirely. A bare ``+1`` reaction (the only
-signal some reviewers ever emit) folds on its own, but can never outrank a newer
-message: reactions carry no timestamp, so a ``+1`` beside a substantive latest
-message is not treated as a sign-off.
+signal some reviewers ever emit) folds on its own; a ``+1`` posted AFTER a
+substantive latest message also folds it — GitHub reactions carry a real
+``created_at``, so a fresh +1 is compared against the message's stamp with the
+same freshness rule the live ``_fold_reactions`` path applies. A ``+1`` that
+is merely a TIE with the message (same instant, or itself undated) does not
+outrank it.
 
 The ``+1`` fold here is deliberately NOT the round loop's ``_fold_reactions``:
 that one reads reactions only, and fails CLOSED until the preflight snapshot has
@@ -242,16 +245,37 @@ def test_same_instant_lgtm_beside_a_finding_does_not_fold_the_bot():
 
 
 def test_stale_plus_one_beside_a_newer_inline_comment_is_resummoned():
-    # A +1 reaction carries no timestamp, so it can never outrank a DATED message.
-    # A reviewer whose newest message is substantive is still engaged, +1 or not.
+    # The +1 PRE-dates the reviewer's substantive latest message (a tie would lose
+    # too — _supersedes requires STRICTLY newer). A reviewer whose newest message
+    # is substantive, and whose +1 does not post-date it, is still engaged.
     comments = [
         Comment(id="f", text="this null check is missing", source="claude[bot]",
                 path="x.py", diff_hunk="@@ -1 +1 @@", created_at=NEW),
     ]
-    driver, clock, gh = make_driver(comments, reactions=[_plus_one()])
+    driver, clock, gh = make_driver(comments, reactions=[_plus_one(created_at=OLD)])
     driver.run()
     assert "claude" not in driver.approved
     assert gh.matching(SUMMON)
+
+
+def test_fresh_plus_one_after_a_finding_outranks_it_and_is_not_resummoned():
+    # The reviewer posted a finding, then — after the fix landed — reacted with a
+    # bare +1 STRICTLY AFTER that finding's timestamp. GitHub reactions carry a
+    # real created_at, so this +1 is a genuine later verdict: the same freshness
+    # rule the live _fold_reactions path applies to every fresh +1 (fold it as
+    # approval regardless of what the bot said before) must also apply on an
+    # --rr-active restart, or the verdict already in hand is discarded and the
+    # bot is re-summoned and re-polled for a fix it already approved.
+    comments = [
+        Comment(id="f", text="this null check is missing", source="claude[bot]",
+                path="x.py", diff_hunk="@@ -1 +1 @@", created_at=OLD),
+    ]
+    driver, clock, gh = make_driver(comments, reactions=[_plus_one(created_at=NEW)],
+                                    auto_merge=True)
+    outcome = driver.run()
+    assert "claude" in driver.done and "claude" in driver.approved
+    assert gh.matching(SUMMON) == []             # never re-asked
+    assert outcome.merged is True
 
 
 # ---------------------------------------------------------------------------

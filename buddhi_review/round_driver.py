@@ -720,6 +720,12 @@ def _genuine_review_shas_by_bot(top_level_reviews, inline_comments):
         if not commit_id:
             continue
         body = review.get("body", "") or ""
+        if not isinstance(body, str):
+            # A non-string truthy body (malformed payload / test seam) can't be
+            # regex-tested; treat it as empty rather than crashing the regex in
+            # is_placeholder_review_body — falls through to the empty-body check
+            # below, which fails closed (skip unless the state is APPROVED).
+            body = ""
         state = (review.get("state") or "").upper()
         # can't-review placeholder → never a review of this commit
         if detectors.is_placeholder_review_body(body):
@@ -737,7 +743,7 @@ def _genuine_review_shas_by_bot(top_level_reviews, inline_comments):
         if not key:
             continue
         anchored = comment.get("original_commit_id") or comment.get("commit_id")
-        if anchored:
+        if isinstance(anchored, str) and anchored:
             shas.setdefault(key, set()).add(anchored)
     return shas
 
@@ -2519,15 +2525,19 @@ class RoundDriver:
         """Fold every reviewer that has ALREADY signed off into voluntarily-done,
         re-derived live from GitHub. Returns the set folded here.
 
-        **Latest message wins.** A reviewer's most-recent message across all three
-        channels (inline comments, review bodies, PR conversation) decides: only a
-        LATEST message that is a clean review folds it. A stale LGTM followed by
-        substantive feedback — including an inline comment, the channel a
-        conversation-only scan would miss — must NOT silence a reviewer that is
-        still engaged. A bare ``+1`` (the sign-off of a reviewer that posts no
-        message at all) folds on its own; a ``+1`` alongside a substantive latest
-        message does not (reactions carry no timestamp, so they can never outrank a
-        message that does).
+        **The latest SIGNAL wins.** A reviewer's most-recent message across all
+        three channels (inline comments, review bodies, PR conversation) decides:
+        only a LATEST message that is a clean review folds it. A stale LGTM
+        followed by substantive feedback — including an inline comment, the
+        channel a conversation-only scan would miss — must NOT silence a reviewer
+        that is still engaged. A bare ``+1`` (the sign-off of a reviewer that
+        posts no message at all) folds on its own; a ``+1`` posted AFTER a
+        substantive latest message also folds it, on the same ``_supersedes``
+        freshness rule the live ``_fold_reactions`` path applies to every
+        reaction — GitHub reaction payloads carry a real ``created_at``, so a
+        fresh +1 is compared against the message's stamp rather than assumed
+        undatable. A tie (same instant, or the +1 undated) does NOT outrank the
+        message.
 
         Deliberately NOT ``_fold_reactions``: that reads ``+1`` reactions only, and
         fails closed while the reaction baseline is unset — which it is here, since
@@ -2592,13 +2602,23 @@ class RoundDriver:
             if st.signal is not None or bot in self.done or self.store.is_excluded(bot):
                 continue
             newest = latest.get(bot)
-            if newest is None:
-                # A bare +1 signs off only when the loop KNOWS the bot posted no
-                # message — i.e. the comment read succeeded. If that read FAILED,
-                # "no message" is ignorance, not evidence: the unread message could
-                # be a failure placeholder or a fresh finding, and a +1 must never
-                # crown such a reviewer "Approved" (which would satisfy the
-                # never-merge-unreviewed gate). Fail closed → it is re-summoned.
+            reaction_stamp = plus_one.get(bot)
+            # A +1 posted STRICTLY AFTER the bot's latest message outranks that
+            # message, mirroring the live _fold_reactions path: a fresh reaction is
+            # folded as approval there regardless of what the bot said before, so a
+            # restart must honor the same fresh reaction rather than re-summon a
+            # reviewer whose verdict (a later +1 on the fixed head) is already in
+            # hand. _supersedes ties go to the message: a same-instant stamp is not
+            # proof the +1 came AFTER the message was posted/read.
+            reaction_wins = newest is not None and _supersedes(reaction_stamp, newest[0])
+            if newest is None or reaction_wins:
+                # A bare +1 (or a +1 that outranks the latest message) signs off
+                # only when the loop KNOWS the comment read succeeded. If that read
+                # FAILED, "no later message" is ignorance, not evidence: an unread
+                # message could be a failure placeholder or a fresh finding, and a
+                # +1 must never crown such a reviewer "Approved" (which would
+                # satisfy the never-merge-unreviewed gate). Fail closed → it is
+                # re-summoned.
                 signed_off = comments_read and bot in plus_one
             else:
                 signed_off = self._is_sign_off(newest[1])
@@ -2608,30 +2628,34 @@ class RoundDriver:
             self.approved.add(bot)
             st.signal = detectors.SIGNAL_CLEAN
             self.responded_ever.add(bot)
-            if newest is not None:
+            if newest is not None and not reaction_wins:
                 # Record the sign-off's effective stamp so a no-reset-time
                 # rate-limit marker can test whether it pre-dates this approval
                 # before un-crowning it (see _scan_unavailable_markers). A bare +1
-                # (newest is None) carries no timestamp, so none is recorded and the
-                # marker un-crowns conservatively.
+                # (newest is None), or a +1 that outranked an older message, carries
+                # no dated MESSAGE to record here, so none is recorded and the
+                # marker un-crowns conservatively — mirroring the bare-+1 case.
                 self._rederived_approval_stamps[bot] = newest[0]
             # F2: the timestamp the head-aware gate date-anchors this sign-off on —
-            # the latest message's effective stamp, or (for a bare +1) the reaction's
-            # own time. None → UNANCHORABLE, so the gate refuses to credit it with
-            # reviewing the current head. Kept separate from
-            # _rederived_approval_stamps, whose rate-limit-marker semantics
-            # deliberately record nothing for a bare +1.
+            # the latest message's effective stamp, or (for a bare +1, or a +1 that
+            # outranked an older message) the reaction's own time. None →
+            # UNANCHORABLE, so the gate refuses to credit it with reviewing the
+            # current head. Kept separate from _rederived_approval_stamps, whose
+            # rate-limit-marker semantics deliberately record nothing for a
+            # reaction-only fold.
             # created_at, NOT the updated_at-or-created_at ORDERING stamp: an EDIT
             # re-dates a message without re-reviewing anything, so an old sign-off
             # edited after the current head would otherwise read as fresh for it.
             self._restore_signal_stamps[bot] = (
-                newest[2] if newest is not None else plus_one.get(bot))
-            if newest is None:
-                # Folded on a bare +1, so NO text of this bot was ever quota-checked.
-                # Mark it reaction-done exactly as the poll's own +1 fold does, so the
-                # between-rounds quota re-check still reconsiders anything it posts
-                # later: a novel-wording quota message must be able to evict this
-                # sign-off rather than ride it into the merge gate.
+                newest[2] if (newest is not None and not reaction_wins) else reaction_stamp)
+            if newest is None or reaction_wins:
+                # Folded on a reaction (bare, or one that outranked an older
+                # message), so NO text of this bot's sign-off was ever
+                # quota-checked by _is_sign_off. Mark it reaction-done exactly as
+                # the poll's own +1 fold does, so the between-rounds quota
+                # re-check still reconsiders anything it posts later: a
+                # novel-wording quota message must be able to evict this sign-off
+                # rather than ride it into the merge gate.
                 self._reaction_done.add(bot)
             folded.add(bot)
             print(f"[rr-active] {bot}: already approved this PR — not re-requesting")

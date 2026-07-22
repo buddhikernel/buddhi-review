@@ -186,6 +186,27 @@ def test_pure_shas_empty_body_only_counts_when_approved():
         [_review("claude", "c1", body="", state="APPROVED")], []) == {"claude": {"c1"}}
 
 
+def test_pure_shas_non_string_body_does_not_crash_and_is_not_credited():
+    # A truthy non-string body (malformed payload / test seam) must not reach the
+    # is_placeholder_review_body regex — it fails closed to "not genuine" instead
+    # of raising, unless the state is an explicit APPROVED.
+    assert _genuine_review_shas_by_bot(
+        [_review("claude", "c1", body={"not": "a string"}, state="COMMENTED")], []) == {}
+    assert _genuine_review_shas_by_bot(
+        [_review("claude", "c1", body=12345, state="APPROVED")], []) == {"claude": {"c1"}}
+
+
+def test_pure_shas_non_string_inline_anchor_is_not_credited():
+    # A non-string commit anchor (malformed payload / test seam) must not be added
+    # to the reviewed-sha set — it would otherwise flow into ancestry / subprocess
+    # argv building downstream.
+    assert _genuine_review_shas_by_bot([], [{"user": {"login": "codex[bot]"},
+                                              "original_commit_id": 12345}]) == {}
+    assert _genuine_review_shas_by_bot([], [{"user": {"login": "codex[bot]"},
+                                              "original_commit_id": None,
+                                              "commit_id": None}]) == {}
+
+
 def test_pure_block_rule_substantive_strict():
     anc = lambda a, b: ORDER[a] <= ORDER[b]
     # merged head reviewed → pass (case 1)

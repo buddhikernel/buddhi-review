@@ -112,11 +112,17 @@ def _comment_from_raw(raw: dict, *, from_issue_channel: Optional[bool] = None) -
     )
 
 
-def _parse_payload(text: str) -> List[dict]:
+def _parse_payload(text: str) -> Optional[List[dict]]:
+    """Parse a seeded JSON payload into a list of dicts, or ``None`` when it is
+    unparseable — distinct from ``[]`` (a valid payload with nothing usable in
+    it). Callers that historically treated a decode failure as "no items"
+    (:func:`fetch_comments`, :func:`fetch_reactions`) fold ``None`` back to
+    ``[]`` themselves; :func:`_fetch_raw_dicts` propagates ``None`` as-is so the
+    head-aware merge gate can fail closed on a malformed seam payload."""
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return []
+        return None
     if isinstance(data, dict):  # tolerate a single-object payload
         data = [data]
     return [d for d in data if isinstance(d, dict)]
@@ -137,7 +143,7 @@ def fetch_comments(
     """
     seeded = os.environ.get(COMMENTS_JSON_ENV)
     if seeded is not None:
-        raws = _parse_payload(seeded)
+        raws = _parse_payload(seeded) or []
         return [c for c in (map(_comment_from_raw, raws)) if c is not None]
 
     repo_path = repo or "{owner}/{repo}"
@@ -246,7 +252,7 @@ def fetch_reactions(
     ``run``. Network errors raise — the caller decides how to degrade."""
     seeded = os.environ.get(REACTIONS_JSON_ENV)
     if seeded is not None:
-        raws = _parse_payload(seeded)
+        raws = _parse_payload(seeded) or []
         return [r for r in map(_reaction_from_raw, raws) if r is not None]
 
     repo_path = repo or "{owner}/{repo}"
@@ -444,7 +450,7 @@ def fetch_review_threads(
     thread and never appears here."""
     seeded = os.environ.get(THREADS_JSON_ENV)
     if seeded is not None:
-        raws = _parse_payload(seeded)
+        raws = _parse_payload(seeded) or []
         return [t for t in map(_review_thread_from_raw, raws) if t is not None]
 
     if not repo or "/" not in repo:
