@@ -8,6 +8,9 @@ nothing here ever touches the real ``~/.claude`` or ``~/.config``.
 from __future__ import annotations
 
 import json
+import os
+import signal
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -496,6 +499,384 @@ def test_sidecar_write_failure_is_reported_not_raised(env):
     assert summary.had_error
     assert (env.target / "review-pr" / "SKILL.md").exists()  # files installed regardless
     assert not env.sidecar.exists()  # provenance genuinely was not recorded
+
+
+# ── No-longer-bundled prune (and what it must NEVER touch) ───────────────────────
+
+def _record(env, key: str, hash_: str) -> None:
+    """Add one raw sidecar record under ``key`` (a string, so non-canonical spellings
+    survive — ``Path`` would collapse them before they ever reach the file)."""
+    sc = json.loads(env.sidecar.read_text())
+    sc["files"][key] = {"version": package_version(), "hash": hash_}
+    env.sidecar.write_text(json.dumps(sc), encoding="utf-8")
+
+
+def test_stale_record_is_pruned_when_ours_unmodified(env):
+    """The genuine prune still works: a recorded file whose source is no longer bundled
+    and whose bytes are ours-unmodified is removed and its record dropped."""
+    skill_install.install_skills()
+    stale = env.target / "open-pr" / "gone.md"
+    stale.write_text("dropped upstream\n", encoding="utf-8")
+    _record(env, str(stale), content_hash("dropped upstream\n"))
+
+    summary = skill_install.install_skills()
+    assert _actions(summary)[("open-pr", "gone.md")] == skill_install.REMOVED
+    assert not stale.exists()
+    assert str(stale) not in json.loads(env.sidecar.read_text())["files"]
+
+
+def test_stale_record_modified_is_conflict_then_removed_with_force(env):
+    """…and a MODIFIED no-longer-bundled file is preserved as a CONFLICT until --force,
+    which backs it up first."""
+    skill_install.install_skills()
+    stale = env.target / "open-pr" / "gone.md"
+    stale.write_text("user edited this\n", encoding="utf-8")
+    _record(env, str(stale), content_hash("the bytes we once wrote\n"))
+
+    summary = skill_install.install_skills()
+    assert _actions(summary)[("open-pr", "gone.md")] == skill_install.CONFLICT
+    assert stale.read_text(encoding="utf-8") == "user edited this\n"
+
+    summary = skill_install.install_skills(force=True)
+    assert _actions(summary)[("open-pr", "gone.md")] == skill_install.REMOVED
+    assert not stale.exists()
+    baks = list((env.target / "open-pr").glob("gone.md.bak-*"))
+    assert len(baks) == 1 and baks[0].read_text(encoding="utf-8") == "user edited this\n"
+
+
+# Non-canonical spellings of one currently-bundled destination. Each normalizes back onto
+# ``<root>/open-pr/SKILL.md`` but is a DIFFERENT string, so a raw-string "still bundled?"
+# check would let the prune act on a file the install loop simultaneously keeps.
+_ALIAS_SPELLINGS = ("{root}/open-pr/./SKILL.md",
+                    "{root}/open-pr//SKILL.md",
+                    "{root}/open-pr/references/../SKILL.md",
+                    "{root}/./open-pr/SKILL.md")
+
+
+@pytest.mark.parametrize("spelling", _ALIAS_SPELLINGS)
+def test_noncanonical_key_never_prunes_a_bundled_file(env, spelling):
+    """DATA LOSS GUARD: a sidecar key that is a non-canonical spelling of a CURRENTLY
+    bundled file must never enter the prune — a plain (force=False) re-run leaves the
+    file on disk, with its content and its canonical record intact."""
+    skill_install.install_skills()
+    dest = env.target / "open-pr" / "SKILL.md"
+    installed = dest.read_text(encoding="utf-8")
+    # The alias carries the file's REAL current hash — i.e. it would match
+    # ``ours_unmodified`` and be unlink()ed, with no backup, by an unfixed prune.
+    _record(env, spelling.format(root=env.target), content_hash(installed))
+
+    summary = skill_install.install_skills()
+    assert dest.exists()                                        # the whole point
+    assert dest.read_text(encoding="utf-8") == installed        # byte-identical
+    assert not any(f.action == skill_install.REMOVED for f in summary.files)
+    assert not any("no longer bundled" in f.detail for f in summary.files)
+    # Exactly ONE verdict for that destination — never a keep from the install loop plus a
+    # contradictory prune verdict for the same file in the same run.
+    assert len([f for f in summary.files if f.path == dest]) == 1
+    assert json.loads(env.sidecar.read_text())["files"][str(dest)]["hash"] == content_hash(installed)
+
+
+@pytest.mark.parametrize("spelling", _ALIAS_SPELLINGS)
+def test_noncanonical_key_never_prunes_a_user_modified_bundled_file(env, spelling):
+    """Same alias, but the on-disk file is USER-MODIFIED: it stays a preserved CONFLICT
+    (the install loop's verdict) and is never removed or backed up by the prune."""
+    skill_install.install_skills()
+    dest = env.target / "open-pr" / "SKILL.md"
+    recorded = json.loads(env.sidecar.read_text())["files"][str(dest)]["hash"]
+    dest.write_text("my own edit\n", encoding="utf-8")
+    _record(env, spelling.format(root=env.target), recorded)
+
+    summary = skill_install.install_skills()
+    assert _actions(summary)[("open-pr", "SKILL.md")] == skill_install.CONFLICT
+    assert dest.read_text(encoding="utf-8") == "my own edit\n"   # untouched
+    assert not any(f.action == skill_install.REMOVED for f in summary.files)
+    assert not list(dest.parent.glob("SKILL.md.bak-*"))          # nothing moved aside
+    assert len([f for f in summary.files if f.path == dest]) == 1  # one verdict, not two
+
+
+def test_hardlinked_alias_key_never_prunes_a_bundled_file(env):
+    """A key that is a HARD LINK to a bundled file is a spelling no amount of lexical
+    normalizing reveals — the prune must still refuse it (filesystem-identity guard)."""
+    skill_install.install_skills()
+    dest = env.target / "open-pr" / "SKILL.md"
+    installed = dest.read_text(encoding="utf-8")
+    alias = env.target / "open-pr" / "alias.md"
+    os.link(dest, alias)  # same inode, second name
+    _record(env, str(alias), content_hash(installed))
+
+    summary = skill_install.install_skills()
+    assert dest.exists() and dest.read_text(encoding="utf-8") == installed
+    # The alias is left alone too: the prune cannot tell an alias-of-a-live-file from the
+    # live file itself, and leaving a stale name is always the safe side of that call.
+    assert alias.exists()
+    assert not any(f.action == skill_install.REMOVED for f in summary.files)
+
+
+def test_case_variant_key_never_prunes_a_bundled_file(env):
+    """On a case-INSENSITIVE filesystem (macOS APFS by default) ``…/OPEN-PR/SKILL.md`` is a
+    different STRING but the SAME file — normalization cannot tell, so identity must."""
+    skill_install.install_skills()
+    dest = env.target / "open-pr" / "SKILL.md"
+    upper = env.target / "OPEN-PR" / "SKILL.md"
+    if not upper.exists():
+        pytest.skip("case-sensitive filesystem — the case-variant alias is a different file")
+    installed = dest.read_text(encoding="utf-8")
+    _record(env, str(upper), content_hash(installed))
+
+    summary = skill_install.install_skills()
+    assert dest.exists()                                     # NOT deleted out from under us
+    assert dest.read_text(encoding="utf-8") == installed
+    assert not any(f.action == skill_install.REMOVED for f in summary.files)
+    assert not any("no longer bundled" in f.detail for f in summary.files)
+
+
+@pytest.mark.parametrize("uninstall", [False, True])
+def test_sidecar_key_naming_a_directory_is_never_moved_aside(env, uninstall):
+    """A record naming a DIRECTORY is corruption. Even under --force it must stay a
+    CONFLICT: backing it up would move a live skill dir (plus the user's own files in it)
+    to a ``.bak-<ts>`` sibling that Claude Code still scans as a skill."""
+    skill_install.install_skills()
+    skill_dir = env.target / "open-pr"
+    (skill_dir / "my-notes.md").write_text("my own notes\n", encoding="utf-8")
+    _record(env, str(skill_dir), content_hash("whatever\n"))
+
+    summary = skill_install.install_skills(force=True, uninstall=uninstall)
+    assert skill_dir.is_dir()                                    # still a live skill dir
+    assert (skill_dir / "my-notes.md").read_text(encoding="utf-8") == "my own notes\n"
+    assert not list(env.target.glob("open-pr.bak-*"))            # nothing moved aside
+    assert not list(env.target.parent.glob("open-pr.bak-*"))
+    dir_outcomes = [f for f in summary.files if f.path == skill_dir]
+    assert dir_outcomes and all(f.action == skill_install.CONFLICT for f in dir_outcomes)
+    # The dead record is retired, so the same CONFLICT does not recur on every future run.
+    assert str(skill_dir) not in json.loads(env.sidecar.read_text())["files"]
+    later = skill_install.install_skills(force=True, uninstall=uninstall)
+    assert not any(f.path == skill_dir for f in later.files)
+
+
+def test_directory_record_is_reported_but_kept_under_dry_run(env):
+    """--dry-run writes nothing — including the sidecar — so the dead directory record is
+    reported and still there afterwards."""
+    skill_install.install_skills()
+    skill_dir = env.target / "open-pr"
+    _record(env, str(skill_dir), content_hash("whatever\n"))
+
+    summary = skill_install.install_skills(force=True, dry_run=True)
+    assert [f.action for f in summary.files if f.path == skill_dir] == [skill_install.CONFLICT]
+    assert str(skill_dir) in json.loads(env.sidecar.read_text())["files"]
+
+
+def test_deeply_nested_sidecar_reads_as_empty(env):
+    """A structurally corrupt sidecar makes ``json.loads`` raise RecursionError, which is
+    neither OSError nor ValueError — it must still degrade to an empty read."""
+    env.sidecar.parent.mkdir(parents=True, exist_ok=True)
+    env.sidecar.write_text("[" * 20000 + "]" * 20000, encoding="utf-8")
+
+    assert skill_install._load_sidecar(env.sidecar) == {}
+    summary = skill_install.install_skills()  # must not raise
+    assert (env.target / "open-pr" / "SKILL.md").exists()
+    assert set(_actions(summary).values()) == {skill_install.INSTALL}
+
+
+@pytest.mark.parametrize("bad", ["\x00", "\ud800"])
+def test_unusable_sidecar_key_never_raises(env, bad):
+    """A sidecar key is untrusted input. An embedded NUL (or a lone surrogate) makes a raw
+    ``os.lstat`` raise ValueError where pathlib swallows it — every mode must still return
+    a summary rather than abort the run with a bare traceback."""
+    skill_install.install_skills()
+    _record(env, f"{env.target}/open{bad}-pr/SKILL.md", content_hash("x\n"))
+
+    for kwargs in ({}, {"dry_run": True}, {"force": True}):
+        summary = skill_install.install_skills(**kwargs)   # must not raise
+        assert isinstance(summary, skill_install.InstallSummary)
+    assert (env.target / "open-pr" / "SKILL.md").exists()  # the real tree is untouched
+    assert isinstance(skill_install.install_skills(uninstall=True), skill_install.InstallSummary)
+
+
+@pytest.mark.parametrize("bad", ["\x00", "\ud800"])
+def test_unusable_sidecar_key_outcome_is_printable(env, bad):
+    """Not raising inside :mod:`skill_install` isn't enough on its own: the CLI prints
+    ``f.skill``/``f.rel`` straight to stdout, so a lone surrogate (or NUL) surviving into
+    those fields crashes the run one layer up with ``UnicodeEncodeError`` even though
+    ``install_skills`` itself returned cleanly. Every outcome's ``skill``/``rel`` must
+    round-trip through UTF-8 unchanged."""
+    skill_install.install_skills()
+    key = f"{env.target}/open{bad}-pr/SKILL.md"
+    _record(env, key, content_hash("x\n"))
+
+    summary = skill_install.install_skills()
+    matches = [f for f in summary.files if bad in str(f.path)]
+    assert matches
+    for f in matches:
+        f.skill.encode("utf-8")  # must not raise UnicodeEncodeError
+        f.rel.encode("utf-8")
+
+
+def test_sidecar_key_equal_to_root_is_not_actionable(env):
+    """A corrupt record naming the skills ROOT itself is rejected outright — otherwise
+    --force would back up (i.e. move away) the ENTIRE skills tree in one step."""
+    skill_install.install_skills()
+    _record(env, str(env.target), content_hash("whatever\n"))
+
+    summary = skill_install.install_skills(force=True)
+    assert env.target.is_dir()
+    assert (env.target / "open-pr" / "SKILL.md").exists()
+    assert not list(env.target.parent.glob(f"{env.target.name}.bak-*"))
+    assert not any(f.path == env.target for f in summary.files)
+
+    # Same on the uninstall path, where the record loop is the only gate.
+    summary = skill_install.install_skills(uninstall=True, force=True)
+    assert env.target.is_dir()
+    assert not list(env.target.parent.glob(f"{env.target.name}.bak-*"))
+    assert not any(f.path == env.target for f in summary.files)
+
+
+# Every mode, so a key that upsets a filesystem probe cannot abort ANY of them — least of
+# all --dry-run, which is documented to write nothing and merely report.
+_ALL_MODES = [{}, {"force": True}, {"dry_run": True}, {"uninstall": True}]
+_MODE_IDS = ["plain", "force", "dry-run", "uninstall"]
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_overlong_sidecar_key_completes_normally(env, kwargs):
+    """An overlong path makes ``os.lstat`` fail ENAMETOOLONG — which ``Path.exists()`` /
+    ``is_symlink()`` re-raise rather than swallow. The run must still report the record
+    instead of dying with a bare traceback.
+
+    ENAMETOOLONG is a limit on the path given to the syscall, NOT proof of absence (a file
+    reached relatively from a deep working directory exists while its absolute path cannot
+    be stat'ed), so the record is reported as an error and KEPT, never retired."""
+    skill_install.install_skills()
+    key = f"{env.target}/open-pr/{'x' * 5000}"
+    _record(env, key, content_hash("x\n"))
+
+    summary = skill_install.install_skills(**kwargs)  # must not raise
+    outs = [f for f in summary.files if str(f.path) == key]
+    assert len(outs) == 1 and outs[0].action == skill_install.ERROR
+    assert "record kept" in outs[0].detail
+    assert key in json.loads(env.sidecar.read_text())["files"]  # never silently retired
+
+
+class _Blocked(BaseException):
+    """Raised by :func:`_no_blocking`. A BaseException on purpose: the code under test
+    swallows ``OSError``, and the root conftest breaker raises ``TimeoutError`` — an
+    OSError subclass — so a hang there is caught by ``_hash_on_disk`` and silently becomes
+    a SLOW PASS instead of a failure. This one cannot be absorbed."""
+
+
+@contextmanager
+def _no_blocking(seconds: int = 5):
+    """Fail — do not merely delay — if the wrapped call blocks. It also replaces the outer
+    per-test breaker for its duration, restoring the previous handler on the way out."""
+    def _fire(signum, frame):
+        raise _Blocked(f"install_skills blocked for more than {seconds}s")
+
+    old = signal.signal(signal.SIGALRM, _fire)
+    signal.setitimer(signal.ITIMER_REAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, old)
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_fifo_record_completes_without_hanging(env, kwargs):
+    """A record naming a FIFO must never be opened: reading one with no writer blocks the
+    whole run forever. It is not a regular file, so it is reported and left alone."""
+    skill_install.install_skills()
+    fifo = env.target / "open-pr" / "pipe.md"
+    os.mkfifo(fifo)
+    _record(env, str(fifo), content_hash("x\n"))
+
+    with _no_blocking(5):  # must not raise AND must not block
+        summary = skill_install.install_skills(**kwargs)
+    assert [f.action for f in summary.files if f.path == fifo] == [skill_install.CONFLICT]
+    assert fifo.is_fifo()          # never opened, never moved aside
+    assert not list(fifo.parent.glob("pipe.md.bak-*"))
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_unreadable_record_keeps_its_provenance(env, kwargs):
+    """When a probe cannot tell what is at a recorded path, the record is KEPT and the
+    failure reported — dropping it would orphan a file that may still be on disk. Both
+    record loops must behave this way, so every mode is exercised (``--uninstall`` reaches
+    :func:`_uninstall`'s loop, the rest reach the prune in :func:`_install`)."""
+    skill_install.install_skills()
+    stale_dir = env.target / "open-pr" / "old"
+    stale_dir.mkdir()
+    stale = stale_dir / "gone.md"
+    stale.write_text("still here\n", encoding="utf-8")
+    _record(env, str(stale), content_hash("still here\n"))
+    stale_dir.chmod(0o000)  # no search bit → lstat fails EACCES
+    try:
+        summary = skill_install.install_skills(**kwargs)  # must not raise
+        outs = [f for f in summary.files if f.path == stale]
+        assert len(outs) == 1 and outs[0].action == skill_install.ERROR
+        assert "could not inspect it — record kept" in outs[0].detail
+        assert str(stale) in json.loads(env.sidecar.read_text())["files"]
+    finally:
+        stale_dir.chmod(0o700)
+    assert stale.read_text(encoding="utf-8") == "still here\n"
+
+
+@pytest.mark.parametrize("uninstall", [False, True], ids=["install", "uninstall"])
+def test_symlink_record_backup_failure_is_reported_not_raised(env, uninstall):
+    """``--force`` on a recorded SYMLINK moves the link aside, which needs write permission
+    on its parent. A read-only skill dir must yield an ERROR outcome — the same treatment
+    the regular-file branch beside it already gives — never a raise."""
+    skill_install.install_skills()
+    legacy = env.target / "legacy-skill"
+    legacy.mkdir()
+    link = legacy / "NOTES.md"
+    link.symlink_to("/etc/hosts")
+    _record(env, str(link), content_hash("x\n"))
+    legacy.chmod(0o500)  # searchable, NOT writable → _backup's os.replace fails EACCES
+    try:
+        summary = skill_install.install_skills(force=True, uninstall=uninstall)  # no raise
+        outs = [f for f in summary.files if f.path == link]
+        assert len(outs) == 1 and outs[0].action == skill_install.ERROR
+        assert str(link) in json.loads(env.sidecar.read_text())["files"]  # record kept
+    finally:
+        legacy.chmod(0o700)
+    assert link.is_symlink()                       # the link itself is untouched
+    assert not list(legacy.glob("NOTES.md.bak-*"))
+
+
+def test_dry_run_alias_key_is_skipped_lexically(env):
+    """The LEXICAL half of the prune's skip is load-bearing exactly where the destination
+    has no inode yet: in a --dry-run first install nothing is on disk, so the (dev, ino)
+    identity guard has nothing to match on and only the normalized-string compare keeps a
+    currently-bundled destination out of the prune. Without it the same run reports two
+    contradictory verdicts for one file — install, and 'no longer bundled'."""
+    env.sidecar.parent.mkdir(parents=True, exist_ok=True)
+    env.sidecar.write_text(json.dumps({"schema": 1, "files": {
+        f"{env.target}/open-pr/./SKILL.md": {"version": "0.0.1", "hash": content_hash("x\n")},
+    }}), encoding="utf-8")
+    dest = env.target / "open-pr" / "SKILL.md"
+
+    summary = skill_install.install_skills(dry_run=True)
+    assert [f.action for f in summary.files if f.path == dest] == [skill_install.INSTALL]
+    assert not any("no longer bundled" in f.detail for f in summary.files)
+    assert not env.target.exists()  # --dry-run still wrote nothing
+
+
+# ── Unreadable config dir: the sidecar read fails SAFE, never raises ──────────────
+
+def test_load_sidecar_on_unsearchable_parent_returns_empty(env):
+    """``Path.exists()`` itself raises PermissionError when the sidecar's parent dir has
+    no search bit; that must read as an empty (=> nothing is ours => nothing clobbered)
+    sidecar, not abort the run with a bare traceback."""
+    env.sidecar.parent.mkdir(parents=True, exist_ok=True)
+    env.sidecar.write_text('{"schema": 1, "files": {}}', encoding="utf-8")
+    env.sidecar.parent.chmod(0o000)
+    try:
+        assert skill_install._load_sidecar(env.sidecar) == {}
+        # And a whole install still completes (files installed, no exception).
+        summary = skill_install.install_skills()
+        assert (env.target / "open-pr" / "SKILL.md").exists()
+        assert set(_actions(summary).values()) >= {skill_install.INSTALL}
+    finally:
+        env.sidecar.parent.chmod(0o700)  # so tmp_path cleanup can recurse
 
 
 # ── CLI subcommand ────────────────────────────────────────────────────────────────
