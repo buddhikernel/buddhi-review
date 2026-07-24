@@ -99,6 +99,37 @@ def test_discover_does_not_duplicate_free_when_registered():
     assert sum(1 for b in found if getattr(b, "name", None) == "free") == 1
 
 
+def test_a_hostile_name_cannot_make_a_broken_entry_point_fatal():
+    """The de-duplication test at the end of discovery sits OUTSIDE the per-entry-point
+    ``try``, so reading (or comparing) a third-party ``name`` there must stay on built-in
+    behaviour. Otherwise a backend whose ``name`` raises makes a broken plugin FATAL —
+    the one thing discovery promises can never happen."""
+    class _HostileName:
+        def __eq__(self, other):
+            raise RuntimeError("hostile __eq__")
+
+        __hash__ = None
+
+    class _RaisingProperty(FakeBackend):
+        @property
+        def name(self):
+            raise RuntimeError("hostile property")
+
+    class _ValueEP:
+        def load(self):
+            b = FakeBackend(name="x")
+            b.name = _HostileName()
+            return b
+
+    class _PropertyEP:
+        def load(self):
+            return _RaisingProperty()
+
+    for ep in (_ValueEP(), _PropertyEP()):
+        found = backends.discover_backends(entry_points_fn=lambda group: [ep])
+        assert any(isinstance(b, backends.FreeBackend) for b in found)
+
+
 # ── select_backend ────────────────────────────────────────────────────────────────
 
 def test_select_prefers_highest_priority_active():

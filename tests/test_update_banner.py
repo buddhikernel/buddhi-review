@@ -279,7 +279,7 @@ def test_format_banner_buddhi_only():
     line = update_banner.format_banner(buddhi_latest="0.3.0", current="0.2.1")
     assert line.startswith("↑ Update available — ")
     assert "buddhi-review 0.3.0" in line and "you have 0.2.1" in line
-    assert "pip install -U buddhi-review" in line
+    assert "buddhi-review upgrade" in line
     assert "\n" not in line
 
 
@@ -287,13 +287,13 @@ def test_format_banner_workflow_only():
     line = update_banner.format_banner(workflow_stale=True, workflow_label="Claude review workflow")
     assert "Claude review workflow is out of date" in line
     assert "re-run /review-pr setup" in line
-    assert "pip install -U" not in line and "\n" not in line
+    assert "buddhi-review upgrade" not in line and "\n" not in line
 
 
 def test_format_banner_both_is_one_line():
     line = update_banner.format_banner(buddhi_latest="0.3.0", current="0.2.1",
                                        workflow_stale=True)
-    assert "pip install -U buddhi-review" in line
+    assert "buddhi-review upgrade" in line
     assert "re-run /review-pr setup" in line
     assert "\n" not in line  # BOTH updates on exactly one line
 
@@ -322,7 +322,7 @@ def _emit(tmp_path, **kw):
 def test_emits_on_buddhi_update(tmp_path):
     text, out = _emit(tmp_path, fetcher=_fresh_fetcher("0.3.0"))
     assert text is not None
-    assert "buddhi-review 0.3.0" in out and "pip install -U buddhi-review" in out
+    assert "buddhi-review 0.3.0" in out and "buddhi-review upgrade" in out
     assert out.count("\n") == 1  # exactly one muted line
 
 
@@ -331,14 +331,14 @@ def test_emits_on_workflow_stale(tmp_path):
     text, out = _emit(tmp_path, cwd=str(tmp_path), fetcher=_fresh_fetcher("0.2.1"))
     assert text is not None
     assert "re-run /review-pr setup" in out
-    assert "pip install -U" not in out  # buddhi is current here
+    assert "buddhi-review upgrade" not in out  # buddhi is current here
     assert out.count("\n") == 1
 
 
 def test_emits_both_on_one_line(tmp_path):
     _write_workflow(tmp_path, "claude-code-review.yml", None)
     text, out = _emit(tmp_path, cwd=str(tmp_path), fetcher=_fresh_fetcher("0.3.0"))
-    assert "pip install -U buddhi-review" in out and "re-run /review-pr setup" in out
+    assert "buddhi-review upgrade" in out and "re-run /review-pr setup" in out
     assert out.count("\n") == 1  # both sources → still ONE line
 
 
@@ -363,7 +363,7 @@ def test_network_failure_still_shows_workflow_and_never_blocks(tmp_path):
     _write_workflow(tmp_path, "claude-code-review.yml", None)
     text, out = _emit(tmp_path, cwd=str(tmp_path), fetcher=_boom_fetcher())
     assert text is not None
-    assert "re-run /review-pr setup" in out and "pip install -U" not in out
+    assert "re-run /review-pr setup" in out and "buddhi-review upgrade" not in out
 
 
 def test_network_failure_with_no_workflow_is_silent(tmp_path):
@@ -393,7 +393,7 @@ def test_check_pypi_false_skips_network(tmp_path):
     fetch = _fresh_fetcher("0.3.0")
     text, out = _emit(tmp_path, cwd=str(tmp_path), check_pypi=False, fetcher=fetch)
     assert text is not None and "re-run /review-pr setup" in out
-    assert "pip install -U" not in out and fetch.calls == []  # network skipped
+    assert "buddhi-review upgrade" not in out and fetch.calls == []  # network skipped
 
 
 def test_orchestrator_is_fail_open(tmp_path, monkeypatch):
@@ -480,5 +480,5 @@ def test_review_pr_end_to_end_banner_to_stderr(monkeypatch, tmp_path, capsys):
     rc = cli._review_pr(args)
     assert rc == 0
     captured = capsys.readouterr()
-    assert "99.0.0" in captured.err and "pip install -U buddhi-review" in captured.err
+    assert "99.0.0" in captured.err and "buddhi-review upgrade" in captured.err
     assert "99.0.0" not in captured.out  # never on stdout

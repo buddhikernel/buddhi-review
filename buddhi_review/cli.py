@@ -18,6 +18,9 @@ Subcommands:
   ``install-skills`` — copy the bundled ``/review-pr`` + ``/open-pr`` skills into Claude
                    Code's skills dir, provenance-safe: idempotent, skips unmodified/current
                    files, refuses to clobber a user edit without ``--force``.
+  ``upgrade``    — upgrade this installation the way it was installed (editable checkout
+                   / pipx / uv tool / venv), then re-sync the skills. An OS-managed or
+                   unidentifiable interpreter is told what to run, never written to.
 
 Any other command word is not one of ours: it is routed to a separately-installed
 backend that CLAIMS it (which runs it), or — the normal free-only state, and equally
@@ -31,8 +34,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import sys
-from typing import List, Optional, TextIO
+from typing import Callable, List, Optional, TextIO
 
 from buddhi_review import __version__, gh_ingest, model_call, round_driver, update_banner, upsell
 from buddhi_review.actuators import default_fix_dispatch
@@ -349,6 +353,143 @@ def _install_skills(args: argparse.Namespace) -> int:
     return 1 if summary.had_error else 0
 
 
+# ── upgrade ────────────────────────────────────────────────────────────────────────
+# What ``upgrade`` re-execs into once the package on disk has been replaced. Spelled as
+# plain module-level strings so the post-upgrade path is assembled from constants alone
+# — see the torn-state note in :func:`_upgrade`.
+#
+# The obvious spelling, ``-m buddhi_review.cli``, is WRONG here: ``-m`` puts the current
+# working directory on ``sys.path`` ahead of everything else, which the console script
+# that launched ``upgrade`` never did. Upgrading while cwd'd into any directory that
+# happens to contain a ``buddhi_review/`` folder — any clone of this repo, any worktree —
+# would silently re-sync the skills from THAT tree and stamp its version into the
+# installed files, reporting success. ``-c`` prepends the cwd the same way, so the
+# payload drops ``sys.path[0]`` before importing anything: the re-sync then resolves the
+# package exactly as the console script would. (``-P`` / ``PYTHONSAFEPATH`` do this
+# natively but only from 3.11; this package supports 3.9.)
+_RESYNC_PATH_PREAMBLE = "import sys; sys.path.pop(0); "
+_RESYNC_CODE = (_RESYNC_PATH_PREAMBLE
+                + "from buddhi_review.cli import main; sys.exit(main(sys.argv[1:]))")
+
+
+def _upgrade_check(plan, *, out: TextIO,
+                   latest_fn: Optional[Callable[[], Optional[str]]] = None) -> int:
+    """``upgrade --check``: say whether a newer release exists, and change nothing.
+
+    Unlike the deliberately-muted launch banner, this prints an explicit verdict even
+    when the install is current — the user asked a direct question, so silence would
+    read as a failure. It reuses the banner's own TTL-cached check (one shared cache,
+    one network behaviour) and distinguishes "current" from "could not tell", which a
+    banner never has to."""
+    print(f"buddhi-review {__version__} — install method: {plan.method}", file=out)
+    if update_banner.update_check_disabled():
+        print("Update checks are switched off by BUDDHI_NO_UPDATE_CHECK, so PyPI was "
+              "not contacted and there is no verdict to report.", file=out)
+        return 0
+    latest = (latest_fn or update_banner.latest_release)()
+    if latest is None:
+        print("Could not determine the latest release (offline, or PyPI was "
+              "unreachable). Nothing was changed.", file=out)
+    elif update_banner.update_available(__version__, latest):
+        print(f"↑ buddhi-review {latest} is available (you have {__version__}).\n"
+              f"    Run: buddhi-review upgrade", file=out)
+    else:
+        print(f"buddhi-review {__version__} is current (latest release: {latest}).",
+              file=out)
+    return 0
+
+
+def _upgrade(args: argparse.Namespace, *,
+             execer: Optional[Callable[[str, List[str]], None]] = None,
+             runner: Optional[Callable[..., int]] = None,
+             latest_fn: Optional[Callable[[], Optional[str]]] = None,
+             out: Optional[TextIO] = None,
+             err: Optional[TextIO] = None) -> int:
+    """Upgrade this installation the way it was installed, then re-sync the skills.
+
+    THE SAFETY GATE LIVES HERE, NOT IN AN UPDATER. Install-method detection and the
+    notify-only decision both run BEFORE any discovered updater is selected, so no
+    installed package can route this command into pip-installing against an
+    interpreter the operating system owns. A notify-only outcome prints the exact
+    command the user should run themselves and exits SUCCESS — refusing to act is the
+    correct result here, not an error.
+
+    ``--check`` and ``--dry-run`` are independent, both strictly read-only, and
+    ``--check`` wins when both are given. ``runner`` / ``execer`` / ``latest_fn`` are
+    injectable so the whole path is unit-testable without ever installing or exec'ing.
+    """
+    from buddhi_review import updaters
+
+    out = out if out is not None else sys.stdout
+    err = err if err is not None else sys.stderr
+    plan = updaters.detect_install_method()
+
+    if args.check:
+        return _upgrade_check(plan, out=out, latest_fn=latest_fn)
+
+    print(f"buddhi-review {__version__} — install method: {plan.method}", file=out)
+    print(plan.reason, file=out)
+
+    if plan.notify_only:
+        print("\nRun this yourself to upgrade:", file=out)
+        for line in plan.manual:
+            print(f"    {line}", file=out)
+        return 0
+
+    if args.dry_run:
+        print("\n[dry-run] would run:", file=out)
+        for step in plan.steps:
+            print(f"    {step.display()}", file=out)
+        print(f"    {shlex.join([sys.executable, '-c', _RESYNC_CODE, 'install-skills'])}",
+              file=out)
+        print("\n[dry-run] nothing was run.", file=out)
+        return 0
+
+    # ── TORN-STATE GUARD ────────────────────────────────────────────────────────────
+    # The upgrade below replaces this package's files on disk while this very process
+    # is running against the OLD ones — and the package root resolves its public names
+    # through a lazy PEP-562 ``__getattr__``, so ANY buddhi_review attribute access
+    # after that point can import a FRESH module against already-loaded stale siblings
+    # and produce a half-new module graph. So every value the tail needs is bound to a
+    # plain local FIRST, and between the upgrade returning and the exec there are ZERO
+    # buddhi_review imports and zero attribute reads on the package.
+    python = sys.executable
+    resync_argv = [python, "-c", _RESYNC_CODE, "install-skills"]
+    resync_display = shlex.join(resync_argv)
+    execv = execer if execer is not None else os.execv
+    manual = list(plan.manual)
+
+    updater = updaters.select_updater(updaters.discover_updaters())
+    outcome = updaters.perform_update(updater, plan, runner=runner, out=out, err=err)
+    returncode, upgraded, message = outcome.returncode, outcome.upgraded, outcome.message
+
+    # ↓↓↓ nothing below this line may touch the buddhi_review package ↓↓↓
+    if not upgraded:
+        # Either a hard failure (non-zero → say so, exit non-zero) or a step that left
+        # everything exactly as it was (zero → the notify-only outcome, with the manual
+        # commands). Neither re-syncs: nothing was installed, so there is nothing new
+        # to sync, and a re-sync after a failed upgrade would only muddy the report.
+        if message:
+            print(message, file=out if returncode == 0 else err)
+        if returncode == 0:
+            for line in manual:
+                print(f"    {line}", file=out)
+        return returncode
+
+    # An "already up to date" package manager also lands here (it exits 0), and that is
+    # deliberate: re-syncing the skills for the installed version is the documented
+    # repair path, so it runs whether or not the version actually moved.
+    print("\nUpgrade finished (an already-current install counts as done). "
+          "Re-syncing the bundled skills…", file=out)
+    try:
+        execv(python, resync_argv)
+    except Exception as exc:
+        print(f"upgrade: could not hand off to the skill re-sync ({exc}). The upgrade "
+              f"itself succeeded — finish it by running:\n    {resync_display}", file=err)
+        return 1
+    return 0  # unreachable once execv replaces the process; kept for the injected seam
+
+
 def _add_loop_args(p: argparse.ArgumentParser) -> None:
     """The review-loop flags, shared by ``review-pr`` (the front door) and
     ``run-loop`` (the detached engine) so they never drift."""
@@ -555,6 +696,17 @@ def build_parser() -> argparse.ArgumentParser:
     isk.add_argument("--uninstall", action="store_true",
                      help="remove the installed skills (unmodified ones; add --force to "
                           "remove modified/foreign ones and a stale legacy create-pr)")
+
+    upg = sub.add_parser("upgrade",
+                         help="upgrade buddhi-review the way it was installed, then "
+                              "re-sync the skills (an OS-managed Python is told what "
+                              "to run, never written to)")
+    upg.add_argument("--dry-run", action="store_true",
+                     help="report the detected install method and the exact command "
+                          "that would run, and change nothing")
+    upg.add_argument("--check", action="store_true",
+                     help="report whether a newer release is available and exit; "
+                          "never upgrades (wins over --dry-run)")
     return p
 
 
@@ -670,6 +822,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return _status(args)
     if args.command == "install-skills":
         return _install_skills(args)
+    if args.command == "upgrade":
+        return _upgrade(args)
     parser.print_help()
     return 0
 
