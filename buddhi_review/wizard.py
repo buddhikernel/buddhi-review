@@ -1132,10 +1132,59 @@ def _offer_update_managed_file(repo: str, default: Optional[str], spec: Dict[str
         _row("ok", f"Opened a PR to update {name}: {detail}", pal, stream)
         print(f"  {pal.GREY}{_REVERT_NOTE}{pal.RESET}", file=stream)
         _row("info", f"Merge that PR to put {name} v{shipped} on '{default}'.", pal, stream)
+        # Make the repo's own CI actually run on this update PR. On a repo that
+        # defers CI to the `ready-for-ci` label, the suite runs ONLY when the
+        # label is present, and this PR would carry none — so the update would
+        # merge unexercised (#94, itself a claude-code-review.yml update PR).
+        # Gated on the recorded per-repo/global opt-in inside the helper, so a
+        # repo the user never opted into label-gated CI gets no stray label.
+        _attach_ready_for_ci(repo, detail, run=run)
         return "pr"
     _row("warn", f"Couldn't open the update PR automatically ({detail}). You can copy "
                  f"the bundled {name} in by hand.", pal, stream)
     return None
+
+
+def _attach_ready_for_ci(repo: str, pr_ref: str, *, run) -> bool:
+    """Attach ``ready-for-ci`` to a PR the wizard just opened, so the repo's
+    label-gated CI actually runs on it. Returns True iff the label is now on the
+    PR (or the repo does not defer CI to the label, so none is needed).
+
+    ONLY attaches when the user has EXPLICITLY opted this repo into label-gated
+    CI: ``config.label_gated_ci`` reads the per-repo value then the global one and
+    DEFAULTS FALSE, so a truthy result means a deliberate opt-in (the per-repo
+    step's double-confirm, the global step, or a CLI flag) — never an unset
+    default. A repo whose CI runs on every push therefore never gets a stray
+    label. During a first-run setup the opt-in has not been persisted yet, so
+    this reads False and skips — correct, because the gate workflow is not live
+    on the default branch yet either, so the label would trigger nothing.
+
+    Attached as a SEPARATE ``gh pr edit`` after the PR exists, never at create
+    time: the label-gated workflow fires on the ``labeled`` event, which a
+    create-time label does not reliably emit. Mirrors the merge loop's land-time
+    attach and the Dependabot labeler.
+
+    Self-bootstrapping and best-effort on the create: ``gh label create`` exits
+    non-zero when the label already exists (the steady state), which is ignored;
+    the add is authoritative."""
+    try:
+        if not config.label_gated_ci(config.load_config(), repo):
+            return True  # repo's CI is not label-gated — no label needed
+    except Exception:  # pragma: no cover - defensive; never block on a config read
+        return True
+    create = ["gh", "label", "create", "ready-for-ci", "--color", "cccccc",
+              "-R", repo]
+    edit = ["gh", "pr", "edit", str(pr_ref), "--add-label", "ready-for-ci",
+            "-R", repo]
+    try:
+        run(create, capture_output=True, text=True, timeout=20)
+    except Exception:
+        pass  # already-exists / transient — the add below surfaces a real problem
+    try:
+        res = run(edit, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return False
+    return getattr(res, "returncode", 1) == 0
 
 
 def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, stream,

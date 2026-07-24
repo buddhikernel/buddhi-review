@@ -165,3 +165,62 @@ def test_non_tty_outdated_defers_with_guidance(monkeypatch):
     assert result is None
     assert not any(c[:2] == ["gh", "pr"] for c in calls)
     assert "Re-run setup in a terminal" in out
+
+
+# ── the update PR must actually get CI when the repo is label-gated (#94) ────────
+# _offer_update_managed_file opens the claude-code-review.yml update PR on a
+# `buddhi/update-<slug>-v<n>` branch. On a repo that defers CI to `ready-for-ci`,
+# that PR carried no label, so the suite never ran on it — which is how #94 (itself
+# a claude-code-review.yml update PR) merged unexercised. The wizard now attaches
+# the label, but ONLY when the user has explicitly opted this repo into label-gated
+# CI (default OFF), so a normal every-push-CI repo gets no stray label.
+
+def _offer_update_lgc(installed_text, *, monkeypatch, label_gated, run=None):
+    monkeypatch.setattr(wizard.config, "label_gated_ci", lambda cfg, repo=None: label_gated)
+    return _offer_update(installed_text, is_tty=True, monkeypatch=monkeypatch, run=run)
+
+
+def test_update_pr_gets_ready_for_ci_when_repo_is_label_gated(monkeypatch):
+    result, out, calls = _offer_update_lgc("legacy\n", monkeypatch=monkeypatch,
+                                           label_gated=True)
+    assert result == "pr"
+    edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert len(edits) == 1, calls
+    assert "--add-label" in edits[0] and "ready-for-ci" in edits[0]
+    assert "-R" in edits[0] and "o/r" in edits[0]
+    # self-bootstrapping so --add-label can't 404 on a repo that never had the label
+    assert any(c[:3] == ["gh", "label", "create"] and "ready-for-ci" in c
+               for c in calls), calls
+
+
+def test_label_attached_after_create_never_at_create_time(monkeypatch):
+    """The label-gated workflow fires on the `labeled` event; a label applied at
+    creation does not reliably emit one, so it must be a separate edit AFTER the
+    PR exists."""
+    result, out, calls = _offer_update_lgc("legacy\n", monkeypatch=monkeypatch,
+                                           label_gated=True)
+    create_i = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "create"])
+    edit_i = next(i for i, c in enumerate(calls) if c[:3] == ["gh", "pr", "edit"])
+    assert create_i < edit_i
+    assert "--label" not in calls[create_i]
+
+
+def test_no_label_when_repo_not_opted_into_label_gated_ci(monkeypatch):
+    """Default OFF: a repo whose CI runs on every push must get no stray label."""
+    result, out, calls = _offer_update_lgc("legacy\n", monkeypatch=monkeypatch,
+                                           label_gated=False)
+    assert result == "pr"                                  # the update PR still opens
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert not [c for c in calls if c[:3] == ["gh", "label", "create"]]
+
+
+def test_label_add_failure_never_breaks_the_update(monkeypatch):
+    """A failed/raising label add leaves the update PR intact — the PR is open, the
+    wizard already reported it; the label is best-effort."""
+    def run(argv, **kw):
+        if list(argv)[:3] == ["gh", "pr", "edit"]:
+            raise OSError("boom")
+        return _update_router()(argv, **kw)
+    result, out, calls = _offer_update_lgc("legacy\n", monkeypatch=monkeypatch,
+                                           label_gated=True, run=run)
+    assert result == "pr"
