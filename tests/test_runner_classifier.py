@@ -23,6 +23,7 @@ gate command, and what did its exit mean?" These tests pin:
 """
 from __future__ import annotations
 
+import json
 import subprocess
 
 import pytest
@@ -298,6 +299,24 @@ _CLASSIFY_CASES = [
     ("ava-pass", tr.AVA, 0, "3 tests passed", tr.PASSED),
     ("ava-no-tests", tr.AVA, 1, "Couldn't find any files to test", tr.NO_TESTS),
 
+    # ---- bun (P10 Tier-C) — marker-first "Ran N tests across M files" ----
+    ("bun-pass", tr.BUN, 0, " 3 pass\n 0 fail\nRan 3 tests across 1 files. [8.00ms]", tr.PASSED),
+    ("bun-fail", tr.BUN, 1, " 2 pass\n 1 fail\nRan 3 tests across 1 files. [8.00ms]", tr.FAILED),
+    ("bun-no-tests", tr.BUN, 1, "Ran 0 tests across 0 files. [1.00ms]", tr.NO_TESTS),
+    # A run with "0 pass" but real failures is a FAILURE, never masked as no_tests.
+    ("bun-zero-pass-with-fails-is-fail", tr.BUN, 1,
+     " 0 pass\n 3 fail\nRan 3 tests across 1 files.", tr.FAILED),
+    ("bun-missing-dep", tr.BUN, 1, 'error: Cannot find module "react" from "/app/x.test.ts"', tr.ENV_ERROR),
+    ("bun-parse-error", tr.BUN, 1, "1 | const x = ;\n              ^\nerror: Unexpected )", tr.COMPILE_ERROR),
+
+    # ---- deno (P10 Tier-C) — EXITS 1 on "No test modules found" (false-red) ----
+    ("deno-pass", tr.DENO, 0, "ok | 3 passed | 0 failed (10ms)", tr.PASSED),
+    ("deno-fail", tr.DENO, 1, "FAILED | 2 passed | 1 failed (10ms)", tr.FAILED),
+    ("deno-no-tests-exit1", tr.DENO, 1, "error: No test modules found", tr.NO_TESTS),
+    ("deno-filter-zero", tr.DENO, 0, "ok | 0 passed | 0 failed (2ms)", tr.NO_TESTS),
+    ("deno-type-error", tr.DENO, 1, "TS2345 [ERROR]: Argument of type 'x'.\nerror: Type checking failed", tr.COMPILE_ERROR),
+    ("deno-missing-module", tr.DENO, 1, 'error: Module not found "file:///app/dep.ts".', tr.ENV_ERROR),
+
     # ---- go (SILENT EXIT 0 on no test files) ----
     ("go-pass", tr.GO, 0, "ok  \texample.com/a\t0.3s", tr.PASSED),
     ("go-fail", tr.GO, 1, "--- FAIL: TestX\nFAIL\texample.com/a", tr.FAILED),
@@ -465,11 +484,12 @@ _CLASSIFY_CASES = [
     ("gtest-pass", tr.GTEST, 0, "[==========] 10 tests from 2 test suites ran.\n[  PASSED  ] 10 tests.", tr.PASSED),
     ("gtest-fail", tr.GTEST, 1, "[  FAILED  ] 1 test, listed below:", tr.FAILED),
     ("gtest-no-tests-exit0", tr.GTEST, 0, "[==========] 0 tests from 0 test suites ran.", tr.NO_TESTS),
-    # A real failure whose captured output merely QUOTES a zero-tests marker (a
-    # wrapper/snapshot test invoking another empty test command) must not
-    # short-circuit to a green no_tests SKIP — the "[  FAILED  ] N tests" summary
-    # gates the zero-tests branch, same as the swift-fail-quoting case below.
-    ("gtest-fail-quoting-no-tests-marker", tr.GTEST, 1, "stdout was: 'Running 0 tests'\n[  FAILED  ] 2 tests, listed below:", tr.FAILED),
+    # A real, failing run whose OWN output happens to quote "Running 0 tests" (e.g. a
+    # wrapper/snapshot test asserting on captured subprocess text) must NOT be masked
+    # as an empty run — the genuine "[  FAILED  ] N tests" summary is real-run evidence.
+    ("gtest-fail-with-embedded-zero-marker", tr.GTEST, 1,
+     "Wrapper.SnapshotMatchesEmptyRun ... FAILED\nExpected substring: \"Running 0 tests from 0 test suites.\"\n\n[  FAILED  ] 1 test, listed below:\n[  FAILED  ] Wrapper.SnapshotMatchesEmptyRun\n",
+     tr.FAILED),
     ("catch2-pass", tr.CATCH2, 0, "All tests passed (12 assertions in 3 test cases)", tr.PASSED),
     ("catch2-fail-42", tr.CATCH2, 42, "test cases: 3 | 2 passed | 1 failed", tr.FAILED),
     ("catch2-no-tests-2", tr.CATCH2, 2, "No test cases matched", tr.NO_TESTS),
@@ -503,6 +523,23 @@ _CLASSIFY_CASES = [
     # test asserting on captured subprocess text) must not short-circuit to a green
     # no_tests SKIP — the "Some tests failed" summary gates the zero-tests branch.
     ("dart-fail-quoting-no-tests-marker", tr.DART, 1, "expected: 'No tests ran.'\nSome tests failed.", tr.FAILED),
+
+    # deno's zero-count summary (`deno test --filter nomatch` exits 0) reached through
+    # an OPAQUE wrapper must classify no_tests — and its column-0 `ok |` head must NOT
+    # read as a go `ok <pkg>` result line (run evidence), which would defeat the
+    # marker and false-green the empty run.
+    ("generic-f2-wrapper-deno-zero", tr.UNKNOWN, 0,
+     "ok | 0 passed | 0 failed (2ms)", tr.NO_TESTS),
+    # …including any-width padding before the pipe: the go run-evidence guard must
+    # exclude the deno head across a whitespace run, not just a single space (a bare
+    # `\s+(?!\|)` backtracks and lets a two-space `ok  |…` slip through as go evidence).
+    ("generic-f2-wrapper-deno-zero-padded", tr.UNKNOWN, 0,
+     "ok  | 0 passed | 0 failed (2ms)", tr.NO_TESTS),
+    ("generic-f2-wrapper-deno-zero-padded-wide", tr.UNKNOWN, 0,
+     "ok   |  0 passed  |  0 failed (2ms)", tr.NO_TESTS),
+    # …while a deno run that really RAN beside a zero-count sibling keeps PASSED.
+    ("generic-f2-wrapper-deno-zero-then-ran", tr.UNKNOWN, 0,
+     "ok | 0 passed | 0 failed (1ms)\nok | 4 passed | 0 failed (9ms)", tr.PASSED),
 
     # ---- universal env / timeout ----
     ("cmd-not-found-127", tr.VITEST, 127, "vitest: command not found", tr.ENV_ERROR),
@@ -754,10 +791,14 @@ class TestGradleZeroTestIsNeverGreen:
         assert tr.classify(tr.GRADLE, 0, _GRADLE_PASSING) == tr.PASSED
 
     def test_up_to_date_execution_task_is_non_evidence(self):
-        # UP-TO-DATE / SKIPPED say neither "it ran" nor "the suite is empty" → not a skip.
+        # UP-TO-DATE proves a previous run's result is still valid → a pass, not a skip.
         assert tr.classify(tr.GRADLE, 0, _GRADLE_UP_TO_DATE) == tr.PASSED
+
+    def test_skipped_execution_task_alone_is_zero_execution(self):
+        # SKIPPED (`onlyIf {false}` / `-x`) executed NOTHING — with no sibling that
+        # really ran, the run verified nothing and must classify no_tests, never green.
         assert tr.classify(
-            tr.GRADLE, 0, "> Task :test SKIPPED\n\nBUILD SUCCESSFUL in 1s") == tr.PASSED
+            tr.GRADLE, 0, "> Task :test SKIPPED\n\nBUILD SUCCESSFUL in 1s") == tr.NO_TESTS
 
     def test_check_run_with_one_empty_task_and_a_sibling_that_ran_is_passed(self):
         # A real run ANYWHERE wins — `gradle check` may have an empty `:test` beside an
@@ -861,14 +902,16 @@ _ARGV_CASES = [
     (["python", "-I", "manage.py", "test"], tr.DJANGO),
     (["npx", "vitest", "run"], tr.VITEST),
     (["npx", "jest"], tr.JEST),
-    (["npx", "-y", "jasmine"], tr.JASMINE),
-    (["npx", "--yes", "vitest", "run"], tr.VITEST),
     (["node_modules/.bin/jest"], tr.JEST),
     (["mocha", "test/"], tr.MOCHA),
     (["jasmine"], tr.JASMINE),
     (["ng", "test"], tr.KARMA),
     (["node", "--test"], tr.NODE_TEST),
     (["npx", "ava"], tr.AVA),
+    (["bun", "test"], tr.BUN),
+    (["bun", "test", "./src"], tr.BUN),
+    (["deno", "test"], tr.DENO),
+    (["deno", "test", "--allow-read", "tests/"], tr.DENO),
     (["go", "test", "./..."], tr.GO),
     (["cargo", "test"], tr.CARGO),
     (["cargo", "nextest", "run"], tr.NEXTEST),
@@ -899,14 +942,14 @@ def test_detect_from_argv(argv, want):
 
 class TestWrapperDetection:
     @pytest.mark.parametrize("argv", [
-        # A shell string whose commands name NO runner we recognize stays opaque:
-        # `npm test` is a package SCRIPT, `make` a build tool — neither is a runner.
+        # A shell string naming NO recognized runner (`npm test`, `make test`), or a
+        # preceding install step whose runner is likewise unrecognized.
         ["bash", "-lc", "npm ci && npm test"],
         ["sh", "-c", "make test"],
         ["bash", "-lc", "./run-tests.sh --all"],
         # TWO distinct runners: the wrapper's exit code + output are a MIX of two
-        # runners' conventions, which no single per-runner classifier can read — so
-        # it stays Tier-B opaque rather than guessing one of them.
+        # runners' conventions — no single per-runner classifier can read it, so it
+        # stays Tier-B opaque rather than guessing one.
         ["bash", "-lc", "pytest && npx jest"],
         # An unbalanced quote cannot be tokenized → stay opaque, never raise.
         ["bash", "-lc", "pytest 'unbalanced"],
@@ -928,11 +971,14 @@ class TestWrapperDetection:
         assert info.source == "wrapper:unrecognized"
         assert info.scopable is False
 
-    def test_npm_test_is_not_a_recognized_runner(self):
-        # `npm test` runs a package SCRIPT (unwrapping scripts.test is out of scope) —
-        # it is NOT the vitest/jest binary, so from argv alone it stays opaque.
-        info = tr.detect_runner(".", ["npm", "test"])
+    def test_npm_test_with_no_resolvable_script_is_unknown(self, tmp_path):
+        # `npm test` runs a package SCRIPT. P10 unwraps `scripts.test` when present;
+        # with NO package.json (here an isolated empty tmp_path) there is nothing to
+        # resolve, so it stays an opaque Tier-B wrapper. Pinned to a fixture cwd — NOT
+        # the ambient `.` — because P10 reads package.json relative to the passed cwd.
+        info = tr.detect_runner(str(tmp_path), ["npm", "test"])
         assert info.runner == tr.UNKNOWN
+        assert info.scopable is False
 
 
 class TestShellStringDetection:
@@ -955,6 +1001,7 @@ class TestShellStringDetection:
         # it (documented there as harmless). The tokenizer is quote-aware, so `A|B`
         # stays one token and the command is NOT split in half at the `|`.
         ("cd sub && go test -run 'A|B' ./...", tr.GO),
+        ("cd app && bun test", tr.BUN),                  # a P10 Tier-C runner in the string
     ])
     def test_runner_read_out_of_the_shell_string(self, cmd, want):
         info = tr.detect_runner(".", commit_push._split_test_command(cmd))
@@ -977,6 +1024,22 @@ class TestShellStringDetection:
         out = "Randomized with seed 1\nNo specs found\nIncomplete: No specs found"
         info = tr.detect_runner(".", commit_push._split_test_command("cd frontend && npx jasmine"))
         assert tr.classify(info.runner, 0, out) == tr.NO_TESTS
+
+
+class TestPythonInterpreterOptSkipping:
+    """Leading `python -I/-X dev/-O/-W ignore` interpreter options must not hide
+    the `-m <module>` / `manage.py` behind them."""
+
+    @pytest.mark.parametrize("argv,want", [
+        (["python", "-I", "-m", "pytest", "tests/"], tr.PYTEST),
+        (["python3", "-X", "dev", "-m", "pytest"], tr.PYTEST),
+        (["python", "-O", "-m", "unittest", "discover"], tr.UNITTEST),
+        (["python", "-W", "ignore", "manage.py", "test"], tr.DJANGO),
+        (["python3", "-X", "dev", "manage.py", "test", "app"], tr.DJANGO),
+        (["python", "-I", "-m", "pytest"], tr.PYTEST),
+    ])
+    def test_interpreter_opts_skipped(self, argv, want):
+        assert tr.detect_runner(".", argv).runner == want
 
 
 class TestOpaqueWrapperNoFalseGreen:
@@ -1142,8 +1205,8 @@ class TestDetectFromMarkers:
         assert self._detect(tmp_path) == tr.VITEST
 
     def test_package_json_no_known_runner_is_unknown(self, tmp_path):
-        # A package.json whose test is an opaque npm script is not a recognized runner
-        # from markers alone.
+        # A package.json whose test is an opaque npm script (P10 unwraps it) is not
+        # a recognized runner from markers alone.
         (tmp_path / "package.json").write_text('{"scripts": {"test": "make test"}}')
         assert self._detect(tmp_path) == tr.UNKNOWN
 
@@ -1404,3 +1467,888 @@ class TestFreeSkillNoGatePostureUnchanged:
         status, _ = commit_push.run_test_gate(
             str(tmp_path), run=_run_returning(0, "5 passed in 0.1s"), notice=_silent)
         assert status == "green"
+
+
+# ── P10 · npm / yarn / pnpm / bun package-script UNWRAP ───────────────────────────
+
+class TestP10PackageScriptUnwrap:
+    """`npm test` / `yarn test` / `pnpm test` (and `<mgr> run <name>`) run a
+    package.json SCRIPT, not a runner binary. P10 reads `scripts.<name>` and resolves
+    THROUGH it — a recognized single runner keeps the repo Tier-A (its own classifier +
+    scoped triage), so a plain `npm test` repo is NEVER second-class. Only an
+    unrecognized single tool or a multi-tool chain degrades to a Tier-B wrapper."""
+
+    def _pkg(self, tmp_path, test_script, extra=None):
+        data = {"scripts": {"test": test_script}}
+        if extra:
+            data["scripts"].update(extra)
+        (tmp_path / "package.json").write_text(json.dumps(data))
+        return str(tmp_path)
+
+    @pytest.mark.parametrize("cmd", [
+        ["npm", "test"], ["npm", "run", "test"], ["npm", "t"],
+        ["yarn", "test"], ["yarn", "run", "test"],
+        ["pnpm", "test"], ["pnpm", "run", "test"],
+        ["npm", "--silent", "run", "test"],
+    ])
+    def test_vitest_script_stays_tier_a(self, tmp_path, cmd):
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, cmd)
+        assert info.runner == tr.VITEST, f"{cmd} should unwrap scripts.test → vitest"
+        assert info.scopable is True                    # Tier-A: scoped triage feasible
+        assert info.source == "npm-script"
+
+    def test_script_args_after_dashdash_stay_tier_a(self, tmp_path):
+        # `npm test -- --filter foo`: `--filter` is a workspace flag when it appears
+        # BEFORE `--`, but after `--` it is forwarded verbatim to the script/runner —
+        # it must not trip multi-project detection and degrade this to UNKNOWN.
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, ["npm", "test", "--", "--filter", "foo"])
+        assert info.runner == tr.VITEST
+        assert info.scopable is True
+        assert info.source == "npm-script"
+        # The forwarded args must actually be CARRIED into resolved_cmd — adapter
+        # binding and scoped reruns read this, not the raw `npm test` argv — else a
+        # behavior-changing flag silently never reaches the underlying runner.
+        assert info.resolved_cmd == ["vitest", "run", "--filter", "foo"]
+
+    @pytest.mark.parametrize("cmd", [
+        ["yarn", "test", "--runxfail"],
+        ["yarn", "run", "test", "--runxfail"],
+        ["pnpm", "test", "--runxfail"],
+        ["pnpm", "run", "test", "--runxfail"],
+        ["bun", "run", "test", "--runxfail"],
+    ])
+    def test_yarn_pnpm_bun_forward_args_without_dashdash(self, tmp_path, cmd):
+        # Unlike npm, yarn/pnpm/bun forward everything after the script name to the
+        # script WITHOUT requiring a literal `--` (confirmed against real `yarn`/
+        # `pnpm`/`bun` — `pnpm test --runxfail` runs the script WITH `--runxfail`).
+        # Dropping it here would silently change the scoped rerun's pass/fail
+        # semantics from the full gate's (an xfailed test that fails in the full
+        # gate would falsely pass in isolation).
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, cmd)
+        assert info.runner == tr.VITEST
+        assert info.resolved_cmd == ["vitest", "run", "--runxfail"], cmd
+
+    def test_npm_still_requires_dashdash_to_forward(self, tmp_path):
+        # npm, unlike yarn/pnpm/bun, consumes/parses trailing args itself without a
+        # literal `--` — it must NOT be treated as implicitly forwarding them.
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, ["npm", "test", "--runxfail"])
+        assert info.runner == tr.VITEST
+        assert info.resolved_cmd == ["vitest", "run"]
+
+    @pytest.mark.parametrize("cmd", [["npm", "tst"], ["pnpm", "t"], ["pnpm", "tst"]])
+    def test_npm_pnpm_t_tst_alias_to_test(self, tmp_path, cmd):
+        # npm and pnpm both document `t`/`tst` as aliases for `test`.
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, cmd)
+        assert info.runner == tr.VITEST, f"{cmd} should unwrap scripts.test → vitest"
+        assert info.source == "npm-script"
+
+    @pytest.mark.parametrize("cmd", [["yarn", "t"], ["yarn", "tst"]])
+    def test_yarn_t_tst_is_literal_script_name_not_test_alias(self, tmp_path, cmd):
+        # Yarn does NOT alias `t`/`tst` to `test` — `yarn <scriptName>` resolves the
+        # LITERAL script name. A yarn project with no `scripts.t`/`scripts.tst` must
+        # stay an opaque UNKNOWN wrapper, never silently classified via `scripts.test`.
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, cmd)
+        assert info.runner == tr.UNKNOWN, f"{cmd} must not resolve through scripts.test"
+
+    def test_yarn_t_resolves_its_own_literal_script(self, tmp_path):
+        # When `scripts.t` DOES exist, `yarn t` must resolve through IT, not `test`.
+        base = self._pkg(tmp_path, "jest", extra={"t": "vitest run"})
+        info = tr.detect_runner(base, ["yarn", "t"])
+        assert info.runner == tr.VITEST
+        assert info.source == "npm-script"
+
+    @pytest.mark.parametrize("cmd", [
+        ["yarn", "-T", "test"],
+        ["yarn", "run", "-T", "test"],
+        ["yarn", "test", "-T"],
+        ["yarn", "--top-level", "test"],
+    ])
+    def test_yarn_top_level_flag_degrades_to_multi_project(self, tmp_path, cmd):
+        # Yarn Berry's `-T`/`--top-level` (confirmed via `yarn run -h=1`) checks the
+        # ROOT workspace for the script instead of the current one — resolving
+        # `scripts.<name>` from `cwd` would then bind to the wrong package.json, so
+        # this must degrade the same as any other workspace-redirecting flag.
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, cmd)
+        assert info.runner == tr.UNKNOWN
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    def test_jest_script(self, tmp_path):
+        base = self._pkg(tmp_path, "jest --coverage")
+        assert tr.detect_runner(base, ["npm", "test"]).runner == tr.JEST
+
+    def test_mocha_script(self, tmp_path):
+        base = self._pkg(tmp_path, "mocha test/")
+        assert tr.detect_runner(base, ["yarn", "test"]).runner == tr.MOCHA
+
+    def test_yarn_r_flag_is_forwarded_not_a_workspace_flag(self, tmp_path):
+        # pnpm's `-r`/`--recursive` is not a yarn flag at all (`yarn run -h=1` lists
+        # `-T`/`--top-level`, not `-r`) — yarn forwards an unrecognized trailing
+        # token verbatim to the script, so `yarn test -r setup.js` runs Mocha WITH
+        # `-r setup.js` (Mocha's own `-r`/`--require`), it must stay Tier-A MOCHA,
+        # not degrade to an opaque multi-project wrapper.
+        base = self._pkg(tmp_path, "mocha test/")
+        info = tr.detect_runner(base, ["yarn", "test", "-r", "setup.js"])
+        assert info.runner == tr.MOCHA
+        assert info.scopable is True
+        assert info.resolved_cmd == ["mocha", "test/", "-r", "setup.js"]
+
+    def test_pnpm_r_flag_still_degrades_to_multi_project(self, tmp_path):
+        # pnpm's own `-r`/`--recursive` must still degrade — only yarn's non-flag
+        # `-r` (forwarded) is the false positive being fixed above.
+        base = self._pkg(tmp_path, "mocha test/")
+        info = tr.detect_runner(base, ["pnpm", "-r", "test"])
+        assert info.runner == tr.UNKNOWN
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    def test_pnpm_r_flag_after_script_name_is_forwarded_not_a_workspace_flag(self, tmp_path):
+        # `pnpm run <command> [<args>...]` (per `pnpm run --help`) forwards everything
+        # after the script name to the invoked script — `pnpm test -r fE` runs pytest
+        # WITH `-r fE` (pytest's own `-r`), it is not pnpm's `--recursive`. Only `-r`
+        # BEFORE the script name (the case above) is pnpm's own workspace flag.
+        base = self._pkg(tmp_path, "pytest")
+        info = tr.detect_runner(base, ["pnpm", "test", "-r", "fE"])
+        assert info.runner == tr.PYTEST
+        assert info.scopable is True
+        assert info.resolved_cmd == ["pytest", "-r", "fE"]
+
+    def test_pnpm_run_flag_after_script_name_is_forwarded_not_a_workspace_flag(self, tmp_path):
+        # The `run`-subcommand flag scan (P10b) must still end AT the script
+        # positional: in `pnpm run test --filter unit`, `--filter unit` trails the
+        # script name, so pnpm forwards it verbatim to the runner (vitest's own
+        # `--filter`) — it is not pnpm's workspace filter and must not degrade the
+        # unwrap to a multi-project wrapper.
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, ["pnpm", "run", "test", "--filter", "unit"])
+        assert info.runner == tr.VITEST
+        assert info.scopable is True
+        assert info.resolved_cmd == ["vitest", "run", "--filter", "unit"]
+
+    @pytest.mark.parametrize("trailing", [
+        ["--filter", "unit"],
+        ["--cwd", "packages/a"],
+    ])
+    def test_bun_run_flag_after_script_name_is_forwarded_not_a_workspace_flag(self, tmp_path, trailing):
+        # bun's flag scan (P10b) must end AT the script positional too: `bun run
+        # --help` shows `Usage: bun run [flags] <file or script>`, and on Bun 1.3.12
+        # `bun run test --filter a` runs the `test` script WITH `--filter a` (node
+        # then chokes on the unknown flag) — everything after the script name is
+        # forwarded verbatim. So a `--filter`/`--cwd` TRAILING the script name is the
+        # runner's own flag (vitest's `--filter`), NOT bun's workspace flag, and must
+        # not degrade the unwrap to a multi-project wrapper. Only `--filter`/`--cwd`
+        # BEFORE the script name (see `test_bun_filter_workspace_run_is_unknown`) are
+        # bun's own workspace flags.
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, ["bun", "run", "test", *trailing])
+        assert info.runner == tr.VITEST, trailing
+        assert info.scopable is True
+        assert info.resolved_cmd == ["vitest", "run", *trailing]
+
+    def test_bun_test_with_filter_is_bun_runner_not_multi_project(self, tmp_path):
+        # `bun test` is bun's OWN test runner (Tier-C), resolved by `_runner_from_argv`
+        # — the workspace-flag scan must not hijack a trailing `--filter` on it and
+        # mislabel it a multi-project wrapper. With the scan bounded to the pre-script
+        # region (there is no `run` subcommand here), `bun test --filter x` stays the
+        # bun runner.
+        base = self._pkg(tmp_path, "vitest run")
+        info = tr.detect_runner(base, ["bun", "test", "--filter", "x"])
+        assert info.runner == tr.BUN
+        assert info.source == "argv"
+
+    def test_bin_path_script(self, tmp_path):
+        # A repo pinning the local binary is still the recognized runner.
+        base = self._pkg(tmp_path, "node_modules/.bin/jest")
+        assert tr.detect_runner(base, ["npm", "test"]).runner == tr.JEST
+
+    def test_env_prefix_script_stays_tier_a(self, tmp_path):
+        # A `cross-env`/`VAR=val` env prefix wraps a REAL runner — it is stripped, not
+        # degraded, so the underlying runner (and its classifier) still applies.
+        for script, want in [
+            ("cross-env NODE_ENV=test jest", tr.JEST),
+            ("NODE_ENV=test vitest run", tr.VITEST),
+            ("env CI=1 mocha test/", tr.MOCHA),
+        ]:
+            base = self._pkg(tmp_path, script)
+            (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": script}}))
+            assert tr.detect_runner(base, ["npm", "test"]).runner == want, script
+
+    def test_script_reindirection_resolves(self, tmp_path):
+        # `"test": "npm run test:ci"` → follow one hop to the real runner.
+        base = self._pkg(tmp_path, "npm run test:ci", extra={"test:ci": "vitest run"})
+        assert tr.detect_runner(base, ["npm", "test"]).runner == tr.VITEST
+
+    def test_reindirection_does_not_forward_outer_args_through_npm_run(self, tmp_path):
+        # `npm test -- --runxfail` with `"test": "npm run test:ci"`: npm appends the
+        # forwarded args to the re-indirect command (`npm run test:ci --runxfail`), and
+        # `npm run` forwards NOTHING to the inner script without its OWN `--` (verified
+        # against npm 11.4.2: the inner runner sees argv `[]`). The resolved runner must
+        # therefore NOT carry `--runxfail`, or a scoped rerun runs a command the gate
+        # never did.
+        base = self._pkg(tmp_path, "npm run test:ci", extra={"test:ci": "vitest run"})
+        info = tr.detect_runner(base, ["npm", "test", "--", "--runxfail"])
+        assert info.runner == tr.VITEST
+        assert info.resolved_cmd == ["vitest", "run"]
+
+    def test_reindirection_forwards_outer_args_through_yarn_run(self, tmp_path):
+        # A yarn/pnpm/bun re-indirect forwards trailing args WITHOUT a `--`: `npm test --
+        # --runxfail` with `"test": "yarn run test:ci"` runs `yarn run test:ci --runxfail`,
+        # and yarn passes `--runxfail` on to the inner script — so the resolved runner DOES
+        # carry it. The forwarding rule is re-applied per nesting level, not dropped.
+        base = self._pkg(tmp_path, "yarn run test:ci", extra={"test:ci": "vitest run"})
+        info = tr.detect_runner(base, ["npm", "test", "--", "--runxfail"])
+        assert info.runner == tr.VITEST
+        assert info.resolved_cmd == ["vitest", "run", "--runxfail"]
+
+    @pytest.mark.parametrize("script", [
+        "tsc && jest",              # chains a compile step + the runner
+        "jest && eslint .",         # chains two tools
+        "vitest run | tap-spec",    # pipes into a reporter
+        "npm run lint; npm run t",  # sequences two scripts (spaced)
+        "npm run lint;npm run t",   # sequences two scripts (unspaced ; — shlex-tokenized)
+        "jest&&eslint",             # no-space chain (raw-substring scan would still see it, token scan too)
+        "jest|tap-spec",            # no-space pipe
+        "jest & webpack serve",     # single `&` backgrounds a second tool
+        "a || b",                   # logical-or chain
+        "jest > out.txt",           # redirection — output diverted, classifier blind
+        "jest 2>&1",                # stderr redirection
+        "jest\neslint",             # newline command separator (shlex treats \n as whitespace)
+        "diff <(jest) <(other)",    # process substitution — argv[0] not even the runner
+        "jest --maxWorkers=$(nproc)",  # command substitution (unquoted) — needs a shell
+        'jest -t "$(pwd)"',         # command substitution in DOUBLE quotes — still executes
+        'jest --config="$(pwd)/jest.config.js"',  # double-quoted $() embedded in a value
+        "$(cat run-cmd.txt)",       # subshell — genuinely opaque
+        "`cat cmd`",                # backtick command substitution
+    ])
+    def test_multi_tool_script_degrades_to_tier_b(self, tmp_path, script):
+        base = self._pkg(tmp_path, script)
+        info = tr.detect_runner(base, ["npm", "test"])
+        assert info.runner == tr.UNKNOWN, f"{script!r} must degrade to Tier-B"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("script", [
+        "MODE=$CI_MODE pytest",         # env prefix — re-run would set the LITERAL `$CI_MODE`
+        "pytest -c $PYTEST_CONFIG",     # config selector — re-run reads a different config
+        "pytest $EXTRA_FLAGS",          # `--runxfail` under the gate, dropped by the re-run
+        "jest --maxWorkers=$JOBS",      # bare `$VAR`
+        "vitest run --reporter=${REPORTER}",   # braced form
+        "jest --maxWorkers=$(nproc)",   # `$(…)` — already Tier-B via _script_chains_tools
+        "pytest -k $1",                 # positional parameter
+    ])
+    def test_shell_expansion_script_degrades_to_tier_b(self, tmp_path, script):
+        # The package manager runs a script through a SHELL, which expands `$VAR`
+        # before the runner starts; `shlex.split` does not, so the token survives
+        # LITERAL into `resolved_cmd` and the shell-less scoped re-run would verify
+        # under a different env/config than the gate that failed — silently, since
+        # a literal `$CI_MODE` is still a valid (wrong) value. Honest degrade.
+        base = self._pkg(tmp_path, script)
+        info = tr.detect_runner(base, ["npm", "test"])
+        assert info.runner == tr.UNKNOWN, f"{script!r} must degrade to Tier-B"
+        assert info.scopable is False
+        assert info.resolved_cmd is None
+
+    @pytest.mark.parametrize("script,want", [
+        # A shell metacharacter INSIDE a quoted argument is NOT composition — the run
+        # is still a single recognized runner and must stay Tier-A. (Adversarial
+        # regression: a raw-string scan misread the quoted `|` as a shell pipe and
+        # false-downgraded these to Tier-B, which also false-REDs a legit no-tests run.)
+        ("jest --testPathPattern='(unit|integration)'", tr.JEST),
+        ('jest --testPathPattern="unit|integration"', tr.JEST),
+        ("jest -t 'renders|updates'", tr.JEST),
+        ("vitest run 'src/(a|b).test.ts'", tr.VITEST),
+        ("mocha --grep 'foo|bar'", tr.MOCHA),
+        # A `$` that introduces NO expansion is literal to the shell too, so
+        # `shlex.split` reproduces it exactly — a trailing regex anchor must not be
+        # swept up by the expansion degrade (`$VAR` forms are covered above, in
+        # `test_shell_expansion_script_degrades_to_tier_b`).
+        ("jest -t 'renders$'", tr.JEST),
+        (r"jest --testPathPattern='\.test\.js$'", tr.JEST),
+        ("vitest run --reporter=dot", tr.VITEST),
+    ])
+    def test_quoted_operator_or_anchor_in_arg_stays_tier_a(self, tmp_path, script, want):
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": script}}))
+        info = tr.detect_runner(str(tmp_path), ["npm", "test"])
+        assert info.runner == want, f"{script!r} should stay Tier-A ({want})"
+        assert info.scopable is True
+
+    def test_unrecognized_single_tool_degrades(self, tmp_path):
+        # react-scripts wraps jest but is not itself a recognized runner → honest
+        # whole-suite degrade rather than a wrong scoped-triage claim.
+        base = self._pkg(tmp_path, "react-scripts test")
+        assert tr.detect_runner(base, ["npm", "test"]).runner == tr.UNKNOWN
+
+    def test_cyclic_script_terminates_unknown(self, tmp_path):
+        # `"test": "npm test"` must not loop — bounded to UNKNOWN.
+        base = self._pkg(tmp_path, "npm test")
+        assert tr.detect_runner(base, ["npm", "test"]).runner == tr.UNKNOWN
+
+    @pytest.mark.parametrize("hook", ["pretest", "posttest"])
+    def test_lifecycle_hook_degrades_to_tier_b(self, tmp_path, hook):
+        # npm runs `pretest`/`posttest` automatically around `npm test`
+        # (docs.npmjs.com/cli/v11/using-npm/scripts#pre--post-scripts) — the
+        # combined output is not attributable to `scripts.test`'s runner alone,
+        # and a scoped rerun of ONLY `test` would skip the hook the full gate
+        # actually ran under. Must degrade honestly rather than misclassify.
+        base = self._pkg(tmp_path, "vitest run", extra={hook: "node setup.js"})
+        info = tr.detect_runner(base, ["npm", "test"])
+        assert info.runner == tr.UNKNOWN
+        assert info.scopable is False
+        assert info.source == "wrapper:npm-script-lifecycle"
+
+    def test_blank_lifecycle_hook_stays_tier_a(self, tmp_path):
+        # An empty/whitespace-only pretest entry is not a real hook — npm treats
+        # it as absent, so this must not false-degrade a plain `npm test` repo.
+        base = self._pkg(tmp_path, "vitest run", extra={"pretest": "  "})
+        info = tr.detect_runner(base, ["npm", "test"])
+        assert info.runner == tr.VITEST
+        assert info.scopable is True
+
+    def test_missing_script_is_unknown(self, tmp_path):
+        (tmp_path / "package.json").write_text('{"scripts": {"build": "tsc"}}')
+        assert tr.detect_runner(str(tmp_path), ["npm", "test"]).runner == tr.UNKNOWN
+
+    def test_malformed_package_json_never_raises(self, tmp_path):
+        (tmp_path / "package.json").write_text("{ not valid json ,,, ")
+        assert tr.detect_runner(str(tmp_path), ["npm", "test"]).runner == tr.UNKNOWN
+
+    def test_pathologically_nested_package_json_degrades_not_raises(self, tmp_path):
+        # `json.loads` overflows the C scanner's recursion limit with RecursionError
+        # — not ValueError — on a pathologically nested document; it must take the
+        # same documented Tier-B degrade, never escape through `detect_runner`.
+        (tmp_path / "package.json").write_text("[" * 200000 + "]" * 200000)
+        info = tr.detect_runner(str(tmp_path), ["npm", "test"])
+        assert info.runner == tr.UNKNOWN
+        assert info.scopable is False
+
+    def test_marker_only_unwrap_keeps_tier_a(self, tmp_path):
+        # Marker-mode (no command) also unwraps scripts.test → a script-only repo is
+        # still recognized for auto-detect / F2.
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "vitest run"}}))
+        assert tr.detect_runner(str(tmp_path), []).runner == tr.VITEST
+
+
+class TestNpmBinPathDirs:
+    """`npm_bin_path_dirs` backs the scoped-rerun PATH fix for a P10 npm-script
+    unwrap — it must mirror npm's own ancestor `node_modules/.bin` PATH-prepend
+    walk (docs.npmjs.com/cli/v11/using-npm/scripts#path) so a locally-installed
+    binary (`cross-env`) resolves the same way for a direct subprocess.run as it
+    does inside `npm test`."""
+
+    def test_finds_own_and_ancestor_bin_dirs(self, tmp_path):
+        root_bin = tmp_path / "node_modules" / ".bin"
+        root_bin.mkdir(parents=True)
+        pkg = tmp_path / "packages" / "app"
+        pkg_bin = pkg / "node_modules" / ".bin"
+        pkg_bin.mkdir(parents=True)
+        dirs = tr.npm_bin_path_dirs(str(pkg))
+        assert dirs[0] == str(pkg_bin)          # nearest first
+        assert str(root_bin) in dirs
+
+    def test_no_node_modules_anywhere_returns_empty(self, tmp_path):
+        leaf = tmp_path / "a" / "b"
+        leaf.mkdir(parents=True)
+        assert tr.npm_bin_path_dirs(str(leaf)) == []
+
+    def test_never_raises_on_bogus_base(self):
+        assert tr.npm_bin_path_dirs("") == []
+        assert tr.npm_bin_path_dirs(None) == []
+
+
+class TestNpmScriptEnv:
+    """`npm_script_env` rebuilds the script-visible variables npm injects into any
+    `scripts.<name>` child (docs.npmjs.com/cli/v11/using-npm/scripts#environment).
+    A scoped re-run bypasses npm, so without them a conftest / setup file that
+    branches on `npm_lifecycle_event` runs a DIFFERENT branch than the full gate —
+    an isolation verdict about an environment the gate never ran under."""
+
+    def test_reconstructs_the_script_visible_vars(self, tmp_path):
+        (tmp_path / "package.json").write_text(json.dumps(
+            {"scripts": {"test": "cross-env SPECIAL=1 pytest"}}))
+        info = tr.detect_runner(str(tmp_path), ["npm", "test"])
+        assert info.source == "npm-script" and info.script_name == "test"
+        env = tr.npm_script_env(str(tmp_path), info)
+        assert env["npm_lifecycle_event"] == "test"
+        assert env["npm_lifecycle_script"] == "cross-env SPECIAL=1 pytest"
+        assert env["npm_package_json"] == str(tmp_path / "package.json")
+        assert env["INIT_CWD"] == str(tmp_path)
+
+    def test_omits_init_cwd_for_a_bun_resolved_unwrap(self, tmp_path):
+        # Bun does not set `INIT_CWD` on a `bun run` child (checked against Bun
+        # 1.2.14) — synthesizing it would hand a scoped re-run a variable the full
+        # gate's child never saw, which a conftest branching on its presence could
+        # take a different path over.
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "pytest"}}))
+        info = tr.detect_runner(str(tmp_path), ["bun", "run", "test"])
+        assert info.source == "npm-script" and info.package_manager == "bun"
+        env = tr.npm_script_env(str(tmp_path), info)
+        assert "INIT_CWD" not in env
+        assert env["npm_lifecycle_event"] == "test"
+
+    def test_mixed_chain_keys_init_cwd_on_the_head_manager(self, tmp_path):
+        # `npm test` → `"test": "bun run inner"` → pytest: npm — the manager the
+        # gate actually invoked — sets INIT_CWD on its child, and bun (which never
+        # sets it) passes it through to the runner. Keying the omission on the
+        # TERMINAL manager dropped a variable the gate's child really saw. The
+        # lifecycle event stays the TERMINAL script's — bun re-sets that one for
+        # its own child.
+        (tmp_path / "package.json").write_text(json.dumps(
+            {"scripts": {"test": "bun run inner", "inner": "pytest"}}))
+        info = tr.detect_runner(str(tmp_path), ["npm", "test"])
+        assert info.source == "npm-script" and info.script_name == "inner"
+        assert info.package_manager == "npm"       # HEAD of the chain, not bun
+        env = tr.npm_script_env(str(tmp_path), info)
+        assert env["INIT_CWD"] == str(tmp_path)
+        assert env["npm_lifecycle_event"] == "inner"
+
+    def test_mirror_chain_omits_init_cwd_when_head_is_bun(self, tmp_path):
+        # The MIRROR of the chain above: `bun run test` → `"test": "npm run inner"` →
+        # pytest. Keying the INIT_CWD omission off the HEAD (bun) correctly OMITS it,
+        # and keying off "every manager in the chain is bun" (i.e. INCLUDING it here
+        # because `npm` textually appears) would be WRONG: bun runs an inner `npm run`
+        # through its OWN script runner (auto-aliased — verified on Bun 1.3.12: the
+        # terminal runner's npm_config_user_agent stays `bun/…` and INIT_CWD is UNSET,
+        # even under `--shell=system`), so the real gate's child sees NO INIT_CWD. The
+        # textual `npm` never actually runs, so synthesizing INIT_CWD would hand a
+        # scoped re-run a variable the full gate never had.
+        (tmp_path / "package.json").write_text(json.dumps(
+            {"scripts": {"test": "npm run inner", "inner": "pytest"}}))
+        info = tr.detect_runner(str(tmp_path), ["bun", "run", "test"])
+        assert info.source == "npm-script" and info.script_name == "inner"
+        assert info.package_manager == "bun"       # HEAD of the chain, not npm
+        env = tr.npm_script_env(str(tmp_path), info)
+        assert "INIT_CWD" not in env
+        assert env["npm_lifecycle_event"] == "inner"
+
+    def test_reports_the_terminal_script_of_a_reindirection(self, tmp_path):
+        # npm runs the INNER script as its own lifecycle event, so `npm run test:ci`
+        # behind `test` makes `npm_lifecycle_event` "test:ci" — not "test".
+        (tmp_path / "package.json").write_text(json.dumps(
+            {"scripts": {"test": "npm run test:ci", "test:ci": "pytest -q"}}))
+        info = tr.detect_runner(str(tmp_path), ["npm", "test"])
+        assert info.script_name == "test:ci"
+        env = tr.npm_script_env(str(tmp_path), info)
+        assert env["npm_lifecycle_event"] == "test:ci"
+        assert env["npm_lifecycle_script"] == "pytest -q"
+
+    def test_never_fabricates_npm_config_vars(self, tmp_path):
+        # npm_config_* comes from npm's own npmrc cascade — unreproducible without
+        # npm, and guessing would swap an incomplete env for a fabricated one.
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "pytest"}}))
+        info = tr.detect_runner(str(tmp_path), ["npm", "test"])
+        env = tr.npm_script_env(str(tmp_path), info)
+        assert not [k for k in env if k.startswith("npm_config_")]
+
+    def test_empty_for_non_npm_script_detections(self, tmp_path):
+        assert tr.npm_script_env(str(tmp_path), None) == {}
+        argv_info = tr.detect_runner(str(tmp_path), ["python3", "-m", "pytest"])
+        assert argv_info.source != "npm-script"
+        assert tr.npm_script_env(str(tmp_path), argv_info) == {}
+        # a Tier-B degrade carries no script_name → nothing to reconstruct
+        (tmp_path / "package.json").write_text(json.dumps(
+            {"scripts": {"test": "eslint . && jest"}}))
+        tier_b = tr.detect_runner(str(tmp_path), ["npm", "test"])
+        assert tier_b.runner == tr.UNKNOWN
+        assert tr.npm_script_env(str(tmp_path), tier_b) == {}
+
+    def test_never_raises_on_bogus_base(self, tmp_path):
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "pytest"}}))
+        info = tr.detect_runner(str(tmp_path), ["npm", "test"])
+        assert tr.npm_script_env("", info) == {}       # no package.json at cwd
+        assert tr.npm_script_env(None, info) == {}
+
+
+class TestP10OpaqueAndMultiProjectWrappers:
+    """Genuinely-opaque wrappers and multi-project orchestrators are FORCED to a
+    Tier-B honest degrade (UNKNOWN): the gate + classifier still work, but scoped
+    triage is never attempted on a command we cannot see through."""
+
+    @pytest.mark.parametrize("argv", [
+        ["make", "test"],
+        ["make", "check"],
+        ["./run-tests.sh"],
+        ["nx", "run-many", "-t", "test"],
+        ["turbo", "run", "test"],
+        ["bazel", "test", "//..."],
+        ["dbt", "test"],
+        ["docker", "compose", "run", "test"],
+    ])
+    def test_opaque_wrapper_is_unknown_unscopable(self, argv):
+        info = tr.detect_runner(".", argv)
+        assert info.runner == tr.UNKNOWN
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv,src", [
+        (["pnpm", "-r", "test"], "wrapper:multi-project"),
+        (["pnpm", "--recursive", "test"], "wrapper:multi-project"),
+        (["pnpm", "--filter", "pkg", "test"], "wrapper:multi-project"),
+        (["npm", "test", "-w", "packages/api"], "wrapper:multi-project"),
+        (["npm", "test", "--workspaces"], "wrapper:multi-project"),
+    ])
+    def test_multi_project_run_is_unknown(self, tmp_path, argv, src):
+        # Even with a resolvable scripts.test, a workspace/recursive run spans multiple
+        # cwds — opaque, never unwrapped.
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "vitest run"}}))
+        info = tr.detect_runner(str(tmp_path), argv)
+        assert info.runner == tr.UNKNOWN
+        assert info.source == src
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["npm", "--prefix=child", "test"],
+        ["npm", "test", "--prefix=child"],
+        ["npm", "test", "--prefix", "child"],
+        ["yarn", "--cwd", "child", "test"],
+        ["yarn", "--cwd=child", "test"],
+        ["pnpm", "-C", "child", "test"],
+        ["pnpm", "--dir", "child", "test"],
+        ["pnpm", "--dir=child", "test"],
+        ["bun", "--cwd=child", "run", "test"],
+    ])
+    def test_package_root_cwd_selector_is_unknown(self, tmp_path, argv):
+        # npm's `--prefix`, yarn's `--cwd`, pnpm's `-C`/`--dir`, and bun's `--cwd` each
+        # read `<dir>/package.json`, not the gate's cwd (confirmed against real npm
+        # 11.4.2, yarn 1.22.22, pnpm 9.15.9, bun: `npm --prefix=child test` /
+        # `npm test --prefix=child` / `yarn --cwd child test` / `pnpm -C child test`
+        # all run `child/package.json`'s `scripts.test`). A ROOT package.json with a
+        # DIFFERENT `scripts.test` here proves the gate does not misroute to it.
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "mocha"}}))
+        child = tmp_path / "child"
+        child.mkdir()
+        (child / "package.json").write_text(json.dumps({"scripts": {"test": "vitest run"}}))
+        info = tr.detect_runner(str(tmp_path), argv)
+        assert info.runner == tr.UNKNOWN
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    def _workspace(self, tmp_path, pnpm=False):
+        # Root scripts.test=vitest, pkgs/a scripts.test=jest — a root unwrap that
+        # classified the whole run as vitest would let a scoped re-run silently
+        # skip pkgs/a's jest suite entirely.
+        (tmp_path / "package.json").write_text(json.dumps(
+            {"workspaces": ["pkgs/*"], "scripts": {"test": "vitest run"}}))
+        pkg = tmp_path / "pkgs" / "a"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(json.dumps({"scripts": {"test": "jest"}}))
+        if pnpm:
+            (tmp_path / "pnpm-workspace.yaml").write_text("packages:\n  - 'pkgs/*'\n")
+        return str(tmp_path)
+
+    @pytest.mark.parametrize("argv", [
+        ["bun", "run", "--filter=*", "test"],
+        ["bun", "run", "--filter", "*", "test"],
+        ["bun", "--filter=*", "run", "test"],
+    ])
+    def test_bun_filter_workspace_run_is_unknown(self, tmp_path, argv):
+        # `bun run --filter <pat> <script>` runs the script in every MATCHING
+        # workspace package (Bun's "Filter" docs) — a multi-package run whose
+        # root-script unwrap skips the other packages' suites (#540 round-4
+        # regression, audited 2026-07-18). Must degrade like pnpm's `--filter`.
+        base = self._workspace(tmp_path)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["bun", "run", "-F=*", "test"],
+        ["bun", "run", "-F*", "test"],
+        ["bun", "run", "-F", "*", "test"],
+        ["bun", "-F=*", "run", "test"],
+        ["bun", "-F*", "run", "test"],
+    ])
+    def test_bun_short_filter_workspace_run_is_unknown(self, tmp_path, argv):
+        # `-F` is bun's documented short alias for `--filter` (`bun run --help`
+        # lists `-F, --filter=<val>`) and all its forms — `-F=<pat>`, `-F<pat>`
+        # (no `=`), and space-separated `-F <pat>` — filter-run the matching
+        # workspace packages just like `--filter=<pat>` (confirmed against real
+        # Bun 1.3.12), so the short form must degrade the same way (P10b round-2,
+        # 2026-07-19).
+        base = self._workspace(tmp_path)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["bun", "run", "--shell", "system", "--filter=*", "test"],
+        ["bun", "run", "--shell", "system", "--filter", "*", "test"],
+        ["bun", "run", "--env-file", ".env.test", "--filter=*", "test"],
+        ["bun", "run", "--elide-lines", "5", "-F", "*", "test"],
+    ])
+    def test_bun_value_flag_before_filter_still_degrades(self, tmp_path, argv):
+        # A bun value-taking flag in SPACE-separated form (`--shell system`,
+        # `--env-file <path>`, `--elide-lines <n>`) before a later `--filter`/`-F`
+        # must have its value token skipped WITH the flag; otherwise the scan stops
+        # at the value (`system`), misses the workspace filter, and `_package_script_
+        # target` treats the value as the script positional — misrouting a filtered
+        # workspace run to a single scopable script (`bun run --shell system
+        # --filter='*' test` runs the MATCHING workspace packages, confirmed on Bun
+        # 1.3.12; P10b, 2026-07-19).
+        base = self._workspace(tmp_path)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["bun", "run", "-r", "./setup.js", "--filter=*", "test"],
+        ["bun", "run", "--preload", "./setup.js", "--filter", "*", "test"],
+        ["bun", "run", "--require", "./setup.js", "--filter=*", "test"],
+        ["bun", "run", "--import", "./setup.js", "-F", "*", "test"],
+    ])
+    def test_bun_preload_flag_before_filter_still_degrades(self, tmp_path, argv):
+        # `bun run --help` lists `-r, --preload=<val>` plus `--require`/`--import` as
+        # Node-compat aliases of `--preload`, none of which `_BUN_VALUE_FLAGS` covered
+        # before P10b round-2 — `_run_flag_prefix_len` stopped its scan at the preload
+        # module path and never reached a later `--filter`, reopening the
+        # workspace-suite skip this patch closes (confirmed against real Bun 1.3.12:
+        # `bun run -r ./setup.js --filter='*' test` preloads `./setup.js` into every
+        # MATCHING workspace package, it does not run a `setup.js` script; 2026-07-19).
+        base = self._workspace(tmp_path)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["pnpm", "run", "--loglevel", "warn", "--filter=a", "test"],
+        ["pnpm", "run", "--resume-from", "a", "--filter=a", "test"],
+        ["bun", "run", "--install", "fallback", "--filter=a", "test"],
+        ["bun", "run", "-d", "X:1", "--filter=a", "test"],
+        ["bun", "run", "--define", "X:1", "-F", "a", "test"],
+    ])
+    def test_pnpm_bun_p10b_round3_value_flag_before_filter_still_degrades(self, tmp_path, argv):
+        # pnpm's `--loglevel <level>` / `--resume-from <package>` and bun's
+        # `--install <mode>` / `-d`/`--define <k:v>` are MANDATORY-value flags in
+        # SPACE-separated form (confirmed on pnpm 10.33.0 / Bun 1.3.12: `pnpm run
+        # --loglevel warn --filter=a test` and `bun run --install fallback
+        # --filter=a test` both run only package `a`'s script) — before P10b
+        # round-3 none of these were in `_PNPM_VALUE_FLAGS`/`_BUN_VALUE_FLAGS`, so
+        # `_run_flag_prefix_len` stopped its scan at the flag's value and never
+        # reached the later `--filter`, misrouting a filtered workspace run to a
+        # single scopable script (2026-07-20).
+        base = self._workspace(tmp_path, pnpm=argv[0] == "pnpm")
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["pnpm", "run", "--changed-files-ignore-pattern", "**/README.md", "--filter=a", "test"],
+        ["pnpm", "run", "--test-pattern", "test/*", "--filter=a", "test"],
+    ])
+    def test_pnpm_p10b_round4_filtering_value_flag_before_filter_still_degrades(self, tmp_path, argv):
+        # pnpm's `--changed-files-ignore-pattern <pattern>` / `--test-pattern
+        # <pattern>` are MANDATORY-value flags listed under pnpm run --help's
+        # Filtering options (confirmed on pnpm 10.33.0) — before P10b round-4
+        # neither was in `_PNPM_VALUE_FLAGS`, so `_run_flag_prefix_len` stopped its
+        # scan at the flag's value and never reached the later `--filter`,
+        # misrouting a filtered workspace run to a single scopable script
+        # (2026-07-21).
+        base = self._workspace(tmp_path, pnpm=True)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["bun", "run", "--conditions", "test", "--filter=a", "test"],
+        ["bun", "run", "--port", "3000", "--filter=a", "test"],
+        ["bun", "run", "--drop", "console", "-F", "a", "test"],
+    ])
+    def test_bun_p10b_round5_value_flag_before_filter_still_degrades(self, tmp_path, argv):
+        # bun's `--conditions <val>` / `--port <val>` / `--drop <val>` are
+        # MANDATORY-value flags — bun's own arg-parser table
+        # (`src/runtime/cli/Arguments.rs`) declares each `<STR>`/`<STR>...` with no
+        # trailing `?`, the same shape as `--define`/`--install` above (unlike the
+        # `?`-suffixed optional-value `--inspect*` flags, which only take an
+        # `=`-joined value) — before P10b round-5 none of these three were in
+        # `_BUN_VALUE_FLAGS`, so `_run_flag_prefix_len` stopped its scan at the
+        # flag's value and never reached the later `--filter`, misrouting a
+        # filtered workspace run to a single scopable script (2026-07-21).
+        base = self._workspace(tmp_path)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["bun", "run", "--title", "ci", "--filter=a", "test"],
+        ["bun", "run", "--title", "ci", "-F", "a", "test"],
+    ])
+    def test_bun_p10b_round6_title_value_flag_before_filter_still_degrades(self, tmp_path, argv):
+        # bun's `--title <val>` is a MANDATORY-value flag (confirmed on Bun 1.3.12
+        # via `bun run --help` and empirically: `bun run --title ci ci` sets the
+        # process title to `ci` and still runs the `ci` script) — before P10b
+        # round-6 it wasn't in `_BUN_VALUE_FLAGS`, so `_run_flag_prefix_len`
+        # stopped its scan at the flag's value (`ci`) as a phantom script
+        # positional, and never reached the later `--filter`, misrouting a
+        # filtered workspace run to a single scopable script named `ci` (2026-07-21).
+        base = self._workspace(tmp_path)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    @pytest.mark.parametrize("argv", [
+        ["pnpm", "run", "-r", "test"],
+        ["pnpm", "run", "--recursive", "test"],
+        ["pnpm", "run", "--filter=a", "test"],
+        ["pnpm", "run", "--filter", "a", "test"],
+        ["pnpm", "run-script", "-r", "test"],
+    ])
+    def test_pnpm_workspace_flag_after_run_subcommand_is_unknown(self, tmp_path, argv):
+        # pnpm accepts its command flags on either side of the `run` subcommand
+        # (`pnpm run -r test` ≡ `pnpm -r run test`, both recursive; `pnpm run
+        # --filter=a test` runs package `a`'s script, not cwd's) — a flag scan
+        # that stopped at `run` unwrapped ROOT's script as Tier-A (#540 round-5
+        # regression, audited 2026-07-18). Only the SCRIPT positional ends pnpm's
+        # own-flag region.
+        base = self._workspace(tmp_path, pnpm=True)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+class TestBunJsxImportSourceValueFlag:
+    """`bun run --jsx-import-source <val>` — a MANDATORY-value flag whose value must
+    be skipped WITH the flag, so a later workspace `--filter`/`-F` is still seen.
+
+    `--jsx-import-source` entered `_BUN_VALUE_FLAGS` without a test of its own, so
+    this class closes that gap rather than inheriting it.
+    The failure it guards is a FALSE Tier-A: without the entry the flag-prefix
+    scan stops at the value token as a phantom script positional, the real
+    `--filter` after it is never recognized, and a multi-package workspace run
+    unwraps ROOT's script as scopable — a scoped re-run would then silently skip
+    every other package's suite.
+    """
+
+    def _workspace(self, tmp_path):
+        # Root scripts.test=vitest, pkgs/a scripts.test=jest — a root unwrap that
+        # classified the whole run as vitest would let a scoped re-run silently
+        # skip pkgs/a's jest suite entirely.
+        (tmp_path / "package.json").write_text(json.dumps(
+            {"workspaces": ["pkgs/*"], "scripts": {"test": "vitest run"}}))
+        pkg = tmp_path / "pkgs" / "a"
+        pkg.mkdir(parents=True)
+        (pkg / "package.json").write_text(json.dumps({"scripts": {"test": "jest"}}))
+        return str(tmp_path)
+
+    @pytest.mark.parametrize("argv", [
+        ["bun", "run", "--jsx-import-source", "someval", "--filter=a", "test"],
+        ["bun", "run", "--jsx-import-source", "someval", "--filter", "a", "test"],
+        ["bun", "run", "--jsx-import-source", "someval", "-F", "a", "test"],
+        # The value token is itself a plausible script name — the case that makes a
+        # value-unaware scan mistake it for the script positional.
+        ["bun", "run", "--jsx-import-source", "test", "--filter=a", "test"],
+    ])
+    def test_value_flag_before_filter_still_degrades(self, tmp_path, argv):
+        base = self._workspace(tmp_path)
+        info = tr.detect_runner(base, argv)
+        assert info.runner == tr.UNKNOWN, argv
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    def test_equals_joined_form_also_degrades(self, tmp_path):
+        # `--jsx-import-source=<val>` consumes no following token, so the scan must
+        # reach `--filter=a` on its own.
+        base = self._workspace(tmp_path)
+        info = tr.detect_runner(
+            base, ["bun", "run", "--jsx-import-source=someval", "--filter=a", "test"])
+        assert info.runner == tr.UNKNOWN
+        assert info.source == "wrapper:multi-project"
+        assert info.scopable is False
+
+    def test_without_a_workspace_flag_the_script_still_unwraps_tier_a(self, tmp_path):
+        # The value skip must not eat the SCRIPT positional: with no workspace flag
+        # present, `bun run --jsx-import-source someval test` is a single-package
+        # run and stays a scopable Tier-A unwrap.
+        (tmp_path / "package.json").write_text(json.dumps(
+            {"scripts": {"test": "vitest run"}}))
+        info = tr.detect_runner(
+            str(tmp_path), ["bun", "run", "--jsx-import-source", "someval", "test"])
+        assert info.runner == tr.VITEST
+        assert info.scopable is True
+        assert info.resolved_cmd == ["vitest", "run"]
+
+
+class TestP10TierCDetectors:
+    """Tier-C — Bun + Deno (NEW in P10) detect + gate; Django + Karma (already in P2)
+    confirmed complete. Bun/Deno are non-scopable (no P4–P9 triage adapter → honest
+    whole-suite degrade)."""
+
+    def test_bun_argv(self):
+        info = tr.detect_runner(".", ["bun", "test"])
+        assert info.runner == tr.BUN and info.source == "argv"
+        assert info.scopable is False           # Tier-C: detect+gate, no scoped triage
+
+    def test_deno_argv(self):
+        info = tr.detect_runner(".", ["deno", "test", "tests/"])
+        assert info.runner == tr.DENO and info.source == "argv"
+        assert info.scopable is False
+
+    def test_bun_run_test_unwraps_not_bun_runner(self, tmp_path):
+        # `bun run test` runs the package SCRIPT (unwrap), NOT bun's built-in runner.
+        (tmp_path / "package.json").write_text(json.dumps({"scripts": {"test": "vitest run"}}))
+        assert tr.detect_runner(str(tmp_path), ["bun", "run", "test"]).runner == tr.VITEST
+
+    @pytest.mark.parametrize("marker", ["bunfig.toml", "bun.lockb", "bun.lock"])
+    def test_bun_markers(self, tmp_path, marker):
+        (tmp_path / marker).write_text("")
+        assert tr.detect_runner(str(tmp_path), []).runner == tr.BUN
+
+    @pytest.mark.parametrize("marker", ["deno.json", "deno.jsonc", "deno.lock"])
+    def test_deno_markers(self, tmp_path, marker):
+        (tmp_path / marker).write_text("{}")
+        assert tr.detect_runner(str(tmp_path), []).runner == tr.DENO
+
+    def test_bun_marker_yields_to_real_runner(self, tmp_path):
+        # A bun-as-package-manager repo that actually drives vitest is vitest, not bun.
+        (tmp_path / "bun.lockb").write_text("")
+        (tmp_path / "vitest.config.ts").write_text("export default {}\n")
+        assert tr.detect_runner(str(tmp_path), []).runner == tr.VITEST
+
+    def test_deno_task_is_opaque_not_deno_runner(self):
+        # `deno task test` runs a deno.json TASK (arbitrary) — opaque, not the runner.
+        assert tr.detect_runner(".", ["deno", "task", "test"]).runner == tr.UNKNOWN
+
+    def test_django_detected_and_scopable_for_unittest_adapter(self, tmp_path):
+        # Django reuses the unittest dotted-id contract → it MUST stay scopable so P3's
+        # unittest adapter can route it (Tier-C-with-scoped-triage, unlike bun/deno).
+        for argv in (["python", "manage.py", "test"], ["./manage.py", "test", "app"]):
+            info = tr.detect_runner(str(tmp_path), argv)
+            assert info.runner == tr.DJANGO
+            assert info.scopable is True
+        (tmp_path / "manage.py").write_text("#!/usr/bin/env python\n")
+        assert tr.detect_runner(str(tmp_path), []).runner == tr.DJANGO
+
+
+class TestP10KarmaSilentGreenGuard:
+    """THE named guard: a Karma / `ng test` run with ZERO specs must classify
+    `no_tests`, NEVER `passed` — regardless of exit code. Karma's default
+    failOnEmptyTestSuite=true EXITS 1 (false-red) and the opt-out EXITS 0 (false-green,
+    the silent-green a test gate exists to catch); both hinge on "Executed 0 of N"."""
+
+    @pytest.mark.parametrize("rc", [0, 1])
+    def test_zero_specs_is_no_tests_never_passed(self, rc):
+        got = tr.classify(tr.KARMA, rc, "Executed 0 of 0 SUCCESS")
+        assert got == tr.NO_TESTS, f"karma zero-spec (exit {rc}) false-classified as {got}"
+        assert got != tr.PASSED
+
+    def test_ng_test_detects_karma(self):
+        assert tr.detect_runner(".", ["ng", "test"]).runner == tr.KARMA
+
+    def test_zero_specs_with_error_is_red_not_skipped(self):
+        # A BROKEN zero-spec run (TS compile error / browser disconnect) is RED, never
+        # masked as a green no-tests SKIP.
+        assert tr.classify(tr.KARMA, 1,
+                           "error TS2304: Cannot find name 'Foo'.\nExecuted 0 of 0 ERROR") == tr.COMPILE_ERROR
+        assert tr.classify(tr.KARMA, 1,
+                           "Chrome DISCONNECTED\nExecuted 0 of 12 DISCONNECTED") == tr.COMPILE_ERROR

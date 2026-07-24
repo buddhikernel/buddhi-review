@@ -7,17 +7,22 @@ no scoped re-run — this free skill's gate escalates on red, nothing more):
 
   detect_runner(cwd, resolved_cmd) -> RunnerInfo
       Identify the runner behind the gate command, from (in priority order) the
-      resolved command's argv[0]/shape, the STRING inside a `bash -lc` wrapper, then
-      repo markers. The gate wraps every command carrying shell syntax in `bash -lc`
-      (`commit_push._split_test_command`: a `cd <dir>` step, a `VAR=val` prefix, an
-      `&&` chain), so the runner is read back OUT of that string — else the most
-      ordinary gate commands there are would all be opaque. An unrecognized argv
-      (`npm test`, `./run-tests.sh`, `make`) or a shell string naming no runner we
-      know stays an opaque wrapper -> runner=UNKNOWN (and `classify` still holds the
-      no-false-green line there); a `tox.ini [tox]` / `noxfile.py` forces tox/nox (a
+      resolved command's argv[0]/shape, then repo markers. An `npm/yarn/pnpm/bun`
+      package-script (`npm test`, `<mgr> run <name>`) is UNWRAPPED (P10) through
+      `package.json` `scripts` to the real runner, so a standard `npm test` repo
+      stays Tier-A. A `bash -lc "<cmd>"` wrapper is read back out of the shell STRING
+      (`_runner_from_shell_string`): a string naming exactly ONE recognized runner —
+      possibly behind a `cd`, an env prefix, or a preceding `&&` step — resolves to
+      that runner (`source="shell"`, but NEVER scopable, since a shell string is not
+      an argv we can append an exact-subset filter to); a string naming NO recognized
+      runner (`make test`) or TWO-plus distinct ones (`pytest && npx jest`) stays an
+      opaque wrapper. An unrecognized argv (`./run-tests.sh`, `make`, `nx`, `bazel`),
+      a multi-tool package script (`tsc && jest`), or a multi-project run (`pnpm -r
+      test`, `npm test -w pkg`) is likewise an opaque wrapper -> runner=UNKNOWN
+      (Tier-B honest degrade); a `tox.ini [tox]` / `noxfile.py` forces tox/nox (a
       Tier-B wrapper) over the tox.ini->pytest signal. Pure / read-only (no network,
-      no installs); the ONLY subprocess it runs is a bounded `cargo nextest --version`
-      probe to tell nextest from stable cargo, which the design explicitly permits.
+      no installs); the ONLY subprocess it runs is a bounded `cargo nextest
+      --version` probe to tell nextest from stable cargo, which the design permits.
 
   classify(runner, exit_code, stdout, stderr, timed_out) -> str
       Map one runner invocation's outcome to exactly one of the six classes
@@ -38,13 +43,14 @@ STRING is parsed, because the exit code alone would false-green.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-from typing import NamedTuple, Optional, Union
+from typing import NamedTuple, Optional
 
 
 # ── Outcome classes — the six-class contract P2 owns ─────────────────────────────
@@ -59,9 +65,10 @@ TIMEOUT = "timeout"
 #: class can never leak into the gate without a matching mapping.
 OUTCOMES = frozenset({PASSED, FAILED, NO_TESTS, COMPILE_ERROR, ENV_ERROR, TIMEOUT})
 
-#: The classes that RED the gate but must NEVER be fed to failing-id parsing (P3
-#: reads this to route them away from triage). `failed`/`timeout` red too, but they
-#: MAY carry ids.
+#: The two RED classes that carry no per-test outcome at all: the run never got as
+#: far as executing tests, so there is nothing test-level to report and the gate
+#: names the class itself in its RED headline (`compile error` / `missing
+#: dependency`). `failed`/`timeout` red too, but those DID reach the tests.
 NON_TRIAGE_RED = frozenset({COMPILE_ERROR, ENV_ERROR})
 
 
@@ -78,6 +85,8 @@ JASMINE = "jasmine"
 KARMA = "karma"
 NODE_TEST = "node_test"
 AVA = "ava"
+BUN = "bun"
+DENO = "deno"
 GO = "go"
 CARGO = "cargo"
 NEXTEST = "nextest"
@@ -97,37 +106,84 @@ DART = "dart"
 FLUTTER = "flutter"
 UNKNOWN = "unknown"
 
-#: Recognized runners for which a per-runner test id can be extracted AND an
-#: exact-subset re-run is feasible (P1's "scopable iff argv AND recognized" rule).
-#: A best-effort forward hint for P3 — P2 does not itself consume `scopable`. The
-#: Tier-B wrappers/whole-suite-degrade runners are deliberately excluded.
+#: The complement of the runners that report per-test identities an exact-subset
+#: re-run could address (a runner is scopable only when it was recognized from argv).
+#: Nothing here consumes `scopable`; it is recorded as a property of the runner, and
+#: the Tier-B wrappers / whole-suite-only runners are deliberately excluded from it.
 _NON_SCOPABLE = frozenset({
     UNKNOWN, TOX, NOX, CARGO, JASMINE, KARMA, AVA, NODE_TEST, MINITEST,
+    # Tier-C runtimes: detected and gated, but they report one whole-suite result,
+    # so they are never advertised as scopable.
+    BUN, DENO,
 })
 
 
 class RunnerInfo(NamedTuple):
     """The identified runner behind a gate command.
 
-    runner   — one of the runner-id constants above, or UNKNOWN for an opaque
-               wrapper (`npm test`, `./run-tests.sh`, `make`, a `bash -lc` string
-               naming no runner we recognize) we cannot see through.
-    scopable — best-effort hint: is this a recognized, scoped-rerun-capable runner?
-               (P1's rule; consumed by P3, not P2.) UNKNOWN, the Tier-B wrappers and
-               ANY shell-wrapped runner (source "shell") are never scopable.
-    source   — how it was identified ("argv", "shell" — read out of a `bash -lc`
-               string, "wrapper:shell", "wrapper:unrecognized", "marker:<file>",
-               "none") — for logging/tests.
+    runner       — one of the runner-id constants above, or UNKNOWN for an opaque
+                   wrapper (`bash -lc`, `./run-tests.sh`, `make`) we cannot see
+                   through.
+    scopable     — best-effort hint: is this a recognized runner whose tests could
+                   be addressed individually, rather than only as a whole suite?
+                   Recorded by detection as a property of the runner; the gate here
+                   runs the whole suite either way. UNKNOWN and the Tier-B wrappers
+                   are never scopable.
+    source       — how it was identified, for logging/tests. A runner FOUND is
+                   tagged by where: `"argv"` (recognized at argv[0]), `"shell"` (read
+                   out of a `bash -lc` string), `"npm-script"` (unwrapped through a
+                   `package.json` script, P10), or `"marker:<file>"` (repo-marker
+                   fallback). An opaque UNKNOWN carries WHY it stayed opaque:
+                   `"wrapper:shell"`, `"wrapper:unrecognized"`,
+                   `"wrapper:multi-project"`, or `"wrapper:npm-script"` (with
+                   `-lifecycle` / `-shell` / `-expansion` suffixes for the specific
+                   package-script degrade). `"none"` = no command AND no marker.
+                   The set is OPEN — new detection paths add values, so match by
+                   prefix (`source.startswith("wrapper:")`), never exact membership.
+    resolved_cmd — the EXPANDED argv that actually invokes the runner, when it
+                   differs from the argv this RunnerInfo was detected from — e.g.
+                   an npm/yarn/pnpm/bun package-script unwrap (P10) exposes
+                   `["cross-env", "SPECIAL=1", "pytest", "-c", "custom.ini"]` behind
+                   a `["npm", "test"]` gate. None when the detected-from argv
+                   already IS the invoking command (argv-detected, marker-detected),
+                   which the caller then uses as-is. Anything that needs to re-derive
+                   how the runner is actually invoked reads THIS rather than the raw
+                   gate argv, so it inherits the script's own env / launcher / config
+                   flags instead of a bare reconstruction that bypasses them.
+    script_name  — for a package-script unwrap (P10), the name of the `scripts.<name>`
+                   entry the runner was found behind — the TERMINAL one when the
+                   script re-indirects (`"test": "npm run test:ci"` → `"test:ci"`),
+                   since that is the one npm reports as `npm_lifecycle_event` to the
+                   runner it finally spawns. None for every non-package-script
+                   detection. Consumed by `npm_script_env`.
+    package_manager — for a package-script unwrap (P10), the `_PKG_MANAGERS` entry
+                   (`"npm"`/`"yarn"`/`"pnpm"`/`"bun"`) the gate command actually
+                   invoked — the HEAD-of-chain one for a re-indirection, the
+                   OPPOSITE end from `script_name`, because the head manager's
+                   process-tree-wide variables (INIT_CWD) survive an inner
+                   re-indirect while the per-child lifecycle variables are re-set
+                   by each manager. None for every non-package-script detection.
+                   Consumed by `npm_script_env`, since not every manager provides
+                   the same npm-compatibility environment variables (bun does not
+                   set `INIT_CWD`).
     """
     runner: str
     scopable: bool
     source: str
+    resolved_cmd: Optional[list[str]] = None
+    script_name: Optional[str] = None
+    package_manager: Optional[str] = None
 
 
-def _mk(runner: str, source: str) -> RunnerInfo:
+def _mk(runner: str, source: str, resolved_cmd: Optional[list[str]] = None,
+        script_name: Optional[str] = None,
+        package_manager: Optional[str] = None) -> RunnerInfo:
     return RunnerInfo(runner=runner,
                       scopable=(runner not in _NON_SCOPABLE),
-                      source=source)
+                      source=source,
+                      resolved_cmd=resolved_cmd,
+                      package_manager=package_manager,
+                      script_name=script_name)
 
 
 # ── Detection: argv shape ────────────────────────────────────────────────────────
@@ -144,6 +200,13 @@ _LAUNCHER_PAIRS = (("bundle", "exec"), ("poetry", "run"), ("uv", "run"),
 #: (`npx -y <pkg>` / `npx --yes <pkg>`) — it precedes the runner token, not the
 #: runner itself, so it must be dropped alongside the launcher.
 _NPX_NONINTERACTIVE_FLAGS = ("-y", "--yes")
+
+#: Env-setting launchers that wrap a real runner (`cross-env NODE_ENV=test jest`,
+#: `env FOO=1 pytest`). Stripped — along with any leading `VAR=value` shell
+#: assignments — so the underlying runner token is exposed. `cross-env-shell` /
+#: `dotenv` / `env-cmd` take a shell string or config flags of their own and are
+#: deliberately NOT here (they stay opaque → Tier-B).
+_ENV_LAUNCHERS = ("env", "cross-env")
 
 
 def _basename_token(tok: str) -> str:
@@ -181,9 +244,35 @@ def _strip_launchers(argv: list) -> list:
     return toks
 
 
-#: Interpreter options that consume a SEPARATE following argument (`-X dev`,
-#: `-W ignore`) — case-sensitive since `-x` (skip the `#!` line) is a distinct,
-#: argument-less flag from `-X` (set an implementation option).
+#: A bare shell `VAR=value` assignment token (`PYTHONPATH=.`, `NODE_ENV=test`) — NOT
+#: itself an executable, unlike `env`/`cross-env`. Shared with `_py_launcher_prefix`,
+#: which must recognize the SAME shape to know when a reconstructed launcher needs an
+#: `env` executable prepended before it is safe to `subprocess.run` without a shell.
+_BARE_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _strip_env_prefix(toks: list) -> list:
+    """Drop a leading env-setting prefix — an `env`/`cross-env` launcher and/or
+    consecutive `VAR=value` shell assignments — so `cross-env NODE_ENV=test jest` and
+    `NODE_ENV=1 pytest` expose the real runner token. Returns a copy; never mutates."""
+    out = list(toks)
+    changed = True
+    while changed and out:
+        changed = False
+        first = str(out[0])
+        if _basename_token(first) in _ENV_LAUNCHERS:
+            out = out[1:]
+            changed = True
+            continue
+        if _BARE_ENV_ASSIGNMENT_RE.match(first):
+            out = out[1:]
+            changed = True
+    return out
+
+
+#: Python interpreter options that CONSUME the following token as their argument
+#: (`-X dev`, `-W ignore`) — case-sensitive since `-x` (skip the `#!` line) is a
+#: distinct, argument-less flag from `-X` (set an implementation option).
 _PY_OPTS_WITH_ARG = ("-X", "-W")
 
 
@@ -202,13 +291,37 @@ def _skip_python_interpreter_opts(toks: list) -> int:
     return i
 
 
+def _strip_launchers_and_env(toks: list) -> list:
+    """Drop BOTH a launcher prefix (`npx`, `bundle exec`, …) and an env prefix
+    (`cross-env`, `FOO=1`, …), interleaved in either order (`cross-env uv run
+    pytest`), until neither strips anything further. Returns a possibly-shorter
+    copy; never mutates. The shared core of `_runner_from_argv` (detection) and
+    `_py_launcher_prefix` (rerun reconstruction) — both must agree on exactly how
+    many leading tokens are launcher/env noise, or a scoped rerun ends up invoking
+    the env-setter itself (`cross-env <test-id> …`) instead of the real runner."""
+    out = list(toks)
+    changed = True
+    while changed:
+        changed = False
+        stripped_launchers = _strip_launchers(out)
+        if len(stripped_launchers) < len(out):
+            out = stripped_launchers
+            changed = True
+        stripped_env = _strip_env_prefix(out)
+        if len(stripped_env) < len(out):
+            out = stripped_env
+            changed = True
+    return out
+
+
 def _runner_from_argv(argv: list) -> Optional[str]:
     """Identify a runner from a bare (non-shell-wrapped) argv, or None when argv[0]
     is not a recognized runner. Handles the `python -m <mod>` form, multi-token
-    shapes (`cargo nextest run`, `go test`, `ng test`), and launcher prefixes."""
+    shapes (`cargo nextest run`, `go test`, `ng test`), launcher prefixes, and a
+    leading env prefix (`cross-env … jest`)."""
     if not argv:
         return None
-    toks = _strip_launchers(argv)
+    toks = _strip_launchers_and_env(argv)
     if not toks:
         return None
     head = _basename_token(toks[0])
@@ -274,6 +387,17 @@ def _runner_from_argv(argv: list) -> Optional[str]:
     if head in ("node", "nodejs"):
         return NODE_TEST if any(str(t) in ("--test", "--test-only") for t in toks[1:]) else None
 
+    # `bun test …` — Bun's built-in test runner (Tier-C). `bun run <script>` is a
+    # package-script wrap resolved by the unwrap layer, not here; `bun test` is the
+    # runner itself.
+    if head == "bun":
+        return BUN if len(toks) >= 2 and _basename_token(toks[1]) == "test" else None
+
+    # `deno test …` — Deno's built-in test runner (Tier-C). `deno task <name>` runs a
+    # deno.json task (opaque) and is deliberately NOT matched here.
+    if head == "deno":
+        return DENO if len(toks) >= 2 and _basename_token(toks[1]) == "test" else None
+
     # Maven / Gradle wrappers.
     if head in ("mvn", "mvnw"):
         return MAVEN
@@ -317,11 +441,6 @@ def _shell_string(argv: list) -> str:
 #: from words (`&&` `||` `;` `|` `(` `)` `<` `>` and combinations like `>&`).
 _SHELL_PUNCT = frozenset("();<>|&")
 
-#: A leading `VAR=val` environment prefix on a command (`CI=1 npx jest`). Mirrors
-#: `commit_push._command_needs_shell`'s own env-prefix rule — which is one of the
-#: reasons a command gets wrapped in `bash -lc` in the first place.
-_ENV_PREFIX_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-
 
 def _shell_segments(cmd: str) -> list:
     """A wrapped shell string split into the individual COMMANDS it runs, each as an
@@ -351,21 +470,12 @@ def _shell_segments(cmd: str) -> list:
     return segments
 
 
-def _strip_env_prefix(toks: list) -> list:
-    """Drop a leading `VAR=val` env prefix (`CI=1 NODE_ENV=test npx jest`) so the
-    runner token comes first. Returns a possibly-shorter copy; never mutates."""
-    i = 0
-    while i < len(toks) and _ENV_PREFIX_RE.match(str(toks[i])):
-        i += 1
-    return toks[i:]
-
-
 def _runner_from_shell_string(cmd: str) -> Optional[str]:
     """Best-effort: the runner behind a `bash -lc "<cmd>"` wrapper, read out of the
     shell STRING. None when the string names no runner we recognize, or names more
     than one.
 
-    This exists because `commit_push._split_test_command` wraps a LOT of ordinary gate
+    This exists because P1's `_command_needs_shell` wraps a LOT of ordinary gate
     commands into `bash -lc` — everything carrying a shell operator, a `cd <dir>` step
     or a `VAR=val` prefix (`cd frontend && npx jasmine`, `CI=1 go test ./...`,
     `npm ci && npx jest`). Reading argv[0] alone calls all of those UNKNOWN, which
@@ -384,6 +494,618 @@ def _runner_from_shell_string(cmd: str) -> Optional[str]:
         if r is not None and r not in found:
             found.append(r)
     return found[0] if len(found) == 1 else None
+
+
+# ── Detection: npm / yarn / pnpm / bun package-script unwrap (P10) ────────────────
+#
+# `npm test` / `yarn test` / `pnpm test` (and `<mgr> run test`) run a package.json
+# SCRIPT, not a runner binary — so from argv alone they are opaque. This layer reads
+# `package.json` `scripts.<name>` and resolves THROUGH it to the real runner, keeping
+# a standard `npm test` repo Tier-A. Only an unrecognized single tool, a multi-tool
+# chain (`jest && eslint`), a shell expansion the unwrap cannot reproduce (`pytest
+# -c $CONF`), or a multi-project/workspace run (`pnpm -r test`, `npm test -w pkg`)
+# degrades to a Tier-B UNKNOWN wrapper.
+
+_PKG_MANAGERS = ("npm", "yarn", "pnpm", "bun")
+_TEST_ALIASES = ("test", "t", "tst")
+_RUN_SUBCMDS = ("run", "run-script")
+
+#: Workspace / recursive flags that make a package-script run span multiple packages
+#: or cwds — opaque, never unwrapped (honest whole-suite degrade). Scoped PER
+#: MANAGER: a flag shape real for one manager is not necessarily a flag at all for
+#: another — pnpm's `-r`/`--recursive` is not a yarn flag (`yarn run -h=1` lists
+#: `-T`/`--top-level`, not `-r`), so a bare `-r` in a yarn invocation is a token
+#: yarn FORWARDS verbatim to the underlying script (`yarn test -r setup.js` forwards
+#: Mocha's `-r`/`--require`, confirmed via mocha's own `-r, --require <module>`
+#: option) — treating it as a universal workspace flag would misclassify a plain
+#: single-runner script as an opaque multi-project wrapper and lose that runner's
+#: classifier. npm's `-w`/`--workspace`/`--workspaces`/`--ws`/`--prefix` (npm
+#: 11.4.2, confirmed via `npm help workspaces` + `npm help run-script`). Yarn
+#: Berry's `-T`/`--top-level` (confirmed via `yarn run -h=1`: "Check the root
+#: workspace for scripts and/or binaries instead of the current one") and `--cwd`
+#: (yarn 1.22.22) — each changes WHICH package.json is read, so resolving
+#: `scripts.<name>` from `cwd` would bind to the wrong script. pnpm's
+#: `-r`/`--recursive`/`--filter`/`-C`/`--dir`/`-w`/`--workspace-root` (pnpm
+#: 9.15.9). bun's `--cwd` and `--filter`/`-F` (`bun run --filter <pat> <script>` /
+#: `bun run -F=<pat> <script>` / `bun -F<pat> run <script>` — confirmed against
+#: real Bun 1.3.12: `bun run --help` lists `-F, --filter=<val>`, and all three
+#: joined/space forms filter-ran the matching workspace packages, not just cwd's —
+#: run the script in every MATCHING workspace package — Bun's "Filter" docs — so a
+#: root-script unwrap would classify the whole run by ONE package's runner and let
+#: a scoped re-run silently skip the others' suites). Each `--cwd`/`--dir`/
+#: `--prefix` reads `<dir>/package.json` instead of the gate's `cwd`, confirmed
+#: empirically — resolving `scripts.<name>` from `cwd` would then bind to the
+#: WRONG package's script.
+_NPM_WORKSPACE_FLAGS = frozenset({"-w", "--workspace", "--workspaces", "--ws", "--prefix"})
+_YARN_WORKSPACE_FLAGS = frozenset({"-T", "--top-level", "--cwd"})
+_PNPM_WORKSPACE_FLAGS = frozenset({
+    "-r", "--recursive", "--filter", "-C", "--dir", "-w", "--workspace-root",
+})
+_BUN_WORKSPACE_FLAGS = frozenset({"--cwd", "--filter", "-F"})
+_MANAGER_WORKSPACE_FLAGS = {
+    "npm": _NPM_WORKSPACE_FLAGS,
+    "yarn": _YARN_WORKSPACE_FLAGS,
+    "pnpm": _PNPM_WORKSPACE_FLAGS,
+    "bun": _BUN_WORKSPACE_FLAGS,
+}
+
+#: A token that is ENTIRELY a shell control operator (`&&`, `||`, `|`, `;`, `&`,
+#: `(`/`)`, `<`/`>`) — emitted as its own token by shlex with `punctuation_chars`.
+#: A shell metacharacter INSIDE a quoted argument (`--testPathPattern='(a|b)'`) is
+#: part of a normal word token and never fullmatches this.
+_OPERATOR_TOKEN_RE = re.compile(r"[|&;()<>]+")
+
+
+def _script_chains_tools(script: str) -> bool:
+    """True when a `scripts.<name>` value composes MULTIPLE tools or needs a subshell
+    — chaining (`&&`/`||`/`|`/`;`), a background/`&`, a subshell `(…)`/`$(…)`, a
+    redirection, or a backtick command — so the captured output is NOT one recognized
+    runner's and a per-runner classifier + scoped triage would be unsafe → Tier-B.
+
+    A shell metacharacter INSIDE a quoted argument (`jest --testPathPattern='(a|b)'`,
+    `jest -t 'x|y'`) is NOT composition: shlex honours the quotes, so the `|`/`(`/`)`
+    stay inside one word token and are not flagged. A plain `VAR=val runner` env
+    prefix is likewise not composition (it is stripped by `_strip_env_prefix`)."""
+    # A newline (or CR) in a package.json script value is a shell command separator
+    # (`"test": "jest\neslint"` runs both) — shlex treats it as whitespace, so guard
+    # it explicitly before tokenizing.
+    if "\n" in script or "\r" in script:
+        return True
+    try:
+        lex = shlex.shlex(script, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        tokens = list(lex)
+    except ValueError:
+        return True                       # unbalanced quotes → opaque, needs a shell
+    if any(_OPERATOR_TOKEN_RE.fullmatch(t) for t in tokens):
+        return True
+    # Backtick and `$(…)` command substitution run a subcommand and need a shell —
+    # raw-scan for BOTH. The punctuation-token split above catches only an UNQUOTED
+    # `(`/`)`; a double-quoted `$(…)` would otherwise slip through, since POSIX double
+    # quotes do NOT suppress command substitution. Deliberately conservative: a
+    # single-quoted LITERAL `$(`/backtick is over-flagged to Tier-B — the safe
+    # (whole-suite degrade) side. A bare `$VAR` expansion is NOT flagged here: it
+    # parameterizes the SAME runner (like a stripped `VAR=val` env prefix), it does
+    # not run a second command — `_script_needs_shell_expansion` degrades it, for
+    # the unrelated reason that `shlex.split` cannot expand it.
+    return "`" in script or "$(" in script
+
+
+#: Where a `$` actually INTRODUCES a shell expansion: a name (`$JOBS`), a brace
+#: (`${JOBS}`), a subshell (`$(nproc)`), or a special/positional parameter (`$1`,
+#: `$@`, `$*`, `$#`, `$?`, `$$`, `$!`, `$-`). A `$` followed by anything else — a
+#: quote, whitespace, a regex metacharacter — is literal to the shell too, so the
+#: common trailing-anchor arg (`jest -t 'renders$'`,
+#: `jest --testPathPattern='\.test\.js$'`) keeps its Tier-A unwrap.
+_SHELL_EXPANSION_RE = re.compile(r"\$[A-Za-z_{(0-9@*#?!$-]")
+
+
+def _script_needs_shell_expansion(script: str) -> bool:
+    """True when a `scripts.<name>` value carries a shell EXPANSION (`$VAR`,
+    `${VAR}`, `$(cmd)`, `$1`/`$@`/…) → Tier-B.
+
+    The package manager runs a script through a SHELL, which expands these before
+    the runner ever starts. `_resolve_package_script` reads the script with
+    `shlex.split`, which does NOT expand, so each such token survives LITERAL into
+    `resolved_cmd` — and the scoped re-run executes that argv with no shell
+    (`subprocess.run(list(cmd))`, `_run_local_pytest_scoped`). The mismatch is
+    silent rather than loud:
+
+      `"test": "MODE=$CI_MODE pytest"` — the gate runs under `MODE=strict`; the
+          re-run sets `MODE` to the literal `$CI_MODE`, so a conftest branching on
+          it takes a DIFFERENT branch and still exits 0.
+      `"test": "pytest $EXTRA_FLAGS"` — `$EXTRA_FLAGS=--runxfail` under the gate;
+          the literal `$EXTRA_FLAGS` matches no flag `_pytest_behavior_flag_args`
+          knows, so the re-run DROPS it and runs under different xfail semantics —
+          the exact shape `_PYTEST_BEHAVIOR_BOOL_FLAGS` exists to preserve.
+
+    Either way "passes in isolation" would answer about a different environment or
+    config than the failing gate, and that answer authorizes the pollution-widening
+    in `_failing_tests_pass_in_isolation`. Stay opaque (honest whole-suite degrade)
+    rather than expand it here — reproducing the package manager's expansion needs
+    that same script-shell, which would also execute any `$(…)` inside it.
+
+    Only `$` expansions are flagged. A tilde (`pytest -c ~/ci.ini`) or an unquoted
+    glob (`pytest tests/*.py`) survives literal too, but neither produces this
+    silent wrong-but-valid run: a glob sits in the target-path slot the scoped
+    re-run replaces with ids anyway, and an unexpanded `~` names a path that does
+    not exist, so the re-run fails LOUDLY and stays conservative (no widening).
+
+    Raw-scanned, so a single-quoted LITERAL `'$VAR'` — which the shell would not
+    expand either — is over-flagged to Tier-B: the safe side, the same deliberate
+    trade-off as `_script_chains_tools`'s `$(`/backtick scan."""
+    return bool(_SHELL_EXPANSION_RE.search(script or ""))
+
+
+def _is_workspace_flag(tok: str, head: str) -> bool:
+    """Whether `tok` is a workspace/recursive flag belonging to package manager
+    `head` specifically — see `_MANAGER_WORKSPACE_FLAGS` for the per-manager
+    citations. A flag shape that only exists for a DIFFERENT manager is not
+    matched: it is either meaningless for `head` or, for yarn/pnpm/bun, a token
+    `head` forwards verbatim to the underlying script."""
+    t = str(tok)
+    if t in _MANAGER_WORKSPACE_FLAGS.get(head, frozenset()):
+        return True
+    if head == "npm":
+        return (t.startswith("--workspace=") or t.startswith("--workspace-")
+                or t.startswith("--prefix="))
+    if head == "yarn":
+        return t.startswith("--cwd=")
+    if head == "pnpm":
+        return (t.startswith("--filter") or t.startswith("--dir=")
+                or t.startswith("--cwd="))
+    if head == "bun":
+        return (t.startswith("--cwd=") or t.startswith("--filter=")
+                or t.startswith("-F"))
+    return False
+
+
+#: Per-manager flags that consume a following value TOKEN (pnpm's `--filter <pattern>`,
+#: `-C <dir>`, `--dir <dir>`, `--loglevel <level>`, `--resume-from <package>`,
+#: `--changed-files-ignore-pattern <pattern>`, `--test-pattern <pattern>`; bun's
+#: `--filter <pattern>`, `-F <pattern>`, `--cwd <dir>`, `--shell <bun|system>`,
+#: `--env-file <path>`, `--elide-lines <n>`, `-r`/`--preload <module>`, `--require
+#: <module>`, `--import <module>`, `--install <mode>`, `-d`/`--define <k:v>`) rather
+#: than an `=`-joined or concatenated form — the pair is skipped together so the
+#: value doesn't prematurely end `_run_flag_prefix_len`'s scan (nor get mistaken for
+#: the script positional). Confirmed on pnpm 10.33.0 / Bun 1.3.12: each accepts the
+#: SPACE-separated form and consumes the next token as its MANDATORY value, so a
+#: value that happens to sit before a later `--filter` (`pnpm run --loglevel warn
+#: --filter=a test`, `pnpm run --changed-files-ignore-pattern '**/README.md'
+#: --filter=a test`, `bun run --install fallback --filter=a test`) no longer ends the
+#: scan early and misroutes a filtered workspace run to a single scopable script
+#: (#540; `--loglevel`/`--resume-from` (pnpm) and `--install`/`-d`/`--define` (bun)
+#: added P10b round-3, 2026-07-20; `--changed-files-ignore-pattern`/`--test-pattern`
+#: (pnpm) added P10b round-4 — `pnpm run --help` lists both under Filtering options
+#: as `<pattern>`-taking flags distinct from `--filter`, and `bun run --help`
+#: documents `--install=<val>` / `-d, --define=<val>` as MANDATORY-value flags
+#: (unlike the optional-value flags below), all confirmed to swallow the following
+#: token the same way as the flags already listed above); `--conditions`/`--port`/
+#: `--drop` (bun) added P10b round-5, 2026-07-21 — bun's own arg-parser table
+#: (`src/runtime/cli/Arguments.rs`) declares each as `<STR>` (or `<STR>...` for
+#: repeatable `--conditions`/`--drop`) with NO trailing `?`, the same mandatory-value
+#: shape as `--define`/`--install` above, so `bun run --conditions test --filter='*'
+#: test` was consuming `test` as `--conditions`'s value then still ending the scan on
+#: it as a phantom script positional, letting the real `--filter` after it slip past
+#: unrecognized. `--title` (bun) added P10b round-6, 2026-07-21 — confirmed on Bun
+#: 1.3.12 (`bun run --help`) and empirically (`bun run --title ci ci` sets the
+#: process title to `ci` and still runs the `ci` script, i.e. the value is consumed
+#: as a MANDATORY space-separated token, not `=`-joined only) that `bun run --title
+#: ci --filter=a test` runs the `test` script scoped to workspace `a`; before this
+#: `--title` wasn't in `_BUN_VALUE_FLAGS`, so the scan stopped at `ci` as a phantom
+#: script positional, letting the real `--filter=a` after it slip past unrecognized.
+#: `--jsx-import-source` (bun) added P10b round-7, 2026-07-21 — confirmed on Bun
+#: 1.3.12 (`bun run --help` lists `--jsx-import-source=<val>` as a `run`-level
+#: flag, distinct from `bun build`'s identically-named bundler flag) and
+#: empirically (`bun run --jsx-import-source someval test` runs the `test`
+#: script, i.e. `someval` is consumed as a MANDATORY space-separated token) that
+#: `bun run --jsx-import-source test --filter=a test` was misrouted: before this,
+#: `--jsx-import-source` wasn't in `_BUN_VALUE_FLAGS`, so the scan stopped at its
+#: value token (`test`) as a phantom script positional, letting the real
+#: `--filter=a` after it slip past unrecognized and returning a scopable=False
+#: root-script target instead of the workspace-`a`-scoped run.
+#: Deliberately EXCLUDED are bun's optional-value flags
+#: (`--inspect`/`--inspect-wait`/`--inspect-brk`): the SAME arg-parser table declares
+#: these `<STR>?` — the trailing `?` marks an OPTIONAL value that is only accepted
+#: `=`-joined, never as a following bare token (confirmed: `bun run --inspect test`
+#: runs the `test` script), so listing them here would wrongly swallow the script
+#: positional.
+_PNPM_VALUE_FLAGS = frozenset({"--filter", "-C", "--dir", "--loglevel", "--resume-from",
+                               "--changed-files-ignore-pattern", "--test-pattern"})
+_BUN_VALUE_FLAGS = frozenset({"--filter", "-F", "--cwd", "--shell", "--env-file",
+                              "--elide-lines", "-r", "--preload", "--require",
+                              "--import", "--install", "-d", "--define",
+                              "--conditions", "--port", "--drop", "--title",
+                              "--jsx-import-source"})
+
+
+def _run_flag_prefix_len(own: list, value_flags: frozenset) -> int:
+    """How many leading tokens of `own` a `run`-subcommand manager (pnpm or bun)
+    parses as ITS OWN flags — the boundary past which its workspace-flag scan must
+    NOT look. The region covers leading flags, ONE `run`/`run-script` subcommand
+    token, and the flags between it and the SCRIPT positional: both accept their
+    command flags on either side of `run` (`pnpm run -r test` ≡ `pnpm -r run test`,
+    both recursive; `bun --filter=* run test` ≡ `bun run --filter=* test`), so a
+    scan that stopped at the `run` SUBCOMMAND let a workspace flag after it slip
+    through to a Tier-A root-script unwrap (#540 round-5 regression, audited
+    2026-07-18). `value_flags` are the manager's OWN value-consuming flags
+    (`--filter <pat>`, `-C <dir>`, `--cwd <dir>`), whose following value token is
+    skipped WITH the flag so it never ends the region as a phantom script positional.
+
+    The SCRIPT positional still ends the region. Unlike yarn's clipanion-based
+    parser, which recognizes its named flags (`-T`) anywhere on the command line —
+    even trailing the script name (confirmed by
+    `test_yarn_top_level_flag_degrades_to_multi_project`) — both managers' own docs
+    (`pnpm run --help`: `Usage: pnpm run <command> [<args>...]`; `bun run --help`:
+    `Usage: bun run [flags] <file or script>`) and empirical behavior (`pnpm test
+    --runxfail` / `bun run test --filter unit` run the script WITH the trailing
+    token) show everything from the script name onward is that script's own
+    argument, never re-parsed as a manager flag. So `pnpm test -r fE` / `bun run
+    test --filter unit` run the `test` script WITH the trailing flag — the runner's
+    own `-r`/`--filter`, not the manager's `--recursive`/workspace filter — and
+    scanning past the script name would misclassify that forwarded runner flag as a
+    workspace/recursive run."""
+    idx = 0
+    seen_run = False
+    while idx < len(own):
+        tok = own[idx]
+        if not tok.startswith("-"):
+            if seen_run or tok not in _RUN_SUBCMDS:
+                break                    # the script positional ends the region
+            seen_run = True              # skip the one run/run-script subcommand
+            idx += 1
+            continue
+        idx += 1
+        if tok in value_flags and idx < len(own):
+            idx += 1                     # consume the flag's value too
+    return idx
+
+
+def _next_nonflag_pos(toks: list, start: int, value_flags: frozenset = frozenset()) -> Optional[int]:
+    """First index at or after `start` that is NOT one of `toks`'s own flags — the
+    script-name positional. `value_flags` are the manager's OWN space-separated
+    value-consuming flags (see `_PNPM_VALUE_FLAGS`/`_BUN_VALUE_FLAGS`): the pair is
+    skipped together so the value token (`warn` in `--loglevel warn`) is never
+    mistaken for the script name (#540 round-6)."""
+    j = start
+    while j < len(toks):
+        t = str(toks[j])
+        if t and not t.startswith("-"):
+            return j
+        if t in value_flags and j + 1 < len(toks):
+            j += 2
+        else:
+            j += 1
+    return None
+
+
+def _read_package_scripts(base: str) -> dict:
+    """The `scripts` object from `package.json`, or {} on absence/malformed JSON.
+    A full JSON parse (not a substring scan) so a script VALUE is read exactly.
+    RecursionError included: a pathologically nested document overflows the C
+    scanner's recursion limit with RecursionError, not ValueError — it must take
+    the same documented Tier-B degrade, never escape through `detect_runner`."""
+    raw = _read_text(base or ".", "package.json")
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError, RecursionError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    scripts = data.get("scripts")
+    return scripts if isinstance(scripts, dict) else {}
+
+
+def _package_script_target(argv: list) -> Optional[tuple]:
+    """If argv invokes a package.json script via npm/yarn/pnpm/bun, return
+    (script_name, multi_project, forwarded_args, package_manager). Else None (argv is
+    not a package-script form).
+
+    package_manager is the `_PKG_MANAGERS` entry (`"npm"`/`"yarn"`/`"pnpm"`/`"bun"`)
+    that invoked it — callers needing to know which npm-compatibility environment
+    variables the manager actually provides (e.g. bun does not set `INIT_CWD`; see
+    `npm_script_env`) key off this instead of assuming npm's behavior for all four.
+
+    multi_project=True → a workspace/recursive run (`pnpm -r test`, `npm test -w pkg`,
+    `pnpm --filter x test`) spanning multiple packages/cwds; the caller must NOT
+    unwrap it (opaque → Tier-B). `bun test` returns None here: it is bun's OWN runner
+    (handled by `_runner_from_argv`); only `bun run <script>` is a package script.
+
+    forwarded_args are the tokens the package manager passes VERBATIM to the invoked
+    script/runner. npm requires a literal `--` separator to forward anything (`npm
+    run <command> [-- <args>]`, confirmed via `npm help run-script`) — without it,
+    npm consumes/parses the trailing tokens itself rather than forwarding them.
+    Yarn, pnpm, and bun forward everything after the script name AS-IS, no `--`
+    needed (confirmed via `pnpm run --help`: `pnpm run <command> [<args>...]`, and
+    empirically: `pnpm test --runxfail` / `yarn test --runxfail` / `bun run test
+    --runxfail` all run the script WITH `--runxfail`); dropping those args would
+    silently change a scoped rerun's pass/fail semantics from the full gate's.
+    `[]` when there is nothing to forward."""
+    if not argv:
+        return None
+    head = _basename_token(argv[0])
+    if head not in _PKG_MANAGERS:
+        return None
+    rest = [str(t) for t in argv[1:]]
+    # A literal `--` separator ends the package manager's own flags — anything after
+    # it is forwarded verbatim to the underlying script/runner (`npm test -- --filter
+    # x` runs the test script WITH `--filter x`, it is not an npm workspace flag), so
+    # workspace-flag AND script-name detection must not scan past it.
+    dd = rest.index("--") if "--" in rest else None
+    own = rest[:dd] if dd is not None else rest
+    forwarded = rest[dd + 1:] if dd is not None else []
+    # pnpm AND bun forward everything after the SCRIPT positional verbatim to the
+    # invoked script (see `_run_flag_prefix_len` — its region spans the flags on
+    # either side of a `run` subcommand) — scanning past the script name would treat
+    # a forwarded runner flag (pytest's `-r fE` in `pnpm test -r fE`, or `--filter
+    # unit` in `bun run test --filter unit`) as the manager's own workspace/recursive
+    # flag. Both empirically forward the trailing token (`bun run test --filter a`
+    # runs the `test` script WITH `--filter a`, per `bun run --help`'s `[flags]
+    # <script>` order — confirmed on Bun 1.3.12). Other managers keep the whole-`own`
+    # scan: yarn's named flags are recognized anywhere (even trailing the script
+    # name), and npm never forwards without a literal `--` (already excluded via
+    # `own`/`forwarded`).
+    if head == "pnpm":
+        workspace_scan = own[:_run_flag_prefix_len(own, _PNPM_VALUE_FLAGS)]
+    elif head == "bun":
+        workspace_scan = own[:_run_flag_prefix_len(own, _BUN_VALUE_FLAGS)]
+    else:
+        workspace_scan = own
+    if any(_is_workspace_flag(t, head) for t in workspace_scan):
+        return ("", True, forwarded, head)
+    # Skip leading global option flags (`npm --silent run test`).
+    i = 0
+    while i < len(own) and own[i].startswith("-"):
+        i += 1
+    if i >= len(own):
+        return None
+    sub = own[i].lower()
+    # Yarn/pnpm/bun forward trailing `own` tokens (past the script name) with no `--`
+    # needed — npm does not, it requires the literal `--` handled via `forwarded`
+    # above. Only applies when no literal `--` was present at all: once one appears,
+    # everything past it is already captured in `forwarded`.
+    implicit_forward = head != "npm" and dd is None
+    if head == "bun":
+        # bun: only `bun run <script>` wraps a package script; `bun test` is bun's
+        # built-in runner (resolved by _runner_from_argv, not here).
+        if sub in _RUN_SUBCMDS:
+            pos = _next_nonflag_pos(own, i + 1, _BUN_VALUE_FLAGS)
+            if pos is None:
+                return None
+            tail = own[pos + 1:] if implicit_forward else []
+            return (own[pos], False, tail + forwarded, head)
+        return None
+    if sub in _RUN_SUBCMDS:
+        pos = _next_nonflag_pos(own, i + 1, _PNPM_VALUE_FLAGS if head == "pnpm" else frozenset())
+        if pos is None:
+            return None
+        tail = own[pos + 1:] if implicit_forward else []
+        return (own[pos], False, tail + forwarded, head)
+    if sub in _TEST_ALIASES:
+        # npm and pnpm document `t`/`tst` as ALIASES for `test` (confirmed via their
+        # CLI docs). Yarn does not: `yarn run -h=1` documents `yarn run <scriptName>
+        # ...`, and yarn also permits omitting `run` — either way it resolves the
+        # LITERAL script name, not an alias table. So for yarn, `t`/`tst` must look
+        # up `scripts.t`/`scripts.tst` themselves, not fall through to `scripts.test`
+        # (which may exist but be an unrelated script). bun never reaches this line
+        # (it early-returns above), so only npm/pnpm alias `t`/`tst` to `test` here.
+        name = sub if (head == "yarn" and sub != "test") else "test"
+        tail = own[i + 1:] if implicit_forward else []
+        return (name, False, tail + forwarded, head)
+    return None
+
+
+def _resolve_package_script(cwd: Optional[str], argv: list,
+                            _depth: int = 0, _seen: frozenset = frozenset()) -> Optional[RunnerInfo]:
+    """Unwrap an npm/yarn/pnpm/bun package-script invocation to the runner behind it.
+
+    Returns None when argv is NOT a package-script form (the caller continues to
+    `_runner_from_argv`). When it IS one, always returns a RunnerInfo:
+      - a recognized single runner  → that runner (Tier-A, source "npm-script");
+      - a multi-project/workspace    → UNKNOWN (source "wrapper:multi-project");
+      - a script carrying a shell expansion the unwrap cannot reproduce (`pytest
+        -c $CONF` — see `_script_needs_shell_expansion`) → UNKNOWN (Tier-B);
+      - a multi-tool / opaque / missing / cyclic / runaway script → UNKNOWN (Tier-B).
+    Resolves one level of script re-indirection (`"test": "npm run test:ci"`), bounded
+    by a depth cap + a visited-name set so `"test": "npm test"` can never loop. A
+    leading env prefix (`cross-env NODE_ENV=test npm test`) is stripped before the
+    package-manager match and reattached to `resolved_cmd`, so an env-prefixed
+    invocation still unwraps instead of degrading to Tier-B. Forwarded args — after a
+    literal `--` for npm (`npm test -- --runxfail`, per `npm run <command> [--
+    <args>]`), or trailing the script name with no `--` needed for yarn/pnpm/bun
+    (`yarn test --runxfail`, `pnpm test --runxfail`) — are likewise reattached to
+    `resolved_cmd`, since dropping them would silently change the scoped rerun's
+    pass/fail semantics from the full gate's.
+
+    A `pre<name>`/`post<name>` lifecycle hook (npm — and, depending on config,
+    yarn/pnpm — runs these automatically around the named script; see
+    https://docs.npmjs.com/cli/v11/using-npm/scripts#pre--post-scripts) makes the
+    combined output NOT attributable to `name`'s runner alone, so its presence
+    degrades this to Tier-B (UNKNOWN) rather than advertising a single-runner
+    unwrap a scoped rerun would then silently bypass."""
+    stripped_argv = _strip_env_prefix(argv)
+    target = _package_script_target(stripped_argv)
+    if target is None:
+        return None
+    name, multi, forwarded, manager = target
+    if multi:
+        return _mk(UNKNOWN, "wrapper:multi-project")
+    if _depth >= 4 or name in _seen:
+        return _mk(UNKNOWN, "wrapper:npm-script")
+    base = cwd or "."
+    scripts = _read_package_scripts(base)
+    script = scripts.get(name)
+    if not isinstance(script, str) or not script.strip():
+        return _mk(UNKNOWN, "wrapper:npm-script")
+    if any(isinstance(scripts.get(hook + name), str) and scripts[hook + name].strip()
+           for hook in ("pre", "post")):
+        # A lifecycle hook runs ALONGSIDE `name` (npm always; yarn/pnpm
+        # conditionally) — the gate's output is then a mix of the hook's and the
+        # target script's, which no single runner's classifier can safely parse,
+        # and a scoped rerun of ONLY the target script would skip the hook the
+        # full gate actually ran under. Stay opaque rather than misattribute it.
+        return _mk(UNKNOWN, "wrapper:npm-script-lifecycle")
+    if _script_chains_tools(script):
+        return _mk(UNKNOWN, "wrapper:npm-script-shell")   # chains tools → Tier-B
+    if _script_needs_shell_expansion(script):
+        # The package manager's shell expands `$VAR` before the runner starts;
+        # `shlex.split` below does not, so unwrapping would hand the scoped re-run
+        # a literal `$VAR` and let it verify under a different env/config than the
+        # gate that failed.
+        return _mk(UNKNOWN, "wrapper:npm-script-expansion")
+    try:
+        sub_argv = shlex.split(script, posix=True)
+    except ValueError:
+        return _mk(UNKNOWN, "wrapper:npm-script")
+    if not sub_argv:
+        return _mk(UNKNOWN, "wrapper:npm-script")
+    env_prefix = argv[:len(argv) - len(stripped_argv)] if len(stripped_argv) < len(argv) else None
+    # The script may itself re-indirect through another package script. Thread the
+    # outer forwarded `-- <args>` INTO the nested invocation instead of blindly
+    # re-appending them to the fully-resolved runner. The package manager appends them
+    # to the re-indirect command as raw trailing tokens (`npm run test:ci <args>`), so
+    # whether they reach the terminal runner is decided by the NESTED command's OWN
+    # forwarding rule: `npm run <other>` forwards NOTHING without its own `--` (verified
+    # against npm 11.4.2 — `npm test -- --x` re-indirecting via `npm run inner` runs the
+    # inner runner with argv `[]`), whereas a yarn/pnpm/bun re-indirect forwards them
+    # bare. Appending unconditionally produced a `resolved_cmd` (`jest --x`) that the
+    # gate never actually ran (`jest`), which would skew a scoped rerun.
+    nested_argv = sub_argv + forwarded if forwarded else sub_argv
+    nested = _resolve_package_script(base, nested_argv, _depth + 1, _seen | {name})
+    if nested is not None:
+        if env_prefix and nested.resolved_cmd is not None:
+            nested = nested._replace(resolved_cmd=env_prefix + nested.resolved_cmd)
+        if nested.package_manager is not None:
+            # A mixed chain (`npm test` → `"test": "bun run inner"` → the runner)
+            # reports the HEAD-of-chain manager — the one the gate command actually
+            # invoked. `npm_script_env` keys the INIT_CWD omission off this: npm at
+            # the head sets INIT_CWD on its child and bun (which never sets it)
+            # passes it through to the runner, so keying off the TERMINAL manager
+            # would drop a variable the gate's child really saw. The lifecycle
+            # variables stay keyed to the TERMINAL script (`script_name`): each
+            # manager overwrites those for its own child, so the innermost wins.
+            #
+            # The MIRROR chain (`bun run test` → `"test": "npm run inner"`) is ALSO
+            # correct keyed on the HEAD, NOT on "every manager in the chain is bun":
+            # bun runs an inner `npm`/`pnpm`/`yarn run` through its OWN script runner
+            # (auto-aliased — verified on Bun 1.3.12: the terminal runner's
+            # `npm_config_user_agent` stays `bun/…` and INIT_CWD is UNSET, even under
+            # `--shell=system`), so a bun-HEADED chain never invokes a real
+            # INIT_CWD-setting manager and its child sees none — exactly what a
+            # head=bun omission reproduces. Keying instead off "any non-bun manager
+            # present" would WRONGLY synthesize INIT_CWD for that child (the textual
+            # `npm` never runs), reopening the fidelity gap it meant to close.
+            nested = nested._replace(package_manager=manager)
+        return nested
+    r = _runner_from_argv(sub_argv)
+    if r is not None:
+        # Carry the EXPANDED sub_argv forward as `resolved_cmd` — the caller binds
+        # the adapter (and builds a scoped re-run) against THIS, not the original
+        # `npm test` argv, so the script's own env/launcher/config flags survive, AND
+        # this invocation's own forwarded `-- <args>` tail so a behavior-changing flag
+        # (`--runxfail`) isn't silently dropped from a scoped rerun.
+        resolved = sub_argv + forwarded if forwarded else sub_argv
+        if env_prefix:
+            resolved = env_prefix + resolved
+        return _mk(r, "npm-script", resolved_cmd=resolved, script_name=name,
+                   package_manager=manager)
+    return _mk(UNKNOWN, "wrapper:npm-script")
+
+
+def npm_script_env(base: str, info: Optional[RunnerInfo]) -> dict:
+    """The script-visible environment variables npm/yarn/pnpm/bun inject into a
+    `scripts.<name>` child that we can reconstruct EXACTLY, without npm — for a
+    P10 package-script unwrap whose scoped re-run bypasses the package manager
+    (https://docs.npmjs.com/cli/v11/using-npm/scripts#environment):
+
+      npm_lifecycle_event   the script name npm is running (`test`, `test:ci`)
+      npm_lifecycle_script  that script's raw command string
+      npm_package_json      absolute path of the package.json it came from
+      INIT_CWD              the directory npm was invoked in — the gate's own cwd,
+                            which is exactly the `cwd` a scoped re-run passes.
+                            OMITTED for a bun-invoked unwrap: bun does not set
+                            `INIT_CWD` on a `bun run` child (checked against Bun
+                            1.2.14 — the lifecycle/package variables are present,
+                            `INIT_CWD` is not), so synthesizing it would hand the
+                            scoped re-run a variable the full gate's child never
+                            saw. Keyed on the HEAD-of-chain manager (the one the
+                            gate command actually invoked): in a mixed chain
+                            (`npm test` → `"test": "bun run inner"`) npm sets
+                            INIT_CWD at the head and bun passes it through, so
+                            the runner's child really does see it
+
+    A conftest / jest setup file / runner config that branches on one of these
+    (`process.env.npm_lifecycle_event === "test:ci"`) would otherwise take a
+    DIFFERENT branch under the scoped re-run than under the full gate, turning the
+    isolation probe's answer into a statement about a different environment.
+
+    Deliberately partial, and only over variables with a single faithful value.
+    `npm_config_*` (and the wider `npm_package_*` set) are OMITTED — NOT because they
+    are purely npm's own knobs: a gate command CAN carry a CLI flag that becomes one
+    (`npm test --mode=strict` exposes `npm_config_mode=strict`; even an arbitrary
+    `--foo=bar` becomes `npm_config_foo=bar` — verified against npm 11.4.2), so a
+    value here can be a user input a conftest could read. They are omitted because we
+    cannot reproduce them FAITHFULLY: the npmrc-cascade-derived values are
+    unrecoverable without npm, and partially reproducing npm's CLI→config
+    normalization (`--silent`→`loglevel=silent`, camelCase, `--no-`, boolean-vs-valued,
+    short flags) would substitute a FABRICATED environment for a merely incomplete one
+    — the worse failure. The residual gap (a scoped re-run seeing different
+    `npm_config_*` than the full gate) is an ACCEPTED, bounded limitation: it bites
+    only a runner/conftest that branches on a CLI-supplied `npm_config_*`. Degrading
+    every config-flag-carrying invocation to whole-suite instead would forfeit the far
+    more common HARMLESS case — `npm --silent run test`, `npm test --runxfail` — which
+    npm consumes as config the runner ignores, and which stay deliberately Tier-A.
+    Returns {} for anything that is not a single-runner package-script unwrap, or when
+    package.json is unreadable. Never raises."""
+    if info is None or info.source != "npm-script" or not info.script_name:
+        return {}
+    base = base or "."
+    try:
+        pkg_json = os.path.abspath(os.path.join(base, "package.json"))
+        init_cwd = os.path.abspath(base)
+    except (OSError, ValueError):
+        return {}
+    if not _exists(base, "package.json"):
+        return {}
+    env = {"npm_lifecycle_event": info.script_name,
+           "npm_package_json": pkg_json}
+    if info.package_manager != "bun":
+        env["INIT_CWD"] = init_cwd
+    script = _read_package_scripts(base).get(info.script_name)
+    if isinstance(script, str):
+        env["npm_lifecycle_script"] = script
+    return env
+
+
+def npm_bin_path_dirs(base: str) -> list[str]:
+    """Ancestor `node_modules/.bin` directories from `base` up to the filesystem
+    root, nearest first — the SAME directories npm/yarn/pnpm prepend to `PATH`
+    while running a `scripts.<name>` entry (https://docs.npmjs.com/cli/v11/
+    using-npm/scripts#path). A P10 package-script unwrap's `resolved_cmd` (e.g.
+    `["cross-env", "SPECIAL=1", "pytest"]` behind `npm test`) can name a binary
+    that exists ONLY in one of these directories; executing it directly via
+    `subprocess.run` — bypassing npm entirely, as a scoped rerun does — would
+    otherwise raise FileNotFoundError even though the full `npm test` gate
+    passed. Missing/unreadable directories are skipped; a `base` with no
+    `node_modules` anywhere in its ancestry returns []. Never raises."""
+    dirs = []
+    try:
+        cur = os.path.abspath(base or ".")
+    except (OSError, ValueError):
+        return dirs
+    seen = set()
+    while cur not in seen:
+        seen.add(cur)
+        candidate = os.path.join(cur, "node_modules", ".bin")
+        if _exists(cur, "node_modules", ".bin") and os.path.isdir(candidate):
+            dirs.append(candidate)
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return dirs
 
 
 # ── Detection: repo markers ──────────────────────────────────────────────────────
@@ -461,6 +1183,16 @@ def _runner_from_markers(cwd: Optional[str]) -> RunnerInfo:
     js = _runner_from_js(base)
     if js is not None:
         return js
+
+    # ── Bun / Deno: their own built-in test runners (Tier-C — often no test-dep in
+    # package.json). Checked AFTER the JS runner-config/dep signals so a bun/deno repo
+    # that actually drives vitest/jest is reported as that runner, not the runtime. A
+    # lockfile / runtime-config marker is the signal.
+    if _exists(base, "bunfig.toml") or _exists(base, "bun.lockb") or _exists(base, "bun.lock"):
+        return _mk(BUN, "marker:bun")
+    if (_exists(base, "deno.json") or _exists(base, "deno.jsonc")
+            or _exists(base, "deno.lock")):
+        return _mk(DENO, "marker:deno")
 
     # ── Go / Rust / Elixir.
     if _exists(base, "go.mod"):
@@ -566,13 +1298,18 @@ def _runner_from_js(base: str) -> Optional[RunnerInfo]:
         return _mk(JASMINE, "marker:package.json")
     if _dep("ava"):
         return _mk(AVA, "marker:package.json")
-    # A package.json with none of the above: the test command is an opaque npm
-    # script (P10 unwraps it). Not indeterminate JS → return None so the caller
-    # falls through / reports UNKNOWN.
+    # No recognized runner dep: its `scripts.test` may still run a real runner
+    # (`"test": "vitest run"`) or a Tier-C runtime (`"test": "bun test"`). Unwrap it
+    # (P10) so a standard `npm test` repo stays Tier-A in marker-only detection too. A
+    # multi-tool / opaque / missing script resolves to UNKNOWN → return None so the
+    # caller continues to the bun/deno markers, then UNKNOWN.
+    unwrapped = _resolve_package_script(base, ["npm", "run", "test"])
+    if unwrapped is not None and unwrapped.runner != UNKNOWN:
+        return unwrapped
     return None
 
 
-def detect_runner(cwd: Optional[str], resolved_cmd: Optional[Union[list[str], str]]) -> RunnerInfo:
+def detect_runner(cwd: Optional[str], resolved_cmd: Optional[list[str] | str]) -> RunnerInfo:
     """Identify the runner behind the resolved gate command.
 
     Priority: the command's argv[0]/shape first, then repo markers. A `bash -lc`
@@ -598,6 +1335,12 @@ def detect_runner(cwd: Optional[str], resolved_cmd: Optional[Union[list[str], st
         if r is not None:
             return RunnerInfo(runner=r, scopable=False, source="shell")
         return _mk(UNKNOWN, "wrapper:shell")
+    # npm/yarn/pnpm/bun package-script → unwrap through package.json `scripts` to the
+    # real runner (P10). A recognized single runner keeps the repo Tier-A; a
+    # multi-tool / multi-project / opaque script degrades to a Tier-B UNKNOWN wrapper.
+    unwrapped = _resolve_package_script(cwd, argv)
+    if unwrapped is not None:
+        return unwrapped
     r = _runner_from_argv(argv)
     if r is not None:
         return _mk(r, "argv")
@@ -686,8 +1429,17 @@ def _has(out: str, *patterns) -> bool:
 #: exit 0 and print a column-0 `ok  pkg 0.5s [no tests to run]` / `[no test files]`
 #: line (verified on go1.26.5), so reading those as "tests ran" false-GREENS a run
 #: that executed nothing. Shared by `_RAN_TESTS_MARKERS_ANY` and `_classify_go` — one
-#: source of truth, because the two MUST agree on what counts as evidence.
-_GO_OK_RAN = r"^ok\s+(?![^\n]*\[no tests? (?:to run|files)\])"
+#: source of truth, because the two MUST agree on what counts as evidence. The
+#: `(?!\s+\|)` excludes deno's OWN column-0 summary (`ok | 0 passed | 0 failed
+#: (0ms)`), which is not a go package result — a go `ok` line is always `ok <pkg>
+#: <time>`, never a `|`. The exclusion spans the whitespace ON PURPOSE: a bare
+#: `\s+(?!\|)` fails here, because its greedy `\s+` backtracks to a single space
+#: when the lookahead trips, so `ok  |…` (two spaces before the pipe) slips through
+#: and false-greens a padded deno summary. Anchoring the pipe test to the whole
+#: whitespace run catches any-width padding, so a zero-test deno run reached
+#: through an opaque wrapper cannot read as go run-evidence and defeat its own
+#: `_NO_TESTS_MARKERS_ANY` entry.
+_GO_OK_RAN = r"^ok(?!\s+\|)\s+(?![^\n]*\[no tests? (?:to run|files)\])"
 
 #: Zero-test markers UNIONED across every per-runner classifier below — the only
 #: signal `_classify_generic` has when the runner is opaque. Not every runner is
@@ -696,7 +1448,7 @@ _GO_OK_RAN = r"^ok\s+(?![^\n]*\[no tests? (?:to run|files)\])"
 #: are precisely the ones that would otherwise false-green.
 _NO_TESTS_MARKERS_ANY = re.compile(
     r"\[no tests? (?:to run|files)\]|testing: warning: no tests to run"  # go
-    r"|^Ran 0 tests\b"                                                   # unittest/django
+    r"|^Ran 0 tests\b"                                                   # unittest/django/bun
     r"|No tests? (?:found|ran|executed|to run)\b"                        # jest/phpunit/dart/maven…
     r"|No test (?:files|suite) found|Couldn't find any files to test"    # vitest/mocha/ava
     r"|No specs found|\b0 specs,\s*0 failures"                           # jasmine
@@ -712,7 +1464,8 @@ _NO_TESTS_MARKERS_ANY = re.compile(
     r"|No tests were found|0 tests from 0 test (?:suites|cases)"         # gtest/ctest
     r"|\[  PASSED  \] 0 tests|Running 0 tests"                           # gtest banners
     r"|Executed 0 tests|Test run with 0 tests|No matching test cases were run"  # swift
-    r"|Found no tests",                                                  # dart
+    r"|Found no tests"                                                   # dart
+    r"|\b0 passed\s*\|\s*0 failed\b",                                    # deno
     re.I | re.M,
 )
 
@@ -755,10 +1508,9 @@ def _classify_generic(rc: int, out: str) -> str:
     shape), so a nonzero count anywhere keeps the run `passed`.
 
     Erring toward no_tests here is deliberate and fail-SAFE: the gate maps no_tests to
-    a loud "zero coverage, not green" SKIP that never blocks the push
-    (`commit_push._emit_no_tests_skip`), whereas the error it replaces — reporting a
-    zero-test run as a verified GREEN — is the one this module must never make.
-    env/timeout are already handled by `classify`."""
+    a loud "zero coverage, not green" SKIP that never blocks the push, whereas the
+    error it replaces — reporting a zero-test run as a verified GREEN — is the one this
+    module must never make. env/timeout are already handled by `classify`."""
     if rc != 0:
         return FAILED
     if _NO_TESTS_MARKERS_ANY.search(out) and not _RAN_TESTS_MARKERS_ANY.search(out):
@@ -794,7 +1546,7 @@ def _classify_unittest(rc: int, out: str) -> str:
     # suite that actually ran and failed — but whose OWN output happens to contain
     # the "Ran 0 tests" string (e.g. a test asserting on captured subprocess text)
     # — can't be masked as an empty run. Same run-evidence guard shape as the
-    # go/cargo/maven/dotnet classifiers above.
+    # go/cargo/maven/dotnet classifiers.
     if rc == 5:
         return NO_TESTS
     if _has(out, r"(?m)^Ran 0 tests\b", r"\bRan 0 tests in\b") and not _has(
@@ -810,9 +1562,9 @@ def _classify_unittest(rc: int, out: str) -> str:
 
 def _classify_django(rc: int, out: str) -> str:
     # `manage.py test` drives unittest; zero tests → "Ran 0 tests". Gated on the
-    # absence of a real "Ran N tests" (nonzero) summary — same run-evidence guard
-    # the unittest classifier above uses — so a suite that actually ran and failed,
-    # but whose own output happens to echo "Ran 0 tests" (e.g. a test asserting on
+    # absence of a real "Ran N tests" (nonzero) summary — same run-evidence guard the
+    # unittest classifier above uses — so a suite that actually ran and failed, but
+    # whose own output happens to echo "Ran 0 tests" (e.g. a test asserting on
     # captured subprocess/management-command text), isn't masked as an empty run.
     if _has(out, r"\bRan 0 tests\b") and not _has(out, r"\bRan [1-9]\d* tests?\b"):
         return NO_TESTS
@@ -977,6 +1729,57 @@ def _classify_ava(rc: int, out: str) -> str:
     return FAILED
 
 
+# ---- Bun / Deno (Tier-C runtimes) -----------------------------------------------
+
+def _classify_bun(rc: int, out: str) -> str:
+    # `bun test` is Bun's built-in runner (JS). A missing dependency → env.
+    if rc != 0 and _js_env(out):
+        return ENV_ERROR
+    # Bun prints "Ran N tests across M files"; zero tests → no_tests. Parsed FIRST
+    # (regardless of exit code) so neither a silent exit 0 nor a "No tests found!"
+    # nonzero exit false-classifies. A bare "0 pass" is NOT used as a marker — a run
+    # with "0 pass / 3 fail" is a real FAILURE, not an empty run. Gated on the absence
+    # of a real nonzero "Ran N tests" summary — same run-evidence guard shape as the
+    # jest/vitest/mocha classifiers above — so a genuinely-run suite whose own output
+    # happens to echo the marker text isn't masked as an empty run.
+    if _has(out, r"Ran 0 tests\b", r"error: No tests found!?") and not _has(
+            out, r"Ran [1-9]\d* tests?\b"):
+        return NO_TESTS
+    if rc == 0:
+        return PASSED
+    # A parse error from Bun's own transpiler runs no tests (Bun does not type-check).
+    if _has(out, r"\bSyntaxError\b",
+            r"(?m)^error:\s+(?:Expected|Unexpected|Cannot parse|Parse error)"):
+        return COMPILE_ERROR
+    return FAILED
+
+
+def _classify_deno(rc: int, out: str) -> str:
+    # `deno test` type-checks + runs. A missing/unresolvable module or a failed remote
+    # fetch is an environment error, not a test failure.
+    if rc != 0 and _has(out, r"error: Module not found",
+                        r"error: (?:Cannot|Could not) resolve",
+                        r"error: Relative import path",
+                        r"Cannot find module"):
+        return ENV_ERROR
+    # deno test EXITS 1 with "No test modules found" — a false-RED no_tests. A
+    # zero-count summary (a filter that matched nothing) is also no_tests. Parsed
+    # FIRST so the nonzero exit does not mask it as a failure. Gated on the absence
+    # of a real nonzero "N passed"/"N failed" summary — same run-evidence guard
+    # shape as the jest/vitest/mocha classifiers above — so a genuinely-run suite
+    # whose own output happens to echo the marker text isn't masked as an empty run.
+    if _has(out, r"No test modules found", r"\b0 passed\s*\|\s*0 failed\b") and not _has(
+            out, r"\b[1-9]\d* passed\b", r"\b[1-9]\d* failed\b"):
+        return NO_TESTS
+    if rc == 0:
+        return PASSED
+    # A type-check / parse error before any test ran.
+    if _has(out, r"TS\d+ \[ERROR\]", r"error: Type checking failed",
+            r"The module's source code could not be parsed"):
+        return COMPILE_ERROR
+    return FAILED
+
+
 # ---- Go / Rust ------------------------------------------------------------------
 
 def _go_json_stream(out: str) -> bool:
@@ -1123,18 +1926,13 @@ def _classify_go(rc: int, out: str) -> str:
         return COMPILE_ERROR
     # go test exits 0 for BOTH all-pass AND a zero-test run — parse the marker, and
     # call it no_tests only when NOTHING actually ran. RUN EVIDENCE is an UNANNOTATED
-    # column-0 `ok` line (`_GO_OK_RAN`) or a `--- PASS`, and deliberately NOT:
-    #   * a bare `^ok\s` — `go test -run Nomatch ./...` filters every test out yet
-    #     still exits 0 printing `ok  pkg 0.5s [no tests to run]` at column 0 (and a
-    #     `_test.go`-less package prints `[no test files]`), so a blind `^ok` read
-    #     those zero-test runs as evidence and false-GREENED them (verified go1.26.5);
-    #   * a bare `^PASS\b` — the test binary prints a column-0 `PASS` under `-v` even
-    #     when zero tests ran (`testing: warning: no tests to run` / `PASS` / `ok pkg
-    #     [no tests to run]`, verified go1.26.5), so `PASS` proves only that the binary
-    #     did not fail, NOT that anything executed.
-    # The evidence check stays a WHOLE-OUTPUT scan so a package that genuinely ran
-    # keeps a `go test ./...` run GREEN when a SIBLING package is empty (the common
-    # `?  pkg [no test files]` beside `ok  pkg 0.2s` shape).
+    # column-0 `ok` line (`_GO_OK_RAN`) or a `--- PASS`, and deliberately NOT a bare
+    # `^ok\s` / `^PASS\b`: `go test -run Nomatch ./...` filters every test out yet still
+    # exits 0 printing `ok  pkg 0.5s [no tests to run]` at column 0 (a `_test.go`-less
+    # package prints `[no test files]`), and the binary prints a column-0 `PASS` even at
+    # zero tests — so a blind `^ok`/`^PASS` read those zero-test runs as evidence and
+    # false-GREENED them (verified go1.26.5). The evidence scan stays WHOLE-OUTPUT so a
+    # `go test ./...` where a SIBLING package really ran stays GREEN beside an empty one.
     if rc == 0:
         if _has(out, r"\[no test files\]", r"no test files", r"\[no tests to run\]",
                 r"testing: warning: no tests to run") and not _has(
@@ -1225,17 +2023,35 @@ def _is_gradle_test_execution_task(name: str) -> bool:
     task — the only task whose status is test-run evidence.
 
     Matches `test` / `integrationTest` / a user `fooTest` / AGP `testDebugUnitTest` /
-    `connectedDebugAndroidTest`. Rejects the COMPILE / RESOURCE / LIFECYCLE tasks Gradle
-    prints around the real one — including the AGP support tasks that merely END in
-    "Test" (`javaPreCompileDebugUnitTest`, `packageDebugUnitTestForUnitTest`) — by their
-    leading verb, and `compileTestJava` / `testClasses` / `processTestResources` by their
-    non-"Test" suffix. Keying the no-tests decision on a broad `\\S*[Tt]est\\S*` (or even
-    `endswith("Test")` alone) name-match is what shipped a FALSE-GREEN: those support
-    tasks execute with a bare header, so their `ran`-evidence discards the genuine
-    `:testDebugUnitTest NO-SOURCE` and a zero-test Android module greens."""
-    if name == "test":
+    `connectedDebugAndroidTest` — and their plural forms (`tests`, `integrationTests`,
+    `unitTests`): task names are user-defined and not required to end in singular
+    "Test". Rejects the COMPILE / RESOURCE / LIFECYCLE tasks Gradle prints around the
+    real one — including the AGP support tasks that merely END in "Test"
+    (`javaPreCompileDebugUnitTest`, `packageDebugUnitTestForUnitTest`) — by their
+    leading verb, and `compileTestJava` / `testClasses` / `processTestResources` by
+    their non-"Test"/"Tests" suffix. No AGP support task name ends in the plural
+    "Tests", so admitting that suffix does not re-admit them. Keying the no-tests
+    decision on a broad `\\S*[Tt]est\\S*` (or even `endswith("Test")` alone) name-match
+    is what shipped a FALSE-GREEN: those support tasks execute with a bare header, so
+    their `ran`-evidence discards the genuine `:testDebugUnitTest NO-SOURCE` and a
+    zero-test Android module greens.
+
+    Known blind spot, NOT fixable from console text alone: a `Test`-TYPE task
+    registered under a name with NO lexical relation to "test" at all (Groovy
+    `tasks.register("integration", Test)`) is invisible to this — and any —
+    name-based rule, so a zero-source `:integration NO-SOURCE` run (if it is the
+    only detected execution task) falls through `_classify_gradle` to PASSED. Gradle's
+    default (non-`--info`) console never prints a task's TYPE, only its NAME and
+    STATUS, so distinguishing an arbitrary-named Test task from an arbitrary-named
+    Copy/JavaCompile/etc. task that also prints NO-SOURCE needs task-registration
+    info this pure text classifier does not have. Broadening the match to catch it
+    (e.g. treating any unrecognized NO-SOURCE task name as evidence) would re-admit
+    the COMPILE/PACKAGE/PROCESS support tasks above — reintroducing the exact
+    false-green this function exists to prevent — so it is left unhandled rather
+    than guessed at."""
+    if name in ("test", "tests"):
         return True
-    if not name.endswith("Test"):
+    if not (name.endswith("Test") or name.endswith("Tests")):
         return False
     m = re.match(r"[a-z]+", name)          # the leading camelCase word
     return (m.group(0) if m else "") not in _GRADLE_NON_TEST_TASK_VERBS
@@ -1271,11 +2087,9 @@ def _classify_gradle(rc: int, out: str) -> str:
         # resolves to PLAIN and prints exactly these lines — verified against real Gradle
         # 8.11.1. (Inherent blind spot, NOT reachable on the default path: a user who
         # forces `org.gradle.console=rich` gets output that persists NO `> Task` status
-        # line at all — the statuses live only in an erased ephemeral progress area — so a
-        # zero-test project is unclassifiable from console text and falls through to
-        # PASSED. Catching that needs `build/test-results/**/*.xml`, outside this pure
-        # function; do NOT fake it with an ANSI strip — real rich output has no line to
-        # strip.)
+        # line at all, so a zero-test project is unclassifiable from console text and
+        # falls through to PASSED. Catching that needs `build/test-results/**/*.xml`,
+        # outside this pure function; do NOT fake it with an ANSI strip.)
         ran, statuses = False, []
         for task, status in re.findall(
                 r"(?m)^> Task (:\S+)(?:[ \t]+(\S[^\n]*?))?[ \t]*$", out):
@@ -1285,21 +2099,21 @@ def _classify_gradle(rc: int, out: str) -> str:
             statuses.append(st)
             if st not in ("NO-SOURCE", "UP-TO-DATE", "SKIPPED"):
                 ran = True                     # no status / FROM-CACHE → suite had tests
-                                                # (FROM-CACHE restores outputs, task itself
-                                                # didn't execute, but its presence proves
-                                                # the suite is non-empty)
         # A real run anywhere WINS: `gradle check` / `gradle test integrationTest` can
         # have one empty execution task beside a sibling that really ran, and that is a
         # verified pass. Otherwise, NO_TESTS requires EVERY detected execution task to be
-        # NO-SOURCE: UP-TO-DATE means Gradle's own up-to-date check ran, which only
-        # happens for a task that HAS source (a sourceless task short-circuits straight
-        # to NO-SOURCE) — so a NO-SOURCE `:test` beside an UP-TO-DATE `:integrationTest`
-        # is a real, previously-verified suite, not an empty one. SKIPPED stays
-        # non-evidence either way (it says nothing about source), but must not let a
-        # sibling NO-SOURCE force NO_TESTS on its own.
+        # zero-execution — NO-SOURCE (no test source) or SKIPPED (task skipped, e.g. an
+        # `onlyIf` predicate / `-x`; its actions never ran, so zero tests executed and
+        # there is NO prior-pass evidence). A `:test NO-SOURCE` beside a `:integrationTest
+        # SKIPPED` executed NOTHING, so reporting PASSED would false-green an untested
+        # build — exactly the class this module exists to catch. UP-TO-DATE is EXCLUDED:
+        # it means Gradle's up-to-date check ran, which only happens for a task that HAS
+        # source (a sourceless task short-circuits straight to NO-SOURCE) — so a
+        # NO-SOURCE `:test` beside an UP-TO-DATE `:integrationTest` is a real,
+        # previously-verified suite that stays PASSED.
         if ran:
             return PASSED
-        if statuses and all(st == "NO-SOURCE" for st in statuses):
+        if statuses and all(st in ("NO-SOURCE", "SKIPPED") for st in statuses):
             return NO_TESTS
         if _has(out, r"No tests found for given includes"):
             return NO_TESTS
@@ -1540,6 +2354,8 @@ _CLASSIFIERS = {
     KARMA: _classify_karma,
     NODE_TEST: _classify_node_test,
     AVA: _classify_ava,
+    BUN: _classify_bun,
+    DENO: _classify_deno,
     GO: _classify_go,
     CARGO: _classify_cargo,
     NEXTEST: _classify_nextest,
@@ -1559,3 +2375,10 @@ _CLASSIFIERS = {
     FLUTTER: _classify_dart,      # flutter test shares dart's exit/marker semantics
     # TOX / NOX / UNKNOWN → _classify_generic (opaque Tier-B wrappers).
 }
+
+
+# ---- module boundary ------------------------------------------------------------
+# Detection + classification is this module's ENTIRE surface, and the byte-parity
+# envelope shared across the product trees ends at this line. The failure-triage
+# layer other trees carry below it (failing-id extraction, scoped re-run) is
+# deliberately absent here: this free skill's gate escalates on red, nothing more.

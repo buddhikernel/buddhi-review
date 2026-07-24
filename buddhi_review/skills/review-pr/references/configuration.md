@@ -120,6 +120,47 @@ autonomous-action trail; each intent line names the flag that disables it.
 | `--auto-merge` / `--no-auto-merge` | Squash-merge on a clean exit, or don't. The merge is **opt-in**: `--no-auto-merge` is the default, so the loop stops on a clean pass and notifies you to merge manually unless you pass `--auto-merge`. |
 | `--test-failure-mode escalate&#124;off` | `escalate` (default): when a fix breaks a local test, the loop never edits a test or reverts the round — it escalates to the console answer-file with three options: *Push as-is* (bypass the gate this round), *Stop the run* (hand over for manual review, the default), or *I've fixed it — re-run the gate & continue*. `off`: skip the local test gate entirely (push unverified). |
 
+## Test-runner detection & tiers
+
+Before it pushes a round's fix the loop runs your test command and reads the
+result. How precisely it can read that result depends on whether it recognises the
+runner behind the command — detection is read-only (it inspects your command and
+your repo's marker files; it installs nothing and hits no network).
+
+**What the loop recognises**
+
+| Where it looks | What it accepts |
+|---|---|
+| The command itself | `pytest` / `py.test`, `python -m {pytest,unittest,nose2,tox,nox}`, `manage.py test`, `tox`, `nox`, `jest`, `vitest`, `mocha`, `jasmine`, `karma`, `ng test`, `node --test`, `ava`, `bun test`, `deno test`, `go test`, `cargo test`, `cargo nextest run`, `mvn` / `mvnw`, `gradle` / `gradlew`, `mix test`, `dotnet test`, `rspec`, `phpunit`, `pest`, `ctest`, `swift test`, `dart test`, `flutter test` |
+| Through a launcher | `npx` / `bunx` / `pnpx`, and `bundle exec` / `poetry run` / `uv run` / `pipenv run` / `rye run` / `pdm run` |
+| Through a package script | `npm test` (and the `t` / `tst` aliases), `npm run <name>` / `run-script`, and the same shapes for `yarn`, `pnpm`, and `bun` — resolved through your `package.json` `scripts` to the real runner, following one script to another when a script just calls a second script |
+| Through a shell string | `bash -lc "<cmd>"`, including a leading `cd`, an env prefix (`CI=1 …`), or an earlier `&&` step, as long as the string names exactly one recognised runner |
+| Repo marker files | `pytest.ini`, `conftest.py`, `pyproject.toml`, `setup.cfg`, `noxfile.py`, `tox.ini`, `package.json`, `bunfig.toml`, `bun.lock*`, `deno.json(c)`, `deno.lock`, `go.mod`, `Cargo.toml`, `mix.exs`, `pom.xml`, `build.gradle(.kts)`, `.rspec`, `Gemfile`, `phpunit.xml`, `tests/Pest.php`, `*.csproj`, `CMakeLists.txt`, `Package.swift`, `pubspec.yaml`, `manage.py` — used when the command alone does not decide |
+
+**The three tiers**
+
+| Tier | What it is | What the gate does |
+|---|---|---|
+| **A** | A recognised runner resolved from your command — including a `npm test` that unwraps to `jest`, or a `bash -lc` string naming one runner | Reads the result with that runner's own exit-code and marker rules. A zero-test run is reported as *no tests* instead of a pass; `pytest`'s exit 5 stays a skip rather than a red; a red gate's headline names whether it was a test failure, a compile error, a missing dependency, or a timeout |
+| **B** | An opaque wrapper — `make test`, `./run-tests.sh`, `nx`, `turbo`, `bazel`, `dbt`, `docker compose`, `tox`, `nox`, a script chaining two tools (`tsc && jest`), or a workspace-wide run (`pnpm -r test`, `npm test -w pkg`, `bun run --filter='*' test`) | Runs the command and gates on it exactly the same way, but reads the output through a marker net pooled across every runner. A non-zero exit is always red; a zero exit whose output carries any runner's zero-test marker is reported as *no tests* |
+| **C** | A recognised runner that reports one whole-suite result — `bun test`, `deno test`, `jasmine`, `karma`, `ava`, `node --test`, `cargo test`, minitest | Same per-runner reading as tier A |
+
+A repo driving `pytest` through `tox` or `nox` is reported as the wrapper, which is
+what actually ran — so it is gated at tier B, on the wrapper's own exit code, rather
+than on `pytest`'s. That is why a `tox` run that ends in a collection error or a
+missing dependency is reported as a plain test failure: only the runner the wrapper
+hides could tell those apart.
+
+**Bun and Deno.** Both are recognised from the command (`bun test`, `deno test`) and
+from their lockfiles/config, and both have runner-specific rules, because each can
+exit in a way a generic reading would get wrong: a filtered `deno test` that matches
+nothing exits **1** printing `No test modules found`, which is reported as *no tests*
+rather than a red, and a `deno` or `bun` run that executed zero tests is reported as
+*no tests* even when it exits 0. A `bun run <script>` resolves through `package.json`
+the same way `npm run` does, and `bun run --filter`/`-F` (which runs the script in
+every matching workspace package) is treated as tier B, so a multi-package run is
+never read as one package's result.
+
 ## Reviewer quota
 
 The loop does not throttle on a budget: if a provider reports its quota exhausted,
