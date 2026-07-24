@@ -36,6 +36,12 @@ REACTIONS_JSON_ENV = "BUDDHI_REVIEW_REACTIONS_JSON"
 # Review-threads seam — a JSON list of raw ``reviewThreads`` node dicts (same
 # shape GitHub's GraphQL returns) short-circuits the gh call, like the two above.
 THREADS_JSON_ENV = "BUDDHI_REVIEW_THREADS_JSON"
+# Head-aware merge-gate seams — RAW review / inline-comment payloads (the exact
+# ``gh api`` dict shape, carrying commit_id / original_commit_id) that the gate
+# maps to per-commit review anchoring. Distinct from COMMENTS_JSON_ENV, whose
+# Comment objects drop the commit ids the gate needs.
+REVIEWS_JSON_ENV = "BUDDHI_REVIEW_REVIEWS_JSON"
+INLINE_JSON_ENV = "BUDDHI_REVIEW_INLINE_JSON"
 _GH_TIMEOUT = 60
 
 
@@ -51,10 +57,17 @@ class Reaction:
     """One reaction on the PR body (issues/<pr>/reactions). ``content`` is the
     GitHub reaction name (``+1``, ``eyes``, …); ``source`` is the reacting login.
     Only bot-authored reactions are ever constructed — a human's +1 must never
-    read as a reviewer sign-off."""
+    read as a reviewer sign-off.
+
+    ``created_at`` is GitHub's reaction timestamp. It is what date-anchors a bare
+    ``+1`` — the reviewer sign-off that carries no commit_id and no message — for
+    the head-aware merge gate: a ``+1`` that PRE-dates the commit being merged
+    reviewed an older head and must not be credited to it. ``None`` when the
+    payload omits it, which the gate treats as UNANCHORABLE (fail-closed)."""
     id: str
     content: str
     source: str
+    created_at: Optional[str] = None
 
 
 def _default_run(argv: Sequence[str], *, cwd: Optional[str] = None) -> "subprocess.CompletedProcess[str]":
@@ -99,11 +112,17 @@ def _comment_from_raw(raw: dict, *, from_issue_channel: Optional[bool] = None) -
     )
 
 
-def _parse_payload(text: str) -> List[dict]:
+def _parse_payload(text: str) -> Optional[List[dict]]:
+    """Parse a seeded JSON payload into a list of dicts, or ``None`` when it is
+    unparseable — distinct from ``[]`` (a valid payload with nothing usable in
+    it). Callers that historically treated a decode failure as "no items"
+    (:func:`fetch_comments`, :func:`fetch_reactions`) fold ``None`` back to
+    ``[]`` themselves; :func:`_fetch_raw_dicts` propagates ``None`` as-is so the
+    head-aware merge gate can fail closed on a malformed seam payload."""
     try:
         data = json.loads(text)
     except (json.JSONDecodeError, TypeError):
-        return []
+        return None
     if isinstance(data, dict):  # tolerate a single-object payload
         data = [data]
     return [d for d in data if isinstance(d, dict)]
@@ -124,7 +143,7 @@ def fetch_comments(
     """
     seeded = os.environ.get(COMMENTS_JSON_ENV)
     if seeded is not None:
-        raws = _parse_payload(seeded)
+        raws = _parse_payload(seeded) or []
         return [c for c in (map(_comment_from_raw, raws)) if c is not None]
 
     repo_path = repo or "{owner}/{repo}"
@@ -213,7 +232,9 @@ def _reaction_from_raw(raw: dict) -> Optional[Reaction]:
     is_bot = login.endswith("[bot]") or user.get("type") == "Bot"
     if not login or not is_bot:
         return None
-    return Reaction(id=str(rid), content=content, source=login)
+    created = raw.get("created_at")
+    return Reaction(id=str(rid), content=content, source=login,
+                    created_at=str(created) if isinstance(created, str) and created else None)
 
 
 def fetch_reactions(
@@ -231,7 +252,7 @@ def fetch_reactions(
     ``run``. Network errors raise — the caller decides how to degrade."""
     seeded = os.environ.get(REACTIONS_JSON_ENV)
     if seeded is not None:
-        raws = _parse_payload(seeded)
+        raws = _parse_payload(seeded) or []
         return [r for r in map(_reaction_from_raw, raws) if r is not None]
 
     repo_path = repo or "{owner}/{repo}"
@@ -257,6 +278,68 @@ def fetch_reactions(
         raise RuntimeError(
             f"failed to parse gh api response for {endpoint}: {exc}") from exc
     return reactions
+
+
+def _fetch_raw_dicts(
+    env_seam: str,
+    endpoint_tmpl: str,
+    pr: str,
+    repo: Optional[str],
+    cwd: Optional[str],
+    run: Callable[..., "subprocess.CompletedProcess[str]"],
+) -> Optional[List[dict]]:
+    """Fetch a raw ``gh api`` payload as a list of dicts, or ``None`` on ANY
+    failure (missing gh, non-zero exit, unparseable output). The head-aware merge
+    gate consumes these, and it must fail CLOSED: ``None`` (unavailable) BLOCKS the
+    auto-merge, distinct from ``[]`` (a successful fetch that found nothing). Seamed
+    on ``env_seam`` (a JSON list short-circuits gh) for network-free tests."""
+    seeded = os.environ.get(env_seam)
+    if seeded is not None:
+        return _parse_payload(seeded)
+    repo_path = repo or "{owner}/{repo}"
+    endpoint = endpoint_tmpl.format(repo=repo_path, pr=pr)
+    try:
+        proc = run(["gh", "api", "--paginate", endpoint], cwd=cwd)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    try:
+        return [d for d in _decode_concatenated(proc.stdout or "")]
+    except ValueError:
+        return None
+
+
+def fetch_top_level_reviews(
+    pr: str,
+    *,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> Optional[List[dict]]:
+    """The PR's top-level reviews (``pulls/<pr>/reviews``) as RAW dicts carrying
+    ``commit_id`` / ``user`` / ``body`` / ``state`` — the per-commit anchoring the
+    head-aware merge gate needs but :class:`Comment` drops. ``None`` on any gh
+    failure (the gate then BLOCKS, fail-closed); ``[]`` when the PR has no reviews.
+    Seamed on ``BUDDHI_REVIEW_REVIEWS_JSON``."""
+    return _fetch_raw_dicts(REVIEWS_JSON_ENV, "repos/{repo}/pulls/{pr}/reviews",
+                            pr, repo, cwd, run)
+
+
+def fetch_inline_comments(
+    pr: str,
+    *,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> Optional[List[dict]]:
+    """The PR's inline review comments (``pulls/<pr>/comments``) as RAW dicts
+    carrying ``original_commit_id`` / ``commit_id`` / ``user`` — the per-commit
+    anchoring the head-aware merge gate needs. ``None`` on any gh failure (the gate
+    then BLOCKS, fail-closed); ``[]`` when the PR has no inline comments. Seamed on
+    ``BUDDHI_REVIEW_INLINE_JSON``."""
+    return _fetch_raw_dicts(INLINE_JSON_ENV, "repos/{repo}/pulls/{pr}/comments",
+                            pr, repo, cwd, run)
 
 
 def _decode_concatenated(text: str) -> Iterable[dict]:
@@ -367,7 +450,7 @@ def fetch_review_threads(
     thread and never appears here."""
     seeded = os.environ.get(THREADS_JSON_ENV)
     if seeded is not None:
-        raws = _parse_payload(seeded)
+        raws = _parse_payload(seeded) or []
         return [t for t in map(_review_thread_from_raw, raws) if t is not None]
 
     if not repo or "/" not in repo:

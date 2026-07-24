@@ -280,3 +280,46 @@ def test_reactions_gh_failure_raises(monkeypatch):
     with pytest.raises(RuntimeError):
         gh_ingest.fetch_reactions("7", repo="o/r",
                                   run=lambda argv, **kw: _proc(rc=1, stderr="boom"))
+
+
+def test_reactions_env_seam_garbage_is_empty(monkeypatch):
+    # A malformed REACTIONS_JSON_ENV payload historically degraded to "no
+    # reactions", not a raised/blocking failure — _parse_payload's None must
+    # be folded back to [] here, unlike the head-aware-gate raw seams below.
+    monkeypatch.setenv(gh_ingest.REACTIONS_JSON_ENV, "not json")
+    assert gh_ingest.fetch_reactions("5") == []
+
+
+def test_reviews_seam_short_circuits_gh(monkeypatch):
+    monkeypatch.setenv(
+        gh_ingest.REVIEWS_JSON_ENV,
+        json.dumps([{"id": 1, "commit_id": "abc123", "state": "APPROVED"}]),
+    )
+    def explode(argv, **kw):
+        raise AssertionError("gh was called")
+    reviews = gh_ingest.fetch_top_level_reviews("5", run=explode)
+    assert reviews == [{"id": 1, "commit_id": "abc123", "state": "APPROVED"}]
+
+
+def test_reviews_seam_malformed_returns_none(monkeypatch):
+    # The head-aware merge gate distinguishes None (fetch failed, fail-closed
+    # block) from [] (fetch succeeded, no reviews) — a malformed seam payload
+    # must report as unavailable, not as "no reviews".
+    monkeypatch.setenv(gh_ingest.REVIEWS_JSON_ENV, "not json")
+    assert gh_ingest.fetch_top_level_reviews("5", run=lambda argv, **kw: _proc()) is None
+
+
+def test_inline_seam_short_circuits_gh(monkeypatch):
+    monkeypatch.setenv(
+        gh_ingest.INLINE_JSON_ENV,
+        json.dumps([{"id": 2, "original_commit_id": "def456"}]),
+    )
+    def explode(argv, **kw):
+        raise AssertionError("gh was called")
+    inline = gh_ingest.fetch_inline_comments("5", run=explode)
+    assert inline == [{"id": 2, "original_commit_id": "def456"}]
+
+
+def test_inline_seam_malformed_returns_none(monkeypatch):
+    monkeypatch.setenv(gh_ingest.INLINE_JSON_ENV, "not json")
+    assert gh_ingest.fetch_inline_comments("5", run=lambda argv, **kw: _proc()) is None

@@ -5,13 +5,16 @@ sign-off lives on GitHub, but the loop reconstructed nothing, so an approved bot
 was summoned, waited on for a register delay, and polled for a full window — for a
 verdict already in hand.
 
-The approval is now re-derived live from GitHub, and **the reviewer's LATEST
-message wins**. A stale "LGTM" must NOT silence a bot that has since posted real
-feedback — including feedback posted as an INLINE review comment, the channel a
+The approval is now re-derived live from GitHub, and **the LATEST signal wins**.
+A stale "LGTM" must NOT silence a bot that has since posted real feedback —
+including feedback posted as an INLINE review comment, the channel a
 conversation-only scan would miss entirely. A bare ``+1`` reaction (the only
-signal some reviewers ever emit) folds on its own, but can never outrank a newer
-message: reactions carry no timestamp, so a ``+1`` beside a substantive latest
-message is not treated as a sign-off.
+signal some reviewers ever emit) folds on its own; a ``+1`` posted AFTER a
+substantive latest message also folds it — GitHub reactions carry a real
+``created_at``, so a fresh +1 is compared against the message's stamp with the
+same freshness rule the live ``_fold_reactions`` path applies. A ``+1`` that
+is merely a TIE with the message (same instant, or itself undated) does not
+outrank it.
 
 The ``+1`` fold here is deliberately NOT the round loop's ``_fold_reactions``:
 that one reads reactions only, and fails CLOSED until the preflight snapshot has
@@ -24,7 +27,7 @@ import json
 import subprocess
 from datetime import datetime, timezone
 
-from buddhi_review import gh_ingest
+from buddhi_review import detectors, gh_ingest
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.fix_apply import FixOutcome
 from buddhi_review.loop import Comment
@@ -32,6 +35,12 @@ from buddhi_review.round_driver import RoundDriver, RoundTimes
 from buddhi_review.seams import ConsoleEscalation
 
 UTC = timezone.utc
+# The head this restart meets was committed BEFORE every seeded sign-off below, so
+# each one provably post-dates the commit it is credited with reviewing — the F2
+# freshness cutoff. (These suites model a restart at the head the reviewers actually
+# approved; a sign-off OLDER than the head is the stale case, covered explicitly in
+# test_head_aware_merge_gate.)
+HEAD_TIME = "2026-06-30T00:00:00+00:00"
 OLD = "2026-07-01T10:00:00Z"
 NEW = "2026-07-02T10:00:00Z"
 EVEN_NEWER = "2026-07-03T10:00:00Z"
@@ -70,12 +79,25 @@ class FakeNotifier:
         pass
 
 
+# The constant local HEAD this restart harness reports. Every restored approval
+# and every seeded review anchors to it (staleness is out of scope for these
+# tests — the head does not move), so the F2 head-aware gate resolves cleanly.
+HEAD_SHA = "restarthead0000"
+
+
 class Gh:
     def __init__(self):
         self.calls = []
 
     def __call__(self, argv, *, cwd=None, timeout=None):
         self.calls.append(list(argv))
+        if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
+            return subprocess.CompletedProcess(argv, 0, stdout=HEAD_SHA + "\n", stderr="")
+        if argv[:3] == ["git", "show", "-s"]:
+            # The head's committer date — F2's freshness cutoff for sha-less signals.
+            return subprocess.CompletedProcess(argv, 0, stdout=HEAD_TIME + "\n", stderr="")
+        if argv[:2] == ["git", "merge-base"]:
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
         out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
@@ -94,6 +116,16 @@ def make_driver(comments, *, reactions=(), cfg=None, **kw):
         fix_dispatch=lambda c, r: FixOutcome(status="applied"),
         fetch=lambda pr, repo=None, cwd=None: list(comments),
         reactions_fetch=lambda pr, repo=None, cwd=None: list(reactions),
+        # F2 head-aware gate: model the raw pulls/<pr>/reviews payload. Each seeded
+        # comment is anchored to the commit it was posted against — this restart
+        # harness holds the tip constant, so that is HEAD_SHA for every one. A bare
+        # +1 / issue-channel sentinel is sha-less and rides the restore's
+        # clean-signal anchor (date-checked against HEAD_TIME) instead.
+        reviews_fetch=lambda pr, repo=None, cwd=None: [
+            {"user": {"login": c.source}, "commit_id": HEAD_SHA,
+             "body": c.text, "state": "COMMENTED"} for c in comments
+            if detectors.bot_for_login(c.source) is not None],
+        inline_fetch=lambda pr, repo=None, cwd=None: [],
         threads_fetch=lambda pr, repo=None, cwd=None: [],
         resolve_thread=lambda thread_id, cwd=None: True,
         gh_run=gh, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
@@ -106,8 +138,13 @@ def make_driver(comments, *, reactions=(), cfg=None, **kw):
     return driver, clock, gh
 
 
-def _plus_one(source="claude[bot]", rid="rx1"):
-    return gh_ingest.Reaction(id=rid, content="+1", source=source)
+def _plus_one(source="claude[bot]", rid="rx1", created_at=NEW):
+    # created_at defaults FRESH (post-dates HEAD_TIME): a bare +1 is the sign-off
+    # that carries neither a commit_id nor a message, so its reaction timestamp is
+    # the only thing that can date-anchor it for the head-aware gate. Pass
+    # created_at=OLD (or None) to model the stale / undated — unanchorable — case.
+    return gh_ingest.Reaction(id=rid, content="+1", source=source,
+                              created_at=created_at)
 
 
 def _lgtm(cid="ok", when=OLD, **kw):
@@ -208,16 +245,37 @@ def test_same_instant_lgtm_beside_a_finding_does_not_fold_the_bot():
 
 
 def test_stale_plus_one_beside_a_newer_inline_comment_is_resummoned():
-    # A +1 reaction carries no timestamp, so it can never outrank a DATED message.
-    # A reviewer whose newest message is substantive is still engaged, +1 or not.
+    # The +1 PRE-dates the reviewer's substantive latest message (a tie would lose
+    # too — _supersedes requires STRICTLY newer). A reviewer whose newest message
+    # is substantive, and whose +1 does not post-date it, is still engaged.
     comments = [
         Comment(id="f", text="this null check is missing", source="claude[bot]",
                 path="x.py", diff_hunk="@@ -1 +1 @@", created_at=NEW),
     ]
-    driver, clock, gh = make_driver(comments, reactions=[_plus_one()])
+    driver, clock, gh = make_driver(comments, reactions=[_plus_one(created_at=OLD)])
     driver.run()
     assert "claude" not in driver.approved
     assert gh.matching(SUMMON)
+
+
+def test_fresh_plus_one_after_a_finding_outranks_it_and_is_not_resummoned():
+    # The reviewer posted a finding, then — after the fix landed — reacted with a
+    # bare +1 STRICTLY AFTER that finding's timestamp. GitHub reactions carry a
+    # real created_at, so this +1 is a genuine later verdict: the same freshness
+    # rule the live _fold_reactions path applies to every fresh +1 (fold it as
+    # approval regardless of what the bot said before) must also apply on an
+    # --rr-active restart, or the verdict already in hand is discarded and the
+    # bot is re-summoned and re-polled for a fix it already approved.
+    comments = [
+        Comment(id="f", text="this null check is missing", source="claude[bot]",
+                path="x.py", diff_hunk="@@ -1 +1 @@", created_at=OLD),
+    ]
+    driver, clock, gh = make_driver(comments, reactions=[_plus_one(created_at=NEW)],
+                                    auto_merge=True)
+    outcome = driver.run()
+    assert "claude" in driver.done and "claude" in driver.approved
+    assert gh.matching(SUMMON) == []             # never re-asked
+    assert outcome.merged is True
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +315,34 @@ def test_bare_plus_one_with_no_messages_is_an_approval():
     assert driver.expected_bots() == []         # nothing left to ask
     assert outcome.merged is True
     assert clock.t == 0                          # no poll window was ever opened
+
+
+def test_a_stale_bare_plus_one_is_folded_but_never_merges():
+    # F2: the SAME fold — codex is still approved and never re-asked — but the +1
+    # PRE-dates the commit now at HEAD, so it approved an EARLIER head. It cannot be
+    # anchored to the head being merged, and the head-aware gate hands the PR back
+    # rather than landing a commit nobody demonstrably reviewed.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    stale = _plus_one(source="codex[bot]", created_at="2026-06-29T00:00:00Z")  # < HEAD_TIME
+    driver, clock, gh = make_driver([], reactions=[stale], cfg=cfg, auto_merge=True)
+    outcome = driver.run()
+    assert "codex" in driver.approved            # the verdict is still in hand …
+    assert driver.expected_bots() == []          # … so it is not re-summoned
+    assert driver._clean_signal_head == {}       # … but it anchors to no head
+    assert outcome.merged is False               # → handback, not an unreviewed merge
+    assert gh.matching("gh", "merge", "--squash") == []
+
+
+def test_an_undated_bare_plus_one_is_unanchorable_and_never_merges():
+    # A +1 whose payload carried no timestamp cannot be dated against ANY head →
+    # unanchorable → fail closed.
+    cfg = {"active_reviewers": ["codex"], "auto_on_open": {"codex": False}}
+    undated = _plus_one(source="codex[bot]", created_at=None)
+    driver, clock, gh = make_driver([], reactions=[undated], cfg=cfg, auto_merge=True)
+    outcome = driver.run()
+    assert "codex" in driver.approved
+    assert driver._clean_signal_head == {}
+    assert outcome.merged is False
 
 
 def test_a_bot_with_no_signal_at_all_is_still_summoned():
