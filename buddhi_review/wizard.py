@@ -2613,11 +2613,10 @@ def _write_global_default(reviewers: Sequence[str], auto_on_open: Dict[str, bool
 
 def _repo_auto_merge_default(cfg: Dict[str, Any], repo: Optional[str]) -> bool:
     """The bound repo's previously-confirmed ``auto_merge`` (a per-repo entry key),
-    else off. There is no global ``auto_merge`` reader (the loop takes auto-merge
-    from a per-run flag), so this only consults ``repos[<repo>]``."""
-    entry = config.repo_entry(cfg, repo) or {}
-    v = entry.get("auto_merge")
-    return v if isinstance(v, bool) else False
+    else off. Delegates to :func:`buddhi_review.config.auto_merge` — the ONE
+    resolver for this rule — so the value the wizard shows as the current default
+    is exactly the value the engine will resolve for that repo."""
+    return config.auto_merge(cfg, repo)
 
 
 def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,

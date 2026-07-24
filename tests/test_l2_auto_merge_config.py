@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import pytest
 
-from buddhi_review import backends, cli, config, open_pr
+from buddhi_review import backends, cli, config, open_pr, wizard
 
 REPO = "octocat/Hello-World"
 
@@ -344,3 +344,23 @@ def test_dispatch_launch_argv_seam_carries_resolved_on(monkeypatch):
     assert rec, "the launcher argv was not captured"
     assert "--auto-merge" in rec[0]
     assert "--no-auto-merge" not in rec[0]
+
+
+# ── the wizard reads through the SAME resolver (one source of truth) ───────────
+
+def test_wizard_default_delegates_to_config_auto_merge(monkeypatch):
+    # The wizard's "current default" prompt must not carry its own copy of the
+    # per-repo auto_merge rule: it delegates to config.auto_merge, so a future
+    # edit to the resolver can never silently diverge the setup UX from the
+    # value the engine resolves. A non-bool sentinel proves pass-through (a
+    # re-implementation would coerce it to False).
+    seen = {}
+    sentinel = object()
+
+    def _fake(cfg, repo=None):
+        seen["args"] = (cfg, repo)
+        return sentinel
+
+    monkeypatch.setattr(config, "auto_merge", _fake)
+    assert wizard._repo_auto_merge_default(_ON_CFG, REPO) is sentinel
+    assert seen.get("args") == (_ON_CFG, REPO)
