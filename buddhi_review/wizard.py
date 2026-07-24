@@ -1156,11 +1156,11 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run) -> bool:
     ONLY attaches when the user has EXPLICITLY opted this repo into label-gated
     CI: ``config.label_gated_ci`` reads the per-repo value then the global one and
     DEFAULTS FALSE, so a truthy result means a deliberate opt-in (the per-repo
-    step's double-confirm, the global step, or a CLI flag) — never an unset
-    default. A repo whose CI runs on every push therefore never gets a stray
-    label. During a first-run setup the opt-in has not been persisted yet, so
-    this reads False and skips — correct, because the gate workflow is not live
-    on the default branch yet either, so the label would trigger nothing.
+    step's double-confirm or the global step) — never an unset default. A repo
+    whose CI runs on every push therefore never gets a stray label. During a
+    first-run setup the opt-in has not been persisted yet, so this reads False
+    and skips — correct, because the gate workflow is not live on the default
+    branch yet either, so the label would trigger nothing.
 
     Attached as a SEPARATE ``gh pr edit`` after the PR exists, never at create
     time: the label-gated workflow fires on the ``labeled`` event, which a
@@ -1171,7 +1171,9 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run) -> bool:
     non-zero when the label already exists (the steady state), which is ignored;
     the add is authoritative."""
     try:
-        if not config.label_gated_ci(config.load_config(), repo):
+        cfg_path = config.config_path()
+        cfg = config.load_config(cfg_path) if cfg_path.exists() else {}
+        if not config.label_gated_ci(cfg, repo):
             return True  # repo's CI is not label-gated — no label needed
     except Exception:  # pragma: no cover - defensive; never block on a config read
         return True
