@@ -390,7 +390,7 @@ def _anchoring_driver(*, head, reviews=(), inline=(), fleet={"claude"}):
 
 def test_stale_shaless_sentinel_is_not_anchored_and_blocks():
     # CRITICAL 1. The ONLY artifact is a claude issue-channel "No issues found."
-    # written when the head was c0; the head is now c2. The sentinet is returned by
+    # written when the head was c0; the head is now c2. The sentinel is returned by
     # NEITHER raw fetch, so nothing else can credit it — if it were anchored to c2 it
     # would merge a commit nobody reviewed. It must NOT anchor.
     driver, gh = _anchoring_driver(head="c2", reviews=[], inline=[])
