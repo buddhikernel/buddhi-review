@@ -1138,7 +1138,10 @@ def _offer_update_managed_file(repo: str, default: Optional[str], spec: Dict[str
         # merge unexercised (#94, itself a claude-code-review.yml update PR).
         # Gated on the recorded per-repo/global opt-in inside the helper, so a
         # repo the user never opted into label-gated CI gets no stray label.
-        _attach_ready_for_ci(repo, detail, run=run)
+        if not _attach_ready_for_ci(repo, detail, run=run):
+            _row("warn", "Couldn't attach the ready-for-ci label — label-gated CI "
+                         "may not run on this update PR. You can add it by hand.",
+                 pal, stream)
         return "pr"
     _row("warn", f"Couldn't open the update PR automatically ({detail}). You can copy "
                  f"the bundled {name} in by hand.", pal, stream)
@@ -1177,11 +1180,11 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run) -> bool:
     edit = ["gh", "pr", "edit", str(pr_ref), "--add-label", "ready-for-ci",
             "-R", repo]
     try:
-        run(create, capture_output=True, text=True, timeout=20)
+        run(create, timeout=20)
     except Exception:
         pass  # already-exists / transient — the add below surfaces a real problem
     try:
-        res = run(edit, capture_output=True, text=True, timeout=20)
+        res = run(edit, timeout=20)
     except Exception:
         return False
     return getattr(res, "returncode", 1) == 0
