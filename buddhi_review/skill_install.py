@@ -357,6 +357,13 @@ def _read_text_or_none(path, *, follow_symlink: bool) -> Optional[str]:
     it at a dotfiles repo through a symlink is a legitimate setup that must keep working."""
     fd = None
     try:
+        if not follow_symlink and not _NO_FOLLOW and os.path.islink(path):
+            # Platforms without ``os.O_NOFOLLOW`` (Windows) can't refuse a symlink at the
+            # open() layer, so ``_BASE_READ_FLAGS | _NO_FOLLOW`` degrades to a plain open
+            # that follows through. This best-effort pre-check keeps the documented
+            # no-follow invariant true for the non-racy case; it is inherently TOCTOU-racy
+            # (the O_NOFOLLOW path below is the atomic guarantee where the flag exists).
+            return None
         fd = os.open(path, _BASE_READ_FLAGS if follow_symlink else _BASE_READ_FLAGS | _NO_FOLLOW)
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             return None

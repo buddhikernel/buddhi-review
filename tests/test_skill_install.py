@@ -971,12 +971,17 @@ def _bind_unix_socket(path: Path):
     import socket as _socket
 
     cwd = os.getcwd()
+    sock = None
     try:
         os.chdir(path.parent)
         sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
         sock.bind(path.name)
         return sock
-    except (AttributeError, OSError):
+    except AttributeError:
+        return None
+    except OSError:
+        if sock is not None:
+            sock.close()
         return None
     finally:
         os.chdir(cwd)
