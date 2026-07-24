@@ -31,6 +31,13 @@ Design invariants (why this module is careful):
   * **Symlinks are never written through.** A destination that is a symlink (or lives
     under a symlinked skill directory) is a CONFLICT; ``force`` replaces the *link*
     itself after backing it up, never its target.
+  * **Nothing raises, nothing blocks, whatever is on disk.** Every destination is inspected
+    with ONE never-raising ``os.lstat`` (:func:`_lstat_probe`) — never pathlib's
+    ``exists``/``is_symlink``/``is_dir``, which re-raise EACCES and ENAMETOOLONG — and only
+    a PROVEN regular file is ever opened, so a FIFO cannot block the run on a read with no
+    writer. A path we could not inspect is reported as an ERROR and left alone: never
+    treated as absence (that would write over whatever is really there, or orphan a
+    recorded file), and never blamed on a symlink that is not there.
   * **The recorded hash round-trips.** We hash ``apply_transforms(<raw bundled source>)``
     — the same bytes we write — so a freshly installed file reads back as NOOP on the
     very next run, and it stays correct when F3b registers a second transform (we always
@@ -181,16 +188,21 @@ def _load_sidecar(path: Path) -> Dict[str, dict]:
     bump — read as empty too, rather than misinterpreting its records under today's
     shape.
 
-    The existence check lives INSIDE the guard on purpose: ``Path.exists()`` itself
-    raises ``PermissionError`` when the config directory lacks the search bit (a
-    ``chmod 000 ~/.config/buddhi``), and an uncaught raise there would abort the whole
-    install with a bare traceback and no summary. This is a pre-write read, so failing
-    safe (empty → every existing file is a CONFLICT) can never clobber."""
+    Read through :func:`_read_text_or_none`, which is the existence check as well: an
+    ``exists()`` + ``read_text()`` pair raises ``PermissionError`` when the config directory
+    lacks the search bit (a ``chmod 000 ~/.config/buddhi``) and, worse, BLOCKS FOREVER when
+    the sidecar path is a FIFO with no writer — hanging every mode, ``--dry-run`` included,
+    before a single file is even looked at. The sidecar sits at a fixed, predictable path in
+    the user's own config dir, so that is reachable state, not a curiosity. Symlinks ARE
+    followed here (unlike a skill destination): pointing the sidecar at a dotfiles repo
+    through a link is a legitimate setup. This is a pre-write read, so failing safe
+    (empty → every existing file is a CONFLICT) can never clobber."""
+    text = _read_text_or_none(path, follow_symlink=True)
+    if text is None:
+        return {}
     try:
-        if not path.exists():
-            return {}
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, RecursionError):
+        data = json.loads(text)
+    except (ValueError, RecursionError):
         # RecursionError: json.loads hits the interpreter's limit on deeply nested input,
         # and it is neither an OSError nor a ValueError — without it a structurally corrupt
         # sidecar still aborts the run with the traceback this guard exists to prevent.
@@ -272,29 +284,26 @@ _ABSENT_ERRNOS = frozenset({errno.ENOENT, errno.ENOTDIR})
 
 
 def _lstat_probe(dest) -> Tuple[Optional[os.stat_result], Optional[str]]:
-    """One ``os.lstat`` that NEVER raises — the single source of truth about a recorded
-    destination for the two RECORD loops (:func:`_install`'s no-longer-bundled prune and
-    :func:`_uninstall`'s).
+    """One ``os.lstat`` that NEVER raises — the single source of truth about what is at a
+    destination, for EVERY loop in this module: the two RECORD loops (:func:`_install`'s
+    no-longer-bundled prune and :func:`_uninstall`'s) and the BUNDLED-tree loop
+    (:func:`_decide_action`, :func:`_handle_legacy_dirs`, :func:`_ancestor_state`).
 
-    A sidecar key is untrusted input, and every pathlib probe those loops would otherwise
-    reach for (``exists`` / ``is_symlink`` / ``is_dir``) swallows only ENOENT, ENOTDIR,
-    EBADF and ELOOP: an overlong path (ENAMETOOLONG), an unsearchable parent (EACCES) or
-    an unusable key (an embedded NUL raises ValueError) escapes and aborts the whole run —
-    ``--dry-run`` included — with a bare traceback and no summary. Asking once, here, also
-    lets the caller confirm the destination is a REGULAR file before opening it, so a
-    RECORDED FIFO never blocks the run on a read that has no writer.
-
-    SCOPE — this covers the record loops ONLY. The bundled-tree loop still probes through
-    pathlib (:func:`_decide_action`, :func:`_handle_legacy_dirs`), so a FIFO sitting at a
-    BUNDLED destination still hangs the run (plain, ``--force`` and ``--dry-run`` alike)
-    and an unsearchable installed skill directory still raises PermissionError out of
-    :func:`install_skills`. Closing that is step F9's job, not this helper's.
+    A sidecar key is untrusted input, and a destination path is only as trustworthy as the
+    directory it lives in — but every pathlib probe those loops would otherwise reach for
+    (``exists`` / ``is_symlink`` / ``is_dir``) swallows only ENOENT, ENOTDIR, EBADF and
+    ELOOP: an overlong path (ENAMETOOLONG), an unsearchable parent (EACCES) or an unusable
+    key (an embedded NUL raises ValueError) escapes and aborts the whole run — ``--dry-run``
+    included — with a bare traceback and no summary. Asking once, here, also lets the caller
+    confirm the destination is a REGULAR file before opening it, so a FIFO at a bundled or
+    recorded path never blocks the run on a read that has no writer.
 
     Returns ``(st, None)`` when the path exists (as a link, directory, regular or special
     file), ``(None, None)`` when it provably does not, and ``(None, "<error>")`` when we
     could not tell. That third case must NOT be read as absence: dropping a record for a
     file that is merely unreachable right now would orphan a file still on disk, which no
-    later run could clean up.
+    later run could clean up — and writing over a destination we could not inspect would
+    clobber whatever is actually there.
     """
     try:
         return os.lstat(dest), None
@@ -306,29 +315,99 @@ def _lstat_probe(dest) -> Tuple[Optional[os.stat_result], Optional[str]]:
         return None, str(exc)
 
 
-def _hash_on_disk(dest: Path) -> Optional[str]:
-    """Post-transform-comparable hash of the on-disk file, or ``None`` if it cannot be
-    read as UTF-8 text (a binary/foreign file → treated as not-ours → CONFLICT)."""
+def _kind_word(st: os.stat_result) -> str:
+    """A human word for what ``st`` describes, so a conflict says what is actually there
+    ("a FIFO where a regular file belongs") instead of guessing."""
+    mode = st.st_mode
+    if stat.S_ISLNK(mode):
+        return "symlink"
+    if stat.S_ISDIR(mode):
+        return "directory"
+    if stat.S_ISFIFO(mode):
+        return "FIFO"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    if stat.S_ISBLK(mode) or stat.S_ISCHR(mode):
+        return "device"
+    if stat.S_ISREG(mode):
+        return "file"
+    return "special file"
+
+
+# ``os.open`` flags that make reading a path safe whatever it turns out to be.
+# ``O_NONBLOCK``: a FIFO with no writer returns immediately instead of blocking forever —
+# and a block is a HANG, not an exception, so no ``except`` clause anywhere can rescue it.
+# ``O_BINARY`` is the Windows-only converse: it keeps newline translation in the text layer
+# alone, so the decoded text is byte-for-byte what ``Path.read_text`` used to return there.
+# Both are platform-specific — ``getattr`` keeps this importable everywhere.
+_BASE_READ_FLAGS = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+# ``O_NOFOLLOW`` refuses a symlink outright (ELOOP) instead of reading through it — added
+# for skill DESTINATIONS, where following a link is the very thing we refuse to do.
+_NO_FOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
+def _read_text_or_none(path, *, follow_symlink: bool) -> Optional[str]:
+    """``path``'s contents as UTF-8 text, or ``None`` if it is not a regular file or cannot
+    be read. NEVER raises and NEVER blocks — the single read primitive this module uses.
+
+    The ``fstat`` is on the OPEN descriptor, not the path: a caller that already proved the
+    path regular via :func:`_lstat_probe` used a separate syscall, and the path could have
+    been swapped for a FIFO in between. ``follow_symlink=False`` additionally refuses to
+    read THROUGH a link (skill destinations); the sidecar passes ``True``, because pointing
+    it at a dotfiles repo through a symlink is a legitimate setup that must keep working."""
+    fd = None
     try:
-        return content_hash(dest.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError):
+        fd = os.open(path, _BASE_READ_FLAGS if follow_symlink else _BASE_READ_FLAGS | _NO_FOLLOW)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        with os.fdopen(fd, "r", encoding="utf-8") as fh:
+            fd = None  # os.fdopen took ownership; don't double-close below
+            return fh.read()
+    except (OSError, ValueError, UnicodeDecodeError):
         return None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
-def _under_symlinked_dir(dest: Path, root: Path) -> bool:
-    """True if any directory BETWEEN ``root`` and ``dest`` (the skill dir or a nested dir)
-    is a symlink. ``root`` itself is not checked — relocating the whole skills root via a
-    symlink is a legitimate user choice; a symlink at/under the skill level is the
-    clobber-through-a-link vector we refuse."""
+def _hash_on_disk(dest: Path) -> Optional[str]:
+    """Post-transform-comparable hash of the on-disk file, or ``None`` if it is not a
+    regular file or cannot be read as UTF-8 text (binary/foreign → not-ours → CONFLICT)."""
+    text = _read_text_or_none(dest, follow_symlink=False)
+    return None if text is None else content_hash(text)
+
+
+def _ancestor_state(dest: Path, root: Path) -> Tuple[bool, Optional[str]]:
+    """Inspect every directory BETWEEN ``root`` and ``dest`` (the skill dir and any nested
+    dir). ``root`` itself is not checked — relocating the whole skills root via a symlink is
+    a legitimate user choice; a symlink at/under the skill level is the clobber-through-a-
+    link vector we refuse.
+
+    Returns ``(is_symlink, probe_error)``: ``(True, None)`` when an ancestor genuinely IS a
+    symlink, ``(False, "<error>")`` when one could not be inspected, ``(False, None)`` when
+    all of them are ordinary. Both non-clean answers are fail-SAFE — no caller writes,
+    unlinks or moves anything through either — but they are kept APART on purpose: the old
+    single boolean answered "could not read this ancestor" with the symlink verdict, so an
+    EACCES one level up told the user to "remove the symlinked directory" when there was no
+    symlink anywhere to remove, while the very same errno on the final component was
+    correctly reported as could-not-inspect. Same condition, two contradictory messages and
+    two different exit codes.
+
+    A probe error does NOT stop the walk: it is remembered and the remaining ancestors are
+    still inspected, so a PROVEN symlink higher up still wins. That matters for a symlink
+    LOOP, where the deeper component fails ELOOP but the link causing it sits above and IS
+    nameable — the actionable "remove the symlinked directory" answer, kept for exactly the
+    case where it is true."""
     cur = dest.parent
+    first_err: Optional[str] = None
     while cur != root and root in cur.parents:
-        try:
-            if cur.is_symlink():
-                return True
-        except OSError:
-            return True
-        cur = cur.parent
-    return False
+        st, err = _lstat_probe(cur)
+        if st is not None and stat.S_ISLNK(st.st_mode):
+            return True, None
+        if err is not None and first_err is None:
+            first_err = err  # the deepest one — the most specific thing we could not read
+        cur = cur.parent  # a missing ancestor is not a symlink — keep walking up
+    return False, first_err
 
 
 def _atomic_write(dest: Path, text: str) -> None:
@@ -393,13 +472,27 @@ def _handle_legacy_dirs(*, root: Path, force: bool, dry_run: bool) -> List[FileO
     it); ``--force`` backs the whole dir up and removes it — same never-clobber-without-
     force convention as a regular file conflict. Shared by install (so a plain upgrade
     surfaces the stale dir instead of only ``--uninstall`` ever mentioning it) and
-    uninstall."""
+    uninstall.
+
+    Probed through :func:`_lstat_probe`, never ``exists()``/``is_symlink()``: an
+    unsearchable skills ROOT makes those raise PermissionError, which aborted the whole run
+    — ``--dry-run`` and ``--uninstall`` included — after the per-file loop had already done
+    its work, with a bare traceback and no summary."""
     outcomes: List[FileOutcome] = []
     for legacy in LEGACY_SKILL_NAMES:
         ldir = root / legacy
-        if not (ldir.exists() or ldir.is_symlink()):
+        st, probe_err = _lstat_probe(ldir)
+        if probe_err is not None:
+            # Could not tell whether it is there. Reported, never assumed absent: silence
+            # would read as "no legacy directory", and acting blind could move a live one.
+            outcomes.append(FileOutcome(
+                legacy, "", ldir, ERROR,
+                f"could not tell whether a legacy {legacy} directory is there — "
+                f"left untouched: {probe_err}"))
             continue
-        kind = "symlink" if ldir.is_symlink() else "directory"
+        if st is None:
+            continue
+        kind = _kind_word(st)
         if force:
             if dry_run:
                 outcomes.append(FileOutcome(legacy, "", ldir, REMOVED,
@@ -430,22 +523,75 @@ def _prune_empty_dir(d: Path, stop: Path) -> None:
 
 # ── The install / update path ─────────────────────────────────────────────────────
 
+_FOREIGN_DETAIL = ("user-modified or foreign — left untouched "
+                   "(pass --force to overwrite, backing it up first)")
+
+
+@dataclass(frozen=True)
+class _Decision:
+    """One destination's verdict, plus everything the caller needs to act on it — so the
+    caller never re-probes the filesystem for a detail string or a symlink check (each
+    such re-probe was a second chance to raise, and a second chance to disagree with the
+    verdict it is explaining)."""
+
+    action: str
+    detail: str = ""
+    # False → refuse to write in EVERY mode, ``--force`` included. ERROR always carries it
+    # (nothing we could not inspect is ever written), even though the caller short-circuits
+    # on the action first — an accurate flag cannot mislead a later reader or caller.
+    writable: bool = True
+
+
 def _decide_action(dest: Path, root: Path, h_cur: str, h_rec: Optional[str],
-                   h_raw: Optional[str] = None) -> str:
-    """The 3-way state for one destination (see the module docstring)."""
-    if dest.is_symlink() or _under_symlinked_dir(dest, root):
-        return CONFLICT
-    if not dest.exists():
-        return INSTALL
-    if dest.is_dir():
-        return CONFLICT  # a directory where a file belongs — never ours to overwrite
+                   h_raw: Optional[str] = None) -> _Decision:
+    """The state for one destination (see the module docstring), derived from ONE
+    never-raising :func:`_lstat_probe` per path rather than from pathlib's ``is_symlink`` /
+    ``exists`` / ``is_dir``, which swallow only ENOENT/ENOTDIR/EBADF/ELOOP and re-raise the
+    rest: a ``chmod 000`` installed skill directory made them raise PermissionError straight
+    out of :func:`install_skills` — in EVERY mode, ``--dry-run`` included — so the run died
+    with no summary and the healthy skill beside it was never processed.
+
+    Anything that is not a proven REGULAR file is decided from the stat alone and is never
+    opened. That is what keeps a FIFO at a bundled destination from blocking the whole run
+    forever on a read with no writer (``--dry-run``, documented to write nothing and merely
+    report, hung on it too)."""
+    anc_link, anc_err = _ancestor_state(dest, root)
+    if anc_link:
+        # Refused in every mode: writing would follow the link and clobber files inside its
+        # target, and ``--force``'s per-file backup would land INSIDE that target rather
+        # than replace the link. The user removes the symlinked directory and re-runs.
+        return _Decision(CONFLICT, "a parent directory is a symlink — refusing to write "
+                                   "through it; remove the symlinked directory and re-run",
+                         writable=False)
+    if anc_err is not None:
+        return _Decision(ERROR, f"could not inspect a parent directory — left untouched: "
+                                f"{anc_err}", writable=False)
+
+    st, probe_err = _lstat_probe(dest)
+    if probe_err is not None:
+        # Could not tell what is there. NOT absence: treating it as INSTALL would write over
+        # whatever is actually on disk the moment the obstruction cleared.
+        return _Decision(ERROR, f"could not inspect it — left untouched: {probe_err}",
+                         writable=False)
+    if st is None:
+        return _Decision(INSTALL)
+    if stat.S_ISLNK(st.st_mode):
+        # Says what ``--force`` would do, because the ancestor-symlink message above says the
+        # opposite: from a bare "symlink" line the user cannot tell which of the two they hit.
+        return _Decision(CONFLICT, "symlink — left untouched "
+                                   "(pass --force to replace the link, backing it up first)")
+    if not stat.S_ISREG(st.st_mode):
+        # A directory, FIFO, socket or device where a file belongs. Never ours, and never
+        # opened — only ``--force`` resolves it, by moving the whole thing aside first.
+        return _Decision(CONFLICT, f"a {_kind_word(st)} where a regular file belongs — left "
+                                   f"untouched (pass --force to replace it, backing it up first)")
     h_disk = _hash_on_disk(dest)
     if h_disk is None:
-        return CONFLICT  # unreadable / non-text → foreign
+        return _Decision(CONFLICT, _FOREIGN_DETAIL)  # unreadable / non-text → foreign
     if h_disk == h_cur:
-        return NOOP
+        return _Decision(NOOP)
     if h_rec is not None and h_disk == h_rec:
-        return UPDATE
+        return _Decision(UPDATE)
     # ADOPTION: the pre-F2 README told users to ``cp -R`` the bundled skills straight into
     # ~/.claude/skills, which leaves the RAW (pre-transform, unstamped) bundled bytes on
     # disk and no sidecar record at all. Such a file matches neither ``h_cur`` (stamped)
@@ -456,8 +602,8 @@ def _decide_action(dest: Path, root: Path, h_cur: str, h_rec: Optional[str],
     # only the version-stamp line changes. A legacy copy of an OLDER release whose content
     # has since changed matches nothing provable and stays a CONFLICT, by design.
     if h_raw is not None and h_disk == h_raw:
-        return UPDATE
-    return CONFLICT
+        return _Decision(UPDATE)
+    return _Decision(CONFLICT, _FOREIGN_DETAIL)
 
 
 def _install(
@@ -491,27 +637,28 @@ def _install(
             # manual ``cp -R`` copy; see the adoption branch in :func:`_decide_action`.
             h_raw = content_hash(raw)
 
-            action = _decide_action(dest, root, h_cur, h_rec, h_raw)
+            decision = _decide_action(dest, root, h_cur, h_rec, h_raw)
+            action = decision.action
             detail = ""
 
-            # A CONFLICT caused by a symlinked ANCESTOR directory can never be resolved by
-            # writing — that would follow the link and clobber files inside its target (and
-            # ``--force``'s per-file backup would land INSIDE that target, not replace the
-            # link). Refuse in every mode, force or not: the user removes the symlinked
-            # directory and re-runs. (A symlinked destination FILE, by contrast, is safely
-            # replaced below — its link is backed up and a fresh file written in its place.)
-            if action == CONFLICT and _under_symlinked_dir(dest, root):
-                outcomes.append(FileOutcome(
-                    skill, rel, dest, CONFLICT,
-                    "a parent directory is a symlink — refusing to write through it; "
-                    "remove the symlinked directory and re-run"))
+            # ``_decide_action`` could not tell what is on disk (an unsearchable parent, an
+            # I/O error). Report it and move on: the healthy files beside it — including the
+            # whole other skill — must still be processed, which is exactly what the raise
+            # this replaced prevented.
+            if action == ERROR:
+                outcomes.append(FileOutcome(skill, rel, dest, ERROR, decision.detail))
+                continue
+
+            # Refused in EVERY mode, force or not (a symlinked ANCESTOR directory, or one we
+            # could not inspect) — see :func:`_decide_action`. A symlinked destination FILE,
+            # by contrast, is safely replaced below: its link is backed up and a fresh file
+            # written in its place.
+            if not decision.writable:
+                outcomes.append(FileOutcome(skill, rel, dest, CONFLICT, decision.detail))
                 continue
 
             if action == CONFLICT and not force:
-                detail = ("symlink — left untouched" if dest.is_symlink()
-                          else "user-modified or foreign — left untouched "
-                               "(pass --force to overwrite, backing it up first)")
-                outcomes.append(FileOutcome(skill, rel, dest, CONFLICT, detail))
+                outcomes.append(FileOutcome(skill, rel, dest, CONFLICT, decision.detail))
                 continue
 
             if dry_run:
@@ -616,17 +763,25 @@ def _install(
         # unconditionally, so it stays the reported reason even when ``dest`` itself
         # also has a probe error (e.g. an EACCES hit while resolving through that same
         # symlink) — the specific "parent directory is a symlink" outcome is more
-        # actionable than a generic "could not inspect it". This cannot raise on an
-        # untrusted key either: ``_under_symlinked_dir`` walks ancestors with
-        # ``Path.is_symlink()``, and pathlib's ``is_symlink()`` already swallows
-        # ``ValueError`` (embedded NUL / lone surrogates) the same way it swallows an
-        # ignorable ``OSError`` — verified empirically on 3.9-3.13.
-        if _under_symlinked_dir(dest, root):
+        # actionable than a generic "could not inspect it". Only a PROVEN symlink says so:
+        # an ancestor we merely could not read falls through to the probe-error branch
+        # below, which is what the same errno on the FINAL component already reported.
+        anc_link, anc_err = _ancestor_state(dest, root)
+        if anc_link:
             outcomes.append(FileOutcome(
                 skill, rel, dest, CONFLICT,
                 "no longer bundled; a parent directory is a symlink — left untouched "
                 "(remove the symlinked directory manually)"))
             continue
+        # If the two probes ever disagree, could-not-tell WINS. Resolving ``dest`` traverses
+        # every ancestor, so an ancestor we cannot read normally makes ``dest``'s own probe
+        # fail with the same errno first — no STATIC filesystem state reaches this line, and
+        # only a concurrent ``chmod`` landing between the two probes can. It is kept (and
+        # pinned by a test that fakes the divergence) because what it prevents is severe:
+        # with ``probe_err`` unset, a record whose ancestor we could not inspect falls
+        # through to the ours-unmodified branch below and the file is UNLINKED.
+        if probe_err is None and anc_err is not None:
+            probe_err = anc_err
 
         if probe_err is not None:
             # We could not tell what is there (an unsearchable parent, an I/O error). The
@@ -752,15 +907,20 @@ def _uninstall(
         #
         # Checked before probe_err for the same reason as :func:`_install`'s twin: the
         # symlink-ancestor reason is unconditional and more actionable than a generic
-        # probe-error message, and it cannot raise on an untrusted key — pathlib's
-        # ``is_symlink()`` already swallows ``ValueError`` (embedded NUL / lone
-        # surrogates), verified empirically on 3.9-3.13.
-        if _under_symlinked_dir(dest, root):
+        # probe-error message — and only a PROVEN symlink claims to be one; an ancestor we
+        # merely could not read falls through to the probe-error branch below.
+        anc_link, anc_err = _ancestor_state(dest, root)
+        if anc_link:
             outcomes.append(FileOutcome(
                 skill, rel, dest, CONFLICT,
                 "a parent directory is a symlink — left untouched "
                 "(remove the symlinked directory manually)"))
             continue
+        # See :func:`_install`'s twin: if the two probes disagree, could-not-tell wins —
+        # reachable only through a concurrent chmod between them, kept because the
+        # alternative is unlinking a file whose ancestor we could not inspect.
+        if probe_err is None and anc_err is not None:
+            probe_err = anc_err
 
         if probe_err is not None:
             # Could not tell what is there; keep the record rather than orphan a file that
@@ -874,7 +1034,7 @@ def _normalized_dest_if_under(key: str, root: Path) -> Optional[Path]:
     contain ``..`` segments that pass a literal-string-parents check on the RAW path
     while the path actually resolves outside ``root`` on disk. Normalize lexically
     (``os.path.normpath`` — never ``Path.resolve()``, which would follow symlinks and
-    defeat ``_under_symlinked_dir``'s later check) before the containment test, and hand
+    defeat ``_ancestor_state``'s later check) before the containment test, and hand
     back that SAME normalized path for every subsequent use — never the raw key.
 
     Containment is STRICT (``root in dest.parents``): a key equal to the skills root

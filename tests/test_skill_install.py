@@ -860,7 +860,395 @@ def test_dry_run_alias_key_is_skipped_lexically(env):
     assert not env.target.exists()  # --dry-run still wrote nothing
 
 
+# ── The BUNDLED-tree loop: hostile on-disk state never raises and never blocks ────
+#
+# The record loops above are probed through ``_lstat_probe``; these cover the loop that
+# walks the BUNDLED tree (``_decide_action`` / ``_handle_legacy_dirs``), which used to probe
+# through pathlib and so re-raised EACCES and blocked on a FIFO.
+
+def _review_pr_file_count() -> int:
+    return len([1 for skill, _rel, _src in _src_files() if skill == "review-pr"])
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_unreadable_skill_dir_never_raises_and_sibling_is_still_processed(env, kwargs):
+    """An installed skill dir with no search bit made every pathlib probe in the bundled
+    loop raise PermissionError straight out of ``install_skills`` — exit 1, no summary, and
+    the healthy skill beside it never processed. Now it is one ERROR outcome and the run
+    continues; the sibling assertion is the one that proves it."""
+    skill_install.install_skills()
+    (env.target / "open-pr").chmod(0o000)
+    try:
+        summary = skill_install.install_skills(**kwargs)  # must not raise
+        assert isinstance(summary, skill_install.InstallSummary)
+        blocked = [f for f in summary.files if f.skill == "open-pr"]
+        assert blocked and all(f.action == skill_install.ERROR for f in blocked)
+        assert all("could not inspect" in f.detail for f in blocked)
+        assert summary.had_error  # the CLI exits 1 — the run genuinely could not tell
+        # THE POINT: the healthy sibling was processed to completion regardless.
+        healthy = [f for f in summary.files if f.skill == "review-pr"]
+        assert len(healthy) == _review_pr_file_count()
+        assert not any(f.action == skill_install.ERROR for f in healthy)
+    finally:
+        (env.target / "open-pr").chmod(0o700)
+    # Nothing was written into (or moved out of) the unreadable directory.
+    assert (env.target / "open-pr" / "SKILL.md").exists()
+    assert not list((env.target / "open-pr").glob("*.bak-*"))
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_unsearchable_skills_root_completes_in_every_mode(env, kwargs):
+    """``_handle_legacy_dirs`` probed with ``exists()``/``is_symlink()``, so an unsearchable
+    skills ROOT aborted the run there too — after the per-file loop had already done its
+    work, leaving a bare traceback instead of the summary that reports it."""
+    skill_install.install_skills()
+    legacy = env.target / "create-pr"
+    legacy.mkdir()
+    (legacy / "SKILL.md").write_text("stale legacy skill\n", encoding="utf-8")
+    env.target.chmod(0o600)  # readable, NOT searchable
+    try:
+        summary = skill_install.install_skills(**kwargs)  # must not raise
+        assert isinstance(summary, skill_install.InstallSummary)
+        legacy_outs = [f for f in summary.files if f.skill == "create-pr"]
+        assert len(legacy_outs) == 1 and legacy_outs[0].action == skill_install.ERROR
+        assert "could not tell whether a legacy create-pr directory is there" in legacy_outs[0].detail
+    finally:
+        env.target.chmod(0o700)
+    assert (legacy / "SKILL.md").read_text(encoding="utf-8") == "stale legacy skill\n"
+    assert not list(env.target.parent.glob("create-pr.bak-*"))  # never acted on blind
+
+
+def test_unsearchable_root_does_not_assert_a_legacy_dir_that_is_absent(env):
+    """The normal modern state has NO ``create-pr`` at all. An unsearchable root still
+    cannot see that, so the message must not name the directory as a thing that is there —
+    asserting something the user cannot find is the exact defect class this step removes."""
+    skill_install.install_skills()
+    assert not (env.target / "create-pr").exists()
+    env.target.chmod(0o600)
+    try:
+        summary = skill_install.install_skills()
+        legacy_outs = [f for f in summary.files if f.skill == "create-pr"]
+        assert len(legacy_outs) == 1
+        detail = legacy_outs[0].detail
+        assert "could not tell whether" in detail
+        assert "left untouched" in detail
+    finally:
+        env.target.chmod(0o700)
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_fifo_at_a_bundled_destination_completes_without_hanging(env, kwargs):
+    """THE WORST ONE: a FIFO at a BUNDLED destination needs no sidecar record at all, and
+    ``_hash_on_disk``'s ``read_text`` on it blocked forever with no writer — plain,
+    ``--force`` AND ``--dry-run`` alike. A read-only, report-only mode must never block."""
+    skill_install.install_skills()
+    dest = env.target / "open-pr" / "SKILL.md"
+    dest.unlink()
+    os.mkfifo(dest)
+
+    with _no_blocking(5):  # must not block AND must not raise
+        summary = skill_install.install_skills(**kwargs)
+    outs = [f for f in summary.files if f.path == dest]
+    assert len(outs) == 1
+    if kwargs == {"force": True}:
+        # --force is the one escape hatch, and it resolves the FIFO the same way it
+        # resolves a symlink: the thing is MOVED aside (never opened) and a real file is
+        # written in its place, so a FIFO-blocked install is not unfixable forever.
+        assert outs[0].action == skill_install.UPDATE
+        assert dest.is_file() and not dest.is_fifo()
+        baks = list(dest.parent.glob("SKILL.md.bak-*"))
+        assert len(baks) == 1 and baks[0].is_fifo()
+    else:
+        assert outs[0].action == skill_install.CONFLICT
+        assert dest.is_fifo()                                  # never opened, never moved
+        assert not list(dest.parent.glob("SKILL.md.bak-*"))
+
+
+def _bind_unix_socket(path: Path):
+    """Bind an AF_UNIX socket AT ``path``, or return ``None`` if this platform will not.
+    Bound from inside the directory so the ~104-byte ``sun_path`` limit applies to the
+    short relative name rather than the long tmp path."""
+    import socket as _socket
+
+    cwd = os.getcwd()
+    try:
+        os.chdir(path.parent)
+        sock = _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM)
+        sock.bind(path.name)
+        return sock
+    except (AttributeError, OSError):
+        return None
+    finally:
+        os.chdir(cwd)
+
+
+@pytest.mark.parametrize("kind", ["fifo", "socket", "directory"])
+def test_non_regular_file_at_a_bundled_destination_is_a_conflict(env, kind):
+    """Anything that is not a proven REGULAR file is decided from the stat alone and is
+    never opened. The detail naming the kind is the proof: a verdict reached by trying to
+    READ the thing reports the generic "user-modified or foreign" reason instead."""
+    skill_install.install_skills()
+    dest = env.target / "open-pr" / "SKILL.md"
+    dest.unlink()
+    sock = None
+    if kind == "fifo":
+        os.mkfifo(dest)
+        expected = "a FIFO where a regular file belongs"
+    elif kind == "socket":
+        sock = _bind_unix_socket(dest)
+        if sock is None:
+            pytest.skip("this platform cannot bind an AF_UNIX socket here")
+        expected = "a socket where a regular file belongs"
+    else:
+        dest.mkdir()
+        expected = "a directory where a regular file belongs"
+
+    try:
+        with _no_blocking(5):
+            summary = skill_install.install_skills()
+        outs = [f for f in summary.files if f.path == dest]
+        assert len(outs) == 1 and outs[0].action == skill_install.CONFLICT
+        assert expected in outs[0].detail
+        assert not summary.had_error                    # a preserved conflict is not an error
+        assert not list(dest.parent.glob("SKILL.md.bak-*"))
+        assert os.path.lexists(dest)                    # left exactly as it was
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def test_hash_on_disk_never_opens_a_non_regular_file(env):
+    """The structural half of the guarantee: even called directly on a FIFO — i.e. if a
+    destination stopped being a regular file between the probe and the open — this returns
+    rather than blocking, and it refuses to read THROUGH a symlink."""
+    env.target.mkdir(parents=True)
+    fifo = env.target / "pipe"
+    os.mkfifo(fifo)
+    real = env.target / "real.md"
+    real.write_text("hello\n", encoding="utf-8")
+    link = env.target / "link.md"
+    link.symlink_to(real)
+
+    with _no_blocking(5):
+        assert skill_install._hash_on_disk(fifo) is None
+    assert skill_install._hash_on_disk(link) is None            # never read through a link
+    assert skill_install._hash_on_disk(real) == content_hash("hello\n")
+
+
+# ── EACCES on an ancestor is could-not-tell, NOT "is a symlink" ───────────────────
+
+def test_eacces_ancestor_is_not_blamed_on_a_symlink_in_the_bundled_loop(env):
+    """``chmod 000`` on the review-pr skill dir hits BOTH ancestor branches at once:
+    ``references/env-vars.md`` fails while inspecting its PARENT, ``SKILL.md`` on the final
+    component. Neither may claim a symlink — there is none to remove."""
+    skill_install.install_skills()
+    (env.target / "review-pr").chmod(0o000)
+    try:
+        summary = skill_install.install_skills()
+        outs = {f.rel: f for f in summary.files if f.skill == "review-pr"}
+        assert outs["references/env-vars.md"].action == skill_install.ERROR
+        assert "could not inspect a parent directory" in outs["references/env-vars.md"].detail
+        assert outs["SKILL.md"].action == skill_install.ERROR
+        assert "could not inspect it" in outs["SKILL.md"].detail
+        assert not any("symlink" in f.detail for f in summary.files)
+        assert summary.had_error
+    finally:
+        (env.target / "review-pr").chmod(0o700)
+
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_eacces_ancestor_matches_the_final_component_in_the_record_loops(env, kwargs):
+    """A recorded file under an unreadable ancestor was reported as ``a parent directory is
+    a symlink — remove the symlinked directory manually`` at exit 0, while the SAME errno on
+    the final component was an ERROR at exit 1. One condition, two contradictory answers,
+    and a user sent hunting for a symlink that does not exist. Both now read alike."""
+    skill_install.install_skills()
+    # (a) the errno one level UP: the record's PARENT directory is unreadable.
+    ghost = env.target / "ghost"
+    (ghost / "sub").mkdir(parents=True)
+    up = ghost / "sub" / "gone.md"
+    up.write_text("still here\n", encoding="utf-8")
+    _record(env, str(up), content_hash("still here\n"))
+    # (b) the SAME errno on the FINAL component — the control this used to disagree with.
+    deep = env.target / "spooky" / "deep"
+    deep.mkdir(parents=True)
+    final = deep / "gone.md"
+    final.write_text("still here\n", encoding="utf-8")
+    _record(env, str(final), content_hash("still here\n"))
+    ghost.chmod(0o000)
+    deep.chmod(0o000)
+    try:
+        summary = skill_install.install_skills(**kwargs)
+        got = {f.path: f for f in summary.files}
+        assert got[up].action == got[final].action == skill_install.ERROR
+        assert "could not inspect it — record kept" in got[up].detail
+        assert "could not inspect it — record kept" in got[final].detail
+        assert "symlink" not in got[up].detail
+        assert summary.had_error  # same exit code for the same condition
+        recs = json.loads(env.sidecar.read_text())["files"]
+        assert str(up) in recs and str(final) in recs  # neither record is retired
+    finally:
+        ghost.chmod(0o700)
+        deep.chmod(0o700)
+    assert up.read_text(encoding="utf-8") == "still here\n"      # nothing acted on blind
+    assert final.read_text(encoding="utf-8") == "still here\n"
+
+
+@pytest.mark.parametrize("uninstall", [False, True], ids=["prune", "uninstall"])
+def test_unreadable_ancestor_beats_a_clean_destination_probe(env, monkeypatch, uninstall):
+    """Both record loops probe the destination FIRST and its ancestors second, and take
+    could-not-tell from EITHER. Resolving the destination traverses every ancestor, so a
+    real permission state cannot make the two disagree — the divergence is faked here
+    because what it guards is severe: with the ancestor's error dropped, the record falls
+    through to the ours-unmodified branch and the file is UNLINKED, no backup, on the
+    strength of a directory we could not read."""
+    skill_install.install_skills()
+    stale = env.target / "open-pr" / "gone.md"        # recorded, ours-unmodified, unbundled
+    stale.write_text("dropped upstream\n", encoding="utf-8")
+    _record(env, str(stale), content_hash("dropped upstream\n"))
+
+    real_probe = skill_install._lstat_probe
+    blinded = env.target / "open-pr"
+
+    def _blind_one_ancestor(path):
+        if Path(path) == blinded:
+            return None, "[Errno 13] Permission denied (simulated)"
+        return real_probe(path)
+
+    monkeypatch.setattr(skill_install, "_lstat_probe", _blind_one_ancestor)
+    summary = skill_install.install_skills(uninstall=uninstall)
+    outs = [f for f in summary.files if f.path == stale]
+    assert len(outs) == 1 and outs[0].action == skill_install.ERROR
+    assert "could not inspect it — record kept" in outs[0].detail
+    assert stale.read_text(encoding="utf-8") == "dropped upstream\n"   # never removed
+    assert str(stale) in json.loads(env.sidecar.read_text())["files"]  # never retired
+
+
+@pytest.mark.parametrize("kwargs", [{"force": True}, {"uninstall": True, "force": True}],
+                         ids=["prune", "uninstall"])
+def test_real_symlinked_ancestor_still_says_symlink_and_is_never_written_through(env, kwargs):
+    """The other half: a REAL symlinked ancestor keeps the symlink verdict, and even
+    ``--force`` never unlinks or backs up through it."""
+    skill_install.install_skills()
+    outside = env.tmp / "outside_stale"
+    outside.mkdir()
+    victim = outside / "gone.md"
+    victim.write_text("PRECIOUS outside content\n", encoding="utf-8")
+    (env.target / "stale").symlink_to(outside, target_is_directory=True)
+    recorded = env.target / "stale" / "gone.md"
+    _record(env, str(recorded), content_hash("PRECIOUS outside content\n"))
+
+    summary = skill_install.install_skills(**kwargs)
+    outs = [f for f in summary.files if f.path == recorded]
+    assert len(outs) == 1 and outs[0].action == skill_install.CONFLICT
+    assert "a parent directory is a symlink" in outs[0].detail
+    assert victim.read_text(encoding="utf-8") == "PRECIOUS outside content\n"
+    assert not list(outside.glob("gone.md.bak-*"))
+    assert (env.target / "stale").is_symlink()
+
+
+def test_symlink_loop_ancestor_is_still_named_as_a_symlink(env):
+    """A self-referential skill dir makes the nested ``references/`` component fail ELOOP,
+    so a walk that stopped at the first unreadable ancestor would report "could not inspect
+    a parent directory" — when the link causing it sits one level up and IS nameable. The
+    walk remembers the error and keeps going, so the actionable answer survives."""
+    env.target.mkdir(parents=True)
+    loop = env.target / "review-pr"
+    loop.symlink_to(loop, target_is_directory=True)  # points at itself
+
+    with _no_blocking(5):
+        summary = skill_install.install_skills(force=True)
+    outs = {f.rel: f for f in summary.files if f.skill == "review-pr"}
+    assert outs["references/env-vars.md"].action == skill_install.CONFLICT
+    assert "a parent directory is a symlink" in outs["references/env-vars.md"].detail
+    assert loop.is_symlink()                                  # never written through
+    assert not list(env.target.glob("review-pr.bak-*"))
+    assert (env.target / "open-pr" / "SKILL.md").exists()      # the sibling still installs
+
+
+def test_dry_run_writes_nothing_across_the_hostile_paths(env):
+    """``--dry-run`` is documented to write nothing and merely report — and it is the mode a
+    hang or a raise hurt most. Every new path at once, with nothing on disk changed."""
+    skill_install.install_skills()
+    fifo = env.target / "open-pr" / "SKILL.md"          # a FIFO at a bundled destination
+    fifo.unlink()
+    os.mkfifo(fifo)
+    as_dir = env.target / "review-pr" / "SKILL.md"      # a directory where a file belongs
+    as_dir.unlink()
+    as_dir.mkdir()
+    refs = env.target / "review-pr" / "references"      # its file becomes uninspectable
+    legacy = env.target / "create-pr"                   # a stale legacy skill dir
+    legacy.mkdir()
+    (legacy / "SKILL.md").write_text("stale legacy skill\n", encoding="utf-8")
+    ghost = env.target / "ghost"                        # a record under an unreadable dir
+    (ghost / "sub").mkdir(parents=True)
+    (ghost / "sub" / "gone.md").write_text("still here\n", encoding="utf-8")
+    _record(env, str(ghost / "sub" / "gone.md"), content_hash("still here\n"))
+    refs.chmod(0o000)
+    ghost.chmod(0o000)
+    before = json.loads(env.sidecar.read_text())
+    try:
+        with _no_blocking(5):
+            summary = skill_install.install_skills(dry_run=True, force=True)
+        assert isinstance(summary, skill_install.InstallSummary)
+    finally:
+        refs.chmod(0o700)
+        ghost.chmod(0o700)
+    assert fifo.is_fifo()                                        # not opened, not replaced
+    assert as_dir.is_dir() and not any(as_dir.iterdir())         # not moved aside, not written
+    assert (refs / "env-vars.md").exists()
+    assert legacy.is_dir() and (legacy / "SKILL.md").exists()
+    assert (ghost / "sub" / "gone.md").read_text(encoding="utf-8") == "still here\n"
+    assert json.loads(env.sidecar.read_text()) == before         # sidecar untouched
+    assert not list(env.target.rglob("*.bak-*"))                 # nothing moved aside
+    assert not list(env.target.parent.glob("create-pr.bak-*"))
+
+
 # ── Unreadable config dir: the sidecar read fails SAFE, never raises ──────────────
+
+@pytest.mark.parametrize("kwargs", _ALL_MODES, ids=_MODE_IDS)
+def test_sidecar_that_is_a_fifo_never_blocks(env, kwargs):
+    """The sidecar sits at a fixed, predictable path in the user's own config dir, and it
+    was read with a plain ``read_text`` — so a FIFO there blocked EVERY mode forever, before
+    a single skill file was even looked at. It now reads as empty (the documented fail-safe:
+    nothing is provably ours, so nothing is clobbered)."""
+    skill_install.install_skills()
+    dest = env.target / "review-pr" / "SKILL.md"
+    installed = dest.read_text(encoding="utf-8")
+    env.sidecar.unlink()
+    os.mkfifo(env.sidecar)
+
+    with _no_blocking(5):  # must not block AND must not raise
+        summary = skill_install.install_skills(**kwargs)
+    assert isinstance(summary, skill_install.InstallSummary)
+    assert dest.read_text(encoding="utf-8") == installed  # no record ⇒ nothing clobbered
+    assert not list(dest.parent.glob("SKILL.md.bak-*"))
+    if kwargs in ({}, {"force": True}):
+        # A real install rewrites the sidecar, so the corrupt FIFO heals itself.
+        assert env.sidecar.is_file() and not env.sidecar.is_fifo()
+    else:
+        assert env.sidecar.is_fifo()  # --dry-run / --uninstall wrote nothing
+
+
+def test_symlinked_sidecar_is_still_followed(env):
+    """A sidecar SYMLINKED into a dotfiles repo is a legitimate setup, so — unlike a skill
+    destination, where following a link is the very thing we refuse — the sidecar read
+    follows links. UPDATE rather than CONFLICT is the proof that the record behind the link
+    was actually read."""
+    skill_install.install_skills()
+    dest = env.target / "open-pr" / "SKILL.md"
+    prior = "old managed content\n"
+    dest.write_text(prior, encoding="utf-8")
+    sc = json.loads(env.sidecar.read_text())
+    sc["files"][str(dest)] = {"version": "0.0.1", "hash": content_hash(prior)}
+    env.sidecar.write_text(json.dumps(sc), encoding="utf-8")
+    real = env.tmp / "dotfiles-installed-skills.json"
+    env.sidecar.rename(real)
+    env.sidecar.symlink_to(real)
+
+    summary = skill_install.install_skills()
+    assert _actions(summary)[("open-pr", "SKILL.md")] == skill_install.UPDATE
+
 
 def test_load_sidecar_on_unsearchable_parent_returns_empty(env):
     """``Path.exists()`` itself raises PermissionError when the sidecar's parent dir has
