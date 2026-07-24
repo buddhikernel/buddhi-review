@@ -65,9 +65,13 @@ are already current, updates ones it installed earlier, and refuses to overwrite
 file you have edited yourself (pass `--force` to overwrite, which backs up the existing
 file first). Run `buddhi-review install-skills --uninstall` to remove them again.
 
-Re-run `buddhi-review install-skills` after every `pip install -U buddhi-review` — it
-copies the skill files rather than linking them, so upgrading the package alone does not
-refresh `~/.claude/skills/`.
+Upgrade later with **`buddhi-review upgrade`**: it works out how this copy was installed
+(a git checkout, pipx, uv tool, or a virtualenv), upgrades it that way, and re-syncs the
+skill files for you. On a Python your operating system's package manager owns, it prints
+the command to run yourself instead of touching that environment. If you upgrade by hand
+(`pip install -U buddhi-review`), re-run `buddhi-review install-skills` afterwards — the
+skills are copied rather than linked, so upgrading the package alone does not refresh
+`~/.claude/skills/`.
 
 **Restart Claude Code** so it loads the new skills, then run **`/review-pr setup`**
 once to onboard (see [Getting started](https://github.com/buddhikernel/buddhi-review/blob/main/GETTING_STARTED.md)).

@@ -62,6 +62,14 @@ buddhi-review = "buddhi_review.cli:main"
 [project.entry-points."buddhi_review.backends"]
 free = "buddhi_review.backends:FreeBackend"
 
+# Updaters are discovered through this second generic entry-points group; the
+# ``upgrade`` command runs the highest-priority active one. The safety gate (install-
+# method detection + the notify-only refusal to touch an OS-managed interpreter) runs
+# in the command itself, BEFORE any updater is selected, so a separately-installed
+# updater can only update its own package — never redirect this one.
+[project.entry-points."buddhi_review.updaters"]
+free = "buddhi_review.updaters:FreeUpdater"
+
 [project.urls]
 Homepage = "https://github.com/buddhikernel/buddhi-review"
 Source = "https://github.com/buddhikernel/buddhi-review"

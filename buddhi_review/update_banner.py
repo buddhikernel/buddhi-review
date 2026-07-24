@@ -14,7 +14,10 @@ Two independent sources feed the one line:
     version. A cheap, TTL-cached PyPI check — within the cache window it makes NO
     network call; when stale it does a single bounded refresh whose worst case is
     one short timeout per window (offline → fail-open, no banner). The one-liner is
-    ``pip install -U buddhi-review``.
+    ``buddhi-review upgrade``, which detects how this copy was installed and does the
+    method-correct thing (an OS-managed interpreter is told, never written to). The
+    banner deliberately does NOT detect the install method itself — naming one command
+    keeps it as cheap and as network-quiet as it is today.
   * **Claude review workflow notice** (SECONDARY): the ``claude-code-review.yml``
     INSTALLED in the reviewed repo is an older ``buddhi-managed-version`` than the
     bundled master copy (:func:`managed_files.needs_update` — a version-NUMBER
@@ -48,10 +51,15 @@ from typing import Callable, Dict, List, Optional, TextIO
 from buddhi_review import managed_files
 from buddhi_review.transparency import _colour_enabled
 
-# The published distribution name (PyPI) and the import name's update one-liner.
+# The published distribution name (PyPI) and the update one-liner the banner names.
+# The one-liner is our OWN command, not a raw ``pip install -U``: ``upgrade`` detects
+# the install method (editable checkout / pipx / uv tool / venv / OS-managed) and picks
+# the right action, so a single method-blind string can never tell a user to run pip
+# against an interpreter their OS package manager owns. Keeping the banner's text
+# method-blind is deliberate — it stays as cheap and as quiet as it is today.
 _DIST_NAME = "buddhi-review"
 _PYPI_JSON_URL = f"https://pypi.org/pypi/{_DIST_NAME}/json"
-_PIP_UPGRADE = f"pip install -U {_DIST_NAME}"
+_UPGRADE_CMD = f"{_DIST_NAME} upgrade"
 # The free onboarding command the reader re-runs to refresh the installed workflow.
 _SETUP_CMD = "/review-pr setup"
 
@@ -233,6 +241,28 @@ def latest_known(*, now: float, state_path: Path,
     return latest if isinstance(latest, str) and latest.strip() else None
 
 
+def latest_release(*, now: Optional[float] = None, state_path: Optional[Path] = None,
+                   fetcher: Optional[Callable[[], Optional[str]]] = None,
+                   ttl_seconds: Optional[float] = None) -> Optional[str]:
+    """The latest known ``buddhi-review`` release string, or ``None`` when unknown.
+
+    The public, defaulted wrapper around :func:`latest_known` — same cache file, same
+    TTL, same single bounded refresh, same fail-open contract. It exists so a caller
+    that wants the verdict WITHOUT the muted banner (``buddhi-review upgrade --check``,
+    which must speak up even when everything is current) reuses this module's cached
+    check instead of opening a second, differently-behaved network path. ``None`` means
+    "could not determine" — offline, unreadable cache, malformed payload — and is never
+    to be reported as "you are up to date"."""
+    try:
+        now = now if now is not None else time.time()
+        path = state_path if state_path is not None else _state_path()
+        ttl = ttl_seconds if ttl_seconds is not None else _ttl_seconds()
+        fetch = fetcher if fetcher is not None else (lambda: _bounded_fetch(_timeout_seconds()))
+        return latest_known(now=now, state_path=path, fetcher=fetch, ttl_seconds=ttl)
+    except Exception:
+        return None
+
+
 # ── Version comparison (fail-closed: uncertain → no banner) ─────────────────────────
 
 _CLEAN_RELEASE_RE = re.compile(r"^\d+(?:\.\d+)*$")
@@ -328,7 +358,7 @@ def format_banner(*, buddhi_latest: Optional[str] = None,
     parts: List[str] = []
     if buddhi_latest:
         have = f" (you have {current})" if current else ""
-        parts.append(f"buddhi-review {buddhi_latest}{have} — run: {_PIP_UPGRADE}")
+        parts.append(f"buddhi-review {buddhi_latest}{have} — run: {_UPGRADE_CMD}")
     if workflow_stale:
         parts.append(f"{workflow_label} is out of date — re-run {_SETUP_CMD} to update it")
     if not parts:
