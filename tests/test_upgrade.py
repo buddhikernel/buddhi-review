@@ -28,6 +28,7 @@ import argparse
 import ast
 import io
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -156,27 +157,56 @@ def test_uv_tool_upgrades_through_uv(tmp_path):
     assert [s.argv for s in plan.steps] == [("uv", "tool", "upgrade", "buddhi-review")]
 
 
-def test_uv_tool_recognised_from_the_layout_without_a_receipt(tmp_path):
+@pytest.mark.parametrize("parts", [
+    ("share", "uv", "tools", "buddhi-review"),   # the genuine uv tool layout…
+    ("uv", "tools", "myproject"),                # …which an ordinary venv may also use
+    ("dev", "uv", "tools", ".venv"),
+])
+def test_the_uv_layout_alone_is_not_enough_without_the_receipt(tmp_path, parts):
+    """A uv tool environment and an ordinary venv kept at the same path are
+    indistinguishable by path alone. Guessing "uv tool" from the layout risks a QUIET
+    wrong answer: ``uv tool upgrade`` would upgrade whatever uv manages (or nothing) and
+    exit 0, and we would report success while the environment actually in use stayed
+    untouched. Without the receipt this falls to the venv branch, which upgrades the
+    environment we are really running in."""
+    prefix = tmp_path.joinpath(*parts)
+    prefix.mkdir(parents=True)
+    plan = _detect(tmp_path, prefix=str(prefix), base_prefix=str(tmp_path / "base"))
+    assert plan.method == updaters.VENV
+    assert all(step.argv[0] != "uv" for step in plan.steps)
+
+
+def test_the_uv_receipt_is_what_identifies_a_uv_tool(tmp_path):
     prefix = tmp_path / "share" / "uv" / "tools" / "buddhi-review"
     prefix.mkdir(parents=True)
+    (prefix / "uv-receipt.toml").write_text("")
     plan = _detect(tmp_path, prefix=str(prefix), base_prefix=str(tmp_path / "base"))
     assert plan.method == updaters.UV_TOOL and plan.notify_only is False
 
 
 @pytest.mark.parametrize("prefix_parts", [
-    ("home", "tools", "uv", "venv"),      # a plain venv kept under a "tools" dir
+    ("home", "tools", "uv", "venv"),       # a plain venv kept under a "tools" dir
     ("srv", "uv", "tools-backup", "env"),  # "tools-backup" is not the uv tools dir
     ("opt", "tools", "venv"),
 ])
 def test_a_plain_venv_is_not_mistaken_for_a_uv_tool(tmp_path, prefix_parts):
-    """A loose "the path mentions uv and tools somewhere" test would route an ordinary
-    virtualenv to ``uv tool upgrade``, which at best fails and at worst upgrades a
-    DIFFERENT, uv-managed copy while leaving the environment in use untouched."""
     prefix = tmp_path.joinpath(*prefix_parts)
     prefix.mkdir(parents=True)
     plan = _detect(tmp_path, prefix=str(prefix), base_prefix=str(tmp_path / "base"))
     assert plan.method == updaters.VENV
     assert all(step.argv[0] != "uv" for step in plan.steps)
+
+
+def test_an_unreadable_marker_directory_never_raises(tmp_path, monkeypatch):
+    """Each marker probe runs against a directory nobody promised us access to, and
+    ``Path.is_file`` re-raises EACCES/EPERM (it only swallows the not-there family). A
+    mode-000 parent on sys.prefix must read as "no marker", not take detection down."""
+    def _denied(self):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "is_file", _denied)
+    plan = _detect(tmp_path)                      # must not raise
+    assert plan.method == updaters.VENV
 
 
 def test_venv_upgrades_with_python_dash_m_pip(tmp_path):
@@ -470,13 +500,45 @@ def test_a_name_property_that_raises_never_breaks_discovery():
     assert any(isinstance(u, updaters.FreeUpdater) for u in found)
 
 
-def test_a_hostile_repr_never_escapes_the_failure_handler():
+class _HostileStr:
+    """A ``name`` value that explodes on every operation the caller might perform."""
+
+    def __eq__(self, other):
+        raise RuntimeError("hostile __eq__")
+
+    __hash__ = None
+
+    def __str__(self):
+        raise RuntimeError("hostile __str__")
+
+    def __format__(self, spec):
+        raise RuntimeError("hostile __format__")
+
+    def __repr__(self):
+        raise RuntimeError("hostile __repr__")
+
+
+def test_a_hostile_name_value_cannot_make_a_broken_entry_point_fatal():
+    """``_safe_name`` returns a str or None precisely so the identity test in discovery
+    — which sits outside the per-entry-point ``try`` — never runs third-party ``__eq__``.
+    A hostile value there would make a broken plugin FATAL, contradicting this seam's
+    whole "skipped, never fatal" guarantee."""
+    class _EP:
+        def load(self):
+            u = FakeUpdater(name="x")
+            u.name = _HostileStr()
+            return u
+
+    found = updaters.discover_updaters(entry_points_fn=lambda group: [_EP()])
+    assert any(isinstance(u, updaters.FreeUpdater) for u in found)
+
+
+@pytest.mark.parametrize("hostile", ["property", "value"])
+def test_a_hostile_name_never_escapes_the_failure_handler(hostile):
+    """The handler's message must not turn a HANDLED failure into an unhandled crash —
+    least of all here, just after a third-party updater began changing the install."""
     class _Hostile:
         priority = 5
-
-        @property
-        def name(self):
-            raise RuntimeError("no name for you")
 
         def is_active(self):
             return True
@@ -484,9 +546,21 @@ def test_a_hostile_repr_never_escapes_the_failure_handler():
         def run_update(self, plan, **opts):
             raise RuntimeError("boom")
 
+    if hostile == "property":
+        _Hostile.name = property(lambda self: (_ for _ in ()).throw(RuntimeError("no")))
+    else:
+        _Hostile.name = _HostileStr()
+
     plan = updaters.UpgradePlan(method=updaters.VENV, notify_only=False, reason="")
     outcome = updaters.perform_update(_Hostile(), plan)   # must not raise
     assert outcome.returncode == 1 and outcome.upgraded is False
+    assert isinstance(outcome.message, str)               # the message really rendered
+
+
+def test_safe_name_returns_a_string_or_none():
+    assert updaters._safe_name(updaters.FreeUpdater()) == "free"
+    assert updaters._safe_name(object()) is None          # no name at all
+    assert updaters._safe_name(FakeUpdater(name=_HostileStr())) is None  # not a str
 
 
 def test_a_non_int_priority_never_breaks_ordering():
@@ -636,7 +710,8 @@ def test_dry_run_executes_nothing(monkeypatch):
     assert rc == 0 and runner.calls == [] and execer.calls == []
     assert "[dry-run]" in out
     assert "-m pip install -U buddhi-review" in out          # the exact command
-    assert "-m buddhi_review.cli install-skills" in out      # and the re-sync that follows
+    assert "install-skills" in out                           # and the re-sync that follows
+    assert cli._RESYNC_PATH_PREAMBLE in out                  # spelled exactly as it runs
 
 
 def test_check_performs_no_upgrade(monkeypatch):
@@ -691,7 +766,7 @@ def test_a_successful_upgrade_re_execs_into_the_skill_resync(monkeypatch):
     assert [c[0] for c in runner.calls] == [
         (_PY, "-m", "pip", "install", "-U", "buddhi-review")]
     assert execer.calls == [
-        (sys.executable, [sys.executable, "-m", "buddhi_review.cli", "install-skills"])]
+        (sys.executable, [sys.executable, "-c", cli._RESYNC_CODE, "install-skills"])]
     assert "Re-syncing" in out
 
 
@@ -727,7 +802,7 @@ def test_a_failed_exec_names_the_command_and_exits_non_zero(monkeypatch):
     runner, execer = Runner(), Execer(on_call=_boom)
     rc, _out, err = _run_upgrade(monkeypatch, _venv_plan(), runner=runner, execer=execer)
     assert rc == 1
-    assert "-m buddhi_review.cli install-skills" in err
+    assert "install-skills" in err and cli._RESYNC_PATH_PREAMBLE in err
 
 
 def _package_bound_names(tree):
@@ -801,18 +876,35 @@ class _ImportRecorder:
 
 # The handler modules cli.py imports lazily — the ones a careless tail would newly
 # import. Evicted before the probe so this test cannot go quiet just because a sibling
-# test module happened to import one of them first.
+# test (or an earlier test in this very file) already warmed one.
 _LAZY_HANDLER_MODULES = (
     "buddhi_review.skill_install", "buddhi_review.open_pr", "buddhi_review.wizard",
     "buddhi_review.rebase_gate", "buddhi_review.git_guardrail_hook",
 )
 
 
-def test_no_package_import_happens_between_the_upgrade_and_the_re_exec(monkeypatch):
-    """The runtime half of the torn-state guard: a real ``_upgrade`` call performs no
-    fresh package import after the upgrade subprocess returns."""
+def _evict(monkeypatch):
+    """Make a fresh import of each lazily-imported handler observable.
+
+    Dropping the ``sys.modules`` entry is NOT enough: importing a submodule also binds it
+    as an ATTRIBUTE of the parent package, and ``from buddhi_review import skill_install``
+    is satisfied by that surviving attribute without ever consulting ``sys.meta_path``.
+    With only the ``sys.modules`` half evicted the recorder below sees nothing and the
+    test passes against code that really does re-import. Both halves have to go."""
+    import buddhi_review as _pkg
+
     for name in _LAZY_HANDLER_MODULES:
         monkeypatch.delitem(sys.modules, name, raising=False)
+        monkeypatch.delattr(_pkg, name.rsplit(".", 1)[1], raising=False)
+
+
+def test_no_package_import_happens_between_the_upgrade_and_the_re_exec(monkeypatch):
+    """The runtime half of the torn-state guard: a real ``_upgrade`` call performs no
+    fresh package import after the upgrade subprocess returns.
+
+    This is what catches an import the static check cannot see — one made inside a helper
+    the tail merely CALLS, where the tail's own syntax stays clean."""
+    _evict(monkeypatch)
     recorder = _ImportRecorder()
     monkeypatch.setattr(sys, "meta_path", [recorder] + list(sys.meta_path))
     seen_at_exec = []
@@ -837,8 +929,41 @@ def test_the_re_exec_target_is_a_minimal_install_skills(monkeypatch):
     _run_upgrade(monkeypatch, _venv_plan(), runner=Runner(), execer=execer)
     _path, argv = execer.calls[0]
     # A bare install-skills: no --force, so a user's edited skill is never clobbered.
-    assert argv[1:] == ["-m", "buddhi_review.cli", "install-skills"]
+    assert argv[0] == sys.executable
+    assert argv[1] == "-c" and argv[3:] == ["install-skills"]
     assert "--force" not in argv
+    # ``-m`` would put the caller's cwd on sys.path ahead of the installed package.
+    assert "-m" not in argv
+
+
+def test_the_re_exec_cannot_resolve_a_buddhi_review_in_the_callers_cwd(tmp_path):
+    """The re-sync must resolve the INSTALLED package, whatever directory the user
+    happened to run ``upgrade`` from. Any clone or worktree checkout contains a
+    ``buddhi_review/`` folder, and re-syncing from one would stamp that tree's version
+    into the installed skills and report success."""
+    shadow = tmp_path / "buddhi_review"
+    shadow.mkdir()
+    (shadow / "__init__.py").write_text("__file__marker__ = 'shadow'\n", encoding="utf-8")
+    probe = "import buddhi_review; print(buddhi_review.__file__)"
+
+    def _resolved(code):
+        proc = subprocess.run([sys.executable, "-c", code], cwd=str(tmp_path),
+                              capture_output=True, text=True)
+        assert proc.returncode == 0, proc.stderr
+        return proc.stdout.strip()
+
+    # Control: without the preamble the shadow really does win, so this test has teeth.
+    assert _resolved(probe).startswith(str(tmp_path))
+    # The real constant's path hygiene, verbatim, resolves the installed package instead.
+    assert not _resolved(cli._RESYNC_PATH_PREAMBLE + probe).startswith(str(tmp_path))
+
+
+def test_the_resync_code_runs_install_skills_through_the_hygienic_preamble():
+    """Pin the two halves together: the payload the command execs is the preamble the
+    test above proves, plus the install-skills entry — no second, unproven spelling."""
+    assert cli._RESYNC_CODE.startswith(cli._RESYNC_PATH_PREAMBLE)
+    assert "from buddhi_review.cli import main" in cli._RESYNC_CODE
+    assert "main(sys.argv[1:])" in cli._RESYNC_CODE
 
 
 def test_an_installed_updater_cannot_bypass_the_safety_gate(monkeypatch):

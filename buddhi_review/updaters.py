@@ -200,32 +200,41 @@ def _editable_source(dist: Any) -> Optional[str]:
     return path or None
 
 
-def _is_uv_tool(prefix: Path) -> bool:
-    """True for a uv-managed tool environment: uv drops a receipt at the tool root, and
-    the layout is exactly ``…/uv/tools/<name>``. Either signal is enough.
+def _is_file(path: Path) -> bool:
+    """``path.is_file()``, with EVERY ``OSError`` read as "no".
 
-    The layout test is anchored to the LAST two parent components on purpose. A loose
-    "does the path mention uv and tools anywhere" test matches an ordinary virtualenv at
-    a path like ``~/tools/uv/venv`` and would send it to ``uv tool upgrade``, which at
-    best fails and at worst upgrades a DIFFERENT, uv-managed copy while leaving the
-    environment the user is actually running untouched."""
+    ``Path.is_file`` only swallows the not-there family (ENOENT / ENOTDIR / EBADF /
+    ELOOP); a permission error on a parent directory (EACCES / EPERM) propagates. Each
+    of these probes runs against a directory nobody promised us access to, so an
+    unreadable parent must read as "this marker is absent" rather than take detection
+    down with an exception. Every marker probe goes through here so no one of them can
+    drift back to the bare call."""
     try:
-        if (prefix / _UV_TOOL_MARKER).is_file():
-            return True
+        return path.is_file()
     except OSError:
-        pass
-    parents = prefix.parents
-    return (len(parents) >= 2
-            and parents[0].name.lower() == "tools"
-            and parents[1].name.lower() == "uv")
+        return False
+
+
+def _is_uv_tool(prefix: Path) -> bool:
+    """True for a uv-managed tool environment, identified SOLELY by uv's own receipt.
+
+    There is deliberately no path-shape fallback. A uv tool environment lives at
+    ``<uv-data>/tools/<name>``, but so may an ordinary virtualenv somebody chose to keep
+    there — the two are indistinguishable by path alone, so any layout heuristic tight
+    enough to be meaningful still mis-fires on a real venv at that path. The failure it
+    produces is quiet: ``uv tool upgrade`` would upgrade whatever uv manages (or
+    nothing) and exit 0, and we would report a successful upgrade while the environment
+    the user is actually running stayed untouched. The receipt is written by
+    ``uv tool install`` and is the one signal that positively identifies the
+    environment, so it is the only one consulted. A uv tool environment somehow missing
+    its receipt falls through to the venv branch, which pip-upgrades it in place — the
+    conservative, still-correct outcome."""
+    return _is_file(prefix / _UV_TOOL_MARKER)
 
 
 def _externally_managed(stdlib_dir: str) -> bool:
     """True when the PEP 668 ``EXTERNALLY-MANAGED`` marker sits beside the stdlib."""
-    try:
-        return (Path(stdlib_dir) / EXTERNALLY_MANAGED).is_file()
-    except OSError:
-        return False
+    return _is_file(Path(stdlib_dir) / EXTERNALLY_MANAGED)
 
 
 def _same_path(a: str, b: str) -> bool:
@@ -293,7 +302,7 @@ def detect_install_method(
     prefix_path = Path(prefix)
     if source_dir is not None:
         method = EDITABLE
-    elif (prefix_path / _PIPX_MARKER).is_file():
+    elif _is_file(prefix_path / _PIPX_MARKER):
         method = PIPX
     elif _is_uv_tool(prefix_path):
         method = UV_TOOL
@@ -572,15 +581,27 @@ def discover_updaters(*, entry_points_fn: Optional[Callable[[str], list]] = None
 
 
 def _safe_name(updater: Any) -> Optional[str]:
-    """An updater's ``name``, or ``None`` when it has none or reading it raises.
+    """An updater's ``name`` as a plain ``str``, or ``None``.
 
-    ``getattr(obj, "name", default)`` only swallows :class:`AttributeError`, so a
-    third-party updater whose ``name`` is a property that raises anything else would
-    otherwise take the whole command down from inside discovery."""
+    Two distinct third-party hazards are closed here, and returning the RAW value would
+    leave both open:
+
+      * ``getattr(obj, "name", default)`` only swallows :class:`AttributeError`, so a
+        ``name`` property raising anything else would take the command down;
+      * a non-string value carries the caller's own operations into third-party code —
+        its ``__eq__`` runs in :func:`discover_updaters`' identity test (outside any
+        ``try``, which would make a broken entry point FATAL and break this module's
+        "skipped, never fatal" invariant) and its ``__str__`` / ``__format__`` runs in
+        the failure handler's message (turning a HANDLED failure into an unhandled
+        crash, immediately after an updater has begun changing the install).
+
+    Coercing to ``str`` or ``None`` means every downstream use touches only built-in
+    behaviour."""
     try:
-        return getattr(updater, "name", None)
+        value = getattr(updater, "name", None)
     except Exception:
         return None
+    return value if isinstance(value, str) else None
 
 
 def _is_active(updater: Updater) -> bool:
@@ -637,9 +658,11 @@ def perform_update(updater: Updater, plan: UpgradePlan, **opts: Any) -> UpdateOu
     try:
         return _coerce_outcome(updater.run_update(plan, **opts))
     except Exception as exc:
-        # Every part of the message is built from something that cannot itself raise:
-        # a hostile ``name`` property or ``__repr__`` must not turn a handled failure
-        # into an unhandled one.
+        # Every part of the message is built from something that cannot itself raise: a
+        # hostile ``name`` (property, ``__str__``, or ``__format__``) or ``__repr__``
+        # must not turn a handled failure into an unhandled one — least of all here,
+        # just after a third-party updater has started changing the installation.
+        # ``object.__repr__`` is called unbound so an overridden ``__repr__`` is bypassed.
         name = _safe_name(updater) or object.__repr__(updater)
         try:
             detail = repr(exc)

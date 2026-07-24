@@ -218,9 +218,24 @@ def discover_backends(*, entry_points_fn: Optional[Callable[[str], list]] = None
         except Exception:
             continue
         found.append(backend)
-    if not any(getattr(b, "name", None) == FreeBackend.name for b in found):
+    if not any(_safe_name(b) == FreeBackend.name for b in found):
         found.append(FreeBackend())
     return found
+
+
+def _safe_name(backend: Any) -> Optional[str]:
+    """A backend's ``name`` as a plain ``str``, or ``None``.
+
+    The bare ``getattr(b, "name", None) == FreeBackend.name`` this replaces sat OUTSIDE
+    the per-entry-point ``try``, so a third-party backend whose ``name`` raises on access
+    — or whose value carries a raising ``__eq__`` — made a broken entry point FATAL,
+    contradicting the "skipped, never fatal" guarantee this whole function exists to
+    provide. Coercing to ``str`` or ``None`` keeps the comparison on built-in behaviour."""
+    try:
+        value = getattr(backend, "name", None)
+    except Exception:
+        return None
+    return value if isinstance(value, str) else None
 
 
 def _is_active(backend: Backend) -> bool:

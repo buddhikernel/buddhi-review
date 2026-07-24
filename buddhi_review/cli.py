@@ -354,10 +354,22 @@ def _install_skills(args: argparse.Namespace) -> int:
 
 
 # ── upgrade ────────────────────────────────────────────────────────────────────────
-# The command this one re-execs into once the package on disk has been replaced. It is
-# spelled as a plain module-level string so the post-upgrade path can be assembled from
-# constants alone — see the torn-state note in :func:`_upgrade`.
-_RESYNC_MODULE = "buddhi_review.cli"
+# What ``upgrade`` re-execs into once the package on disk has been replaced. Spelled as
+# plain module-level strings so the post-upgrade path is assembled from constants alone
+# — see the torn-state note in :func:`_upgrade`.
+#
+# The obvious spelling, ``-m buddhi_review.cli``, is WRONG here: ``-m`` puts the current
+# working directory on ``sys.path`` ahead of everything else, which the console script
+# that launched ``upgrade`` never did. Upgrading while cwd'd into any directory that
+# happens to contain a ``buddhi_review/`` folder — any clone of this repo, any worktree —
+# would silently re-sync the skills from THAT tree and stamp its version into the
+# installed files, reporting success. ``-c`` prepends the cwd the same way, so the
+# payload drops ``sys.path[0]`` before importing anything: the re-sync then resolves the
+# package exactly as the console script would. (``-P`` / ``PYTHONSAFEPATH`` do this
+# natively but only from 3.11; this package supports 3.9.)
+_RESYNC_PATH_PREAMBLE = "import sys; sys.path.pop(0); "
+_RESYNC_CODE = (_RESYNC_PATH_PREAMBLE
+                + "from buddhi_review.cli import main; sys.exit(main(sys.argv[1:]))")
 
 
 def _upgrade_check(plan, *, out: TextIO,
@@ -428,7 +440,7 @@ def _upgrade(args: argparse.Namespace, *,
         print("\n[dry-run] would run:", file=out)
         for step in plan.steps:
             print(f"    {step.display()}", file=out)
-        print(f"    {shlex.join([sys.executable, '-m', _RESYNC_MODULE, 'install-skills'])}",
+        print(f"    {shlex.join([sys.executable, '-c', _RESYNC_CODE, 'install-skills'])}",
               file=out)
         print("\n[dry-run] nothing was run.", file=out)
         return 0
@@ -442,7 +454,7 @@ def _upgrade(args: argparse.Namespace, *,
     # plain local FIRST, and between the upgrade returning and the exec there are ZERO
     # buddhi_review imports and zero attribute reads on the package.
     python = sys.executable
-    resync_argv = [python, "-m", _RESYNC_MODULE, "install-skills"]
+    resync_argv = [python, "-c", _RESYNC_CODE, "install-skills"]
     resync_display = shlex.join(resync_argv)
     execv = execer if execer is not None else os.execv
     manual = list(plan.manual)
