@@ -131,7 +131,7 @@ your repo's marker files; it installs nothing and hits no network).
 
 | Where it looks | What it accepts |
 |---|---|
-| The command itself | `pytest` / `py.test`, `python -m pytest\|unittest\|nose2\|tox\|nox`, `manage.py test`, `tox`, `nox`, `jest`, `vitest`, `mocha`, `jasmine`, `karma`, `ng test`, `node --test`, `ava`, `bun test`, `deno test`, `go test`, `cargo test`, `cargo nextest run`, `mvn` / `mvnw`, `gradle` / `gradlew`, `mix test`, `dotnet test`, `rspec`, `phpunit`, `pest`, `ctest`, `swift test`, `dart test`, `flutter test` |
+| The command itself | `pytest` / `py.test`, `python -m {pytest,unittest,nose2,tox,nox}`, `manage.py test`, `tox`, `nox`, `jest`, `vitest`, `mocha`, `jasmine`, `karma`, `ng test`, `node --test`, `ava`, `bun test`, `deno test`, `go test`, `cargo test`, `cargo nextest run`, `mvn` / `mvnw`, `gradle` / `gradlew`, `mix test`, `dotnet test`, `rspec`, `phpunit`, `pest`, `ctest`, `swift test`, `dart test`, `flutter test` |
 | Through a launcher | `npx` / `bunx` / `pnpx`, and `bundle exec` / `poetry run` / `uv run` / `pipenv run` / `rye run` / `pdm run` |
 | Through a package script | `npm test` (and the `t` / `tst` aliases), `npm run <name>` / `run-script`, and the same shapes for `yarn`, `pnpm`, and `bun` — resolved through your `package.json` `scripts` to the real runner, following one script to another when a script just calls a second script |
 | Through a shell string | `bash -lc "<cmd>"`, including a leading `cd`, an env prefix (`CI=1 …`), or an earlier `&&` step, as long as the string names exactly one recognised runner |
