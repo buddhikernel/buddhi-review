@@ -435,7 +435,11 @@ def _editable_plan(source_dir: str, *, python: str,
         steps=(
             # A failed pull leaves the checkout exactly as it was, so it degrades to
             # the same manual guidance instead of reporting a broken upgrade.
-            Step(("git", "-C", source_dir, "pull"), cwd=source_dir, soft_fail=True),
+            # --ff-only: a plain `pull` obeys the user's merge/rebase config, which can
+            # create a merge commit, rewrite local commits, or leave conflict markers —
+            # none of which match the soft_fail message below. --ff-only either fast-
+            # forwards cleanly or aborts untouched, so "nothing was changed" stays true.
+            Step(("git", "-C", source_dir, "pull", "--ff-only"), cwd=source_dir, soft_fail=True),
             Step((python, "-m", "pip", "install", "-e", source_dir), cwd=source_dir),
         ),
         manual=manual,

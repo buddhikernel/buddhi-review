@@ -120,7 +120,7 @@ def test_editable_pulls_then_reinstalls_in_place(tmp_path):
     assert plan.method == updaters.EDITABLE and plan.notify_only is False
     assert plan.source_dir == str(src)
     assert [s.argv for s in plan.steps] == [
-        ("git", "-C", str(src), "pull"),
+        ("git", "-C", str(src), "pull", "--ff-only"),
         (_PY, "-m", "pip", "install", "-e", str(src)),
     ]
     # A failed pull leaves the checkout untouched → the soft outcome, not a broken upgrade.
