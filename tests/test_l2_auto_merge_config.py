@@ -363,4 +363,4 @@ def test_wizard_default_delegates_to_config_auto_merge(monkeypatch):
 
     monkeypatch.setattr(config, "auto_merge", _fake)
     assert wizard._repo_auto_merge_default(_ON_CFG, REPO) is sentinel
-    assert seen["args"] == (_ON_CFG, REPO)
+    assert seen.get("args") == (_ON_CFG, REPO)
