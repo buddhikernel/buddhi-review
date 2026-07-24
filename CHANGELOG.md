@@ -21,6 +21,22 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.8.0](https://github.com/buddhikernel/buddhi-review/compare/v0.7.0...v0.8.0) (2026-07-24)
+
+
+### Features
+
+* **cli:** F3a — upgrade command + updaters entry-point seam ([#100](https://github.com/buddhikernel/buddhi-review/issues/100)) ([477f43c](https://github.com/buddhikernel/buddhi-review/commit/477f43ca242cf5b9f6c735e2fb24267d4df591e6))
+* **gate:** F3 — mirror the post-P10b test-runner detection layer into OSS + document the tiers ([#99](https://github.com/buddhikernel/buddhi-review/issues/99)) ([1f73415](https://github.com/buddhikernel/buddhi-review/commit/1f734154a22549f3fdba924b7da007e65d995aba))
+
+
+### Bug Fixes
+
+* **ci:** restore the canonical workflow from the shipped template — main is red and the private master had been installed ([#96](https://github.com/buddhikernel/buddhi-review/issues/96)) ([ffd863d](https://github.com/buddhikernel/buddhi-review/commit/ffd863d9a73f411ba2a066daad4379a215d14cb6))
+* **install:** F6 — the prune can never delete a currently-bundled file ([#92](https://github.com/buddhikernel/buddhi-review/issues/92)) ([cf5c587](https://github.com/buddhikernel/buddhi-review/commit/cf5c5873b5fa5b48fe35522d2bdc80d8b96ff811))
+* **install:** F9 — the bundled-tree loop can never raise or hang ([#101](https://github.com/buddhikernel/buddhi-review/issues/101)) ([ef20a25](https://github.com/buddhikernel/buddhi-review/commit/ef20a2546251a1ac8885d4fe32d6dfbf22ea4721))
+* **loop:** F2 — HEAD-aware never-merge-unreviewed gate (substantive-strict) ([#93](https://github.com/buddhikernel/buddhi-review/issues/93)) ([eff576a](https://github.com/buddhikernel/buddhi-review/commit/eff576a08637de9fa381dc17b7612faac3fa608c))
+
 ## [0.7.0](https://github.com/buddhikernel/buddhi-review/compare/v0.6.0...v0.7.0) (2026-07-22)
 
 
