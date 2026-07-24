@@ -196,6 +196,11 @@ _LAUNCHERS = ("npx", "bunx", "pnpx")
 _LAUNCHER_PAIRS = (("bundle", "exec"), ("poetry", "run"), ("uv", "run"),
                    ("pipenv", "run"), ("rye", "run"), ("pdm", "run"))
 
+#: npm's documented `-y`/`--yes` flag suppresses npx's install-confirmation prompt
+#: (`npx -y <pkg>` / `npx --yes <pkg>`) — it precedes the runner token, not the
+#: runner itself, so it must be dropped alongside the launcher.
+_NPX_NONINTERACTIVE_FLAGS = ("-y", "--yes")
+
 #: Env-setting launchers that wrap a real runner (`cross-env NODE_ENV=test jest`,
 #: `env FOO=1 pytest`). Stripped — along with any leading `VAR=value` shell
 #: assignments — so the underlying runner token is exposed. `cross-env-shell` /
@@ -227,6 +232,8 @@ def _strip_launchers(argv: list) -> list:
         if head in _LAUNCHERS:
             toks = toks[1:]
             changed = True
+            while toks and _basename_token(toks[0]) in _NPX_NONINTERACTIVE_FLAGS:
+                toks = toks[1:]
             continue
         if len(toks) >= 2:
             for a, b in _LAUNCHER_PAIRS:
@@ -2245,9 +2252,15 @@ def _classify_catch2(rc: int, out: str) -> str:
 
 def _classify_gtest(rc: int, out: str) -> str:
     # GoogleTest EXITS 0 when zero tests match a filter unless
-    # --gtest_fail_if_no_test_selected is set — parse the "0 tests" banner.
+    # --gtest_fail_if_no_test_selected is set — parse the "0 tests" banner. Gated on
+    # the absence of a real "[  PASSED/FAILED  ] N tests" summary (nonzero N) so a
+    # suite that actually ran and failed — but whose OWN output happens to echo a
+    # zero-tests marker (e.g. a wrapper/snapshot test quoting another empty run) —
+    # can't be masked as an empty run. Same run-evidence guard shape as the
+    # jest/vitest/mocha/jasmine classifiers above.
     if _has(out, r"No tests were found", r"0 tests from 0 test (?:suites|cases)",
-            r"\[  PASSED  \] 0 tests", r"Running 0 tests"):
+            r"\[  PASSED  \] 0 tests", r"Running 0 tests") and not _has(
+            out, r"\[  (?:PASSED|FAILED)  \] [1-9]"):
         return NO_TESTS
     if _has(out, r"\[  FAILED  \]") and rc == 0:
         # defensive: a FAILED banner with rc 0 shouldn't happen, but never green it.

@@ -484,6 +484,12 @@ _CLASSIFY_CASES = [
     ("gtest-pass", tr.GTEST, 0, "[==========] 10 tests from 2 test suites ran.\n[  PASSED  ] 10 tests.", tr.PASSED),
     ("gtest-fail", tr.GTEST, 1, "[  FAILED  ] 1 test, listed below:", tr.FAILED),
     ("gtest-no-tests-exit0", tr.GTEST, 0, "[==========] 0 tests from 0 test suites ran.", tr.NO_TESTS),
+    # A real, failing run whose OWN output happens to quote "Running 0 tests" (e.g. a
+    # wrapper/snapshot test asserting on captured subprocess text) must NOT be masked
+    # as an empty run — the genuine "[  FAILED  ] N tests" summary is real-run evidence.
+    ("gtest-fail-with-embedded-zero-marker", tr.GTEST, 1,
+     "Wrapper.SnapshotMatchesEmptyRun ... FAILED\nExpected substring: \"Running 0 tests from 0 test suites.\"\n\n[  FAILED  ] 1 test, listed below:\n[  FAILED  ] Wrapper.SnapshotMatchesEmptyRun\n",
+     tr.FAILED),
     ("catch2-pass", tr.CATCH2, 0, "All tests passed (12 assertions in 3 test cases)", tr.PASSED),
     ("catch2-fail-42", tr.CATCH2, 42, "test cases: 3 | 2 passed | 1 failed", tr.FAILED),
     ("catch2-no-tests-2", tr.CATCH2, 2, "No test cases matched", tr.NO_TESTS),
@@ -1258,16 +1264,15 @@ class TestGateNoTestsSkip:
         assert "gate SKIPPED" in out and "not green" in out
 
     def test_npx_yes_flag_jasmine_no_tests_skips_not_green(self, monkeypatch, capsys):
-        # `npx --yes jasmine`: the `--yes` flag hides the runner token, so detection
-        # stays an opaque wrapper (UNKNOWN) — but the generic no-tests marker net
-        # still refuses to green the silent "No specs found" rc==0 run. The gate
-        # SKIPs loudly; the posture holds even without per-runner attribution.
+        # `npx -y jasmine` / `npx --yes jasmine` (npm's noninteractive flag) must
+        # still resolve to jasmine, not fall through to UNKNOWN's generic classifier
+        # (which would false-green a silent "No specs found" rc==0 run).
         monkeypatch.setenv("BUDDHI_TEST_COMMAND", "npx --yes jasmine")
         status, tail = commit_push.run_test_gate(
             "/w", run=_run_returning(0, "Started\nNo specs found\n"), notice=_silent)
         assert status == "skipped"
         assert tail == ""
-        assert "no tests detected for unknown" in capsys.readouterr().out
+        assert "no tests detected for jasmine" in capsys.readouterr().out
 
     def test_python_dash_i_dash_m_pytest_exit5_is_skip_not_red(self, monkeypatch, capsys):
         # `python -I -m pytest` (an interpreter option before `-m`) must still
