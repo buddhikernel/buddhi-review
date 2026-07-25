@@ -1206,9 +1206,10 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run,
     label-gated CI actually runs on it. Returns True iff the label is now on the
     PR (or the repo does not defer CI to the label, so none is needed).
 
-    ONLY attaches when the user has EXPLICITLY opted this repo into label-gated
-    CI — a repo whose CI runs on every push never gets a stray label. Two
-    independent sources say so, and EITHER is enough:
+    Attaches only when one of two opt-in signals says so, plus one fail-closed
+    exception described below: a repo whose CI runs on every push never gets a
+    stray label from an explicit opt-out or an absent config. Two independent
+    opt-in sources say so, and EITHER is enough:
 
     * ``opted_in`` — the choice made in THIS run (the per-repo step's
       double-confirm), passed down by the caller because it is not on disk yet
@@ -1232,7 +1233,12 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run,
     read, so ``label_gated_ci({}, repo)`` correctly reads as "off"); an unreadable
     config falls through to attempt the attach, so the outcome reflects what
     actually happened on the PR (and the caller's warning fires iff the attach
-    itself fails).
+    itself fails). NOTE: every current caller passes a real ``bool`` for
+    ``opted_in`` (``_flush_pending_ci_labels`` always forwards one, and the three
+    inline call sites only run when ``pending_ci_prs`` is ``None``, which no
+    production entry point does today), so this fallthrough is defense-in-depth
+    for a direct or future caller that omits ``opted_in`` — not something any
+    current user path exercises.
 
     That fail-closed fallthrough runs ONLY for ``opted_in is None`` — no signal at
     all. ``opted_in`` is three-valued, and an explicit ``False`` (the user answered
@@ -1951,10 +1957,14 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
         # On an UPDATE the probe above proved the gate is already live on the
         # default branch — the same unlabeled-CI exposure as the other managed-file
         # update PRs (#94), so this PR needs the label too. A fresh install has no
-        # existing gate to react to the label yet, so attaching it here is a
-        # harmless no-op; unconditional mirrors the other two offers' simpler
-        # always-append shape. See the docstring for why this mirrors
-        # _offer_update_managed_file's attach.
+        # existing gate on the default branch — but GitHub resolves `pull_request`
+        # workflows from the PR's OWN head branch, and this PR's head branch is
+        # exactly where the gate file just landed, so labeling this PR DOES fire
+        # the brand-new workflow on itself. Attaching the label here is therefore
+        # not a no-op; it's the desired behavior (the freshly baked `run:` line
+        # gets exercised before this PR merges), and unconditional mirrors the
+        # other two offers' simpler always-append shape. See the docstring for
+        # why this mirrors _offer_update_managed_file's attach.
         if pending_ci_prs is not None:
             pending_ci_prs.append(detail)
         elif not _attach_ready_for_ci(repo, detail, run=run, sleep=sleep,
