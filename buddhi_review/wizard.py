@@ -56,7 +56,7 @@ try:  # PyYAML is a hard dep of the package; guard so import never explodes.
 except ImportError:  # pragma: no cover
     yaml = None  # type: ignore[assignment]
 
-from buddhi_review import (config, detectors, managed_files, plan_profile,
+from buddhi_review import (config, detectors, managed_files, merge, plan_profile,
                            pro_trial, setup_launcher, shell_env, upsell)
 from buddhi_review.transparency import _colour_enabled
 
@@ -64,11 +64,12 @@ _GH_MIN = (2, 87)
 _REVIEWERS = ("copilot", "gemini", "codex", "claude")
 _GITHUB_APP_BOTS = ("copilot", "gemini", "codex")  # claude is workflow/mention-driven
 _MODEL_TIERS = ("opus", "sonnet", "haiku")
-# Mirrors buddhi_review.merge's LABEL_ADD_ATTEMPTS/LABEL_ADD_BACKOFF_S: the label
-# ADD is retried with linear backoff so a transient gh/GitHub blip doesn't leave
-# the update PR unlabeled; the `gh label create` bootstrap stays single-shot.
-_LABEL_ADD_ATTEMPTS = 3
-_LABEL_ADD_BACKOFF_S = 2.0
+# Single-sourced from the merge loop's land-time attach (buddhi_review.merge) — one
+# retry budget, not two that could silently drift apart. The label ADD is retried
+# with linear backoff so a transient gh/GitHub blip doesn't leave the update PR
+# unlabeled; the `gh label create` bootstrap stays single-shot.
+_LABEL_ADD_ATTEMPTS = merge.LABEL_ADD_ATTEMPTS
+_LABEL_ADD_BACKOFF_S = merge.LABEL_ADD_BACKOFF_S
 
 # Each locked teaser is a single-line, single-BENEFIT contextual upgrade nudge
 # (exec-plan §E: one of the sanctioned paid-reference surfaces in OSS, not the
@@ -1073,9 +1074,11 @@ _REVERT_NOTE = ("Your previous version is preserved in the PR's git history — 
                 "revert the PR to roll back.")
 
 # The ONLY user-visible signal that an update PR may merge without its CI having
-# run. Shared by the inline attach and the deferred flush so both read identically.
-_LABEL_ATTACH_WARN = ("Couldn't attach the ready-for-ci label — label-gated CI "
-                      "may not run on this update PR. You can add it by hand.")
+# run. Shared by the inline attach and the deferred flush so both read identically;
+# the PR ref is interpolated so a multi-PR flush says WHICH PR needs the label.
+_LABEL_ATTACH_WARN = ("Couldn't attach the ready-for-ci label to {ref} — label-gated "
+                      "CI may not run on this update PR. Add it by hand: "
+                      "gh pr edit {ref} --add-label ready-for-ci")
 
 
 def _installed_managed_file_text(repo: Optional[str], dest_path: str, run) -> Optional[str]:
@@ -1168,7 +1171,7 @@ def _offer_update_managed_file(repo: str, default: Optional[str], spec: Dict[str
             pending_ci_prs.append(detail)
         elif not _attach_ready_for_ci(repo, detail, run=run, sleep=sleep,
                                       cfg_path=cfg_path):
-            _row("warn", _LABEL_ATTACH_WARN, pal, stream)
+            _row("warn", _LABEL_ATTACH_WARN.format(ref=detail), pal, stream)
         return "pr"
     _row("warn", f"Couldn't open the update PR automatically ({detail}). You can copy "
                  f"the bundled {name} in by hand.", pal, stream)
@@ -1267,11 +1270,15 @@ def _flush_pending_ci_labels(repo: str, pr_refs: Sequence[str], *, opted_in: boo
     for ref in pr_refs:
         if not _attach_ready_for_ci(repo, ref, run=run, sleep=sleep,
                                     cfg_path=cfg_path, opted_in=opted_in):
-            _row("warn", _LABEL_ATTACH_WARN, pal, stream)
+            _row("warn", _LABEL_ATTACH_WARN.format(ref=ref), pal, stream)
 
 
 def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, stream,
-                                   input_fn=input) -> Optional[str]:
+                                   input_fn=input,
+                                   sleep: Callable[[float], None] = time.sleep,
+                                   cfg_path: Optional[Path] = None,
+                                   pending_ci_prs: Optional[List[str]] = None
+                                   ) -> Optional[str]:
     """Offer to install ``claude-code-review.yml`` when it is absent from the
     default branch. An issue_comment workflow runs ONLY from the default branch, so
     a silent write into a feature checkout never enables reviews. On a feature
@@ -1279,7 +1286,15 @@ def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, s
     workflow on the default branch on a fresh branch, leaving the local checkout
     untouched — and falls back to a local copy only if that fails or is declined.
     Returns ``'pr'`` (a PR was opened), ``True`` (written into the local checkout),
-    or ``None`` (nothing done)."""
+    or ``None`` (nothing done).
+
+    ``cfg_path`` and ``pending_ci_prs`` mirror :func:`_offer_update_managed_file`:
+    this install PR is, like the update PR, one the wizard just opened on the
+    default branch — on a repo whose CI defers to the ``ready-for-ci`` label it
+    would otherwise merge unlabeled and so unexercised (#94's shape via the
+    install path). ``pending_ci_prs``, when given, defers the attach to
+    :func:`_flush_pending_ci_labels`; otherwise the attach happens inline, decided
+    from the persisted config alone."""
     template = _workflow_template_path()
     if not template.exists():
         return None
@@ -1313,6 +1328,13 @@ def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, s
                 _row("info", f"Merge that PR to put the workflow on '{default}' (the "
                              "default branch), then set the CLAUDE_CODE_OAUTH_TOKEN "
                              "secret below.", pal, stream)
+                # Same unlabeled-CI exposure as the update-PR path (#94) — see the
+                # docstring for why this mirrors _offer_update_managed_file's attach.
+                if pending_ci_prs is not None:
+                    pending_ci_prs.append(detail)
+                elif not _attach_ready_for_ci(repo, detail, run=run, sleep=sleep,
+                                              cfg_path=cfg_path):
+                    _row("warn", _LABEL_ATTACH_WARN.format(ref=detail), pal, stream)
                 return "pr"
             _row("warn", f"Could not open the PR automatically ({detail}). Falling "
                          "back to a local copy you can land yourself.", pal, stream)
@@ -2358,9 +2380,11 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
     ``seed`` (when given — e.g. the per-repo confirm mode passes the global default)
     is the set of reviewers to PRESELECT; ``None`` preselects all four (the full
     wizard's first-run default). ``cfg_path`` (the run's resolved config path) and
-    ``pending_ci_prs`` (a sink for update-PR refs whose ``ready-for-ci`` label is
-    attached later, once this run's opt-in is known) are passed straight through to
-    :func:`_offer_update_managed_file`."""
+    ``pending_ci_prs`` (a sink for update-PR and install-PR refs whose ``ready-for-ci``
+    label is attached later, once this run's opt-in is known) are passed straight
+    through to :func:`_offer_update_managed_file` and
+    :func:`_offer_install_claude_workflow` — both open a PR the wizard just opened
+    on the default branch, so both are exposed to the same unlabeled-CI risk."""
     _panel("Step 5 — Reviewer fleet", [
         "Enable only the reviewers you have set up on this repo.",
         "EVERY reviewer you enable must already have its vendor GitHub app + plan "
@@ -2414,7 +2438,9 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
             if repo:
                 if not present:
                     _offer_install_claude_workflow(repo, cwd, run=run, pal=pal,
-                                                   stream=stream, input_fn=input_fn)
+                                                   stream=stream, input_fn=input_fn,
+                                                   cfg_path=cfg_path,
+                                                   pending_ci_prs=pending_ci_prs)
                 else:
                     # Present — but maybe an OLDER version. Offer an in-place update
                     # when the installed copy's `buddhi-managed-version` marker is

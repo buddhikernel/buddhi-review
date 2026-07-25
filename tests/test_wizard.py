@@ -1,4 +1,5 @@
 """The setup wizard — step gating (free vs locked teaser) + config keys written."""
+import base64
 import io
 import types
 from pathlib import Path
@@ -166,6 +167,127 @@ def test_full_run_confirms_the_bound_repo(monkeypatch, tmp_path):
     assert config.label_gated_ci(cfg, "acme/widgets") is False
     # The top-level global default still exists alongside the per-repo entry.
     assert config.has_global_default(cfg) is True
+
+
+# ── #94 via the full wizard.run() path (no --repo): a deferred update PR still gets
+# labeled ────────────────────────────────────────────────────────────────────────────
+# tests/test_managed_files.py proves the deferral for confirm_repo_interactive (the
+# `setup --repo <owner/repo>` lightweight path):
+# test_confirm_run_labels_the_update_pr_it_opened_before_the_optin. run() — the
+# no-arg, full-wizard, DEFAULT entry point — wires the exact same pending_ci_prs sink
+# through step_reviewers and flushes it after step_repo_label_gated_ci, but nothing
+# drove that path with a non-empty pending_ci_prs: every existing full-run test uses
+# either no TTY or an empty reviewer fleet, so the flush call always ran as a no-op
+# and a regression there (e.g. losing the flush) would leave the whole suite green.
+
+def _full_run_update_router(*, default="main", legacy=b"name: legacy claude workflow\n",
+                            pr_url="https://github.com/acme/widgets/pull/9"):
+    """Covers step_doctor's tooling probes AND a whole wizard.run() pass with a
+    Claude-only fleet: the claude workflow is PRESENT on the default branch but
+    unversioned (→ outdated, so the update PR is offered), and every gh call the
+    update path makes succeeds. Mirrors test_managed_files.py's ``_e2e_router``."""
+    installed_b64 = base64.b64encode(legacy).decode()
+
+    def run(argv, cwd=None, timeout=30, input=None):
+        argv = list(argv)
+        joined = " ".join(argv)
+        if argv[:2] == ["gh", "--version"]:
+            return types.SimpleNamespace(returncode=0, stdout="gh version 2.90.0 (2026-01-01)")
+        if argv[:3] == ["gh", "auth", "status"]:
+            return types.SimpleNamespace(returncode=1, stdout="")  # skip the secret walkthrough
+        if argv[:2] == ["git", "-C"] and "remote" in argv:
+            return types.SimpleNamespace(returncode=0, stdout="git@github.com:acme/widgets.git\n")
+        if argv[:2] == ["git", "-C"] and "rev-parse" in argv:
+            return types.SimpleNamespace(returncode=0, stdout="")
+        if argv and (argv[0] == "claude" or str(argv[0]).endswith("claude")):
+            return types.SimpleNamespace(returncode=0, stdout="pong")
+        if argv[:3] == ["gh", "repo", "view"]:
+            return types.SimpleNamespace(returncode=0, stdout=default + "\n")
+        if argv[:2] == ["gh", "pr"]:
+            return types.SimpleNamespace(returncode=0, stdout=pr_url + "\n")
+        if argv[:2] == ["gh", "api"]:
+            if "-X" in argv and "PUT" in argv:
+                return types.SimpleNamespace(returncode=0)
+            if "claude-code-review.yml" in joined and ".content" in argv:
+                return types.SimpleNamespace(returncode=0, stdout=installed_b64 + "\n")
+            if "/git/ref/heads/" in joined and "--jq" in argv:
+                return types.SimpleNamespace(returncode=0, stdout="cafe\n")
+            if argv[2].endswith("/git/refs"):
+                return types.SimpleNamespace(returncode=0)
+            if "contents/" in joined and ".sha" in argv:
+                return types.SimpleNamespace(returncode=0, stdout="blob123\n")
+        return types.SimpleNamespace(returncode=0, stdout="")
+
+    return run
+
+
+def _drive_full_run_with_update(monkeypatch, tmp_path, *, lgc_on):
+    """wizard.run() (no --repo, inferred as acme/widgets): Claude confirmed installed,
+    the outdated workflow updated by PR, and label-gated CI answered ``lgc_on`` — the
+    answer the reviewer step could not see when it opened that PR."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)   # for _ask_yes_no
+    # The gate installer has its own suite (tests/test_wizard_ready_for_ci.py); this
+    # test is about the label on the UPDATE PR, so keep it out of the router.
+    monkeypatch.setattr(wizard, "_offer_install_ready_for_ci", lambda *a, **k: None)
+    calls = []
+    base_run = _full_run_update_router()
+
+    def run_with_cwd(argv, cwd=None, timeout=30, input=None):
+        argv = list(argv)
+        calls.append(argv)
+        if argv[:2] == ["git", "-C"] and "rev-parse" in argv and "--show-toplevel" in argv:
+            return types.SimpleNamespace(returncode=0, stdout=str(tmp_path) + "\n")
+        return base_run(argv, cwd=cwd, timeout=timeout, input=input)
+
+    def ss(prompt, options, *, preselect=0, **kw):
+        for key, idx in {"reviewer is installed": 1,
+                         "Auto-merge default for": 0,
+                         "Label-gated CI default for": 1 if lgc_on else 0,
+                         "Confirm: enable label-gated CI": 1}.items():
+            if key in prompt:
+                return idx
+        return preselect
+
+    cfg_path = tmp_path / "config.yaml"
+    buf = io.StringIO()
+    rc = wizard.run(
+        config_path=cfg_path, run=run_with_cwd,
+        which=lambda x: "/bin/claude" if x == "claude" else None,
+        single_select=ss, multi_select=lambda *a, **k: {3},   # claude only
+        getpass_fn=lambda *a: "", spawn_command=lambda *a, **k: {"spawned": False},
+        input_fn=lambda *a, **k: "y", stream=buf)
+    return rc, buf.getvalue(), calls, cfg_path
+
+
+def test_full_run_labels_the_update_pr_it_opened_before_the_optin(monkeypatch, tmp_path):
+    """#94 via the DEFAULT entry point: step_reviewers opens the outdated
+    claude-code-review.yml update PR BEFORE step_repo_label_gated_ci is asked.
+    Opting in seconds later must still get the ready-for-ci label onto that PR —
+    otherwise `buddhi-review setup` with no --repo regresses to #94 even though the
+    lightweight --repo path is fixed."""
+    rc, _, calls, cfg_path = _drive_full_run_with_update(monkeypatch, tmp_path, lgc_on=True)
+    assert rc == 0
+    cfg = wizard.config.load_config(cfg_path)
+    assert wizard.config.label_gated_ci(cfg, "acme/widgets") is True
+    creates = [c for c in calls if c[:3] == ["gh", "pr", "create"]]
+    edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert len(creates) == 1, calls          # the update PR was opened
+    assert len(edits) == 1, calls            # …and then labeled
+    assert "--add-label" in edits[0] and "ready-for-ci" in edits[0]
+    assert calls.index(creates[0]) < calls.index(edits[0])
+
+
+def test_full_run_without_the_optin_leaves_the_update_pr_unlabeled(monkeypatch, tmp_path):
+    """The same full-wizard run, label-gated CI declined and nothing on disk → the
+    update PR is still opened, and no stray label is added to a repo whose CI runs on
+    every push."""
+    rc, _, calls, cfg_path = _drive_full_run_with_update(monkeypatch, tmp_path, lgc_on=False)
+    assert rc == 0
+    cfg = wizard.config.load_config(cfg_path)
+    assert wizard.config.label_gated_ci(cfg, "acme/widgets") is False
+    assert [c for c in calls if c[:3] == ["gh", "pr", "create"]], calls
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
 
 
 def test_run_renders_locked_teasers(monkeypatch, tmp_path):

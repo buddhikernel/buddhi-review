@@ -501,10 +501,13 @@ def test_flush_warns_once_per_pr_when_the_attach_fails(monkeypatch, tmp_path):
     monkeypatch.setenv("BUDDHI_CONFIG", str(tmp_path / "absent.yaml"))
     run, calls = _label_recorder(edit_rc=1)
     out = _flush(["5", "6"], opted_in=True, run=run)
-    assert out.count("ready-for-ci") == 2 and out.count("by hand") == 2, out
+    assert out.count("ready-for-ci") == 4 and out.count("by hand") == 2, out
+    assert "to 5 —" in out and "to 6 —" in out, out
+    assert "gh pr edit 5 --add-label ready-for-ci" in out, out
+    assert "gh pr edit 6 --add-label ready-for-ci" in out, out
 
 
-def test_flush_with_nothing_pending_touches_gh_at_all(monkeypatch):
+def test_flush_with_nothing_pending_touches_no_gh_at_all(monkeypatch):
     """The common case — no managed file was outdated — must shell out to nothing."""
     run, calls = _label_recorder()
     assert _flush([], opted_in=True, run=run) == ""
