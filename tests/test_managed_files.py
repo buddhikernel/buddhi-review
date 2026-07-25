@@ -273,6 +273,11 @@ def test_label_add_skips_retries_when_pr_ref_is_unresolvable_sentinel(monkeypatc
     assert "ready-for-ci" in out and "by hand" in out
     assert "gh pr edit (PR opened)" not in out   # never an unrunnable hand-run hint
     assert "gh pr edit <PR#> --add-label ready-for-ci -R o/r" in out
+    # The best-effort `gh label create` still ran, even though the ref was
+    # unusable — otherwise the hand-run hint above names a label that doesn't
+    # exist yet on a repo that never carried it before.
+    creates = [c for c in calls if c[:3] == ["gh", "label", "create"]]
+    assert creates, calls
 
 
 # ── _attach_ready_for_ci: direct unit coverage of the helper itself ─────────────────
@@ -294,6 +299,26 @@ def test_attach_ready_for_ci_backoff_uses_injected_sleep(monkeypatch):
     ok = wizard._attach_ready_for_ci("o/r", "5", run=run, sleep=slept.append)
     assert ok is True
     assert slept == [2.0, 4.0]  # backoff_s * attempt for the two failed tries
+
+
+def test_attach_ready_for_ci_bootstraps_label_even_for_unresolvable_sentinel_ref(monkeypatch):
+    """The `_NO_PR_REF` sentinel skips the doomed `gh pr edit` retries (there is no
+    ref to resolve), but the best-effort `gh label create` must still run before
+    that early return — it's the only thing that guarantees `ready-for-ci` exists
+    on a repo that never carried it, which is what the caller's hand-run hint
+    (`gh pr edit <PR#> --add-label ready-for-ci -R {repo}`) assumes."""
+    monkeypatch.setattr(wizard.config, "label_gated_ci", lambda cfg, repo=None: True)
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return _R()
+
+    ok = wizard._attach_ready_for_ci("o/r", wizard._NO_PR_REF, run=run,
+                                     sleep=lambda s: None)
+    assert ok is False
+    assert calls == [["gh", "label", "create", "ready-for-ci", "--color",
+                      "cccccc", "-R", "o/r"]]   # created, no gh pr edit attempted
 
 
 def test_attach_ready_for_ci_gives_up_after_all_attempts_fail(monkeypatch):
@@ -474,6 +499,25 @@ def test_load_config_checked_non_mapping_document_is_unreadable(tmp_path):
     assert wizard.config.load_config_checked(p) == ({}, False)
 
 
+@pytest.mark.parametrize("body", ["[]\n", "{}\n", "false\n", "0\n", "''\n"])
+def test_load_config_checked_falsy_non_mapping_document_is_unreadable(tmp_path, body):
+    """A FALSY non-mapping document (``[]``, ``false``, ``0``, ``''``) is the same class
+    of malformed config as the non-empty list above — it must land on the unreadable
+    side, not be normalised to a readable ``{}``. ``{}`` itself IS a mapping and stays
+    readable."""
+    p = tmp_path / "config.yaml"
+    p.write_text(body, encoding="utf-8")
+    expected = ({}, True) if body.strip() == "{}" else ({}, False)
+    assert wizard.config.load_config_checked(p) == expected
+
+
+def test_load_config_checked_explicit_null_document_is_readable(tmp_path):
+    """``null`` is legitimately-absent content, not garbage — same as an empty file."""
+    p = tmp_path / "config.yaml"
+    p.write_text("null\n", encoding="utf-8")
+    assert wizard.config.load_config_checked(p) == ({}, True)
+
+
 # ── one run, ONE config: the decision follows the run's resolved cfg_path ───────────
 # setup_interactive resolves `cfg_path = config_path or config.config_path()` and
 # confirm_repo_interactive takes it as a parameter; every other read + write in a run
@@ -576,6 +620,34 @@ def test_flush_attaches_nothing_when_neither_source_opted_in(monkeypatch, tmp_pa
     _flush(["5"], opted_in=False, run=run)
     assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
     assert not [c for c in calls if c[:3] == ["gh", "label", "create"]], calls
+
+
+@pytest.mark.parametrize("text", ["label_gated_ci: [true\n", "- just\n- a\n- list\n"])
+def test_flush_explicit_no_beats_an_unreadable_config(monkeypatch, tmp_path, text):
+    """The three-valued `opted_in` must not collapse False into None. The config
+    EXISTS but can't be parsed, so `load_config_checked` reports readable=False — the
+    fail-closed fallthrough that an unreadable config normally triggers. Here the user
+    ALSO answered "no" seconds ago, and that direct answer outranks a file that
+    wouldn't parse: no stray label on a repo the user explicitly declined. Only
+    `opted_in is None` (no signal at all) may fall through to the attach."""
+    p = _real_config(tmp_path, monkeypatch, text)
+    assert wizard.config.load_config_checked(p)[1] is False, "sanity: config is unreadable"
+    run, calls = _label_recorder()
+    out = _flush(["5"], opted_in=False, run=run)
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+    assert not [c for c in calls if c[:3] == ["gh", "label", "create"]], calls
+    assert out == "", out   # "no label needed" is not a failed attach — no warning
+
+
+def test_flush_no_signal_still_falls_through_on_an_unreadable_config(monkeypatch, tmp_path):
+    """The other half of the same distinction: with `opted_in=None` there is no in-run
+    answer to honour, so an unreadable config keeps failing CLOSED and attempts the
+    attach rather than silently masking a label-gated repo."""
+    _real_config(tmp_path, monkeypatch, "label_gated_ci: [true\n")
+    run, calls = _label_recorder()
+    assert wizard._attach_ready_for_ci("o/r", "5", run=run, sleep=lambda s: None,
+                                       opted_in=None) is True
+    assert [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
 
 
 def test_flush_warns_once_per_pr_when_the_attach_fails(monkeypatch, tmp_path):

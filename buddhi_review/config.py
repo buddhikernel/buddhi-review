@@ -95,9 +95,16 @@ def load_config_checked(path: Optional[Path] = None) -> Tuple[Dict[str, Any], bo
     if yaml is None:
         return {}, False
     try:
-        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return {}, False
+    # No ``or {}`` normalisation before the isinstance check: it would rewrite every
+    # FALSY non-mapping document (``[]``, ``false``, ``0``) to ``{}`` and report it as
+    # readable, which is the "garbage config read as 'says no'" outcome this helper
+    # exists to prevent. ``None`` (empty file / explicit ``null``) is the one legitimately
+    # absent-content case, so it alone maps to ``({}, True)``.
+    if data is None:
+        return {}, True
     return (data, True) if isinstance(data, dict) else ({}, False)
 
 

@@ -1234,6 +1234,16 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run,
     actually happened on the PR (and the caller's warning fires iff the attach
     itself fails).
 
+    That fail-closed fallthrough runs ONLY for ``opted_in is None`` — no signal at
+    all. ``opted_in`` is three-valued, and an explicit ``False`` (the user answered
+    "no" at ``step_repo_label_gated_ci`` seconds ago) is the STRONGEST signal
+    available: it must not be discarded in favour of a config that failed to parse.
+    An explicit decline plus an unreadable config therefore ends in "no label",
+    which is what the no-stray-label invariant above means. A READABLE config still
+    outranks the decline exactly as documented — the persisted flag is consulted for
+    ``False`` and ``None`` alike, and only the unreadable-config fallthrough is
+    suppressed by an explicit decline.
+
     Attached as a SEPARATE ``gh pr edit`` after the PR exists, never at create
     time: the label-gated workflow fires on the ``labeled`` event, which a
     create-time label does not reliably emit. Mirrors the merge loop's land-time
@@ -1246,33 +1256,50 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run,
     ``buddhi_review.merge._attach_ready_for_ci``, so a transient ``gh``/GitHub
     blip does not leave the PR unlabeled."""
     if not opted_in:
+        # Tri-state: True/False = the persisted flag was actually read; None = the
+        # config exists but is unreadable (or the read itself blew up), so it says
+        # nothing either way.
+        gated: Optional[bool] = None
         try:
             path = cfg_path or config.config_path()
             cfg, readable = config.load_config_checked(path)
-            if readable and not config.label_gated_ci(cfg, repo):
-                return True  # repo's CI is not label-gated — no label needed
+            if readable:
+                gated = bool(config.label_gated_ci(cfg, repo))
         except Exception:
-            # Config unreadable, or the read itself blew up — fail closed: fall
-            # through and attempt the attach rather than assuming no label is
-            # needed.
-            pass
-        # `readable is False` (and no exception) falls through the same way: the
-        # `if` above short-circuits before calling `label_gated_ci`, so an
-        # unreadable config never gets read as "no label needed".
-    if str(pr_ref) == _NO_PR_REF:
-        # `_create_file_pr` couldn't report the new PR's number/URL — there is no
-        # ref `gh pr edit` could resolve, so skip the doomed retries/backoff
-        # entirely and let the caller warn once, naming the repo instead of an
-        # unrunnable `gh pr edit (PR opened) ...` hint.
-        return False
+            gated = None
+        if gated is False:
+            return True  # repo's CI is not label-gated — no label needed
+        if gated is None and opted_in is False:
+            # Unreadable config, but the user EXPLICITLY declined label-gated CI in
+            # this run. A direct answer outranks a file that wouldn't parse, so the
+            # fail-closed fallthrough below is suppressed: no stray label on a repo
+            # the user just said no to. (Only `opted_in is None` — no signal at all
+            # — falls through.) Returning True, not False, because "no label" is the
+            # correct outcome here, not a failed attach the caller should warn about.
+            return True
+        # `gated is None` with `opted_in is None`: fail closed — fall through and
+        # attempt the attach rather than assuming no label is needed, so an
+        # unreadable config never gets read as an opt-OUT. `gated is True` falls
+        # through too: a persisted opt-in is not vetoed by a falsy `opted_in`.
     create = ["gh", "label", "create", "ready-for-ci", "--color", "cccccc",
               "-R", repo]
-    edit = ["gh", "pr", "edit", str(pr_ref), "--add-label", "ready-for-ci",
-            "-R", repo]
     try:
         run(create, timeout=20)
     except Exception:
         pass  # already-exists / transient — the add below surfaces a real problem
+    if str(pr_ref) == _NO_PR_REF:
+        # `_create_file_pr` couldn't report the new PR's number/URL — there is no
+        # ref `gh pr edit` could resolve, so skip the doomed retries/backoff
+        # entirely and let the caller warn once, naming the repo instead of an
+        # unrunnable `gh pr edit (PR opened) ...` hint. The `gh label create` call
+        # above still ran, though — it's best-effort and repo-scoped (not tied to
+        # a PR ref), so it bootstraps the label even here, which is what makes the
+        # `_LABEL_ATTACH_WARN_NO_REF` hand-run hint (`gh pr edit <PR#> --add-label
+        # ready-for-ci -R {repo}`) actually work on a repo that never carried the
+        # label before.
+        return False
+    edit = ["gh", "pr", "edit", str(pr_ref), "--add-label", "ready-for-ci",
+            "-R", repo]
     attempts = max(1, attempts)
     for attempt in range(1, attempts + 1):
         try:
