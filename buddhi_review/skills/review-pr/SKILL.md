@@ -380,6 +380,16 @@ This is the front door: it selects the review engine, **detaches the process and
 immediately** (so the long-running work survives the Bash tool's timeout), and prints where to
 watch the run. You do not need to resolve any script path yourself.
 
+**Use the front door. Never invoke the underlying module directly, and never reconstruct what you
+think the front door does — this rule is ABSOLUTE and holds even when you believe you have solved
+the reason it gives.** A rule that states one reason is not listing all of them: the front door
+also sets up the run's environment and bookkeeping, including where the live log is published for
+status surfaces to read. A hand-rolled run that satisfies the stated reason still leaves that
+pointing at the PREVIOUS run, so the user sees a live status above a stale, finished log and
+reasonably concludes the run is broken. In particular, backgrounding a direct run to dodge the
+timeout does NOT make this rule moot. If the front door genuinely cannot do what is needed, STOP
+and tell the user rather than improvising a replacement.
+
 **Before you stop, print EXACTLY this brief block — it is the ONE allowed output (it replaces
 any longer summary), and it MUST go in your CHAT REPLY, not be left inside the tool output
 (Claude Code collapses tool output under Ctrl+O but never your message, so a link left in the
