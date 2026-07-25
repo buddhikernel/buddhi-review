@@ -110,7 +110,8 @@ def _update_router(*, head_sha="cafe", pr_url="https://github.com/o/r/pull/5",
     return run
 
 
-def _offer_update(installed_text, *, is_tty, monkeypatch, run=None, accept=True):
+def _offer_update(installed_text, *, is_tty, monkeypatch, run=None, accept=True,
+                  cfg_path=None, pending_ci_prs=None):
     monkeypatch.setattr(wizard, "_is_tty", lambda: is_tty)
     if is_tty:
         monkeypatch.setattr(wizard, "single_select", _yn_bridge)
@@ -124,7 +125,9 @@ def _offer_update(installed_text, *, is_tty, monkeypatch, run=None, accept=True)
     result = wizard._offer_update_managed_file(
         "o/r", "main", _claude_spec(), installed_text,
         run=rec, pal=wizard._Palette(False), stream=buf,
-        input_fn=lambda prompt="": "y" if accept else "n")
+        input_fn=lambda prompt="": "y" if accept else "n",
+        sleep=lambda s: None,  # never a real sleep — the retry backoff seam
+        cfg_path=cfg_path, pending_ci_prs=pending_ci_prs)
     return result, buf.getvalue(), calls
 
 
@@ -215,8 +218,9 @@ def test_no_label_when_repo_not_opted_into_label_gated_ci(monkeypatch):
 
 
 def test_label_add_failure_never_breaks_the_update(monkeypatch):
-    """A failed/raising label add leaves the update PR intact — the PR is open, the
-    wizard already reported it; the label is best-effort."""
+    """A raising label add leaves the update PR intact — the PR is open, the wizard
+    already reported it; the label is best-effort. The user is TOLD, though: the warn
+    row is the only signal that the update may merge without CI having run."""
     def run(argv, **kw):
         if list(argv)[:3] == ["gh", "pr", "edit"]:
             raise OSError("boom")
@@ -224,3 +228,379 @@ def test_label_add_failure_never_breaks_the_update(monkeypatch):
     result, out, calls = _offer_update_lgc("legacy\n", monkeypatch=monkeypatch,
                                            label_gated=True, run=run)
     assert result == "pr"
+    assert "ready-for-ci" in out and "by hand" in out
+
+
+def test_label_add_nonzero_exit_warns_and_keeps_the_update_pr(monkeypatch):
+    """The likelier real-world failure is not an exception but ``gh pr edit`` exiting
+    NON-ZERO (no auth, no `pull_requests: write`, an unresolvable PR ref) — a
+    different branch of the helper than the raising one. Here the PR ref is
+    ``(PR opened)``, which ``_create_file_pr`` returns when ``gh pr create``
+    succeeds with empty stdout and which ``gh pr edit`` genuinely cannot resolve.
+    Same degradation: the update PR stands, the user is warned."""
+    base = _update_router(pr_url="")  # empty create stdout → ref is "(PR opened)"
+
+    def run(argv, **kw):
+        if list(argv)[:3] == ["gh", "pr", "edit"]:
+            return _R(returncode=1)
+        return base(argv, **kw)
+
+    result, out, calls = _offer_update_lgc("legacy\n", monkeypatch=monkeypatch,
+                                           label_gated=True, run=run)
+    assert result == "pr"
+    assert "ready-for-ci" in out and "by hand" in out
+    edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert len(edits) == wizard._LABEL_ADD_ATTEMPTS, edits   # retried, then gave up
+    assert "(PR opened)" in edits[0]
+
+
+# ── _attach_ready_for_ci: direct unit coverage of the helper itself ─────────────────
+
+def test_attach_ready_for_ci_backoff_uses_injected_sleep(monkeypatch):
+    """Mirrors buddhi_review.merge._attach_ready_for_ci: the label ADD is retried
+    with linear backoff through the injected sleep seam (never a real time.sleep)
+    so a transient gh/GitHub blip doesn't leave the PR unlabeled."""
+    monkeypatch.setattr(wizard.config, "label_gated_ci", lambda cfg, repo=None: True)
+    slept = []
+    calls = {"n": 0}
+
+    def run(argv, **kw):
+        if argv[:3] == ["gh", "pr", "edit"]:
+            calls["n"] += 1
+            return _R(returncode=0 if calls["n"] >= 3 else 1)
+        return _R()
+
+    ok = wizard._attach_ready_for_ci("o/r", "5", run=run, sleep=slept.append)
+    assert ok is True
+    assert slept == [2.0, 4.0]  # backoff_s * attempt for the two failed tries
+
+
+def test_attach_ready_for_ci_gives_up_after_all_attempts_fail(monkeypatch):
+    monkeypatch.setattr(wizard.config, "label_gated_ci", lambda cfg, repo=None: True)
+
+    def run(argv, **kw):
+        if argv[:3] == ["gh", "pr", "edit"]:
+            return _R(returncode=1)
+        return _R()
+
+    ok = wizard._attach_ready_for_ci("o/r", "5", run=run, sleep=lambda s: None)
+    assert ok is False
+
+
+def test_attach_ready_for_ci_config_read_failure_falls_through_to_attach(monkeypatch):
+    """A broken config read must NOT default to "no label needed" (which would
+    silently suppress the caller's warning on an actually-label-gated repo) — it
+    falls through and attempts the attach, so the return value reflects whether the
+    label really landed."""
+    monkeypatch.setattr(
+        wizard.config, "label_gated_ci",
+        lambda cfg, repo=None: (_ for _ in ()).throw(RuntimeError("boom")))
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        if argv[:3] == ["gh", "pr", "edit"]:
+            return _R(returncode=0)
+        return _R()
+
+    ok = wizard._attach_ready_for_ci("o/r", "5", run=run, sleep=lambda s: None)
+    assert ok is True
+    assert any(c[:3] == ["gh", "pr", "edit"] for c in calls)
+
+
+def test_attach_ready_for_ci_config_read_failure_and_attach_failure_returns_false(monkeypatch):
+    """Same broken-config path, but the attach itself fails — the caller must see
+    False (and warn), not a blanket True that hides the failure."""
+    monkeypatch.setattr(
+        wizard.config, "label_gated_ci",
+        lambda cfg, repo=None: (_ for _ in ()).throw(RuntimeError("boom")))
+
+    def run(argv, **kw):
+        if argv[:3] == ["gh", "pr", "edit"]:
+            return _R(returncode=1)
+        return _R()
+
+    ok = wizard._attach_ready_for_ci("o/r", "5", run=run, sleep=lambda s: None,
+                                     attempts=1)
+    assert ok is False
+
+
+# ── the gating decision itself, against a REAL config file (no label_gated_ci stub) ──
+# The stubbed tests above pin the wiring; these pin the DECISION. With
+# config.label_gated_ci patched out, config_path(), the .exists() guard, load_config
+# and the per-repo-vs-global resolution are never exercised — a mutation to
+# `label_gated_ci(cfg)` (dropping the repo argument) or to a different config file
+# would keep every stubbed test green while silently un-labelling a repo that opted
+# in per-repo. These write a real config and leave the resolver alone.
+
+def _real_config(tmp_path, monkeypatch, text, *, name="config.yaml"):
+    """Write a real config and point $BUDDHI_CONFIG (what config.config_path() reads)
+    at it, overriding the autouse hermetic fixture's absent-file default."""
+    p = tmp_path / name
+    p.write_text(text, encoding="utf-8")
+    monkeypatch.setenv("BUDDHI_CONFIG", str(p))
+    return p
+
+
+def test_real_config_per_repo_optin_under_global_off_gets_the_label(monkeypatch, tmp_path):
+    """The per-repo value WINS over a global false — the resolution the wizard's own
+    label-gated-CI step writes. A `label_gated_ci(cfg)` that drops the repo argument
+    reads the global false and leaves this PR unlabeled (and so untested)."""
+    _real_config(tmp_path, monkeypatch,
+                 "label_gated_ci: false\nrepos:\n  o/r:\n    label_gated_ci: true\n")
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch)
+    assert result == "pr"
+    edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert len(edits) == 1, calls
+    assert "--add-label" in edits[0] and "ready-for-ci" in edits[0]
+
+
+def test_real_config_global_optin_with_no_repo_entry_gets_the_label(monkeypatch, tmp_path):
+    """The global flag is the fallback when the repo has no entry of its own."""
+    _real_config(tmp_path, monkeypatch, "label_gated_ci: true\n")
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch)
+    assert result == "pr"
+    assert [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+def test_real_config_per_repo_off_under_global_on_gets_no_label(monkeypatch, tmp_path):
+    """The other direction of the same resolution: an explicit per-repo OFF shadows a
+    global ON, so this repo keeps its every-push CI and gets no stray label."""
+    _real_config(tmp_path, monkeypatch,
+                 "label_gated_ci: true\nrepos:\n  o/r:\n    label_gated_ci: false\n")
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch)
+    assert result == "pr"
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+@pytest.mark.parametrize("text", ["", "plan: free\n"])
+def test_real_config_empty_or_silent_defaults_off(monkeypatch, tmp_path, text):
+    """DEFAULT OFF: a config that says nothing about label-gated CI attaches nothing."""
+    _real_config(tmp_path, monkeypatch, text)
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch)
+    assert result == "pr"
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+def test_real_config_absent_file_defaults_off(monkeypatch, tmp_path):
+    """No config on disk at all (a first run) — the .exists() guard short-circuits to
+    the empty-config default, and nothing is labeled."""
+    monkeypatch.setenv("BUDDHI_CONFIG", str(tmp_path / "never-written.yaml"))
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch)
+    assert result == "pr"
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+# ── one run, ONE config: the decision follows the run's resolved cfg_path ───────────
+# setup_interactive resolves `cfg_path = config_path or config.config_path()` and
+# confirm_repo_interactive takes it as a parameter; every other read + write in a run
+# goes through that value. The label decision must too, or an injected path (the
+# `buddhi-review setup` config seam the tests use) would read one file while the same
+# run's opt-in is written to another.
+
+def test_injected_cfg_path_decides_the_label_not_the_ambient_env(monkeypatch, tmp_path):
+    """$BUDDHI_CONFIG says OFF, the run's own config says ON → the label lands."""
+    _real_config(tmp_path, monkeypatch, "label_gated_ci: false\n", name="ambient.yaml")
+    run_cfg = tmp_path / "run-config.yaml"
+    run_cfg.write_text("repos:\n  o/r:\n    label_gated_ci: true\n", encoding="utf-8")
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch,
+                                       cfg_path=run_cfg)
+    assert result == "pr"
+    assert [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+def test_injected_cfg_path_off_wins_over_an_ambient_optin(monkeypatch, tmp_path):
+    """The mirror image: the ambient env config would attach, the run's config says
+    OFF → no label. Proves the injected path is READ, not merely accepted."""
+    _real_config(tmp_path, monkeypatch, "label_gated_ci: true\n", name="ambient.yaml")
+    run_cfg = tmp_path / "run-config.yaml"
+    run_cfg.write_text("label_gated_ci: false\n", encoding="utf-8")
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch,
+                                       cfg_path=run_cfg)
+    assert result == "pr"
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+# ── the opt-in made in THIS run counts, not just what was on disk when it started ───
+# step_reviewers (which opens the update PR) runs BEFORE the label-gated-CI step and
+# before the config is written, in both entry points. Deciding the attach from the
+# persisted flag alone therefore misses the run that turns label-gated CI on: on a
+# repo whose gate workflow is ALREADY live on the default branch, that update PR
+# merges unexercised — #94 again. So the attach is DEFERRED to the caller, which
+# flushes it once the answer is in.
+
+def _flush(pr_refs, *, opted_in, run, cfg_path=None):
+    buf = io.StringIO()
+    wizard._flush_pending_ci_labels("o/r", pr_refs, opted_in=opted_in, run=run,
+                                    pal=wizard._Palette(False), stream=buf,
+                                    cfg_path=cfg_path, sleep=lambda s: None)
+    return buf.getvalue()
+
+
+def _label_recorder(*, edit_rc=0):
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        if list(argv)[:3] == ["gh", "pr", "edit"]:
+            return _R(returncode=edit_rc)
+        return _R()
+
+    return run, calls
+
+
+def test_update_pr_label_is_deferred_when_the_caller_asks_later(monkeypatch, tmp_path):
+    """With a `pending_ci_prs` sink the update PR is opened and its ref handed back
+    UNLABELED — no attach yet, because the opt-in question has not been asked."""
+    _real_config(tmp_path, monkeypatch, "label_gated_ci: true\n")  # would attach inline
+    pending = []
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch,
+                                       pending_ci_prs=pending)
+    assert result == "pr"
+    assert pending == ["https://github.com/o/r/pull/5"]
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+def test_flush_attaches_on_this_runs_optin_with_nothing_on_disk_yet(monkeypatch, tmp_path):
+    """The #94 shape: the gate workflow is live on the default branch, the opt-in is
+    not persisted yet (this run is about to write it). The in-run answer alone must
+    put the label on the PR."""
+    monkeypatch.setenv("BUDDHI_CONFIG", str(tmp_path / "not-written-yet.yaml"))
+    run, calls = _label_recorder()
+    out = _flush(["https://github.com/o/r/pull/5"], opted_in=True, run=run)
+    edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert len(edits) == 1, calls
+    assert "--add-label" in edits[0] and "ready-for-ci" in edits[0]
+    assert "https://github.com/o/r/pull/5" in edits[0]
+    assert any(c[:3] == ["gh", "label", "create"] for c in calls), calls
+    assert out == ""
+
+
+def test_flush_still_honours_the_persisted_flag_when_this_run_says_no(monkeypatch, tmp_path):
+    """A run that answers "off" does NOT veto an earlier opt-in: the gate workflow can
+    already be live on the default branch, and that PR still needs the label to get
+    CI. The in-run answer can only turn the attach ON."""
+    _real_config(tmp_path, monkeypatch, "repos:\n  o/r:\n    label_gated_ci: true\n")
+    run, calls = _label_recorder()
+    _flush(["5"], opted_in=False, run=run)
+    assert [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+def test_flush_attaches_nothing_when_neither_source_opted_in(monkeypatch, tmp_path):
+    """Neither this run nor the config asked for label-gated CI → no stray label."""
+    _real_config(tmp_path, monkeypatch, "label_gated_ci: false\n")
+    run, calls = _label_recorder()
+    _flush(["5"], opted_in=False, run=run)
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+    assert not [c for c in calls if c[:3] == ["gh", "label", "create"]], calls
+
+
+def test_flush_warns_once_per_pr_when_the_attach_fails(monkeypatch, tmp_path):
+    """A failed deferred attach warns exactly as the inline one does — the user's only
+    signal that the update PR may merge without CI."""
+    monkeypatch.setenv("BUDDHI_CONFIG", str(tmp_path / "absent.yaml"))
+    run, calls = _label_recorder(edit_rc=1)
+    out = _flush(["5", "6"], opted_in=True, run=run)
+    assert out.count("ready-for-ci") == 2 and out.count("by hand") == 2, out
+
+
+def test_flush_with_nothing_pending_touches_gh_at_all(monkeypatch):
+    """The common case — no managed file was outdated — must shell out to nothing."""
+    run, calls = _label_recorder()
+    assert _flush([], opted_in=True, run=run) == ""
+    assert calls == []
+
+
+# ── end-to-end: the per-repo confirm labels the update PR it opened earlier ─────────
+
+def _e2e_router(*, default="main", legacy=b"name: legacy claude workflow\n"):
+    """A run() for a whole confirm_repo_interactive pass with a Claude-only fleet: the
+    claude workflow is PRESENT on the default branch but unversioned (→ outdated, so
+    the update PR is offered), and every gh call the update path makes succeeds."""
+    calls = []
+    installed_b64 = base64.b64encode(legacy).decode()
+
+    def run(argv, cwd=None, timeout=30, input=None):
+        argv = list(argv)
+        calls.append(argv)
+        joined = " ".join(argv)
+        if argv[:3] == ["gh", "auth", "status"]:
+            return _R(returncode=1)          # no gh auth → skip the secret walkthrough
+        if argv[:2] == ["git", "-C"]:
+            return _R(returncode=1)          # cwd is passed explicitly
+        if argv[:3] == ["gh", "repo", "view"]:
+            return _R(returncode=0, stdout=default + "\n")
+        if argv[:2] == ["gh", "pr"]:
+            return _R(returncode=0, stdout="https://github.com/o/r/pull/7\n")
+        if argv[:2] == ["gh", "api"]:
+            if "-X" in argv and "PUT" in argv:
+                return _R(returncode=0)
+            if "claude-code-review.yml" in joined and ".content" in argv:
+                return _R(returncode=0, stdout=installed_b64 + "\n")
+            if "/git/ref/heads/" in joined and "--jq" in argv:
+                return _R(returncode=0, stdout="cafe\n")
+            if argv[2].endswith("/git/refs"):
+                return _R(returncode=0)
+            if "contents/" in joined and ".sha" in argv:
+                return _R(returncode=0, stdout="blob123\n")
+        return _R()
+
+    return run, calls
+
+
+def _drive_confirm_with_update(monkeypatch, tmp_path, *, lgc_on):
+    """confirm_repo_interactive over o/r: Claude confirmed installed, the outdated
+    workflow updated by PR, and label-gated CI answered ``lgc_on`` — the answer the
+    reviewer step could not see when it opened that PR."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)   # for _ask_yes_no
+    # The gate installer has its own suite (tests/test_wizard_ready_for_ci.py); this
+    # test is about the label on the UPDATE PR, so keep it out of the router.
+    monkeypatch.setattr(wizard, "_offer_install_ready_for_ci", lambda *a, **k: None)
+    run, calls = _e2e_router()
+
+    def ss(prompt, options, *, preselect=0, **kw):
+        for key, idx in {"reviewer is installed": 1,
+                         "Auto-merge default for": 0,
+                         "Label-gated CI default for": 1 if lgc_on else 0,
+                         "Confirm: enable label-gated CI": 1}.items():
+            if key in prompt:
+                return idx
+        return preselect
+
+    buf = io.StringIO()
+    cfg_path = tmp_path / "config.yaml"          # nothing persisted yet — a first run
+    rc = wizard.confirm_repo_interactive(
+        "o/r", str(tmp_path), run=run, spawn_command=lambda *a, **k: None,
+        getpass_fn=lambda *a: "", pal=wizard._Palette(False), stream=buf,
+        cfg_path=cfg_path, multi_select=lambda *a, **k: {3},   # claude
+        single_select=ss, input_fn=lambda prompt="": "y")
+    return rc, buf.getvalue(), calls, cfg_path
+
+
+def test_confirm_run_labels_the_update_pr_it_opened_before_the_optin(monkeypatch, tmp_path):
+    """#94, round 2: the reviewer step opens the claude-code-review.yml update PR
+    BEFORE the label-gated-CI step is asked and before anything is written to disk.
+    Opting in seconds later must still get the label onto that PR — otherwise, on a
+    repo whose gate workflow is already live, the update merges with CI never run."""
+    rc, out, calls, cfg_path = _drive_confirm_with_update(monkeypatch, tmp_path,
+                                                          lgc_on=True)
+    assert rc == 0
+    assert wizard.config.label_gated_ci(wizard.config.load_config(cfg_path), "o/r") is True
+    creates = [c for c in calls if c[:3] == ["gh", "pr", "create"]]
+    edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert len(creates) == 1, calls          # the update PR was opened
+    assert len(edits) == 1, calls            # …and then labeled
+    assert "--add-label" in edits[0] and "ready-for-ci" in edits[0]
+    assert calls.index(creates[0]) < calls.index(edits[0])
+
+
+def test_confirm_run_without_the_optin_leaves_the_update_pr_unlabeled(monkeypatch, tmp_path):
+    """The same run, label-gated CI declined and nothing on disk → the update PR is
+    still opened, and no stray label is added to a repo whose CI runs on every push."""
+    rc, out, calls, cfg_path = _drive_confirm_with_update(monkeypatch, tmp_path,
+                                                          lgc_on=False)
+    assert rc == 0
+    assert wizard.config.label_gated_ci(wizard.config.load_config(cfg_path), "o/r") is False
+    assert [c for c in calls if c[:3] == ["gh", "pr", "create"]], calls
+    assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls

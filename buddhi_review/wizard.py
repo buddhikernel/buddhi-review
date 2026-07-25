@@ -46,6 +46,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.parse
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
@@ -63,6 +64,11 @@ _GH_MIN = (2, 87)
 _REVIEWERS = ("copilot", "gemini", "codex", "claude")
 _GITHUB_APP_BOTS = ("copilot", "gemini", "codex")  # claude is workflow/mention-driven
 _MODEL_TIERS = ("opus", "sonnet", "haiku")
+# Mirrors buddhi_review.merge's LABEL_ADD_ATTEMPTS/LABEL_ADD_BACKOFF_S: the label
+# ADD is retried with linear backoff so a transient gh/GitHub blip doesn't leave
+# the update PR unlabeled; the `gh label create` bootstrap stays single-shot.
+_LABEL_ADD_ATTEMPTS = 3
+_LABEL_ADD_BACKOFF_S = 2.0
 
 # Each locked teaser is a single-line, single-BENEFIT contextual upgrade nudge
 # (exec-plan §E: one of the sanctioned paid-reference surfaces in OSS, not the
@@ -1066,6 +1072,11 @@ def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
 _REVERT_NOTE = ("Your previous version is preserved in the PR's git history — "
                 "revert the PR to roll back.")
 
+# The ONLY user-visible signal that an update PR may merge without its CI having
+# run. Shared by the inline attach and the deferred flush so both read identically.
+_LABEL_ATTACH_WARN = ("Couldn't attach the ready-for-ci label — label-gated CI "
+                      "may not run on this update PR. You can add it by hand.")
+
 
 def _installed_managed_file_text(repo: Optional[str], dest_path: str, run) -> Optional[str]:
     """Decoded text of a managed file as it currently exists on ``repo``'s default
@@ -1087,13 +1098,26 @@ def _installed_managed_file_text(repo: Optional[str], dest_path: str, run) -> Op
 
 def _offer_update_managed_file(repo: str, default: Optional[str], spec: Dict[str, object],
                                installed_text: Optional[str], *, run, pal, stream,
-                               input_fn=input) -> Optional[str]:
+                               input_fn=input,
+                               sleep: Callable[[float], None] = time.sleep,
+                               cfg_path: Optional[Path] = None,
+                               pending_ci_prs: Optional[List[str]] = None) -> Optional[str]:
     """Offer a server-side PR that updates a managed file IN PLACE when the installed
     copy is older than the bundled template (verbatim overwrite — for files with NO
     per-install baking, i.e. the Claude workflow; ``ready-for-ci`` re-bakes its CI
     command via its own installer). The old version stays in the update PR's git
     history. Returns ``'pr'`` (update PR opened) or ``None`` (already current /
-    unknown / declined / non-TTY / no default branch / write failed)."""
+    unknown / declined / non-TTY / no default branch / write failed).
+
+    ``cfg_path`` is the RUN's resolved config path — the same file the caller reads
+    and writes — so the label-gated-CI decision can never be made from a different
+    config than the rest of the run (``None`` → the global lookup).
+
+    ``pending_ci_prs``, when given, DEFERS the ``ready-for-ci`` attach: the opened
+    PR's ref is appended to it instead, for the caller to flush through
+    :func:`_flush_pending_ci_labels` once this run's label-gated-CI opt-in is known
+    (the per-repo opt-in step runs AFTER this one). Without it the attach happens
+    inline, decided from the persisted config alone."""
     template = spec["template"]  # type: ignore[index]
     name = str(spec["name"])
     shipped = managed_files.shipped_version(template)  # type: ignore[arg-type]
@@ -1136,31 +1160,54 @@ def _offer_update_managed_file(repo: str, default: Optional[str], spec: Dict[str
         # defers CI to the `ready-for-ci` label, the suite runs ONLY when the
         # label is present, and this PR would carry none — so the update would
         # merge unexercised (#94, itself a claude-code-review.yml update PR).
-        # Gated on the recorded per-repo/global opt-in inside the helper, so a
-        # repo the user never opted into label-gated CI gets no stray label.
-        if not _attach_ready_for_ci(repo, detail, run=run):
-            _row("warn", "Couldn't attach the ready-for-ci label — label-gated CI "
-                         "may not run on this update PR. You can add it by hand.",
-                 pal, stream)
+        # Gated on the opt-in, so a repo the user never opted into label-gated CI
+        # gets no stray label. A caller that will ASK for that opt-in later in the
+        # same run hands us `pending_ci_prs` and attaches after the answer is in;
+        # a direct caller has only the persisted flag, decided inside the helper.
+        if pending_ci_prs is not None:
+            pending_ci_prs.append(detail)
+        elif not _attach_ready_for_ci(repo, detail, run=run, sleep=sleep,
+                                      cfg_path=cfg_path):
+            _row("warn", _LABEL_ATTACH_WARN, pal, stream)
         return "pr"
     _row("warn", f"Couldn't open the update PR automatically ({detail}). You can copy "
                  f"the bundled {name} in by hand.", pal, stream)
     return None
 
 
-def _attach_ready_for_ci(repo: str, pr_ref: str, *, run) -> bool:
+def _attach_ready_for_ci(repo: str, pr_ref: str, *, run,
+                          sleep: Callable[[float], None] = time.sleep,
+                          attempts: int = _LABEL_ADD_ATTEMPTS,
+                          backoff_s: float = _LABEL_ADD_BACKOFF_S,
+                          cfg_path: Optional[Path] = None,
+                          opted_in: Optional[bool] = None) -> bool:
     """Attach ``ready-for-ci`` to a PR the wizard just opened, so the repo's
     label-gated CI actually runs on it. Returns True iff the label is now on the
     PR (or the repo does not defer CI to the label, so none is needed).
 
     ONLY attaches when the user has EXPLICITLY opted this repo into label-gated
-    CI: ``config.label_gated_ci`` reads the per-repo value then the global one and
-    DEFAULTS FALSE, so a truthy result means a deliberate opt-in (the per-repo
-    step's double-confirm or the global step) — never an unset default. A repo
-    whose CI runs on every push therefore never gets a stray label. During a
-    first-run setup the opt-in has not been persisted yet, so this reads False
-    and skips — correct, because the gate workflow is not live on the default
-    branch yet either, so the label would trigger nothing.
+    CI — a repo whose CI runs on every push never gets a stray label. Two
+    independent sources say so, and EITHER is enough:
+
+    * ``opted_in`` — the choice made in THIS run (the per-repo step's
+      double-confirm), passed down by the caller because it is not on disk yet
+      when the update PR is opened.
+    * the PERSISTED flag, read via ``config.label_gated_ci`` (per-repo value then
+      the global one, DEFAULTS FALSE, so a truthy result is always a deliberate
+      opt-in) from ``cfg_path`` — the run's resolved config path, so an injected
+      ``--config``/test path decides this exactly as it decides everything else
+      in the run. ``None`` falls back to the global ``config.config_path()``.
+
+    A falsy ``opted_in`` does NOT veto the persisted flag: the gate workflow can
+    be live on the default branch from an earlier opt-in (or another machine)
+    regardless of what this run chose, and that PR still needs the label to get
+    CI. The in-run choice can only turn the attach ON.
+
+    A broken config read does NOT default to "no label needed" — that would
+    silently mask a label-gated repo that actually needs the label. It instead
+    falls through to attempt the attach, so the outcome reflects what actually
+    happened on the PR (and the caller's warning fires iff the attach itself
+    fails).
 
     Attached as a SEPARATE ``gh pr edit`` after the PR exists, never at create
     time: the label-gated workflow fires on the ``labeled`` event, which a
@@ -1169,14 +1216,20 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run) -> bool:
 
     Self-bootstrapping and best-effort on the create: ``gh label create`` exits
     non-zero when the label already exists (the steady state), which is ignored;
-    the add is authoritative."""
-    try:
-        cfg_path = config.config_path()
-        cfg = config.load_config(cfg_path) if cfg_path.exists() else {}
-        if not config.label_gated_ci(cfg, repo):
-            return True  # repo's CI is not label-gated — no label needed
-    except Exception:  # pragma: no cover - defensive; never block on a config read
-        return True
+    the add is authoritative. The add itself is retried up to ``attempts`` times
+    with linear backoff (``backoff_s * attempt`` between failed tries), mirroring
+    ``buddhi_review.merge._attach_ready_for_ci``, so a transient ``gh``/GitHub
+    blip does not leave the PR unlabeled."""
+    if not opted_in:
+        try:
+            path = cfg_path or config.config_path()
+            cfg = config.load_config(path) if path.exists() else {}
+            if not config.label_gated_ci(cfg, repo):
+                return True  # repo's CI is not label-gated — no label needed
+        except Exception:
+            # Config read broken — fail closed: fall through and attempt the attach
+            # rather than assuming no label is needed.
+            pass
     create = ["gh", "label", "create", "ready-for-ci", "--color", "cccccc",
               "-R", repo]
     edit = ["gh", "pr", "edit", str(pr_ref), "--add-label", "ready-for-ci",
@@ -1185,11 +1238,36 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run) -> bool:
         run(create, timeout=20)
     except Exception:
         pass  # already-exists / transient — the add below surfaces a real problem
-    try:
-        res = run(edit, timeout=20)
-    except Exception:
-        return False
-    return getattr(res, "returncode", 1) == 0
+    attempts = max(1, attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            res = run(edit, timeout=20)
+        except Exception:
+            res = None
+        if res is not None and getattr(res, "returncode", 1) == 0:
+            return True
+        if attempt < attempts:
+            sleep(backoff_s * attempt)  # transient blip — linear backoff, then retry
+    return False
+
+
+def _flush_pending_ci_labels(repo: str, pr_refs: Sequence[str], *, opted_in: bool,
+                             run, pal, stream, cfg_path: Optional[Path] = None,
+                             sleep: Callable[[float], None] = time.sleep) -> None:
+    """Attach ``ready-for-ci`` to the update PRs opened EARLIER in this run, now that
+    the label-gated-CI opt-in is known.
+
+    The reviewer step (which opens a managed-file update PR) runs BEFORE the per-repo
+    label-gated-CI step and before the config is written, so at PR-open time the
+    in-run opt-in exists nowhere the attach could read it. A repo whose gate workflow
+    is ALREADY live on the default branch while the flag is not yet on disk would
+    therefore get an unlabeled — and so untested — update PR merged, which is #94.
+    Deferring the attach to here decides it from the answer the user just gave (or,
+    failing that, the persisted flag). A no-op when nothing was opened."""
+    for ref in pr_refs:
+        if not _attach_ready_for_ci(repo, ref, run=run, sleep=sleep,
+                                    cfg_path=cfg_path, opted_in=opted_in):
+            _row("warn", _LABEL_ATTACH_WARN, pal, stream)
 
 
 def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, stream,
@@ -2272,12 +2350,17 @@ def _ask_auto_on_open(bot: str, *, single_select, pal, stream, input_fn) -> bool
 def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, Any], *,
                    run, spawn_command, getpass_fn, pal, stream,
                    multi_select=multi_select, single_select=single_select,
-                   input_fn=input, seed: Optional[Sequence[str]] = None
+                   input_fn=input, seed: Optional[Sequence[str]] = None,
+                   cfg_path: Optional[Path] = None,
+                   pending_ci_prs: Optional[List[str]] = None
                    ) -> Tuple[List[str], Dict[str, bool]]:
     """Step 5 — reviewer fleet: multi-select, validate each, capture auto_on_open.
     ``seed`` (when given — e.g. the per-repo confirm mode passes the global default)
     is the set of reviewers to PRESELECT; ``None`` preselects all four (the full
-    wizard's first-run default)."""
+    wizard's first-run default). ``cfg_path`` (the run's resolved config path) and
+    ``pending_ci_prs`` (a sink for update-PR refs whose ``ready-for-ci`` label is
+    attached later, once this run's opt-in is known) are passed straight through to
+    :func:`_offer_update_managed_file`."""
     _panel("Step 5 — Reviewer fleet", [
         "Enable only the reviewers you have set up on this repo.",
         "EVERY reviewer you enable must already have its vendor GitHub app + plan "
@@ -2345,7 +2428,8 @@ def step_reviewers(repo: Optional[str], cwd: Optional[str], doctor: Dict[str, An
                             repo, str(_spec["dest"]), run)
                         _offer_update_managed_file(
                             repo, _default_branch(repo, run=run), _spec, _installed,
-                            run=run, pal=pal, stream=stream, input_fn=input_fn)
+                            run=run, pal=pal, stream=stream, input_fn=input_fn,
+                            cfg_path=cfg_path, pending_ci_prs=pending_ci_prs)
                 if doctor.get("gh_auth"):
                     _set_claude_secret(repo, run=run, spawn_command=spawn_command,
                                        getpass_fn=getpass_fn, pal=pal, stream=stream,
@@ -2711,10 +2795,13 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
     has_gd = config.has_global_default(existing)
     seed = list(config.active_reviewers(existing)) if has_gd else None
 
+    # Update PRs the reviewer step opens land here; their `ready-for-ci` label is
+    # attached below, once the label-gated-CI step has produced this run's opt-in.
+    pending_ci_prs: List[str] = []
     reviewers, auto_on_open = step_reviewers(
         repo, cwd, doctor, run=run, spawn_command=spawn_command, getpass_fn=getpass_fn,
         pal=pal, stream=stream, multi_select=multi_select, single_select=single_select,
-        input_fn=input_fn, seed=seed)
+        input_fn=input_fn, seed=seed, cfg_path=cfg_path, pending_ci_prs=pending_ci_prs)
 
     if _ask_global_default():
         # BUDDHI_ASK_GLOBAL_DEFAULT restores the interactive promotion prompt.
@@ -2763,6 +2850,9 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
     if lgc:
         _offer_install_ready_for_ci(repo, cwd, run=run, pal=pal, stream=stream,
                                     input_fn=input_fn)
+    # The opt-in is now known — label any update PR this run opened before it was.
+    _flush_pending_ci_labels(repo, pending_ci_prs, opted_in=lgc, run=run, pal=pal,
+                             stream=stream, cfg_path=cfg_path)
     tc = step_repo_test_command(repo, config.repo_test_command(existing, repo), cwd,
                                 pal=pal, stream=stream, input_fn=input_fn)
 
@@ -2848,10 +2938,13 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
         plan = step_plan(doctor, pal=pal, stream=stream, single_select=single_select, input_fn=input_fn)
         repo, cwd = step_repo(preset_repo, run=run, pal=pal, stream=stream, input_fn=input_fn)
         step_budgets_locked(pal=pal, stream=stream)  # paid teaser
+        # Same deferral as the per-repo confirm: an update PR opened here is labeled
+        # only after the label-gated-CI step below answers the opt-in question.
+        pending_ci_prs: List[str] = []
         reviewers, auto_on_open = step_reviewers(
             repo, cwd, doctor, run=run, spawn_command=spawn_command, getpass_fn=getpass_fn,
             pal=pal, stream=stream, multi_select=multi_select, single_select=single_select,
-            input_fn=input_fn)
+            input_fn=input_fn, cfg_path=cfg_path, pending_ci_prs=pending_ci_prs)
         step_monitoring_locked(pal=pal, stream=stream)  # paid teaser
 
         existing = config.load_config(cfg_path) if cfg_path.exists() else {}
@@ -2870,6 +2963,9 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
             if repo_label_gated_ci:
                 _offer_install_ready_for_ci(repo, cwd, run=run, pal=pal, stream=stream,
                                             input_fn=input_fn)
+            # The opt-in is now known — label any update PR opened before it was.
+            _flush_pending_ci_labels(repo, pending_ci_prs, opted_in=repo_label_gated_ci,
+                                     run=run, pal=pal, stream=stream, cfg_path=cfg_path)
             # Per-repo local test-gate command, same as confirm_repo_interactive's
             # lightweight path — otherwise a JS/Go repo bound via the full wizard is
             # silently left on the auto-detect default with no chance to set its own
