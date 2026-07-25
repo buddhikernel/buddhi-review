@@ -78,6 +78,40 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def load_config_checked(path: Optional[Path] = None) -> Tuple[Dict[str, Any], bool]:
+    """Like :func:`load_config`, but also reports whether the read genuinely
+    succeeded. ``load_config`` folds "absent", "corrupt", and "malformed" into the
+    same ``{}`` so most callers never have to handle an exception; a caller that
+    must never mistake "config unreadable" for "config says no" (a fail-closed
+    opt-in check) uses this instead. Today the one caller,
+    ``wizard._attach_ready_for_ci``, only reaches the unreadable-vs-absent branch
+    when its own ``opted_in`` parameter is ``None`` — a state no current
+    production path leaves it in — so this distinction is defense-in-depth for
+    that caller's direct/future use, not an active guarantee on any user path yet.
+
+    Returns ``(cfg, ok)``. ``ok`` is False only when ``path`` EXISTS but could not
+    be read or parsed into a dict (PyYAML missing, an ``OSError``/``UnicodeDecodeError``,
+    a YAML syntax error, or a document that isn't a mapping) — a genuinely absent
+    file is ``({}, True)``, since there is nothing to fail to read."""
+    p = path or config_path()
+    if not p.exists():
+        return {}, True
+    if yaml is None:
+        return {}, False
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return {}, False
+    # No ``or {}`` normalisation before the isinstance check: it would rewrite every
+    # FALSY non-mapping document (``[]``, ``false``, ``0``) to ``{}`` and report it as
+    # readable, which is the "garbage config read as 'says no'" outcome this helper
+    # exists to prevent. ``None`` (empty file / explicit ``null``) is the one legitimately
+    # absent-content case, so it alone maps to ``({}, True)``.
+    if data is None:
+        return {}, True
+    return (data, True) if isinstance(data, dict) else ({}, False)
+
+
 def plan(cfg: Dict[str, Any]) -> str:
     v = cfg.get("plan")
     return v if isinstance(v, str) and v else DEFAULT_PLAN
