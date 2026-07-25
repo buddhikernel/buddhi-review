@@ -78,6 +78,29 @@ def load_config(path: Optional[Path] = None) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def load_config_checked(path: Optional[Path] = None) -> Tuple[Dict[str, Any], bool]:
+    """Like :func:`load_config`, but also reports whether the read genuinely
+    succeeded. ``load_config`` folds "absent", "corrupt", and "malformed" into the
+    same ``{}`` so most callers never have to handle an exception; a caller that
+    must never mistake "config unreadable" for "config says no" (a fail-closed
+    opt-in check) uses this instead.
+
+    Returns ``(cfg, ok)``. ``ok`` is False only when ``path`` EXISTS but could not
+    be read or parsed into a dict (PyYAML missing, an ``OSError``/``UnicodeDecodeError``,
+    a YAML syntax error, or a document that isn't a mapping) — a genuinely absent
+    file is ``({}, True)``, since there is nothing to fail to read."""
+    p = path or config_path()
+    if not p.exists():
+        return {}, True
+    if yaml is None:
+        return {}, False
+    try:
+        data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        return {}, False
+    return (data, True) if isinstance(data, dict) else ({}, False)
+
+
 def plan(cfg: Dict[str, Any]) -> str:
     v = cfg.get("plan")
     return v if isinstance(v, str) and v else DEFAULT_PLAN

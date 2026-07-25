@@ -70,6 +70,10 @@ _MODEL_TIERS = ("opus", "sonnet", "haiku")
 # unlabeled; the `gh label create` bootstrap stays single-shot.
 _LABEL_ADD_ATTEMPTS = merge.LABEL_ADD_ATTEMPTS
 _LABEL_ADD_BACKOFF_S = merge.LABEL_ADD_BACKOFF_S
+# `_create_file_pr`'s fallback ``detail`` when `gh pr create` succeeds but prints no
+# URL (seen with some `gh` versions/output modes) — NOT a resolvable PR ref, so
+# `_attach_ready_for_ci` must recognize and skip it rather than feed it to `gh pr edit`.
+_NO_PR_REF = "(PR opened)"
 
 # Each locked teaser is a single-line, single-BENEFIT contextual upgrade nudge
 # (exec-plan §E: one of the sanctioned paid-reference surfaces in OSS, not the
@@ -1065,7 +1069,7 @@ def _create_file_pr(repo: str, default_branch: str, path: str, content: str,
             pass
         return (False, "branch pushed but opening the PR failed")
     out = (getattr(pr, "stdout", "") or "").strip()
-    url = out.splitlines()[-1] if out else "(PR opened)"
+    url = out.splitlines()[-1] if out else _NO_PR_REF
     return (True, url)
 
 
@@ -1075,10 +1079,24 @@ _REVERT_NOTE = ("Your previous version is preserved in the PR's git history — 
 
 # The ONLY user-visible signal that an update PR may merge without its CI having
 # run. Shared by the inline attach and the deferred flush so both read identically;
-# the PR ref is interpolated so a multi-PR flush says WHICH PR needs the label.
+# the PR ref and repo are interpolated so the hand-run hint is copy-pasteable from
+# anywhere, not just from inside that repo's checkout.
 _LABEL_ATTACH_WARN = ("Couldn't attach the ready-for-ci label to {ref} — label-gated "
                       "CI may not run on this update PR. Add it by hand: "
-                      "gh pr edit {ref} --add-label ready-for-ci")
+                      "gh pr edit {ref} --add-label ready-for-ci -R {repo}")
+# `ref` is `_NO_PR_REF` when `gh pr create` reported no usable PR number/URL — there
+# is nothing to plug into `gh pr edit`, so this names the repo instead of printing
+# a hint that can never run.
+_LABEL_ATTACH_WARN_NO_REF = ("Couldn't attach the ready-for-ci label — label-gated CI "
+                             "may not run on the update PR just opened on {repo} (gh "
+                             "reported no PR number). Find it and add the label by "
+                             "hand: gh pr edit <PR#> --add-label ready-for-ci -R {repo}")
+
+
+def _label_attach_warning(ref: str, repo: str) -> str:
+    if ref == _NO_PR_REF:
+        return _LABEL_ATTACH_WARN_NO_REF.format(repo=repo)
+    return _LABEL_ATTACH_WARN.format(ref=ref, repo=repo)
 
 
 def _installed_managed_file_text(repo: Optional[str], dest_path: str, run) -> Optional[str]:
@@ -1171,7 +1189,7 @@ def _offer_update_managed_file(repo: str, default: Optional[str], spec: Dict[str
             pending_ci_prs.append(detail)
         elif not _attach_ready_for_ci(repo, detail, run=run, sleep=sleep,
                                       cfg_path=cfg_path):
-            _row("warn", _LABEL_ATTACH_WARN.format(ref=detail), pal, stream)
+            _row("warn", _label_attach_warning(detail, repo), pal, stream)
         return "pr"
     _row("warn", f"Couldn't open the update PR automatically ({detail}). You can copy "
                  f"the bundled {name} in by hand.", pal, stream)
@@ -1206,11 +1224,15 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run,
     regardless of what this run chose, and that PR still needs the label to get
     CI. The in-run choice can only turn the attach ON.
 
-    A broken config read does NOT default to "no label needed" — that would
-    silently mask a label-gated repo that actually needs the label. It instead
-    falls through to attempt the attach, so the outcome reflects what actually
-    happened on the PR (and the caller's warning fires iff the attach itself
-    fails).
+    A config file that EXISTS but could not be read or parsed (PyYAML missing, an
+    OS/decode error, a YAML syntax error, a non-mapping document) does NOT default
+    to "no label needed" — that would silently mask a label-gated repo that
+    actually needs the label. ``config.load_config_checked`` reports this
+    "unreadable" case distinctly from a genuinely ABSENT config (nothing to fail to
+    read, so ``label_gated_ci({}, repo)`` correctly reads as "off"); an unreadable
+    config falls through to attempt the attach, so the outcome reflects what
+    actually happened on the PR (and the caller's warning fires iff the attach
+    itself fails).
 
     Attached as a SEPARATE ``gh pr edit`` after the PR exists, never at create
     time: the label-gated workflow fires on the ``labeled`` event, which a
@@ -1226,13 +1248,23 @@ def _attach_ready_for_ci(repo: str, pr_ref: str, *, run,
     if not opted_in:
         try:
             path = cfg_path or config.config_path()
-            cfg = config.load_config(path) if path.exists() else {}
-            if not config.label_gated_ci(cfg, repo):
+            cfg, readable = config.load_config_checked(path)
+            if readable and not config.label_gated_ci(cfg, repo):
                 return True  # repo's CI is not label-gated — no label needed
         except Exception:
-            # Config read broken — fail closed: fall through and attempt the attach
-            # rather than assuming no label is needed.
+            # Config unreadable, or the read itself blew up — fail closed: fall
+            # through and attempt the attach rather than assuming no label is
+            # needed.
             pass
+        # `readable is False` (and no exception) falls through the same way: the
+        # `if` above short-circuits before calling `label_gated_ci`, so an
+        # unreadable config never gets read as "no label needed".
+    if str(pr_ref) == _NO_PR_REF:
+        # `_create_file_pr` couldn't report the new PR's number/URL — there is no
+        # ref `gh pr edit` could resolve, so skip the doomed retries/backoff
+        # entirely and let the caller warn once, naming the repo instead of an
+        # unrunnable `gh pr edit (PR opened) ...` hint.
+        return False
     create = ["gh", "label", "create", "ready-for-ci", "--color", "cccccc",
               "-R", repo]
     edit = ["gh", "pr", "edit", str(pr_ref), "--add-label", "ready-for-ci",
@@ -1270,7 +1302,7 @@ def _flush_pending_ci_labels(repo: str, pr_refs: Sequence[str], *, opted_in: boo
     for ref in pr_refs:
         if not _attach_ready_for_ci(repo, ref, run=run, sleep=sleep,
                                     cfg_path=cfg_path, opted_in=opted_in):
-            _row("warn", _LABEL_ATTACH_WARN.format(ref=ref), pal, stream)
+            _row("warn", _label_attach_warning(ref, repo), pal, stream)
 
 
 def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, stream,
@@ -1334,7 +1366,7 @@ def _offer_install_claude_workflow(repo: str, cwd: Optional[str], *, run, pal, s
                     pending_ci_prs.append(detail)
                 elif not _attach_ready_for_ci(repo, detail, run=run, sleep=sleep,
                                               cfg_path=cfg_path):
-                    _row("warn", _LABEL_ATTACH_WARN.format(ref=detail), pal, stream)
+                    _row("warn", _label_attach_warning(detail, repo), pal, stream)
                 return "pr"
             _row("warn", f"Could not open the PR automatically ({detail}). Falling "
                          "back to a local copy you can land yourself.", pal, stream)
@@ -1726,7 +1758,11 @@ def _installed_ci_command(installed_text: Optional[str]) -> Optional[str]:
 
 
 def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stream,
-                                input_fn=input) -> Optional[str]:
+                                input_fn=input,
+                                sleep: Callable[[float], None] = time.sleep,
+                                cfg_path: Optional[Path] = None,
+                                pending_ci_prs: Optional[List[str]] = None
+                                ) -> Optional[str]:
     """After a repo opts INTO label-gated CI, install the generic
     ``tests-ready-for-ci.yml`` label gate on the repo's DEFAULT branch via a
     server-side PR (reusing :func:`_create_file_pr` with its OWN branch + path,
@@ -1750,7 +1786,15 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
     successful PR it prints a PROMINENT warn row — not a dim line — that the gate
     stays INACTIVE until the PR is merged. Returns ``'pr'`` (a PR was opened) or
     ``None`` (already present / no template / declined / no command resolved / write
-    failed); on any failure it prints the manual fallback."""
+    failed); on any failure it prints the manual fallback.
+
+    ``cfg_path`` and ``pending_ci_prs`` mirror :func:`_offer_update_managed_file` and
+    :func:`_offer_install_claude_workflow`: this PR is, on an UPDATE of an
+    already-live gate, exactly the #94 shape — the repo's CI is provably
+    label-gated (the probe above found the gate on the default branch), so this
+    update PR needs the label itself to get CI run on it. ``pending_ci_prs``, when
+    given, defers the attach to :func:`_flush_pending_ci_labels`; otherwise the
+    attach happens inline, decided from the persisted config alone."""
     # P7 #4 — probe first; never open a redundant second PR for a gate already there.
     # Version-aware: when the installed gate is OLDER than the bundled template, fall
     # through to the bake-and-PR flow as an UPDATE (re-wiring the CI command) instead
@@ -1877,6 +1921,18 @@ def _offer_install_ready_for_ci(repo: str, cwd: Optional[str], *, run, pal, stre
                      f"is reviewed and merged onto '{default}' (the default branch). "
                      f"Until then the merge automation attaches `ready-for-ci` but no "
                      f"workflow listens for it, so CI is never gated.", pal, stream)
+        # On an UPDATE the probe above proved the gate is already live on the
+        # default branch — the same unlabeled-CI exposure as the other managed-file
+        # update PRs (#94), so this PR needs the label too. A fresh install has no
+        # existing gate to react to the label yet, so attaching it here is a
+        # harmless no-op; unconditional mirrors the other two offers' simpler
+        # always-append shape. See the docstring for why this mirrors
+        # _offer_update_managed_file's attach.
+        if pending_ci_prs is not None:
+            pending_ci_prs.append(detail)
+        elif not _attach_ready_for_ci(repo, detail, run=run, sleep=sleep,
+                                      cfg_path=cfg_path):
+            _row("warn", _label_attach_warning(detail, repo), pal, stream)
         return "pr"
     _row("warn", f"Couldn't open the PR automatically ({detail}). Copy the bundled "
                  "tests-ready-for-ci.yml into .github/workflows/ on your default "
@@ -2875,7 +2931,8 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
     # install (P7 #4) skips a redundant PR when the gate is already present.
     if lgc:
         _offer_install_ready_for_ci(repo, cwd, run=run, pal=pal, stream=stream,
-                                    input_fn=input_fn)
+                                    input_fn=input_fn, cfg_path=cfg_path,
+                                    pending_ci_prs=pending_ci_prs)
     # The opt-in is now known — label any update PR this run opened before it was.
     _flush_pending_ci_labels(repo, pending_ci_prs, opted_in=lgc, run=run, pal=pal,
                              stream=stream, cfg_path=cfg_path)
@@ -2988,7 +3045,8 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
             # (same server-side install + probe-before-install as the confirm flow).
             if repo_label_gated_ci:
                 _offer_install_ready_for_ci(repo, cwd, run=run, pal=pal, stream=stream,
-                                            input_fn=input_fn)
+                                            input_fn=input_fn, cfg_path=cfg_path,
+                                            pending_ci_prs=pending_ci_prs)
             # The opt-in is now known — label any update PR opened before it was.
             _flush_pending_ci_labels(repo, pending_ci_prs, opted_in=repo_label_gated_ci,
                                      run=run, pal=pal, stream=stream, cfg_path=cfg_path)

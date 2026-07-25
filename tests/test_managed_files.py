@@ -233,12 +233,12 @@ def test_label_add_failure_never_breaks_the_update(monkeypatch):
 
 def test_label_add_nonzero_exit_warns_and_keeps_the_update_pr(monkeypatch):
     """The likelier real-world failure is not an exception but ``gh pr edit`` exiting
-    NON-ZERO (no auth, no `pull_requests: write`, an unresolvable PR ref) — a
-    different branch of the helper than the raising one. Here the PR ref is
-    ``(PR opened)``, which ``_create_file_pr`` returns when ``gh pr create``
-    succeeds with empty stdout and which ``gh pr edit`` genuinely cannot resolve.
-    Same degradation: the update PR stands, the user is warned."""
-    base = _update_router(pr_url="")  # empty create stdout → ref is "(PR opened)"
+    NON-ZERO (no auth, no `pull_requests: write`) for a REAL, resolvable PR ref — a
+    different branch of the helper than the raising one. Same degradation: the
+    update PR stands, the user is warned, and — because the ref IS resolvable — the
+    hand-run hint is a command that actually runs: ``gh pr edit <ref> --add-label
+    ready-for-ci -R <repo>``."""
+    base = _update_router()  # default pr_url → a real, resolvable ref
 
     def run(argv, **kw):
         if list(argv)[:3] == ["gh", "pr", "edit"]:
@@ -251,7 +251,28 @@ def test_label_add_nonzero_exit_warns_and_keeps_the_update_pr(monkeypatch):
     assert "ready-for-ci" in out and "by hand" in out
     edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
     assert len(edits) == wizard._LABEL_ADD_ATTEMPTS, edits   # retried, then gave up
-    assert "(PR opened)" in edits[0]
+    assert "https://github.com/o/r/pull/5" in edits[0]
+    assert ("gh pr edit https://github.com/o/r/pull/5 --add-label ready-for-ci "
+            "-R o/r") in out
+
+
+def test_label_add_skips_retries_when_pr_ref_is_unresolvable_sentinel(monkeypatch):
+    """``_create_file_pr`` falls back to the ``(PR opened)`` sentinel when `gh pr
+    create` succeeds but reports no PR number/URL — not a ref ``gh pr edit`` could
+    ever resolve. The attach must recognize this and skip the doomed retries/backoff
+    entirely (no attempts, no real ``time.sleep`` burned in front of a waiting user),
+    and the warning must name the repo instead of printing an unrunnable
+    ``gh pr edit (PR opened) ...`` hint."""
+    base = _update_router(pr_url="")  # empty create stdout → ref is the sentinel
+
+    result, out, calls = _offer_update_lgc("legacy\n", monkeypatch=monkeypatch,
+                                           label_gated=True, run=base)
+    assert result == "pr"
+    edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert not edits, edits   # no doomed gh pr edit attempts against an unusable ref
+    assert "ready-for-ci" in out and "by hand" in out
+    assert "gh pr edit (PR opened)" not in out   # never an unrunnable hand-run hint
+    assert "gh pr edit <PR#> --add-label ready-for-ci -R o/r" in out
 
 
 # ── _attach_ready_for_ci: direct unit coverage of the helper itself ─────────────────
@@ -389,6 +410,68 @@ def test_real_config_absent_file_defaults_off(monkeypatch, tmp_path):
     result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch)
     assert result == "pr"
     assert not [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+# ── a config that EXISTS but can't be read must fail closed, not "no label needed" ──
+# config.load_config swallows a syntax error / non-mapping document into the SAME `{}`
+# an absent or genuinely empty file returns, so `label_gated_ci({}, repo)` reads False
+# either way. _attach_ready_for_ci must tell these apart via load_config_checked's
+# `readable` flag — an absent file legitimately means "no label needed", but a present,
+# unreadable one must never be read as an opt-out.
+
+def test_real_config_corrupt_yaml_fails_closed(monkeypatch, tmp_path):
+    """A real YAML syntax error (not a mocked exception) on disk — `load_config` itself
+    swallows it into `{}`, so the fix must be in how `_attach_ready_for_ci` reads that
+    `{}`, not in `load_config`'s own error handling."""
+    p = _real_config(tmp_path, monkeypatch, "label_gated_ci: [true\n")  # unbalanced flow seq
+    assert wizard.config.load_config(p) == {}, "sanity: load_config swallows the parse error"
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch)
+    assert result == "pr"
+    assert [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+def test_real_config_non_mapping_document_fails_closed(monkeypatch, tmp_path):
+    """A config file that parses cleanly but to something other than a mapping (e.g. a
+    bare YAML list) can never carry a genuine `label_gated_ci` key either — just as
+    unreadable as a syntax error for this decision, and must fail closed the same way."""
+    _real_config(tmp_path, monkeypatch, "- just\n- a\n- list\n")
+    result, out, calls = _offer_update("legacy\n", is_tty=True, monkeypatch=monkeypatch)
+    assert result == "pr"
+    assert [c for c in calls if c[:3] == ["gh", "pr", "edit"]], calls
+
+
+# ── load_config_checked: the helper itself, distinguishing the two `{}`s ────────────
+
+def test_load_config_checked_absent_file_is_readable_empty(tmp_path):
+    cfg, readable = wizard.config.load_config_checked(tmp_path / "never-written.yaml")
+    assert (cfg, readable) == ({}, True)
+
+
+def test_load_config_checked_genuinely_empty_file_is_readable_empty(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("", encoding="utf-8")
+    assert wizard.config.load_config_checked(p) == ({}, True)
+
+
+def test_load_config_checked_valid_config_is_readable(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("label_gated_ci: true\n", encoding="utf-8")
+    cfg, readable = wizard.config.load_config_checked(p)
+    assert readable is True
+    assert cfg == {"label_gated_ci": True}
+
+
+def test_load_config_checked_corrupt_yaml_is_unreadable(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("label_gated_ci: [true\n", encoding="utf-8")
+    cfg, readable = wizard.config.load_config_checked(p)
+    assert (cfg, readable) == ({}, False)
+
+
+def test_load_config_checked_non_mapping_document_is_unreadable(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text("- just\n- a\n- list\n", encoding="utf-8")
+    assert wizard.config.load_config_checked(p) == ({}, False)
 
 
 # ── one run, ONE config: the decision follows the run's resolved cfg_path ───────────

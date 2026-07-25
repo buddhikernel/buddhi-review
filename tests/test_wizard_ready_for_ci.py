@@ -341,7 +341,8 @@ def _install_router(*, present=False, version=None, default="main", head_sha="de
     return router
 
 
-def _offer(tmp_path, *, is_tty, router, make_detectable=True, input_answers=None):
+def _offer(tmp_path, *, is_tty, router, make_detectable=True, input_answers=None,
+          cfg_path=None, pending_ci_prs=None):
     if make_detectable:
         (tmp_path / "Makefile").write_text("ci:\n\techo hi\n", encoding="utf-8")
     run, calls = _recorder(router)
@@ -356,7 +357,8 @@ def _offer(tmp_path, *, is_tty, router, make_detectable=True, input_answers=None
     with _tty(is_tty):
         result = wizard._offer_install_ready_for_ci(
             REPO, str(tmp_path), run=run, pal=wizard._Palette(False), stream=buf,
-            input_fn=in_fn)
+            input_fn=in_fn, sleep=lambda s: None,
+            cfg_path=cfg_path, pending_ci_prs=pending_ci_prs)
     return result, buf.getvalue(), calls
 
 
@@ -488,6 +490,50 @@ def test_offer_pr_failure_prints_manual_fallback(tmp_path):
     assert "by hand" in out or "manually" in out
 
 
+# ── the gate-update PR must itself get CI when the repo is label-gated (#94) ────────
+# _offer_install_ready_for_ci's own PR (installing/updating tests-ready-for-ci.yml) is
+# exactly the same managed-file-update shape as the other two "offer" helpers: on an
+# UPDATE the probe already found the gate live on the default branch, so this PR needs
+# the `ready-for-ci` label itself to get CI run on it. Mirrors
+# test_managed_files.py's coverage of _offer_update_managed_file's attach.
+
+def test_install_pr_gets_ready_for_ci_when_repo_is_label_gated(monkeypatch, tmp_path):
+    monkeypatch.setattr(wizard.config, "label_gated_ci", lambda cfg, repo=None: True)
+    result, out, calls = _offer(
+        tmp_path, is_tty=True, router=_install_router(present=True, version=None),
+        input_answers={"Install the label-gated CI workflow": "y"})
+    assert result == "pr"
+    edits = [c["argv"] for c in calls if c["argv"][:3] == ["gh", "pr", "edit"]]
+    assert len(edits) == 1, calls
+    assert "--add-label" in edits[0] and "ready-for-ci" in edits[0]
+    assert any(c["argv"][:3] == ["gh", "label", "create"] for c in calls), calls
+
+
+def test_install_pr_gets_no_label_when_repo_not_opted_into_label_gated_ci(tmp_path):
+    """Default OFF: a repo whose CI runs on every push must get no stray label."""
+    result, out, calls = _offer(
+        tmp_path, is_tty=True, router=_install_router(present=True, version=None),
+        input_answers={"Install the label-gated CI workflow": "y"})
+    assert result == "pr"
+    assert not [c for c in calls if c["argv"][:3] == ["gh", "pr", "edit"]], calls
+
+
+def test_install_pr_label_is_deferred_when_the_caller_asks_later(monkeypatch, tmp_path):
+    """With a `pending_ci_prs` sink the install/update PR is opened and its ref handed
+    back UNLABELED — no inline attach, because the caller (confirm_repo_interactive /
+    setup_interactive) hasn't asked the label-gated-CI opt-in question yet at this
+    point in the run."""
+    monkeypatch.setattr(wizard.config, "label_gated_ci", lambda cfg, repo=None: True)
+    pending = []
+    result, out, calls = _offer(
+        tmp_path, is_tty=True, router=_install_router(present=True, version=None),
+        input_answers={"Install the label-gated CI workflow": "y"},
+        pending_ci_prs=pending)
+    assert result == "pr"
+    assert pending == ["https://github.com/octocat/Hello-World/pull/9"]
+    assert not [c for c in calls if c["argv"][:3] == ["gh", "pr", "edit"]], calls
+
+
 # ── Wire-up into the per-repo confirm flow + the full wizard ─────────────────────────
 
 def _confirm_run(*, gh_auth=True, default="main", present=False, version=None):
@@ -544,6 +590,23 @@ def test_confirm_lgc_on_installs_ready_for_ci(tmp_path):
     # The installer opened a PR on its own branch, with the merge-me callout.
     assert any(c[:2] == ["gh", "pr"] for c in calls), "the ready-for-ci PR must be opened"
     assert "MERGE THIS PR" in out
+
+
+def test_confirm_labels_the_ready_for_ci_update_pr_it_opened(tmp_path):
+    """End-to-end #94 shape: the installer finds the gate already on the default
+    branch but OUTDATED, so it opens an UPDATE PR for tests-ready-for-ci.yml itself
+    — the repo's CI is thus provably label-gated, and that update PR must come away
+    labeled via the same pending_ci_prs sink the other managed-file update PRs use."""
+    run, calls = _confirm_run(present=True, version=None)  # legacy unmarked → update
+    rc, out, cfg_path = _drive_confirm(tmp_path, run, lgc_on=True)
+    assert rc == 0
+    assert config.label_gated_ci(config.load_config(cfg_path), REPO) is True
+    creates = [c for c in calls if c[:3] == ["gh", "pr", "create"]]
+    edits = [c for c in calls if c[:3] == ["gh", "pr", "edit"]]
+    assert len(creates) == 1, calls          # the gate-update PR was opened
+    assert len(edits) == 1, calls            # …and then labeled
+    assert "--add-label" in edits[0] and "ready-for-ci" in edits[0]
+    assert calls.index(creates[0]) < calls.index(edits[0])
 
 
 def test_confirm_lgc_off_does_not_install(tmp_path):

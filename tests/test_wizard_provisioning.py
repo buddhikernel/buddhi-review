@@ -511,6 +511,68 @@ def test_offer_install_default_branch_writes_local(monkeypatch, tmp_path):
     assert not any(c["argv"][:2] == ["gh", "pr"] for c in calls)
 
 
+# ── install-path ready-for-ci attach/defer branch (#94's install-path shape) ────────
+# _offer_install_claude_workflow's server-side PR reaches the SAME
+# `pending_ci_prs`/`_attach_ready_for_ci` branch as _offer_update_managed_file (see
+# tests/test_managed_files.py's "the update PR must actually get CI" section) — but
+# neither existing test above exercises a config that actually DECIDES something:
+# test_offer_install_feature_branch_opens_server_side_pr runs under the suite's
+# hermetic absent-config fixture (tests/conftest.py's `_hermetic_config`), so
+# `_attach_ready_for_ci` short-circuits to True (repo not label-gated) before any
+# `gh pr edit` call — deleting the whole attach/defer branch would leave this file's
+# suite green.
+
+def _feature_branch_install_router(**installer_kwargs):
+    def router(argv, _inp):
+        if argv[:2] == ["git", "-C"] and "rev-parse" in argv:
+            return _R(returncode=0, stdout="feature/x\n")     # current branch
+        if argv[:3] == ["gh", "repo", "view"]:
+            return _R(returncode=0, stdout="main\n")          # default branch
+        return _installer_router(**installer_kwargs)(argv, _inp)
+    return router
+
+
+def test_offer_install_defers_the_label_when_pending_ci_prs_given(monkeypatch, tmp_path):
+    """A `pending_ci_prs` sink defers the attach on the install path exactly as it
+    does on the update path: the opened PR's ref is appended, and no `gh pr edit`
+    runs yet."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
+    run, calls = _recorder(_feature_branch_install_router())
+    pal, buf = wizard._Palette(False), io.StringIO()
+    pending = []
+    result = wizard._offer_install_claude_workflow(
+        "acme/widgets", str(tmp_path), run=run, pal=pal, stream=buf,
+        input_fn=lambda *a: "", sleep=lambda s: None, pending_ci_prs=pending)
+    assert result == "pr"
+    assert pending == ["https://github.com/acme/widgets/pull/7"]
+    assert not [c for c in calls if c["argv"][:3] == ["gh", "pr", "edit"]], calls
+
+
+def test_offer_install_attaches_ready_for_ci_inline_when_label_gated(monkeypatch, tmp_path):
+    """Without a `pending_ci_prs` sink, a label-gated repo's persisted config gets
+    `ready-for-ci` attached to the install PR right after `gh pr create` — mirrors
+    tests/test_managed_files.py::test_update_pr_gets_ready_for_ci_when_repo_is_label_gated
+    for the install path."""
+    monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
+    cfg_path = tmp_path / "config.yaml"
+    cfg_path.write_text("label_gated_ci: true\n", encoding="utf-8")
+    run, calls = _recorder(_feature_branch_install_router())
+    pal, buf = wizard._Palette(False), io.StringIO()
+    result = wizard._offer_install_claude_workflow(
+        "acme/widgets", str(tmp_path), run=run, pal=pal, stream=buf,
+        input_fn=lambda *a: "", sleep=lambda s: None, cfg_path=cfg_path)
+    assert result == "pr"
+    edits = [c["argv"] for c in calls if c["argv"][:3] == ["gh", "pr", "edit"]]
+    assert len(edits) == 1, calls
+    assert "--add-label" in edits[0] and "ready-for-ci" in edits[0]
+    # attached AFTER the PR exists, never at create time (the labeled event needs it)
+    create_i = next(i for i, c in enumerate(calls) if c["argv"][:3] == ["gh", "pr", "create"])
+    edit_i = next(i for i, c in enumerate(calls) if c["argv"][:3] == ["gh", "pr", "edit"])
+    assert create_i < edit_i
+
+
 # ── P7 #1 — the re-check prompt phrasing ────────────────────────────────────────────
 
 def test_claude_recheck_prompt_is_clear_and_names_the_file():
