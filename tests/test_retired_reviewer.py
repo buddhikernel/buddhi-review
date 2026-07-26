@@ -554,6 +554,25 @@ class TestRetiredDetector:
         assert detectors.is_retired_message(
             "Our code review service has been shut down as of 2026-07-01.")
 
+    def test_a_fronted_locus_beats_the_deictic_this_too(self):
+        # English states the same third-party fact with the locus BEFORE the
+        # clause instead of after it — "Upstream, this code review integration
+        # has been retired" is word-for-word the same claim as "…has been
+        # retired upstream." A suffix-only check misses it and permanently
+        # retires the healthy reviewer that posted it as feedback.
+        assert not detectors.is_retired_message(
+            "Upstream, this code review integration has been retired.")
+        assert detectors.detect_signal(
+            "Upstream, this code review integration has been retired.") is None
+
+    def test_the_fronted_locus_must_stay_in_the_same_clause(self):
+        # A fronted locus in an EARLIER, separate sentence is not the locus of
+        # THIS claim, and vetoing on it would hide a real banner — the same
+        # boundary the trailing form is already held to.
+        assert detectors.is_retired_message(
+            "The SDK lives upstream. Our code review service has been "
+            "discontinued.")
+
     def test_empty_body(self):
         assert not detectors.is_retired_message("")
         assert not detectors.is_retired_message(None)
@@ -1083,6 +1102,26 @@ class TestProgressiveAndFutureNoticesAreRecognized:
         # silences a healthy reviewer for the whole run with no retraction path.
         assert not detectors.is_retired_message(body), body
         assert detectors.detect_signal(body) is None
+
+    @pytest.mark.parametrize("body", [
+        # The date FRONTS the clause instead of trailing it — the identical
+        # deprecation warning, stated the other way round. A suffix-only check
+        # misses it and permanently retires the still-alive reviewer.
+        "Effective August 1, our review bot will be shut down permanently.",
+        "Starting next month, our code review bot will be shut down.",
+        "In Q4, our review bot is being retired.",
+    ])
+    def test_a_fronted_scheduled_notice_retires_nobody_too(self, body):
+        assert not detectors.is_retired_message(body), body
+        assert detectors.detect_signal(body) is None
+
+    def test_the_fronted_schedule_must_stay_in_the_same_clause(self):
+        # A fronted date in an EARLIER, separate sentence does not date THIS
+        # claim, and vetoing on it would hide a real banner — the same
+        # boundary the trailing form is already held to.
+        assert detectors.is_retired_message(
+            "Our release ships on August 1. Our review bot will be shut down "
+            "permanently.")
 
     def test_a_completed_claim_keeps_its_date(self):
         # The veto is keyed on the PROSPECTIVE marker in the matched span, so a

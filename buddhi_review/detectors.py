@@ -907,13 +907,26 @@ def _retired_scope_veto(text: str, match: "re.Match") -> bool:
 # by its maintainer") is NOT listed — a first-party banner can legitimately name
 # its own publisher that way. A DATE is not a locus at all ("has been shut down
 # as of 2026-07-01" is a banner, and stays one).
-_RETIRED_ELSEWHERE_LOCUS_RE = re.compile(
-    r"[^.!?;:\n]{0,24}?"
-    r"(?:\bupstream\b"
+#
+# The locus is checked on BOTH sides of the matched predicate: English fronts
+# it just as naturally as it trails it — "Upstream, this code review
+# integration has been retired" states the identical third-party fact as
+# "…has been retired upstream." A suffix-only check misreads the fronted form
+# as a live reviewer's self-report and permanently retires it.
+_RETIRED_ELSEWHERE_LOCUS_CORE = (
+    r"\bupstream\b"
     r"|\bby\s+(?:the|its|their|a)\s+(?:vendor|provider|publisher|supplier"
-    r"|third[\s-]party)\b)",
+    r"|third[\s-]party)\b"
+)
+_RETIRED_ELSEWHERE_LOCUS_RE = re.compile(
+    r"[^.!?;:\n]{0,24}?(?:" + _RETIRED_ELSEWHERE_LOCUS_CORE + r")",
     re.IGNORECASE,
 )
+_RETIRED_ELSEWHERE_LOCUS_CORE_RE = re.compile(
+    _RETIRED_ELSEWHERE_LOCUS_CORE, re.IGNORECASE)
+# The clause/sentence break the prefix scan must not cross — the same break
+# set `_RETIRED_GAP` treats as a same-clause boundary elsewhere in this module.
+_RETIRED_CLAUSE_BREAK_RE = re.compile(r"[.!?;:\n]")
 
 
 def _retired_elsewhere_veto(text: str, match: "re.Match") -> bool:
@@ -922,11 +935,17 @@ def _retired_elsewhere_veto(text: str, match: "re.Match") -> bool:
     someone else's dead service, i.e. review feedback, never a self-report.
 
     The locus must qualify THIS predicate: it is matched immediately after the
-    matched span and may not cross a sentence or clause break. That is what
-    keeps "…has been retired UPSTREAM" (feedback) apart from "…has been retired.
-    No further code reviews will be posted." (a notice) — the two differ in
-    nothing else. See :data:`_RETIRED_ELSEWHERE_LOCUS_RE`."""
-    return bool(_RETIRED_ELSEWHERE_LOCUS_RE.match(text, match.end()))
+    matched span, or fronted immediately before it in the same clause, and may
+    not cross a sentence or clause break. That is what keeps "…has been retired
+    UPSTREAM" and "Upstream, this…has been retired" (both feedback) apart from
+    "…has been retired. No further code reviews will be posted." (a notice) —
+    they differ in nothing else. See :data:`_RETIRED_ELSEWHERE_LOCUS_RE`."""
+    if _RETIRED_ELSEWHERE_LOCUS_RE.match(text, match.end()):
+        return True
+    lo = 0
+    for brk in _RETIRED_CLAUSE_BREAK_RE.finditer(text, 0, match.start()):
+        lo = brk.end()
+    return bool(_RETIRED_ELSEWHERE_LOCUS_CORE_RE.search(text, lo, match.start()))
 
 
 # (j), the veto the PROSPECTIVE tenses bring with them. A completed claim says
@@ -963,19 +982,22 @@ _RETIRED_SCHEDULE_DATE = (
     r"|next\s+(?:week|month|quarter|year|release|sprint)"
     r"|the\s+end\s+of\s+(?:the\s+)?(?:week|month|quarter|year))"
 )
-_RETIRED_SCHEDULE_RE = re.compile(
-    # Same-clause window, like every other veto here: a date in the next
-    # sentence does not date THIS claim.
-    r"[^.!?;:\n]{0,60}?"
-    r"(?:\b(?:on|from|after|by|starting|beginning|effective|as\s+of|come)\s+"
+_RETIRED_SCHEDULE_CORE = (
+    r"\b(?:on|from|after|by|starting|beginning|effective|as\s+of|come)\s+"
     + _RETIRED_SCHEDULE_DATE + r"\b"
     r"|\bin\s+(?:q[1-4]\b|\d+\s+(?:days?|weeks?|months?)\b|"
     + _RETIRED_SCHEDULE_MONTH + r"\b)"
     r"|\bnext\s+(?:week|month|quarter|year|release|sprint)\b"
     r"|\b(?:later|early|late)\s+(?:this|next)\s+(?:week|month|quarter|year)\b"
-    r"|\bat\s+the\s+end\s+of\s+(?:the\s+)?(?:week|month|quarter|year)\b)",
+    r"|\bat\s+the\s+end\s+of\s+(?:the\s+)?(?:week|month|quarter|year)\b"
+)
+_RETIRED_SCHEDULE_RE = re.compile(
+    # Same-clause window, like every other veto here: a date in the next
+    # sentence does not date THIS claim.
+    r"[^.!?;:\n]{0,60}?(?:" + _RETIRED_SCHEDULE_CORE + r")",
     re.IGNORECASE,
 )
+_RETIRED_SCHEDULE_CORE_RE = re.compile(_RETIRED_SCHEDULE_CORE, re.IGNORECASE)
 
 
 def _retired_scheduled_veto(text: str, match: "re.Match") -> bool:
@@ -983,10 +1005,20 @@ def _retired_scheduled_veto(text: str, match: "re.Match") -> bool:
     future effective date — a deprecation warning from a reviewer that is still
     alive today, never a self-report of a shutdown that has happened.
 
-    See the block comment above :data:`_RETIRED_SCHEDULE_RE`."""
+    The date is checked on BOTH sides of the matched predicate: a schedule is
+    just as often fronted — "Effective August 1, our review bot will be shut
+    down permanently" — as trailing, and a suffix-only check misses the
+    fronted form, misreading a live reviewer's deprecation warning as a
+    completed self-report. See the block comment above
+    :data:`_RETIRED_SCHEDULE_RE`."""
     if not _RETIRED_PROSPECTIVE_MARKER_RE.search(match.group(0)):
         return False
-    return bool(_RETIRED_SCHEDULE_RE.match(text, match.end()))
+    if _RETIRED_SCHEDULE_RE.match(text, match.end()):
+        return True
+    lo = 0
+    for brk in _RETIRED_CLAUSE_BREAK_RE.finditer(text, 0, match.start()):
+        lo = brk.end()
+    return bool(_RETIRED_SCHEDULE_CORE_RE.search(text, lo, match.start()))
 
 
 def _retired_claim_vetoed(text: str, match: "re.Match") -> bool:
