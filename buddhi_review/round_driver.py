@@ -3038,7 +3038,7 @@ class RoundDriver:
                   f"to process in round 1 without waiting")
 
     def _fold_hard_signal(self, comment: Comment) -> None:
-        """Apply ONLY the hard-cause exclusions (quota / PR-too-large) from a comment
+        """Apply ONLY the hard-cause exclusions (retired / quota / PR-too-large) from a comment
         whose WORK is finished — an inline finding on a RESOLVED review thread, which
         the preflight fold skips. The exclusion outlives the resolution: a reviewer
         that said it was out of quota is still out of quota, and re-summoning it would

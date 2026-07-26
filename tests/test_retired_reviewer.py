@@ -27,7 +27,6 @@ table — :class:`TestNoBotNamesHardcoded` greps the shipped constants to keep i
 that way.
 """
 import re
-import subprocess
 
 import pytest
 
