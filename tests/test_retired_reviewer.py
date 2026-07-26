@@ -466,6 +466,49 @@ class TestRetiredDetector:
         assert not detectors._RETIRED_FEEDBACK_MARKER_RE.search(body.lower()), body
         assert detectors.is_retired_message(body), body
 
+    @pytest.mark.parametrize("body", [
+        # …and the UNINSTALL instruction is exempt. A dead reviewer leaves an
+        # installed artifact behind, so the banner tells you to take it out —
+        # and the cleanup branch above then blanked the notice, which let
+        # is_placeholder_review_body CREDIT the banner's commit sha to the
+        # never-merge-unreviewed gate.
+        "Our code review service has been permanently retired. "
+        "Please remove the GitHub App.",
+        "Our code review service has been permanently retired. Please remove "
+        "the GitHub App from your organization.",
+        "This code review service has been discontinued. Remove the GitHub App "
+        "installation.",
+        "Our review bot has been retired. Please uninstall the GitHub App and "
+        "remove the marketplace listing.",
+    ])
+    def test_an_uninstall_instruction_does_not_blank_the_notice(self, body):
+        # The veto branch itself is NOT loosened: it still matches the raw body.
+        assert detectors._RETIRED_FEEDBACK_MARKER_RE.search(body.lower()), body
+        assert detectors.is_retired_message(body), body
+        # The half the regression actually broke.
+        assert detectors.is_placeholder_review_body(body), body
+
+    @pytest.mark.parametrize("body", [
+        # The exemption is EARNED, exactly like the declined-PR one: someone
+        # ELSE's dead service leaves no retirement claim standing once the
+        # uninstall clause is blanked, so it keeps the full veto.
+        "The vendor's code review service has been discontinued, so remove the "
+        "GitHub App.",
+        "Remove the GitHub App; it is unused.",
+        # …and the object is an ALLOWLIST of the reviewer's own installation,
+        # never a code noun phrase that merely starts with one.
+        "Our code review service has been retired. Remove the installation "
+        "step from the workflow.",
+    ])
+    def test_the_uninstall_exemption_is_earned_and_narrow(self, body):
+        assert not detectors.is_retired_message(body), body
+
+    def test_the_uninstall_exemption_leaves_the_cleanup_branch_intact(self):
+        # The pin the exemption must not spend: a code-shaped cleanup object is
+        # a review, and stays vetoed in full.
+        assert not detectors.is_retired_message(
+            "Our review bot has been retired; remove its adapter.")
+
     def test_domain_review_nouns_never_match(self):
         # (a) CODE review only — a bare "review" noun never counts. This is what
         # removes the entire product-domain class (product reviews, peer review,
@@ -1386,18 +1429,19 @@ class TestDeicticClaimsGoThroughTheContentGate:
 
     @pytest.mark.parametrize("body", [
         RETIREMENT_BANNER,                                   # global quantifier
-        "Our code review bot has been permanently retired.",  # first-person det.
         "We have ceased all code review operations on GitHub.",  # first person
         "All automated code review activity has been permanently disabled.",
         # Deictic AND independently anchored — the "our" clause still names the
         # speaker with "this" neutralized, so the verdict never rested on it.
+        # (The "our" clause has an ambiguity of its own, settled by the same
+        # gate one class down; what is pinned here is that the DEICTIC reason
+        # does not arm.)
         "This code review integration has been retired. Our code review service "
         "has been discontinued.",
     ])
     def test_a_corroborated_claim_never_arms_the_gate(self, body):
-        # Only the claims that hang on "this" alone pay for a model call; every
-        # other anchor names the speaker by itself and keeps the deterministic
-        # verdict with no call at all.
+        # Only the claims that hang on "this" alone pay for a model call on the
+        # deictic account; every other anchor names the speaker by itself.
         assert not detectors._retired_claim_is_deictic_only(body), body
         calls = []
 
@@ -1445,6 +1489,12 @@ class TestDeicticClaimsGoThroughTheContentGate:
         assert '"this"' in prompts[0]
         assert '{"self_reporting": false}' in prompts[0]
 
+    def test_the_possessive_our_raises_its_own_reason_not_the_deictic_one(self):
+        # The two reasons are disjoint: an "our" claim is not deictic, and the
+        # gate it arms must be told about "our", not about "this".
+        assert not detectors._retired_claim_is_deictic_only(POSSESSIVE_FINDING)
+        assert detectors._retired_claim_is_possessive_only(POSSESSIVE_FINDING)
+
     def test_the_three_recoverable_causes_never_raise_the_deictic_reason(self):
         # Their exclusions recover on their own, and none of them is anchored by
         # a determiner, so the tie-breaker they are told stays "true" (exclude).
@@ -1460,6 +1510,108 @@ class TestDeicticClaimsGoThroughTheContentGate:
             pr_body="The reviewer answers oversized diffs with a placeholder.")
         assert len(prompts) == 1
         assert '{"self_reporting": true}' in prompts[0]
+
+
+# ═════════════════════════════════════════════════════════════════════
+# 3b-ii. The POSSESSIVE "our" — the other anchor that does not say WHO.
+#
+# "our" was read as conclusive speaker self-reference, but the owner it
+# names is whoever is TALKING, and a reviewer talks in the voice of the
+# project it is reviewing constantly — the identical weakness the
+# first-person "we" member already pays for. On a repository whose own
+# product IS a code review service (this one is), an ordinary finding wears
+# the banner's exact wording.
+#
+# The remedy is the deictic one and ONLY that one: the claim is routed
+# through the content gate. Nothing deterministic moves — is_retired_message,
+# the merge gate that reads it LLM-free, and the migration-guidance exemption
+# all keep treating "our" as conclusive.
+# ═════════════════════════════════════════════════════════════════════
+
+# The reported false positive: a healthy reviewer's finding about the
+# CUSTOMER'S own retired service, with the live defect trailing it. No
+# feedback-veto marker, no repo/CI scope qualifier, under the length gate, on a
+# PR about the webhook — so nothing before the gate saves its author.
+POSSESSIVE_FINDING = (
+    "Our code review service has been permanently retired, but the webhook "
+    "remains enabled and now returns 404.")
+WEBHOOK_PR = {"pr_title": "Fix the webhook 404",
+              "pr_body": "The handler still answers after the service went away."}
+
+
+class TestPossessiveClaimsGoThroughTheContentGate:
+    def test_the_possessive_finding_is_flagged_as_possessive_only(self):
+        assert detectors._retired_claim_is_possessive_only(POSSESSIVE_FINDING)
+
+    def test_the_gate_keeps_a_healthy_reviewer_that_wrote_it(self):
+        # THE FIX. Before it, a PR whose subject is not retirement meant no
+        # model call at all, so this finding permanently excluded its author and
+        # never reached the fixer, with no retraction path.
+        assert detectors.detect_signal(
+            POSSESSIVE_FINDING, quota_llm=_llm(False), **WEBHOOK_PR) is None
+
+    def test_the_gate_still_excludes_when_the_model_reads_it_as_a_banner(self):
+        assert detectors.detect_signal(
+            POSSESSIVE_FINDING, quota_llm=_llm(True), **WEBHOOK_PR
+        ) == detectors.SIGNAL_RETIRED
+
+    def test_a_broken_gate_falls_back_to_the_deterministic_verdict(self):
+        assert detectors.detect_signal(
+            POSSESSIVE_FINDING, quota_llm=_llm(None), **WEBHOOK_PR
+        ) == detectors.SIGNAL_RETIRED
+        assert detectors.detect_signal(POSSESSIVE_FINDING) == detectors.SIGNAL_RETIRED
+
+    def test_the_merge_gate_still_refuses_the_review_credit(self):
+        # The half that must NOT move, exactly as for the deictic claim.
+        assert detectors.is_retired_message(POSSESSIVE_FINDING)
+        assert detectors.is_placeholder_review_body(POSSESSIVE_FINDING)
+
+    def test_the_prompt_names_the_determiner_actually_in_play(self):
+        # A framing the message does not fit biases the answer: "it says
+        # 'this'" is simply false of an "our" claim, so the paragraph is
+        # determiner-specific and the tie still breaks toward the healthy
+        # reviewer.
+        prompts = []
+
+        def capture(prompt):
+            prompts.append(prompt)
+            return {"self_reporting": True}
+
+        detectors.detect_signal(POSSESSIVE_FINDING, quota_llm=capture,
+                                **WEBHOOK_PR)
+        assert len(prompts) == 1
+        assert '"our"' in prompts[0]
+        assert 'it says "this"' not in prompts[0]
+        assert '{"self_reporting": false}' in prompts[0]
+
+    @pytest.mark.parametrize("body", [
+        # "my" is left conclusive — a reviewer never writes it in the project's
+        # voice — and so is every anchor that names the speaker without a
+        # determiner at all.
+        "My code review service has been permanently retired.",
+        "We have ceased all code review operations on GitHub.",
+        RETIREMENT_BANNER,
+    ])
+    def test_the_other_anchors_still_keep_the_deterministic_verdict(self, body):
+        calls = []
+
+        def counting(prompt):
+            calls.append(prompt)
+            return {"self_reporting": False}
+
+        assert not detectors._retired_claim_is_possessive_only(body), body
+        assert detectors.detect_signal(
+            body, quota_llm=counting, **WEBHOOK_PR) == detectors.SIGNAL_RETIRED
+        assert calls == []
+
+    def test_migration_guidance_is_still_exempt_from_the_feedback_guard(self):
+        # The pin the fix must not spend. A genuine "our" banner routinely
+        # carries migration guidance, which _REVIEW_FEEDBACK_RE matches — so the
+        # possessive reason arms the GATE only and never withdraws that
+        # exemption. With no model wired the notice classifies exactly as before.
+        assert detectors._REVIEW_FEEDBACK_RE.search(NOTICE_WITH_MIGRATION_PROSE)
+        assert detectors.detect_signal(
+            NOTICE_WITH_MIGRATION_PROSE) == detectors.SIGNAL_RETIRED
 
 
 # ═════════════════════════════════════════════════════════════════════

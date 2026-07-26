@@ -1327,6 +1327,51 @@ _RETIRED_DECLINED_PR_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The SECOND clause a shutdown notice legitimately carries into the veto: the
+# UNINSTALL instruction. A dead reviewer leaves an installed artifact behind, so
+# the banner tells you to take it out — "Our code review service has been
+# permanently retired. Please remove the GitHub App." The cleanup-imperative
+# branch of the veto ("remove") fired on that, is_retired_message answered False,
+# and the notice was then treated as actionable review output — including by
+# :func:`is_placeholder_review_body`, which would CREDIT its commit sha to the
+# never-merge-unreviewed gate. With this reviewer the only one configured, that
+# gate can then merge a head no reviewer ever read: the exact regression this
+# whole cause exists to close, and the expensive direction.
+#
+# Same construction as the declined-PR exemption above, for the same reason: the
+# veto branch is NOT loosened (it is the last line of defense) — this one clause
+# is blanked out of the COPY the veto scans, and only when the retirement claim
+# SURVIVES the blanking (see is_retired_message). A cleanup imperative trailing
+# an INDEPENDENTLY self-anchored notice is migration guidance; the same words
+# with no notice of their own left standing keep the full veto.
+#
+# The OBJECT is what separates the two, and it is an ALLOWLIST of the reviewer's
+# own GitHub-side INSTALLATION — the thing a repo admin uninstalls, which is not
+# a thing that appears in a diff. It deliberately does NOT include the code-shaped
+# objects that made the cleanup branch necessary in the first place: "remove its
+# adapter", "delete the vendored client", "drop the unused import" all still veto
+# in full, and so does the bare service noun ("remove the integration"), which
+# :data:`_RETIRED_SELF_SERVICE_NOUN` already treats as two-way — a vendored
+# integration is routinely the thing under review.
+_RETIRED_UNINSTALL_OBJECT = (
+    r"(?:github\s+app(?:lication)?|app\s+installation|installation"
+    r"|marketplace\s+(?:app|listing|integration))"
+)
+# The tail guard keeps the object from being merely the HEAD of a longer code
+# noun phrase: "remove the installation STEP from the workflow" is feedback about
+# a workflow file, not an uninstall instruction, so only a clause end or a
+# location/connective continuation ("…from your organization") is admitted.
+_RETIRED_UNINSTALL_CLEANUP_RE = re.compile(
+    r"\b(?:please\s+|kindly\s+|you\s+(?:can|may|should|will\s+need\s+to)\s+"
+    r"|feel\s+free\s+to\s+)?"
+    r"(?:remove|delete|drop|uninstall|disable|revoke)\s+"
+    r"(?:the|this|our|your|its)\s+(?:[\w'’-]+[\s-]+){0,1}"
+    + _RETIRED_UNINSTALL_OBJECT + r"\b"
+    r"(?=\s*(?:[.,;:!?)\]}\"'“”‘’]|\n|$)"
+    r"|\s+(?:from|in|on|at|for|to|and|so|since|because|as|if|once|when)\b)",
+    re.IGNORECASE,
+)
+
 SIGNAL_CLEAN = "clean"
 SIGNAL_QUOTA = "quota"
 SIGNAL_PR_TOO_LARGE = "pr-too-large"
@@ -1753,11 +1798,34 @@ _CAUSE_SELF_REPORT = {
 }
 
 
+# The ambiguity paragraph, one per determiner that can raise
+# ``ambiguous_self_reference``. Each states the actual two readings of ITS OWN
+# word: a framing the message does not fit biases the answer rather than
+# sharpening it, and "it says 'this'" is simply false of an "our" claim.
+_AMBIGUOUS_DET_FRAMING = {
+    "this": (
+        " The wording is ambiguous by construction: it says \"this\", and "
+        "\"this\" can point either at the bot posting the message (case A) "
+        "or at the code, service, or integration the bot is commenting on "
+        "(case B). Answer A only if the message clearly speaks about the "
+        "bot posting it."),
+    "our": (
+        " The wording is ambiguous by construction: it says \"our\", and a "
+        "code review bot writes \"our\" both for its OWN service (case A) and "
+        "in the voice of the project it is reviewing — \"our service\", \"our "
+        "code\" — which on a repository that itself owns a code review "
+        "service makes the sentence an ordinary finding about that "
+        "repository's product (case B). Answer A only if the message clearly "
+        "speaks about the bot posting it."),
+}
+
+
 def _placeholder_self_reported(
     cause: str, text: str, pr_title: Optional[str], pr_body: Optional[str],
     quota_llm: Callable[[str], Optional[Dict]], *,
     pr_about_cause: bool = True,
     ambiguous_self_reference: bool = False,
+    ambiguous_determiner: str = "this",
 ) -> bool:
     """Second-pass: tell apart the bot SELF-REPORTING ``cause``'s failure (True
     → keep the exclusion) from the bot merely DESCRIBING the PR's content or the
@@ -1771,10 +1839,14 @@ def _placeholder_self_reported(
         cause's vocabulary, so alternative (B) is the bot quoting or summarizing
         the PR. This is the only reason the three recoverable causes ever arm.
       * ``ambiguous_self_reference`` — the deterministic match hangs on a
-        deictic "this" that may equally denote the speaker or something in the
-        diff (see :func:`_retired_claim_is_deictic_only`). Alternative (B) is
-        then ordinary review feedback about a dead thing under review, and the
-        PR's subject is beside the point. The two can arm together.
+        determiner that may equally denote the speaker or something under
+        review: the deictic "this" (:func:`_retired_claim_is_deictic_only`) or
+        the possessive "our", which a reviewer writes in the project's voice
+        (:func:`_retired_claim_is_possessive_only`). Alternative (B) is then
+        ordinary review feedback about a dead thing under review, and the PR's
+        subject is beside the point. ``ambiguous_determiner`` selects the
+        paragraph that describes the determiner actually in play
+        (:data:`_AMBIGUOUS_DET_FRAMING`). The two reasons can arm together.
 
     FAILURE SEMANTICS, and the one place they differ. A None / unparseable /
     non-bool result is a BROKEN gate, not an answer: it returns True (exclude)
@@ -1803,12 +1875,8 @@ def _placeholder_self_reported(
             "is REVIEWING this pull request — reporting that something in the "
             "diff, the repository, or a dependency it uses has that property.")
     if ambiguous_self_reference:
-        framing += (
-            " The wording is ambiguous by construction: it says \"this\", and "
-            "\"this\" can point either at the bot posting the message (case A) "
-            "or at the code, service, or integration the bot is commenting on "
-            "(case B). Answer A only if the message clearly speaks about the "
-            "bot posting it.")
+        framing += _AMBIGUOUS_DET_FRAMING.get(
+            ambiguous_determiner, _AMBIGUOUS_DET_FRAMING["this"])
     tie = "false" if ambiguous_self_reference else "true"
     prompt = (
         framing + " Reply with ONE JSON object "
@@ -1919,9 +1987,13 @@ def is_retired_message(body: Optional[str]) -> bool:
         comments on the DIFF is a review, whatever vocabulary it borrows. This
         is what stops "the vendor's code review integration has been retired,
         so this adapter is unreachable — delete it" from retiring the reviewer
-        that wrote it. Its ONE exemption (:data:`_RETIRED_DECLINED_PR_RE`): a
-        notice may name the PR it is DECLINING to review ("…will no longer
-        review this pull request") without that counting as diff feedback.
+        that wrote it. Its TWO exemptions, both earned only by a claim that
+        stands without the exempted clause: a notice may name the PR it is
+        DECLINING to review ("…will no longer review this pull request",
+        :data:`_RETIRED_DECLINED_PR_RE`), and it may tell the reader to
+        UNINSTALL it ("…please remove the GitHub App",
+        :data:`_RETIRED_UNINSTALL_CLEANUP_RE`), without either counting as diff
+        feedback.
       * LENGTH GATE (:data:`_RETIRED_MAX_LEN`, measured on the RAW body): a
         retirement notice is a short standalone banner; a genuine review that
         merely quotes or discusses one is long. Deliberately measured BEFORE any
@@ -1960,27 +2032,28 @@ def is_retired_message(body: Optional[str]) -> bool:
     if not raw or len(raw) > _RETIRED_MAX_LEN:
         return False
     b = raw.lower()
-    # The veto scans a COPY with the "declining to review this PR" clause
-    # blanked out (see _RETIRED_DECLINED_PR_RE) — a notice that names the PR it
-    # is refusing is still a notice — but ONLY when the retirement claim still
-    # stands WITHOUT that clause. A body whose only retirement match IS the
-    # clause is unanchored feedback about someone else's dead service, and
+    # The veto scans a COPY with the two clauses a NOTICE legitimately carries
+    # blanked out — the PR it is declining to review (_RETIRED_DECLINED_PR_RE)
+    # and the instruction to uninstall the dead reviewer
+    # (_RETIRED_UNINSTALL_CLEANUP_RE) — but ONLY when the retirement claim still
+    # stands WITHOUT them. A body whose only retirement match IS one of those
+    # clauses is unanchored feedback about someone else's dead service, and
     # keeps the full veto. The patterns below always run on the untouched body.
-    b_no_decline = _RETIRED_DECLINED_PR_RE.sub(" ", b)
+    b_exempt = _RETIRED_UNINSTALL_CLEANUP_RE.sub(
+        " ", _RETIRED_DECLINED_PR_RE.sub(" ", b))
     earns_exemption = (
-        b_no_decline != b and _retired_patterns_match(b_no_decline))
-    if _RETIRED_FEEDBACK_MARKER_RE.search(b_no_decline if earns_exemption else b):
+        b_exempt != b and _retired_patterns_match(b_exempt))
+    if _RETIRED_FEEDBACK_MARKER_RE.search(b_exempt if earns_exemption else b):
         return False
     if any(c in _QUOTED_VOCAB_DELIMITERS for c in b):
         b = _strip_quoted_vocab(b)
     return _retired_patterns_match(b)
 
 
-# (b), the RESIDUE the two halves above cannot reach. "our"/"my" name the
-# speaker outright and a first-person "we have ceased …" is self-reference by
-# grammar, but the third accepted determiner — the deictic "this" — points at
-# whatever the sentence is ABOUT, and on a review comment that is routinely the
-# thing in the diff:
+# (b), the RESIDUE the two halves above cannot reach. "my" names the speaker
+# outright, but the other two accepted determiners do not settle WHO on their
+# own. The deictic "this" points at whatever the sentence is ABOUT, and on a
+# review comment that is routinely the thing in the diff:
 #     "This code review integration has been retired in favor of the new App."
 # Read as a banner, "this" is the speaker; read as an inline finding, "this" is
 # the vendored integration under review. The adverbial-locus veto above
@@ -2008,28 +2081,77 @@ def is_retired_message(body: Optional[str]) -> bool:
 # directly and is unaffected by anything here — that keeps a retirement notice
 # from being credited as a review of the merged commit.
 _RETIRED_DEICTIC_DET_RE = re.compile(r"\bthis\b", re.IGNORECASE)
+# The POSSESSIVE half of the same residue. "our" was read as conclusive speaker
+# self-reference on the theory that a possessor names its owner — but the owner
+# it names is whoever is TALKING, and a reviewer talks in the voice of the
+# project it is reviewing constantly. That is the identical weakness the
+# first-person member already pays for
+# (see :data:`_RETIRED_SCOPE_VETOED_PATTERNS`: "a reviewer writes 'we' for the
+# PROJECT UNDER REVIEW constantly"), and "our" is that same "we", possessive. On
+# a customer whose product IS a code review service — not a hypothetical class;
+# this repository is one — an ordinary finding reads:
+#     "Our code review service has been permanently retired, but the webhook
+#      remains enabled and now returns 404."
+# Nothing else catches it: no feedback-veto marker, no repo/CI scope qualifier
+# for :func:`_retired_scope_veto` (the noun-phrase members do not take it in any
+# case), well under the length gate, and on a PR whose own subject is the
+# webhook the second pass never armed — so a HEALTHY reviewer was permanently
+# excluded and this very finding never reached the fixer.
+#
+# The remedy is the deictic one, and ONLY that one: the claim is routed through
+# the content gate in :func:`detect_signal`, which reads the PR beside the
+# message. What is deliberately NOT done is anything that moves the
+# deterministic verdict — "our" stays a conclusive anchor for
+# :func:`is_retired_message`, for the never-merge-unreviewed gate that reads it
+# LLM-free, and for the review-feedback-guard exemption that lets a genuine
+# banner carry migration guidance. With no model wired, behaviour is unchanged;
+# with one wired, an "our" claim buys a second opinion instead of a coin flip.
+#
+# "my" is left conclusive. A reviewer never writes "my" in the project's voice —
+# it is the one determiner here that can only be the speaker.
+_RETIRED_POSSESSIVE_DET_RE = re.compile(r"\bour\b", re.IGNORECASE)
+
+
+def _retired_claim_hangs_on(
+    det_re: "re.Pattern[str]", body: Optional[str]
+) -> bool:
+    """True when ``body`` reads as a retirement notice ONLY by way of the
+    determiner ``det_re`` — i.e. the very same body stops reading as one once
+    that determiner is swapped for the neutral "the".
+
+    The swap is the whole test, and it is exact rather than approximate: every
+    OTHER self-reference anchor in the detector survives a given determiner's
+    swap untouched, so a body that still matches afterwards is anchored by
+    something that names the speaker independently of the swapped word."""
+    if not is_retired_message(body):
+        return False
+    return not is_retired_message(det_re.sub("the", body or ""))
 
 
 def _retired_claim_is_deictic_only(body: Optional[str]) -> bool:
-    """True when ``body`` reads as a retirement notice ONLY by way of the
-    deictic determiner "this" — i.e. the very same body stops reading as one
-    once "this" is swapped for the neutral "the".
-
-    The swap is the whole test, and it is exact rather than approximate: every
-    OTHER self-reference anchor in the detector ("our"/"my", a first-person
-    "we have ceased …", the global-quantifier group) survives it untouched, so
-    a body that still matches afterwards is anchored by something that names
-    the speaker independently of what "this" points at.
+    """True when ``body``'s retirement reading rests on the deictic "this"
+    alone — "this code review integration has been retired" with nothing else
+    naming the speaker.
 
     Used by :func:`detect_signal` to decide whether the deterministic verdict
     is conclusive or has to go through the content gate. NOT used by
     :func:`is_retired_message` itself: the merge gate reads that predicate
     LLM-free and is biased to over-block on purpose, and a deictic banner must
     keep failing the review-credit test there."""
-    if not is_retired_message(body):
-        return False
-    return not is_retired_message(
-        _RETIRED_DEICTIC_DET_RE.sub("the", body or ""))
+    return _retired_claim_hangs_on(_RETIRED_DEICTIC_DET_RE, body)
+
+
+def _retired_claim_is_possessive_only(body: Optional[str]) -> bool:
+    """True when ``body``'s retirement reading rests on the possessive "our"
+    alone — the reviewer-voice-vs-project-voice ambiguity described above
+    :data:`_RETIRED_POSSESSIVE_DET_RE`.
+
+    Arms the same content gate as its deictic sibling, and nothing else: unlike
+    that sibling it does NOT withdraw the review-feedback-guard exemption in
+    :func:`detect_signal`, since a genuine "our" banner routinely carries the
+    migration guidance that guard matches, and withdrawing it would downgrade
+    the notice with no model wired to settle the question."""
+    return _retired_claim_hangs_on(_RETIRED_POSSESSIVE_DET_RE, body)
 
 
 def detect_signal(
@@ -2060,8 +2182,9 @@ def detect_signal(
         RETIRED cause additionally arms on UNKNOWN PR meta (see
         :func:`_pr_is_about_cause`), the one asymmetry in the set, and — whatever
         the PR is about — on a claim anchored by nothing but the deictic "this"
-        (see :func:`_retired_claim_is_deictic_only`), whose subject a healthy
-        reviewer and a shutdown banner word identically.
+        (:func:`_retired_claim_is_deictic_only`) or the possessive "our"
+        (:func:`_retired_claim_is_possessive_only`), the two determiners a
+        healthy reviewer and a shutdown banner word identically.
 
     With ``quota_llm=None`` (and the default empty PR context) behaviour is the
     deterministic-regex classification, with one deliberate carve-out: errored
@@ -2095,6 +2218,15 @@ def detect_signal(
     # is_retired_message directly and never consults this guard.
     retired = is_retired_message(text)
     retired_deictic_only = retired and _retired_claim_is_deictic_only(text)
+    # The possessive "our" arms the gate too (see _RETIRED_POSSESSIVE_DET_RE) —
+    # but it does NOT join the guard test on the next line. A genuine "our"
+    # banner is exactly the shape that carries migration guidance, so keeping
+    # the guard for it would return None here with no model wired and downgrade
+    # the notice again. The gate below is where an "our" claim is settled, and
+    # with no model wired it settles the way it always did: retired.
+    retired_possessive_only = (
+        retired and not retired_deictic_only
+        and _retired_claim_is_possessive_only(text))
     # Guard: if the message reads as review feedback (recommendation starters,
     # bullet lists, or code blocks), it is NOT a bot status signal — skip matching
     # so "Consider handling the rate limit (429) here" is never misclassified as
@@ -2102,8 +2234,8 @@ def detect_signal(
     if not (retired and not retired_deictic_only) and _REVIEW_FEEDBACK_RE.search(text):
         return None
 
-    def gated(cause: str, *, ambiguous_self_reference: bool = False
-              ) -> Optional[str]:
+    def gated(cause: str, *, ambiguous_self_reference: bool = False,
+              ambiguous_determiner: str = "this") -> Optional[str]:
         # On a PR whose own subject carries this cause's vocabulary, a healthy
         # reviewer summarizing the PR can trip the cause's regex; disambiguate
         # via the model ONLY then. Every other PR (the vast majority) keeps the
@@ -2111,9 +2243,10 @@ def detect_signal(
         #
         # ``ambiguous_self_reference`` arms the same gate for a SECOND reason,
         # independent of the PR's subject: the match itself does not establish
-        # WHO it is about. Only the retired cause raises it, and only for a
-        # deictic-"this" claim — the one shape whose subject a reviewer and a
-        # shutdown banner word identically.
+        # WHO it is about. Only the retired cause raises it, and only for the
+        # two determiners a reviewer and a shutdown banner word identically —
+        # the deictic "this" and the possessive "our", named to the model by
+        # ``ambiguous_determiner`` so the prompt describes the real ambiguity.
         if quota_llm is None:
             return cause
         pr_about = _pr_is_about_cause(cause, pr_title, pr_body)
@@ -2122,7 +2255,8 @@ def detect_signal(
         if not _placeholder_self_reported(
                 cause, text, pr_title, pr_body, quota_llm,
                 pr_about_cause=pr_about,
-                ambiguous_self_reference=ambiguous_self_reference):
+                ambiguous_self_reference=ambiguous_self_reference,
+                ambiguous_determiner=ambiguous_determiner):
             return None  # describing the PR's content / the diff, not itself
         return cause
 
@@ -2136,7 +2270,9 @@ def detect_signal(
     if retired:
         return gated(
             SIGNAL_RETIRED,
-            ambiguous_self_reference=retired_deictic_only)
+            ambiguous_self_reference=(
+                retired_deictic_only or retired_possessive_only),
+            ambiguous_determiner="our" if retired_possessive_only else "this")
     if QUOTA_RE.search(text):
         return gated(SIGNAL_QUOTA)
     if PR_TOO_LARGE_RE.search(text):
