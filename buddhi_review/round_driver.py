@@ -291,7 +291,7 @@ CLAUDE_REVIEW_CHECK_NAME = "Claude Code Review"
 @dataclass
 class BotState:
     last_seen: Optional[float] = None       # driver-clock stamp of the last contribution
-    signal: Optional[str] = None            # clean | quota | pr-too-large | errored
+    signal: Optional[str] = None            # clean | quota | pr-too-large | errored | retired
     error_created_at: Optional[str] = None  # ISO stamp of the errored signal (comeback rule)
 
 
@@ -402,6 +402,7 @@ _REAL_FINDING_LABELS = frozenset({
 _SKIP_LONG: Dict[str, str] = {
     "approved": "voluntarily done (LGTM)",
     "done": "voluntarily done (reviewed — no findings)",
+    "retired": "announced its own permanent retirement — never re-requested",
     "quota": "quota exhausted",
     "pr-too-large": "PR too large",
     "errored": "errored (retractable on a newer comment)",
@@ -423,6 +424,13 @@ _STATUS_SHORT: Dict[str, str] = {
     "approved": "Approved 👍",
     "done": "Reviewed — no findings ✓",
     "no-change": "Reviewed — no change ✓",
+    # The reviewer announced its OWN PERMANENT SHUTDOWN. Ranked above every
+    # other hard cause: it is the only one that NEVER recovers, so it is the
+    # honest verdict in this and every later round. NEVER "Active ✅" — before
+    # this cause existed the bot reached Active on the POSITIVE "it posted
+    # something" signal, so the loop genuinely believed a dead reviewer was
+    # engaged.
+    "retired": "Retired ⛔",
     "quota": "Quota exhausted ⚠️",
     "pr-too-large": "PR too large 📦",
     "errored": "Could not review ❌",
@@ -1145,6 +1153,24 @@ class RoundDriver:
         #   clean approval, OR a quota/error placeholder). A single response in
         #   any round permanently protects a reviewer from the silent warning.
         self.responded_ever: Set[str] = set()
+        # _retired: reviewers that announced their OWN PERMANENT SHUTDOWN
+        #   ("…has been sunset. All code review activity has officially ceased.").
+        #   The ONLY cause that is PERMANENT FOR THE RUN — nothing retracts it
+        #   (contrast the errored cause, which a later genuine review clears via
+        #   the comeback rule) — and it does two jobs:
+        #     * the store's PERMANENT exclusion tier stops the loop summoning a
+        #       reviewer that can never answer, so no round burns a trigger
+        #       comment and a poll window on it;
+        #     * it is subtracted from `reviewed_ever` at every merge-gate site
+        #       (see _genuine_reviewers). A retirement notice is a RESPONSE, never
+        #       a REVIEW: the message says the reviewer will never review again.
+        #       Without the subtraction the bot flowed into `reviewed_ever` AND
+        #       kept a `_clean_signal_head` anchor, so a reviewer announcing "all
+        #       code review activity has officially ceased" contributed a "this
+        #       bot reviewed the merged commit" signal to the
+        #       never-merge-unreviewed gate — and on a repo where it is the ONLY
+        #       configured reviewer, the gate then auto-merges code nobody read.
+        self._retired: Set[str] = set()
         # requested_ever: reviewers the loop successfully re-requested at least
         #   once — so silence is the reviewer's, not a failed summon.
         self.requested_ever: Set[str] = set()
@@ -1244,6 +1270,69 @@ class RoundDriver:
     def _bot_state(self, bot: str) -> BotState:
         return self.bots.setdefault(bot, BotState())
 
+    def _genuine_reviewers(self) -> Set[str]:
+        """``reviewed_ever`` minus the reviewers that announced their own
+        PERMANENT retirement — the set every never-merge-unreviewed decision
+        must read instead of ``reviewed_ever`` directly.
+
+        The subtraction is applied HERE, at read time, rather than only at
+        detection time, on purpose. :meth:`_record_retired` already discards the
+        bot from ``reviewed_ever`` the moment the notice is classified, but
+        several later paths re-add to that set from their own sources — the
+        --rr-active restore fold, the reaction fold, an actionable comment — and
+        a retirement notice must never be re-credited by any of them. Reading
+        the difference makes the property hold for every writer, present and
+        future, instead of depending on each one remembering to check.
+
+        A retirement notice IS a response (``responded_ever`` still counts it,
+        so the reviewer is not also reported as wastefully silent) but is NEVER
+        a review: the message says the reviewer will never review again."""
+        return self.reviewed_ever - self._retired
+
+    def _record_retired(self, bot: str) -> None:
+        """Record ``bot`` as PERMANENTLY RETIRED for this run and strip every
+        review credit it may already hold.
+
+        Two effects, both required:
+
+        * the PERMANENT exclusion tier (never the transient one — nothing
+          retracts this cause, and ``errored_comeback`` must not be able to
+          reach it) drops the bot out of :meth:`expected_bots`, so the loop
+          stops summoning a reviewer that can never answer;
+        * every credit it already earned is revoked — its ``reviewed_ever``
+          entry, its head-aware ``_clean_signal_head`` anchor, and any
+          voluntarily-done / approved crown a clean-looking earlier message won
+          it. A service that has announced its own shutdown did not review the
+          code being merged, so none of those may survive into the merge gate.
+          (:meth:`_genuine_reviewers` enforces the same property against later
+          writers; this is the eager half.)"""
+        st = self._bot_state(bot)
+        st.signal = detectors.SIGNAL_RETIRED
+        # Clear any pending errored stamp. The errored COMEBACK keys off
+        # ``error_created_at is not None`` alone, so a bot that errored earlier
+        # in the run and later announced its retirement would have its
+        # ``signal`` reset to None by the first review-output comment processed
+        # after the notice — leaving the summary row reading "excluded" instead
+        # of "Retired ⛔". Safety is unaffected either way (``_retired`` and the
+        # PERMANENT exclusion tier are what the merge gate and the summon gate
+        # read, and neither is retractable), but the reported cause must stay
+        # the honest one.
+        st.error_created_at = None
+        self._retired.add(bot)
+        self.store.exclude_permanent(bot)
+        self.reviewed_ever.discard(bot)
+        self._clean_signal_head.pop(bot, None)
+        self.done.discard(bot)
+        self.approved.discard(bot)
+        self._reaction_done.discard(bot)  # keep in sync with done
+        self.notice(
+            "exclusion",
+            f"{bot} excluded for the run: it announced its own permanent "
+            f"retirement — a retirement notice is not a review, and this is "
+            f"never retracted. Turn this reviewer off in your config so future "
+            f"runs stop summoning it",
+            status="skip")
+
     # ----------------------------------------------------- skip reason + summary
 
     def _skip_key(self, bot: str) -> Optional[str]:
@@ -1259,6 +1348,15 @@ class RoundDriver:
             return "done"
         if bot in self.reviewed_no_change:
             return "no-change"
+        if st.signal == detectors.SIGNAL_RETIRED:
+            # Ranked FIRST among the hard causes because it is the only
+            # PERMANENT one: quota / rate-limit recover on a clock, PR-too-large
+            # recovers if the diff shrinks, and errored is round-scoped and
+            # retractable by design. A retirement notice is true in this round
+            # and in every round after it, so no other cause may mask it. It
+            # stays BELOW the completed-review outcomes above: a genuine review
+            # from an EARLIER round is a real review and outranks it.
+            return "retired"
         if st.signal == detectors.SIGNAL_QUOTA:
             return "quota"
         if st.signal == detectors.SIGNAL_PR_TOO_LARGE:
@@ -1868,6 +1966,18 @@ class RoundDriver:
             return None  # humans and unknown logins don't drive bot state or rounds
         st = self._bot_state(bot)
         st.last_seen = now
+        # PERMANENCE. A reviewer that announced its own shutdown does not come
+        # back mid-run: nothing it posts afterwards is a review, so nothing it
+        # posts may re-credit it. `last_seen` is set above (the message IS a
+        # response — attendance and the silent-reviewer warning still see it),
+        # but the fold stops here, BEFORE every add-site below: the clean-review
+        # promotion (which would crown a dead reviewer "Approved 👍", re-enter
+        # `reviewed_ever` and satisfy the merge gate), the actionable
+        # `reviewed_ever` add, and the errored-comeback path the caller runs on
+        # an actionable return. Contrast the errored cause, which a newer
+        # comment deliberately DOES retract.
+        if bot in self._retired:
+            return None
         # Re-include immediately on any new comment — _record_round_attendance()
         # only iterates over expected_bots(), which excludes silent_dropped, so
         # the discard() there never fires for a dropped bot.
@@ -1922,6 +2032,9 @@ class RoundDriver:
                 shielded_errored_body = False
         else:
             shielded_errored_body = False
+        if signal == detectors.SIGNAL_RETIRED:
+            self._record_retired(bot)
+            return None
         if signal == detectors.SIGNAL_QUOTA:
             self.store.exclude_quota(bot)
             st.signal = signal
@@ -2016,7 +2129,7 @@ class RoundDriver:
         for bot in _canonical([b for b, ok in verdict.items() if ok]):
             if bot in self.done or self._bot_state(bot).signal is not None:
                 continue
-            if bot not in self.reviewed_ever:
+            if bot not in self._genuine_reviewers():
                 continue  # only a genuine review promotes — never mere chatter
             self.done.add(bot)
             print(f"[round] → excluding {bot} from subsequent rounds this run "
@@ -2351,13 +2464,13 @@ class RoundDriver:
         # between-rounds LLM quota re-check, an --rr-active hard cause) loses its sha
         # here and blocks where the reference loop merges — an over-block that hands
         # back, never an unreviewed merge.
-        shas = {b: s for b, s in shas.items() if b in self.reviewed_ever}
+        shas = {b: s for b, s in shas.items() if b in self._genuine_reviewers()}
         blocked = _head_reviewed_blocks_merge(
             clean_exit, fleet, shas, merged_head, self._last_substantive_head,
             self._is_ancestor)
         if not blocked:
             return False, "", merged_head
-        if not (fleet & self.reviewed_ever):
+        if not (fleet & self._genuine_reviewers()):
             # No expected reviewer genuinely reviewed ANYTHING this run.
             reason = ("[no-reviewer-reviewed] None of the expected reviewers "
                       f"({', '.join(_canonical(fleet))}) reviewed this PR — zero "
@@ -2947,7 +3060,15 @@ class RoundDriver:
             pr_title, pr_body = None, None
         signal = detectors.detect_signal(
             comment.text, quota_llm=self.quota_llm, pr_title=pr_title, pr_body=pr_body)
-        if signal == detectors.SIGNAL_QUOTA:
+        if signal == detectors.SIGNAL_RETIRED:
+            # First, and recordable here unlike ERRORED: an inline comment being
+            # review OUTPUT is what makes an errored body a finding rather than a
+            # placeholder, but a retirement notice says the reviewer will never
+            # review AGAIN — that outlives the finding it is attached to exactly
+            # as a quota cap does, and re-summoning a shut-down service would
+            # burn every remaining round on a bot that cannot answer.
+            self._record_retired(bot)
+        elif signal == detectors.SIGNAL_QUOTA:
             self.store.exclude_quota(bot)
             st.signal = signal
             self.notice("exclusion", f"{bot} excluded for the run: quota exhausted",
@@ -3645,7 +3766,7 @@ class RoundDriver:
         fleet = set(self._run_start_fleet)
         if not fleet:
             return False  # (a) no reviewers configured → nothing reviewed
-        return bool(fleet & self.reviewed_ever)  # (c) someone reviewed vs (b) nobody
+        return bool(fleet & self._genuine_reviewers())  # (c) someone reviewed vs (b) nobody
 
     def _interactive_merge_prompt(self) -> bool:
         """#g9b: auto-merge is off and we are attached to a terminal — offer to
@@ -3720,9 +3841,9 @@ class RoundDriver:
         fleet = set(self._run_start_fleet)
         if not self._claude_trigger_failed:
             return
-        if "claude" not in fleet or "claude" in self.reviewed_ever:
+        if "claude" not in fleet or "claude" in self._genuine_reviewers():
             return
-        if not (fleet & self.reviewed_ever):
+        if not (fleet & self._genuine_reviewers()):
             return  # nobody reviewed → the SAFETY gate handles that (block), not this note
         _print_refusal_banner(
             f"PRIMARY REVIEWER SKIPPED — @claude never reviewed PR #{self.pr}",
@@ -3791,7 +3912,7 @@ class RoundDriver:
         fleet = set(self._run_start_fleet)
         if not fleet:
             return "no reviewers are configured for this repo"
-        if not (fleet & self.reviewed_ever):
+        if not (fleet & self._genuine_reviewers()):
             return "no expected reviewer actually reviewed this PR"
         # #52: a genuine review happened and no cached CI-red flag fired — but
         # GitHub itself may still refuse the merge (conflicts / behind / branch

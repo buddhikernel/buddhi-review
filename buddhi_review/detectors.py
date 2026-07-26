@@ -1,4 +1,4 @@
-"""Bot-signal detection — clean-review, quota, PR-too-large, errored.
+"""Bot-signal detection — clean-review, quota, PR-too-large, errored, retired.
 
 A reviewer bot quiesces through a **definitive single-shot signal** or through
 silence (the round driver owns the silence timer). This module owns the signal
@@ -16,16 +16,25 @@ classification:
   verdict that reads as deterministically clean once stripped short-circuits with
   no model call; anything ambiguous stays "not clean" (the bot then quiesces by
   silence instead, which is always safe).
-* **Quota / PR-too-large / errored**: regex classification of the three
+* **Quota / PR-too-large / errored / retired**: regex classification of the four
   re-request exclusion causes. Quota adds an optional tier-2 check behind an
-  injected model seam (keyword-gated) for wording the regex misses. ALL THREE
+  injected model seam (keyword-gated) for wording the regex misses. ALL FOUR
   causes share a narrow per-cause second-pass: on a PR whose OWN subject
   carries that cause's vocabulary (review-status labels, quota wording, size
-  limits, review-failure copy), a healthy reviewer merely QUOTING or DESCRIBING
-  that vocabulary must not read as the reviewer self-reporting the failure —
-  the model tells the two apart, failing open to the exclusion when it is
-  unreachable. Quota and PR-too-large are permanent for the run; errored is
-  transient (the comeback rule lives in the round driver).
+  limits, review-failure copy, reviewer sunsetting), a healthy reviewer merely
+  QUOTING or DESCRIBING that vocabulary must not read as the reviewer
+  self-reporting the failure — the model tells the two apart, failing open to
+  the exclusion when it is unreachable. Quota and PR-too-large are permanent for
+  the run; errored is transient (the comeback rule lives in the round driver).
+* **Retired** is the one cause that NEVER recovers: the reviewer announced its
+  OWN permanent shutdown ("…has been sunset. All code review activity has
+  officially ceased."), so it will never review anything again. Because a stray
+  match silences a HEALTHY reviewer for the whole run with no retraction path —
+  strictly worse than the bug it fixes — :func:`is_retired_message` carries a
+  far heavier guard stack than its siblings, and its second-pass predicate is
+  deliberately INVERTED on unknown PR meta so a transient ``gh pr view`` failure
+  cannot disable the guard. It is BOT-AGNOSTIC by contract: no vendor or bot
+  name appears in any retirement pattern or cause table.
 
 ``CLEAN_REVIEW_PATTERNS[0]`` is a **load-bearing hardcoded literal** — NOT
 env-overridable. The shipped ``claude-code-review.yml`` workflow template
@@ -339,10 +348,457 @@ CLEAN_RESULT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# ── the RETIRED cause: a reviewer announcing its OWN permanent shutdown ──────
+# A bot that hits these patterns announced its OWN PERMANENT RETIREMENT — the
+# service behind the reviewer has been shut down, so it will never review
+# anything again. Distinct from every other cause here:
+#   * quota / rate-limit  → recovers on a clock;
+#   * PR-too-large        → recovers when the diff shrinks;
+#   * errored             → recovers on the next successful run (RETRACTABLE);
+#   * retired             → NEVER recovers. Permanent for the run, never
+#                           retracted by a later comment.
+#
+# Observed wording (a real reviewer sunset, 2026-07-22): "The consumer version
+# of <product> on GitHub has been sunset. All code review activity has
+# officially ceased." The vocabulary is deliberately GENERIC — self-reported
+# permanent shutdown — and names NO bot: this is a capability about any
+# reviewer announcing its own death, not about one vendor.
+#
+# The false-positive bias here is INVERTED relative to the other cause regexes
+# above. A stray match does not merely skip a round: it silences a HEALTHY
+# reviewer for the whole run — with NO retraction path, unlike every other
+# cause — AND withholds its review from the never-merge-unreviewed gate.
+# Adversarial review of the first cut broke it exactly there: any review-domain
+# noun beside a shutdown verb matched, so ordinary feedback ("the vendor's
+# review service has been sunset, and this module still imports its SDK")
+# retired a healthy reviewer, and on customer repos where "review" IS the
+# product domain noun (product reviews, peer review, performance review,
+# contract review, moderation queues) it fired on every such comment. Five
+# independent tightenings, in order of strength:
+#   (a) CODE REVIEW ONLY (`_RETIRED_CODE_REVIEW`). A bare "review" noun never
+#       counts. This removes the entire domain-noun class at a stroke.
+#   (b) A SELF-REFERENCE anchor. "The vendor's / the upstream / the
+#       third-party code review integration has been retired" describes
+#       SOMEONE ELSE's dead service — that is review feedback, not a
+#       self-report. Only "this/our/my <service>", a first-person "we have
+#       ceased…", or a global "ALL code review activity…" reads as the speaker
+#       announcing its own death.
+#   (c) SAME-CLAUSE proximity (`_RETIRED_GAP`), so a match can never straddle a
+#       sentence/clause break ("The staging service has been terminated. Since
+#       code review of that module is out of scope…"). Between a
+#       self-referential SUBJECT and its retirement verb the gap tightens
+#       further to noun-phrase continuation only (`_RETIRED_SUBJECT_GAP`), so
+#       the verb binds to the reviewer subject itself and can never reach
+#       across a nested second subject.
+#   (d) Weak verbs (disabled / stopped / ended / removed / withdrawn /
+#       suspended) require an explicit permanence adverb.
+#   (e) is_retired_message adds a REVIEW-FEEDBACK VETO, a length gate, and a
+#       quoted-vocabulary strip — see its docstring.
+#   (f) The GLOBAL-QUANTIFIER group carries NO self-reference anchor by
+#       construction, so it gets its own pair of guards — a required
+#       announcement register and a repo-scope veto. See
+#       _RETIRED_GLOBAL_PATTERNS.
+# Anything that still slips through must survive the per-cause second pass in
+# ``detect_signal`` (the model confirms SELF-reporting) before it excludes.
+_RETIRED_MAX_LEN = 600
+_RETIRED_GAP = r"[^.!?;:\n]{0,80}"   # same-clause gap: no sentence/clause break
+_RETIRED_STRONG_VERB = (
+    r"(?:sunset|sunsetted|discontinued|decommissioned|retired"
+    r"|terminated|shut\s+down|shutdown|ceased)"
+)
+_RETIRED_WEAK_VERB = r"(?:disabled|stopped|ended|removed|withdrawn|suspended)"
+_RETIRED_PERMANENCE_ADV = (
+    r"(?:officially|permanently|formally|indefinitely|entirely|completely"
+    r"|now|fully)"
+)
+_RETIRED_TENSE = (
+    r"(?:has|have|had|is|are|was|were)\s+"
+    r"(?:" + _RETIRED_PERMANENCE_ADV + r"\s+)*"
+    r"(?:been\s+)?"
+    r"(?:" + _RETIRED_PERMANENCE_ADV + r"\s+)*"
+)
+# (a) CODE review only. A bare "review" noun is what made the first cut fire on
+# product reviews, peer review, performance review and moderation queues.
+_RETIRED_CODE_REVIEW = (
+    r"(?:code[\s-]*review(?:s|er|ers|ing)?"
+    r"|pull[\s-]request\s+review(?:s|ing)?"
+    r"|\bpr\s+review(?:s|ing)?)"
+)
+# The OBJECT a bare "review(ing)" VERB must take before it counts as a
+# code-review claim. Same role as (a) on the noun side: "reviewing" is far too
+# ordinary a verb in review prose to carry a retirement claim alone. Without it
+# "We have discontinued reviewing dependency updates in this workflow because
+# the path filter is too broad; restore that coverage." — a healthy reviewer
+# describing the DIFF, in the first person — matched the FIRST-PERSON CESSATION
+# member below, and no feedback-veto marker appears in that wording, so on a PR
+# whose title/body lacks retirement vocabulary the second pass never arms and
+# the reviewer is silenced for the whole run with no retraction path. Shared
+# with the "will no longer review …" member so the two can never drift apart.
+_RETIRED_REVIEW_OBJECT = (
+    r"(?:pull\s+requests?|prs?|code|your\s+code|this\s+pull\s+request)"
+)
+# (b) The SPEAKER's own service. "the vendor's / the upstream / the third-party"
+# is someone ELSE's dead service — review feedback, never a self-report.
+_RETIRED_SELF_DET = r"(?:this|our|my)"
+# The GENERIC service noun ("review bot / service / integration / …") must sit
+# IMMEDIATELY after the self-determiner. Allowing filler words there let a
+# DOMAIN adjective ride it — "our peer review service", "our product review
+# service", "our manual review queue" — and those are the customer's own
+# product, not the speaker. Explicit "code review" keeps the filler: it is
+# already unambiguous on its own.
+_RETIRED_GENERIC_SERVICE = (
+    r"review\s+(?:bot|service|integration|assistant|app|action|tool"
+    r"|extension|feature)"
+)
+_RETIRED_SELF_SUBJECT = (
+    r"(?:" + _RETIRED_SELF_DET + r"\s+(?:\w+[\s-]+){0,3}"
+    + _RETIRED_CODE_REVIEW + r"|" + _RETIRED_SELF_DET + r"\s+"
+    + _RETIRED_GENERIC_SERVICE + r")"
+)
+# The SUBJECT→PREDICATE gap. `_RETIRED_GAP` above is a same-clause WILDCARD: it
+# stops at a sentence/clause break but happily spans a NESTED clause, so a
+# second, arbitrary subject could sit between the self-referential anchor and
+# the retirement verb — "our code reviewer found that the legacy service has
+# been retired" anchored on "our code reviewer" while "has been retired" in
+# fact predicated *the legacy service*. That is a genuine review, and matching
+# it silences the healthy reviewer that wrote it for the whole run, with no
+# retraction path.
+#
+# So between a self-referential subject and its verb, only material that
+# CONTINUES the subject noun phrase is admitted: at most ONE trailing noun
+# ("this code review INTEGRATION has been retired") and up to two prepositional
+# phrases ("our code review app ON GITHUB has been sunset"). A nested subject
+# needs a reporting verb plus its own noun — two words minimum — so it no
+# longer fits, and the verb can only bind to the reviewer subject itself.
+# One trailing noun, not two, is deliberate: a two-word tail re-admits exactly
+# the "<reporting verb> <nested subject>" shape this closes ("our code reviewer
+# says <vendor> has been retired"). The cost is the usual one this whole block
+# pays on purpose — a rarer banner shape ("this code review GitHub app has been
+# decommissioned") is missed, which degrades to the pre-fix behavior of awaiting
+# the bot until quiescence, never to silencing a live one.
+#
+# Patterns whose predicate legitimately trails a SAME-SUBJECT verb phrase spell
+# that verb phrase out explicitly (`_RETIRED_SHUTDOWN_COORD`, `_RETIRED_EOL_LINK`
+# below) instead of reopening the wildcard.
+_RETIRED_NP_WORD = r"[\w'’-]+"
+_RETIRED_SUBJECT_GAP = (
+    r"(?:\s+" + _RETIRED_NP_WORD + r"){0,1}"
+    r"(?:\s*[(,]?\s*(?:on|in|at|for|from|of|by|with|via|under|within|across)"
+    r"\s+" + _RETIRED_NP_WORD + r"(?:\s+" + _RETIRED_NP_WORD + r"){0,2}\)?){0,2}"
+    r"\s+"
+)
+# A shutdown predicate COORDINATED with the one that follows — "our integration
+# HAS BEEN SHUT DOWN AND will no longer review pull requests". Both verbs share
+# the one self-referential subject, so unlike the old wildcard gap this can
+# never introduce a second one.
+_RETIRED_SHUTDOWN_COORD = (
+    r"(?:" + _RETIRED_TENSE + r"(?:" + _RETIRED_STRONG_VERB + r"|"
+    + _RETIRED_WEAK_VERB + r")\b(?:\s+" + _RETIRED_NP_WORD + r"){0,4}"
+    r"\s+and\s+)?"
+)
+# The copula/verb phrase that legitimately sits between the subject and an
+# end-of-life noun phrase — "this review bot HAS REACHED end-of-life", "our
+# code review service IS end-of-life". Spelled out for the same reason: with a
+# wildcard there, "our code review bot noted that the REST API reaches
+# end-of-life in Q4" — ordinary feedback — matched.
+_RETIRED_EOL_LINK = (
+    r"(?:(?:has|have|had|is|are|was|were)\s+"
+    r"(?:(?:" + _RETIRED_PERMANENCE_ADV + r"|already)\s+)?"
+    r"(?:been\s+)?(?:reached|reaching|hit|entered|at|approaching)?\s*"
+    r"|reach(?:es|ed|ing)\s+|hits\s+|approach(?:es|ed|ing)\s+)?"
+)
+# The reverse order — the end-of-life / cessation noun phrase FIRST, its subject
+# trailing. English attaches that subject with a preposition ("end-of-life
+# notice FOR our code review bot"), so only that bridge is admitted. A wildcard
+# there let a coordinating conjunction bolt an unrelated clause on: "the legacy
+# service reaches end-of-life, and our code review bot will need updating" —
+# again a genuine review, again permanently silencing its author.
+_RETIRED_TRAILING_SUBJECT_LINK = (
+    r"(?:\s+" + _RETIRED_NP_WORD + r"){0,2}\s+(?:for|of)\s+"
+)
+
+# (f) THE GLOBAL-QUANTIFIER GROUP — "All code review activity has officially
+# ceased." Alone among the patterns it has NO self-reference anchor: the
+# all/every quantifier was taken as a self-announcement signature on the theory
+# that nobody says "all code review activity has ceased" about a dependency.
+# That theory is wrong. A quantifier says nothing about WHO stopped, and the
+# feedback veto does not recognize the SCOPE qualifiers that give ordinary
+# review feedback exactly this shape:
+#     "All code review activity has ceased in CI since the workflow
+#      condition changed."       ← a healthy reviewer describing the DIFF
+# On an ordinary PR the second pass never arms, so that sentence permanently
+# silenced the reviewer that wrote it. Two guards, both required, replace the
+# missing anchor:
+#
+#   1. ANNOUNCEMENT REGISTER (_RETIRED_TENSE_FINAL) — the verb must carry an
+#      explicit permanence adverb ("has OFFICIALLY ceased", "has been
+#      PERMANENTLY disabled"). A formal, final declaration is the register a
+#      service sunset is written in; "has ceased in CI" is the descriptive
+#      register of an outage found in the diff. This is the same tightening the
+#      weak-verb member has always carried, for the same stated reason, now
+#      applied to the strong verbs too and factored into one constant.
+#      Escape hatch for the notice that skips the adverb: the body may instead
+#      carry an independent self-anchored shutdown claim in the sentence beside
+#      it (_RETIRED_SELF_SHUTDOWN_RE) — "This service has been sunset. All code
+#      review activity has ceased."
+#   2. REPO-SCOPE VETO (_RETIRED_SCOPED_QUALIFIER_RE) — a cessation scoped to
+#      the user's own repo or CI ("in CI", "for this repository", "on forks")
+#      is an outage discovered in the diff, never a vendor sunset, so it is
+#      discarded even when it satisfies (1).
+#
+# Both guards live in _retired_patterns_match, which is why this group is kept
+# in its own list. RETIRED_PATTERNS below stays the flat union, unchanged in
+# content and order, for the callers that scan it directly.
+_RETIRED_FINAL_ADV = (
+    r"(?:officially|permanently|formally|indefinitely|entirely|completely"
+    r"|fully)"
+)
+# Tense REQUIRING at least one permanence adverb, in either position relative
+# to "been" ("has officially ceased" / "has been permanently disabled" /
+# "has permanently been withdrawn"). Contrast _RETIRED_TENSE, where the adverb
+# is optional.
+_RETIRED_TENSE_FINAL = (
+    r"(?:has|have|had|is|are|was|were)\s+"
+    r"(?:(?:" + _RETIRED_FINAL_ADV + r"\s+)+(?:been\s+)?"
+    r"|been\s+(?:" + _RETIRED_FINAL_ADV + r"\s+)+)"
+)
+_RETIRED_GLOBAL_HEAD = (
+    r"\b(?:all|every)\s+(?:\w+\s+){0,2}" + _RETIRED_CODE_REVIEW +
+    r"\s+(?:activit(?:y|ies)|operations?|services?|support|functionality"
+    r"|coverage)\b" + _RETIRED_GAP + r"\b"
+)
+_RETIRED_GLOBAL_PATTERNS = [
+    _RETIRED_GLOBAL_HEAD + _RETIRED_TENSE_FINAL + _RETIRED_STRONG_VERB + r"\b",
+    _RETIRED_GLOBAL_HEAD + _RETIRED_TENSE_FINAL + _RETIRED_WEAK_VERB + r"\b",
+]
+# The same head with the adverb OPTIONAL. Never sufficient on its own — it is
+# admitted only when _RETIRED_SELF_SHUTDOWN_RE independently anchors the body
+# to the speaker's own shutdown (guard 1's escape hatch above).
+_RETIRED_GLOBAL_UNADVERBED_PATTERNS = [
+    _RETIRED_GLOBAL_HEAD + _RETIRED_TENSE + _RETIRED_STRONG_VERB + r"\b",
+]
+# The speaker's OWN service, shut down, stated independently of the global
+# clause. "this|our|my" is mandatory — "the vendor's / the upstream / the
+# consumer" is someone ELSE's dead service, i.e. review feedback.
+_RETIRED_SELF_SERVICE_NOUN = (
+    r"(?:service|bot|app|integration|assistant|action|tool|extension"
+    r"|feature|product|offering|plugin|reviewer|agent|add-?on)"
+)
+_RETIRED_SELF_SERVICE_SUBJECT = (
+    r"(?:this|our|my)\s+(?:\w+[\s-]+){0,3}" + _RETIRED_SELF_SERVICE_NOUN
+)
+_RETIRED_SELF_SHUTDOWN_RE = re.compile(
+    r"\b" + _RETIRED_SELF_SERVICE_SUBJECT
+    + r"\b" + _RETIRED_SUBJECT_GAP + r"\b" + _RETIRED_TENSE
+    + _RETIRED_STRONG_VERB + r"\b",
+    re.IGNORECASE,
+)
+# A cessation SCOPED to the reader's own repo / CI / environment. A vendor
+# sunset is global by definition; "in CI", "for this repository", "on forks"
+# name a place inside the codebase under review, which makes the sentence
+# feedback about the diff. Scanned over the WHOLE body (bounded to
+# _RETIRED_MAX_LEN) rather than the matched clause, deliberately: the global
+# patterns carry no anchor, so the cheap false NEGATIVE is the right trade —
+# see the is_retired_message docstring. Platform names ("on GitHub") are NOT
+# qualifiers: the real observed banner says "…on GitHub has been sunset".
+_RETIRED_SCOPED_QUALIFIER_RE = re.compile(
+    r"\b(?:in|on|for|within|under|across|from)\s+"
+    r"(?:"
+    # CI / infrastructure scope — unambiguous, determiner optional.
+    r"(?:the\s+|this\s+|our\s+|your\s+)?"
+    r"(?:ci(?:\s*/\s*cd)?|forks?|pipelines?|workflows?|github\s+actions?"
+    r"|pull[\s-]request\s+builds?)"
+    # Repo-local scope — a determiner is required so ordinary prose
+    # ("for projects of this size") does not fire.
+    r"|(?:this|the|our|your)\s+"
+    r"(?:repos?|repositor(?:y|ies)|branch(?:es)?|paths?|director(?:y|ies)"
+    r"|folders?|files?|modules?|packages?|projects?|codebases?|monorepos?"
+    r"|workspaces?|organi[sz]ations?|orgs?|environments?|namespaces?"
+    r"|tenants?|pull\s+requests?|prs?)"
+    # Deployment scope.
+    r"|(?:staging|production|prod|sandbox|development|dev)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Every pattern below carries its own self-reference anchor INLINE, so neither
+# guard (f) applies to it — the anchor already answers "who stopped?".
+_RETIRED_ANCHORED_PATTERNS = [
+    # SELF-REFERENTIAL SHUTDOWN — "This code review service has been
+    # discontinued." / "Our review bot has been permanently retired."
+    # _RETIRED_SUBJECT_GAP, not _RETIRED_GAP: the verb must predicate the
+    # reviewer subject itself, never a nested one (see the constant).
+    r"\b" + _RETIRED_SELF_SUBJECT + r"\b" + _RETIRED_SUBJECT_GAP + r"\b"
+    + _RETIRED_TENSE + _RETIRED_STRONG_VERB + r"\b",
+    # FIRST-PERSON CESSATION — "We have ceased all code review operations." /
+    # "We have discontinued reviewing pull requests."
+    # The first person is this member's self-reference anchor, so the OBJECT
+    # carries the code-review anchor, exactly as in the "will no longer
+    # review …" member below: explicit "code review", or a bare "reviewing"
+    # that takes a code/PR object (_RETIRED_REVIEW_OBJECT). A bare "reviewing
+    # <anything>" is ordinary first-person review prose about the diff, never a
+    # retirement notice — see the constant.
+    r"\b(?:we|i)\s+(?:have|has|had)\s+(?:\w+\s+){0,2}"
+    r"(?:ceased|discontinued|retired|terminated|shut\s+down)\s+"
+    r"(?:all\s+|any\s+|our\s+)?(?:providing\s+)?(?:"
+    + _RETIRED_CODE_REVIEW + r"|reviewing\s+(?:all\s+|any\s+)?"
+    + _RETIRED_REVIEW_OBJECT + r")",
+    # "will no longer review pull requests" / "will no longer provide code
+    # reviews". Two anchors, both required. The OBJECT must be code / a pull
+    # request — a bare "will no longer review" is too easy to hit in prose
+    # about something else. The SUBJECT must be the speaker's own service (or
+    # a first-person "we"), exactly like every sibling pattern here: the
+    # object anchor alone says WHAT stopped, never WHO stopped it, so ordinary
+    # feedback about the diff — "with the new condition, the bot will no
+    # longer review pull requests from forks; that breaks fork coverage" —
+    # matched and permanently silenced the healthy reviewer that wrote it.
+    # Only the subject-precedes order is offered: "will no longer …" is a
+    # finite verb clause, so its subject cannot trail it (unlike the
+    # end-of-life noun phrase above, which takes both orders). The subject
+    # admits the wider _RETIRED_SELF_SERVICE_SUBJECT ("our integration") on
+    # top of _RETIRED_SELF_SUBJECT, since this pattern's object anchor is
+    # already code-review-specific; the "this|our|my" determiner is what does
+    # the work, and it is exactly the determiner the false positive lacked.
+    # The subject reaches its verb through _RETIRED_SUBJECT_GAP plus, at most,
+    # a coordinated shutdown predicate of that SAME subject ("has been shut
+    # down AND will no longer review …") — never a nested clause.
+    r"\b(?:(?:" + _RETIRED_SELF_SUBJECT + r"|"
+    + _RETIRED_SELF_SERVICE_SUBJECT + r")\b" + _RETIRED_SUBJECT_GAP
+    + _RETIRED_SHUTDOWN_COORD
+    + r"|(?:we|i)\s+)"
+    r"\bwill\s+no\s+longer\s+(?:be\s+)?(?:"
+    r"review(?:ing)?\s+" + _RETIRED_REVIEW_OBJECT
+    + r"|(?:provide|providing|post|posting|generate|generating)\s+"
+    r"(?:any\s+|further\s+|new\s+|automated\s+)?code\s+reviews?)",
+    # "Our code review support is no longer available." The self/global
+    # determiner is REQUIRED: without it "The starter plan's code review
+    # support is no longer available" — ordinary feedback — matched.
+    r"\b(?:all|this|our|my)\s+(?:\w+\s+){0,2}" + _RETIRED_CODE_REVIEW +
+    r"(?:\s+(?:support|service|services|activity|functionality|coverage"
+    r"|capabilit(?:y|ies)))?\s+(?:is|are|was|were)\s+no\s+longer\s+"
+    r"(?:available|supported|offered|provided|operational)\b",
+    # end-of-life, self-anchored, either order. Subject-first binds through the
+    # explicit copula (_RETIRED_EOL_LINK); subject-last only through a
+    # prepositional attachment (_RETIRED_TRAILING_SUBJECT_LINK).
+    r"\b" + _RETIRED_SELF_SUBJECT + r"\b" + _RETIRED_SUBJECT_GAP
+    + _RETIRED_EOL_LINK + r"\bend[\s-]of[\s-]life\b",
+    r"\bend[\s-]of[\s-]life\b" + _RETIRED_TRAILING_SUBJECT_LINK + r"\b"
+    + _RETIRED_SELF_SUBJECT + r"\b",
+    # "(has) ceased (all) code review(ing)", self-anchored like the
+    # end-of-life pair above — unanchored, this matched ordinary prose about
+    # an unrelated subject ("the callback ceases reviewing once the queue is
+    # empty").
+    r"\b" + _RETIRED_SELF_SUBJECT + r"\b" + _RETIRED_SUBJECT_GAP
+    + r"(?:" + _RETIRED_TENSE + r")?"
+    + r"\bceas(?:ed|ing|es)\s+(?:all\s+|any\s+|our\s+)?(?:"
+    + _RETIRED_CODE_REVIEW + r"|reviewing)\b",
+    r"\bceas(?:ed|ing|es)\s+(?:all\s+|any\s+|our\s+)?(?:"
+    + _RETIRED_CODE_REVIEW + r"|reviewing)\b"
+    + _RETIRED_TRAILING_SUBJECT_LINK + r"\b"
+    + _RETIRED_SELF_SUBJECT + r"\b",
+]
+
+# The flat union, in the original order (globals first). Callers that only need
+# "does any retirement pattern match this text" — the no-bot-names guard, the
+# compile check — scan this. The guarded predicate every behavioral caller goes
+# through is _retired_patterns_match / is_retired_message.
+RETIRED_PATTERNS = _RETIRED_GLOBAL_PATTERNS + _RETIRED_ANCHORED_PATTERNS
+
+
+def _retired_patterns_match(text: str) -> bool:
+    """True if ``text`` carries a retirement claim that survives the
+    global-quantifier guards (f). ``text`` is already lower-cased/normalized.
+
+    An ANCHORED pattern names its own subject, so a hit is conclusive. A
+    GLOBAL-quantifier hit is not: it must additionally be in announcement
+    register (a permanence adverb bound to the verb, or an independent
+    self-anchored shutdown claim elsewhere in the body) and must not be scoped
+    to the reader's own repo / CI. See the block comment above
+    :data:`_RETIRED_GLOBAL_PATTERNS`."""
+    if any(re.search(p, text) for p in _RETIRED_ANCHORED_PATTERNS):
+        return True
+    hit = any(re.search(p, text) for p in _RETIRED_GLOBAL_PATTERNS)
+    if not hit and _RETIRED_SELF_SHUTDOWN_RE.search(text):
+        hit = any(re.search(p, text)
+                  for p in _RETIRED_GLOBAL_UNADVERBED_PATTERNS)
+    if not hit:
+        return False
+    return not _RETIRED_SCOPED_QUALIFIER_RE.search(text)
+
+
+# (e) A retirement notice is a NOTICE. A body that comments on the DIFF is a
+# REVIEW, whatever vocabulary it borrows — so any code-feedback marker vetoes
+# the whole detector. This is the last line of defense and the cheapest one: it
+# spends a false NEGATIVE (which degrades to exactly the pre-fix behavior — the
+# bot stays awaited until quiescence) to buy immunity from the false POSITIVE
+# (which silences a healthy reviewer for the run, unrecoverably). Deliberately
+# BROADER than :data:`_REVIEW_FEEDBACK_RE` (the shared signal-suppression guard)
+# for that reason.
+_RETIRED_FEEDBACK_MARKER_RE = re.compile(
+    r"(?:```"
+    r"|\b(?:this|the)\s+(?:pr|pull\s+request)\b"
+    r"|\bthis\s+(?:change|diff|patch|module|adapter|helper"
+    r"|class|function|method|file|component|call|query|loop|branch|migration"
+    r"|client|importer|test|line|block)\b"
+    r"|\bpull\s+request\s+overview\b"
+    r"|\b(?:on\s+)?line\s+\d+"
+    r"|\b(?:consider|suggest|suggested|recommend|recommended|nit|typo"
+    r"|refactor|instead\s+of|rather\s+than|prefer|avoid|guard|pin\s+the"
+    r"|dead\s+code|todo|fallback|circuit\s+breaker|edge\s+case|null\s+check"
+    r"|should\s+(?:be|use|add|handle)|could\s+be|needs?\s+the|worth\s+a)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+# The ONE way a shutdown notice legitimately names the PR: to say it is
+# DECLINING to review it ("…has been retired and will no longer review this
+# pull request", "this pull request will not be reviewed"). That is the notice
+# itself, not feedback on the diff — yet the `this|the pr/pull request` branch
+# above vetoed it, which silently made the `this pull request` object of the
+# "will no longer review …" retirement pattern unreachable dead code.
+#
+# The veto branch is NOT loosened (it is the last line of defense): instead
+# this one clause is blanked out of the COPY of the body the veto scans, and
+# only when the retirement claim SURVIVES that blanking (see
+# is_retired_message). That earned-exemption test is load-bearing, not
+# ceremony: it keeps the exemption from resting on the declining clause
+# itself. Exempting the clause unconditionally would admit
+# "The vendor's code review service has been discontinued, so CI will no
+# longer review this pull request. Drop the adapter." — someone ELSE's dead
+# service, i.e. ordinary feedback — on the strength of the decline alone.
+# Requiring a retirement match on the BLANKED text means only an independently
+# self-anchored notice ("our code review service has been retired", "all code
+# review activity has ceased") earns the exemption.
+#
+# Every other mention of "this PR" still vetoes in full — "This PR notes that
+# this code review service has been discontinued" is still a review — and the
+# retirement patterns themselves still see the UNTOUCHED body, which they must,
+# since one of them matches on exactly this phrase.
+#
+# Deliberately tight: an explicit DECLINE (negation / "no longer") must sit
+# adjacent to a review verb and the PR noun in the same clause. A bare
+# "reviewed this PR" is not exempted — a reviewer saying that is reviewing.
+_RETIRED_DECLINE = (
+    r"(?:will\s+no\s+longer|will\s+not|won'?t|no\s+longer|cannot|can'?t"
+    r"|is\s+not|are\s+not|has\s+not\s+been|have\s+not\s+been|never)"
+)
+_RETIRED_DECLINED_PR_RE = re.compile(
+    # "…will no longer review this pull request"
+    r"\b" + _RETIRED_DECLINE + r"\s+(?:be\s+)?(?:review(?:ing|ed)?"
+    r"|(?:comment|commenting)\s+on)\s+(?:this|the)\s+(?:pr|pull\s+request)\b"
+    # "this pull request will not be reviewed"
+    r"|\b(?:this|the)\s+(?:pr|pull\s+request)\s+" + _RETIRED_DECLINE
+    + r"\s+(?:be\s+)?review(?:ed|ing)?\b",
+    re.IGNORECASE,
+)
+
 SIGNAL_CLEAN = "clean"
 SIGNAL_QUOTA = "quota"
 SIGNAL_PR_TOO_LARGE = "pr-too-large"
 SIGNAL_ERRORED = "errored"
+# A reviewer that announced its OWN PERMANENT shutdown. The ONLY permanent,
+# never-retracted cause — see :func:`is_retired_message`.
+SIGNAL_RETIRED = "retired"
 # A state code (NOT a detect_signal output): set by the round driver when the
 # claude-code-review.yml workflow posts a rate_limited usage-limit marker.
 SIGNAL_RATE_LIMITED = "rate-limited"
@@ -374,8 +830,8 @@ def bot_for_login(login: str) -> Optional[str]:
 
 def is_placeholder_review_body(body: Optional[str]) -> bool:
     """Regex-only (LLM-free), FAIL-CLOSED test: does ``body`` read as a can't-review
-    PLACEHOLDER — quota exhausted / PR too large / a transient review error — rather
-    than a genuine review of its commit?
+    PLACEHOLDER — quota exhausted / PR too large / a transient review error / a
+    self-announced PERMANENT RETIREMENT — rather than a genuine review of its commit?
 
     Used by the head-aware merge gate (:func:`round_driver._genuine_review_shas_by_bot`)
     to refuse a commit-sha credit for a placeholder body: a quota / PR-too-large /
@@ -391,11 +847,19 @@ def is_placeholder_review_body(body: Optional[str]) -> bool:
     ``Review run failed.`` yields the errored signal" — is a real review of its
     commit and must keep its sha. Quota / PR-too-large keep the raw regexes (their
     own guards are the disambiguation, matching the reference loop). Empty / None →
-    False (an empty body is handled by the caller's APPROVED-state check, not here)."""
+    False (an empty body is handled by the caller's APPROVED-state check, not here).
+
+    The RETIRED cause rides the GUARDED :func:`is_retired_message` (never a raw
+    ``RETIRED_PATTERNS`` scan) for the same #470 reason the errored cause takes
+    the quoted-span route: a genuine review that merely quotes or discusses a
+    retirement banner is a real review of its commit and must keep its sha. A
+    retirement notice, though, says the reviewer will never review again — it is
+    the strongest possible statement that this body is not a review of the
+    commit it carries — so its sha is dropped like any other placeholder's."""
     if not body:
         return False
     return bool(QUOTA_RE.search(body) or PR_TOO_LARGE_RE.search(body)
-                or _errored_outside_quotes(body))
+                or _errored_outside_quotes(body) or is_retired_message(body))
 
 
 def is_clean_review(text: str) -> bool:
@@ -616,11 +1080,46 @@ PR_ERRORED_VOCAB_RE = re.compile(
     r"|something[\s-]+went[\s-]+wrong[\s\S]{0,40}(?:review(?:er)?s?|bots?|generat(?:e[sd]?|ing|ion)?)"
     r")\b"
 )
+# The RETIRED analogue. A PR whose own subject is reviewer sunsetting — this
+# very capability's PR is one — makes genuine review bodies echo shutdown
+# vocabulary, and the retirement patterns would then hard-exclude a healthy bot
+# for the whole run. Same design contract as its three siblings: this only needs
+# to recognize "this PR plausibly talks about a service being retired" —
+# borderline matches are fine because the model still has to confirm SELF-
+# reporting before an exclusion is suppressed, and a miss just preserves the
+# deterministic verdict (exclude).
+PR_RETIREMENT_VOCAB_RE = re.compile(
+    r"(?i)\b(?:"
+    r"sunset(?:s|ted|ting)?"
+    r"|retire(?:s|d|ment|ments)?|retiring"
+    r"|discontinu(?:e|es|ed|ing|ation)"
+    r"|decommission(?:s|ed|ing)?"
+    r"|deprecat(?:e|es|ed|ing|ion)"
+    r"|shut(?:s|ting)?[\s-]?down|shutdown"
+    r"|end[\s-]of[\s-]life|eol"
+    r"|no\s+longer\s+(?:available|supported|offered|maintained|active"
+    r"|review(?:s|ing)?|running|reachable)"
+    r"|ceas(?:e|es|ed|ing)|cessation"
+    r"|wind(?:s|ing)?[\s-]?down|wound[\s-]?down"
+    r"|permanent(?:ly)?\s+(?:shut|disabled|unavailable|excluded|off)"
+    r"|went\s+dark|gone\s+away|defunct|dead\s+reviewer"
+    r"|turn(?:s|ed|ing)?\s+off(?:\s+for\s+good)?|switch(?:ed)?\s+off"
+    # "kill the consumer/free/legacy <reviewer>" — the blunt way a cleanup PR
+    # titles itself. Without it a PR plainly about ripping out a sunset reviewer
+    # never armed the second pass, so a healthy reviewer describing that PR was
+    # excluded with no model call.
+    r"|kill(?:s|ed|ing)?\s+(?:the\s+)?(?:consumer|free|legacy)"
+    r"|sunsett?ing|retirement"
+    r")\b"
+)
 _PR_CAUSE_VOCAB: Dict[str, "re.Pattern[str]"] = {
     SIGNAL_QUOTA: PR_QUOTA_VOCAB_RE,
     SIGNAL_PR_TOO_LARGE: PR_TOO_LARGE_VOCAB_RE,
     SIGNAL_ERRORED: PR_ERRORED_VOCAB_RE,
+    SIGNAL_RETIRED: PR_RETIREMENT_VOCAB_RE,
 }
+# Causes whose "unknown PR meta" answer is INVERTED — see :func:`_pr_is_about_cause`.
+_PR_CAUSE_UNKNOWN_META_ARMS = frozenset({SIGNAL_RETIRED})
 
 
 def _pr_is_about_cause(
@@ -628,10 +1127,24 @@ def _pr_is_about_cause(
 ) -> bool:
     """True iff the PR's own title or body carries ``cause``'s vocabulary — the
     only case where a healthy reviewer summarizing the PR can trip that cause's
-    deterministic regex."""
+    deterministic regex.
+
+    DELIBERATELY INVERTED on unknown PR meta for the RETIRED cause. The other
+    three return False for an empty title AND body, which short-circuits their
+    second pass straight to "exclude". That is right for them — their exclusions
+    recover on their own (quota on a clock, errored on the comeback,
+    PR-too-large when the diff shrinks). Retirement never recovers, so a
+    transient ``gh pr view``
+    failure — which is exactly what yields ``(None, None)`` — must NOT be allowed
+    to disable the guard and permanently silence a healthy reviewer. With no meta
+    to rule retirement out, arm the second pass and let the model decide; it
+    still fails OPEN to exclude on its own error, so the safe direction is
+    preserved at both ends."""
     rx = _PR_CAUSE_VOCAB.get(cause)
-    if rx is None or (not pr_title and not pr_body):
+    if rx is None:
         return False
+    if not pr_title and not pr_body:
+        return cause in _PR_CAUSE_UNKNOWN_META_ARMS
     return bool(rx.search(pr_title or "") or rx.search(pr_body or ""))
 
 
@@ -695,6 +1208,12 @@ _CAUSE_SELF_REPORT = {
     SIGNAL_ERRORED: (
         "review-failure statuses / labels",
         "it hit an error of its own and could not produce the review",
+    ),
+    SIGNAL_RETIRED: (
+        "a service being retired / sunset / discontinued",
+        "IT ITSELF — the review service posting this message — has been "
+        "permanently shut down / sunset / discontinued and will never review "
+        "again",
     ),
 }
 
@@ -768,6 +1287,109 @@ def _errored_outside_quotes(text: str) -> bool:
     return False
 
 
+# The delimiters the strip below can possibly open a span with — a cheap
+# pre-test so the regex work is skipped for plain-prose bodies (the common case).
+_QUOTED_VOCAB_DELIMITERS = frozenset("`~'\"" + "‘’“”")
+
+# The RETIRED strip's own span regex: :data:`_QUOTED_VOCAB_RE` plus the
+# CommonMark ``~~~`` alt-fence. ``~~~`` is a legal fence everywhere ``` is, and
+# without it a healthy reviewer quoting a retirement banner inside one was
+# PERMANENTLY retired — the exact failure this guard exists to prevent. The
+# reference implementation strips both fences; matching it here is a parity fix.
+#
+# Deliberately a SEPARATE constant rather than a widening of _QUOTED_VOCAB_RE:
+# that regex also drives :func:`_errored_outside_quotes`, and changing an
+# unrelated cause's behaviour is not this detector's business. (The errored
+# path's own ``~~~`` gap is pre-existing and untouched here.)
+_RETIRED_QUOTED_VOCAB_RE = re.compile(
+    r"~~~[\s\S]*?~~~" + "|" + _QUOTED_VOCAB_RE.pattern
+)
+
+
+def _strip_quoted_vocab(text: str) -> str:
+    """Remove fenced code blocks, inline code spans, and short quoted strings
+    from ``text``, replacing each with a space so the word boundaries around the
+    removed span survive.
+
+    The RETIRED detector strips (rather than testing containment as
+    :func:`_errored_outside_quotes` does) because its patterns are long,
+    multi-clause and proximity-bounded: a quoted mention sitting INSIDE an
+    otherwise-genuine review is exactly the "author mentioning the words" case,
+    and leaving it in place would let it supply a clause the surrounding prose
+    never said. Unbalanced fences / backticks / quotes simply don't match and
+    are left as-is (conservative: better to over-match and let the second-pass
+    content gate disambiguate than to mangle a genuine notice)."""
+    return _RETIRED_QUOTED_VOCAB_RE.sub(" ", text)
+
+
+def is_retired_message(body: Optional[str]) -> bool:
+    """True if the bot's message announces its OWN PERMANENT RETIREMENT — the
+    service behind the reviewer has been sunset / discontinued / shut down, so
+    it will never review anything again.
+
+    PERMANENT FOR THE RUN and never retracted: unlike the errored cause (which a
+    later genuine review clears via the comeback rule), a bot that has announced
+    its own shutdown does not come back. The round driver records it in
+    ``self._retired``, which does BOTH jobs — the loop stops summoning a reviewer
+    that can never answer, AND the notice is subtracted from ``reviewed_ever``
+    so it can never satisfy the never-merge-unreviewed gate nor keep a
+    reviewed-head anchor.
+
+    Three guards run before the patterns, all aimed at the one failure mode that
+    matters here — silencing a HEALTHY reviewer:
+
+      * REVIEW-FEEDBACK VETO (:data:`_RETIRED_FEEDBACK_MARKER_RE`): a body that
+        comments on the DIFF is a review, whatever vocabulary it borrows. This
+        is what stops "the vendor's code review integration has been retired,
+        so this adapter is unreachable — delete it" from retiring the reviewer
+        that wrote it. Its ONE exemption (:data:`_RETIRED_DECLINED_PR_RE`): a
+        notice may name the PR it is DECLINING to review ("…will no longer
+        review this pull request") without that counting as diff feedback.
+      * LENGTH GATE (:data:`_RETIRED_MAX_LEN`, measured on the RAW body): a
+        retirement notice is a short standalone banner; a genuine review that
+        merely quotes or discusses one is long. Deliberately measured BEFORE any
+        boilerplate strip — the observed real notice IS a ``> [!CAUTION]``
+        admonition blockquote, which :func:`_strip_review_boilerplate` would
+        remove wholesale.
+      * QUOTED-VOCABULARY STRIP (:func:`_strip_quoted_vocab`): backticked /
+        fenced / quoted mentions of shutdown wording inside a genuine review are
+        the author MENTIONING the words, never the bot reporting its own death.
+
+    The patterns themselves are then applied through
+    :func:`_retired_patterns_match` rather than scanned raw: the
+    GLOBAL-QUANTIFIER group ("all code review activity has …") is the one group
+    with no inline self-reference anchor, so it additionally requires
+    announcement register and is vetoed by a repo-scoped qualifier ("has ceased
+    **in CI**"). See the block comment above :data:`_RETIRED_GLOBAL_PATTERNS`.
+
+    Regex-only by design (no LLM tier): the wording is a stylized service
+    notice. A MISS degrades to exactly the pre-fix behavior — the bot stays
+    awaited until the silence timer fires, and (the half worth stating plainly)
+    its non-review response can still be credited by the merge gate, which is
+    the bug this cause exists to fix. That is the cheaper direction only because
+    the alternative — a false POSITIVE — silences a healthy reviewer for the
+    whole run with no retraction path AND withholds its real review from the
+    same gate. Every guard here is calibrated on that asymmetry."""
+    raw = (body or "").strip()
+    if not raw or len(raw) > _RETIRED_MAX_LEN:
+        return False
+    b = raw.lower()
+    # The veto scans a COPY with the "declining to review this PR" clause
+    # blanked out (see _RETIRED_DECLINED_PR_RE) — a notice that names the PR it
+    # is refusing is still a notice — but ONLY when the retirement claim still
+    # stands WITHOUT that clause. A body whose only retirement match IS the
+    # clause is unanchored feedback about someone else's dead service, and
+    # keeps the full veto. The patterns below always run on the untouched body.
+    b_no_decline = _RETIRED_DECLINED_PR_RE.sub(" ", b)
+    earns_exemption = (
+        b_no_decline != b and _retired_patterns_match(b_no_decline))
+    if _RETIRED_FEEDBACK_MARKER_RE.search(b_no_decline if earns_exemption else b):
+        return False
+    if any(c in _QUOTED_VOCAB_DELIMITERS for c in b):
+        b = _strip_quoted_vocab(b)
+    return _retired_patterns_match(b)
+
+
 def detect_signal(
     text: str,
     *,
@@ -788,11 +1410,13 @@ def detect_signal(
       * a **per-cause second-pass** on a PR whose own subject carries a cause's
         vocabulary (``pr_title`` / ``pr_body`` match that cause's
         ``PR_*_VOCAB_RE``) that keeps a reviewer QUOTING or DESCRIBING the PR's
-        own quota / size-limit / review-status content from reading as the
-        reviewer self-reporting that failure (fail-open: ambiguous → keep the
-        exclusion). All three causes are gated — a PR that standardizes
-        review-status labels quotes every placeholder string literally, and a
-        healthy reviewer's overview of it echoes them.
+        own quota / size-limit / review-status / reviewer-sunsetting content from
+        reading as the reviewer self-reporting that failure (fail-open:
+        ambiguous → keep the exclusion). All four causes are gated — a PR that
+        standardizes review-status labels quotes every placeholder string
+        literally, and a healthy reviewer's overview of it echoes them. The
+        RETIRED cause additionally arms on UNKNOWN PR meta (see
+        :func:`_pr_is_about_cause`), the one asymmetry in the set.
 
     With ``quota_llm=None`` (and the default empty PR context) behaviour is the
     deterministic-regex classification, with one deliberate carve-out: errored
@@ -819,6 +1443,15 @@ def detect_signal(
                 return None  # describing the PR's content, not self-reporting
         return cause
 
+    # RETIRED first: it is the only PERMANENT cause (nothing retracts it), so it
+    # must win over any weaker, recoverable cause a retirement banner might also
+    # trip — the honest verdict in this round and in every round after it. Safe to
+    # put first because its own detector is the most heavily guarded of the four
+    # (feedback veto + length gate + quoted-vocabulary strip + the anchored /
+    # global-quantifier pattern split), so it defers to the causes below on
+    # anything that is not an unmistakable self-announced shutdown.
+    if is_retired_message(text):
+        return gated(SIGNAL_RETIRED)
     if QUOTA_RE.search(text):
         return gated(SIGNAL_QUOTA)
     if PR_TOO_LARGE_RE.search(text):
