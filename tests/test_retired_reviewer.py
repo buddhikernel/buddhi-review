@@ -428,6 +428,44 @@ class TestRetiredDetector:
             assert detectors._RETIRED_FEEDBACK_MARKER_RE.search(
                 f"{fence}\nx = 1\n{fence}"), fence
 
+    @pytest.mark.parametrize("body", [
+        # A CLEANUP IMPERATIVE is a review. The marker list started at the
+        # advisory verbs (consider / suggest / recommend), but the commonest way
+        # a reviewer asks for code to GO is the bare imperative — and this shape
+        # arms nothing else: the anchor is not deictic, so the content gate stays
+        # shut, and an ordinary cleanup PR title carries no retirement
+        # vocabulary either. So the reviewer was deterministically RETIRED, its
+        # finding dropped and its later output ignored for the whole run, with
+        # no retraction path.
+        "Our review bot has been retired; remove its adapter.",
+        "Our review bot has been retired. Delete the vendored client.",
+        "Our code review service has been sunset — drop the unused import.",
+        "Our code review integration has been discontinued. Rename the helper "
+        "to match.",
+        "Our code review service has been decommissioned; replace the call "
+        "with the new endpoint.",
+        "Our review bot has been retired, so extract the shared branch.",
+        "Our code review app has been shut down. Inline the one-line wrapper.",
+    ])
+    def test_a_cleanup_imperative_keeps_its_author(self, body):
+        assert detectors._RETIRED_FEEDBACK_MARKER_RE.search(body.lower()), body
+        assert not detectors.is_retired_message(body), body
+        assert detectors.detect_signal(
+            body, quota_llm=_llm(True),
+            pr_title="Clean up legacy integration",
+            pr_body="Removes the old vendor adapter.") != detectors.SIGNAL_RETIRED
+
+    @pytest.mark.parametrize("body", [
+        # …and BASE FORMS only. "removed" / "withdrawn" are members of
+        # _RETIRED_WEAK_VERB, so vetoing the participle would blank the
+        # weak-verb route the detector must keep catching.
+        "All code review activity has been permanently removed.",
+        "All code review support has been permanently withdrawn.",
+    ])
+    def test_the_imperative_veto_spares_the_participle(self, body):
+        assert not detectors._RETIRED_FEEDBACK_MARKER_RE.search(body.lower()), body
+        assert detectors.is_retired_message(body), body
+
     def test_domain_review_nouns_never_match(self):
         # (a) CODE review only — a bare "review" noun never counts. This is what
         # removes the entire product-domain class (product reviews, peer review,
@@ -1483,7 +1521,10 @@ class TestMigrationGuidanceDoesNotDowngradeANotice:
         # The safety half. "this" does not say WHO, and the content gate that
         # settles it needs a model — so with none wired the guard must still
         # save the healthy reviewer whose bulleted review wrote this.
-        body = DEICTIC_FINDING + "\n\n- You should drop the vendored client."
+        # The bullet says "migrate off", not "drop": a cleanup imperative is
+        # itself a feedback marker (_RETIRED_FEEDBACK_MARKER_RE), which would
+        # settle the body one layer earlier and leave the guard untested here.
+        body = DEICTIC_FINDING + "\n\n- You should migrate off the vendored client."
         assert detectors.is_retired_message(body)
         assert detectors._retired_claim_is_deictic_only(body)
         assert detectors.detect_signal(body) is None

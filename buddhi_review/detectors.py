@@ -1251,6 +1251,23 @@ def _retired_patterns_match(text: str) -> bool:
 # permanently retired the healthy reviewer that wrote it. Same parity gap the
 # quoted-vocabulary strip already closed for its own span regex (see
 # :data:`_RETIRED_QUOTED_VOCAB_RE`); the two must agree on what a fence is.
+#
+# CLEANUP IMPERATIVES count too. The marker list started at the ADVISORY verbs
+# (consider / suggest / recommend), which a reviewer uses to propose a change —
+# but the most common way to ask for code to GO is a bare imperative:
+#     "Our review bot has been retired; remove its adapter."
+# That is a healthy reviewer reporting a dead THIRD-PARTY service on a PR whose
+# own title ("Clean up legacy integration") carries no retirement vocabulary, so
+# the second-pass content gate never arms and the anchor is not deictic either —
+# the verdict was deterministically RETIRED, the finding dropped and its author
+# silenced for the whole run with no retraction path.
+#
+# BASE FORMS ONLY, and the closing ``\b`` is what enforces that: "removed" /
+# "dropped" / "replaced" cannot match, which is deliberate — "removed" and
+# "withdrawn" are members of :data:`_RETIRED_WEAK_VERB`, so vetoing the
+# participle would blank the weak-verb route ("All code review activity has been
+# permanently removed.") that the detector must keep catching. Third-person
+# forms ("this PR removes …") are already covered by the PR branch above.
 _RETIRED_FEEDBACK_MARKER_RE = re.compile(
     r"(?:```|~~~"
     r"|\b(?:this|the)\s+(?:pr|pull\s+request)\b"
@@ -1262,6 +1279,7 @@ _RETIRED_FEEDBACK_MARKER_RE = re.compile(
     r"|\b(?:consider|suggest|suggested|recommend|recommended|nit|typo"
     r"|refactor|instead\s+of|rather\s+than|prefer|avoid|guard|pin\s+the"
     r"|dead\s+code|todo|fallback|circuit\s+breaker|edge\s+case|null\s+check"
+    r"|delete|remove|drop|rename|replace|extract|inline|unused"
     r"|should\s+(?:be|use|add|handle)|could\s+be|needs?\s+the|worth\s+a)\b"
     r")",
     re.IGNORECASE,
