@@ -413,6 +413,22 @@ CLEAN_RESULT_RE = re.compile(
 #       cessation to that object — "our review bot has ceased reviewing
 #       dependency updates" complains about COVERAGE, it does not announce a
 #       shutdown. See _RETIRED_NARROWED_REVIEW_GUARD.
+#   (i) The same narrowing with ANY object, since the object need not be a
+#       review verb: "our code review service has discontinued THE LEGACY
+#       ENDPOINT" describes the diff. Only an ACTIVE verb phrase can take a
+#       direct object, so the tense is split by voice and the guard rides the
+#       active half alone. See _RETIRED_TENSE_NO_OBJECT /
+#       _RETIRED_OBJECTLESS_TAIL / _RETIRED_SHUTDOWN_PREDICATE.
+#   (j) is the one WIDENING in this list, and it is here because a MISS is the
+#       expensive direction for the merge gate: the tenses above are all
+#       completed, so "our code review service IS BEING retired" and "our review
+#       bot WILL BE shut down permanently" — self-announced shutdowns both —
+#       matched nothing and were credited as reviews. Admitted only on the
+#       self-anchored predicate, never on the unanchored global group (the
+#       future is also the register a reviewer describes the DIFF'S consequences
+#       in), and vetoed when the notice names a future effective date, which
+#       makes it a live reviewer's deprecation warning. See
+#       _RETIRED_TENSE_PROSPECTIVE_NO_OBJECT and _retired_scheduled_veto.
 # Anything that still slips through must survive the per-cause second pass in
 # ``detect_signal`` (the model confirms SELF-reporting) before it excludes.
 _RETIRED_MAX_LEN = 600
@@ -426,11 +442,79 @@ _RETIRED_PERMANENCE_ADV = (
     r"(?:officially|permanently|formally|indefinitely|entirely|completely"
     r"|now|fully)"
 )
+_RETIRED_ADV_RUN = r"(?:" + _RETIRED_PERMANENCE_ADV + r"\s+)*"
+# (i) VOICE, because only an ACTIVE verb phrase can take a DIRECT OBJECT — and
+# an object narrows the claim to that object exactly as tightening (h) says,
+# whether or not the object is a review verb:
+#     "Our code review service has discontinued the legacy endpoint, so the
+#      adapter now returns 404."          ← a healthy reviewer describing the DIFF
+# The tense is therefore split by voice. The PASSIVE / copular half ("has been
+# sunset", "was retired", "is decommissioned") cannot take an object at all, so
+# it is admitted unchanged; the ACTIVE half ("has discontinued …") is admitted
+# only when nothing object-shaped follows the verb
+# (:data:`_RETIRED_OBJECTLESS_TAIL`). :data:`_RETIRED_TENSE` stays the UNION of
+# the two, for the members whose predicate does not end at the shutdown verb.
+_RETIRED_TENSE_NO_OBJECT = (
+    r"(?:(?:has|have|had|is|are|was|were)\s+" + _RETIRED_ADV_RUN
+    + r"been\s+" + _RETIRED_ADV_RUN
+    + r"|(?:is|are|was|were)\s+" + _RETIRED_ADV_RUN + r")"
+)
+_RETIRED_TENSE_ACTIVE = r"(?:has|have|had)\s+" + _RETIRED_ADV_RUN
 _RETIRED_TENSE = (
-    r"(?:has|have|had|is|are|was|were)\s+"
-    r"(?:" + _RETIRED_PERMANENCE_ADV + r"\s+)*"
-    r"(?:been\s+)?"
-    r"(?:" + _RETIRED_PERMANENCE_ADV + r"\s+)*"
+    r"(?:" + _RETIRED_TENSE_NO_OBJECT + r"|" + _RETIRED_TENSE_ACTIVE + r")"
+)
+# (j) PROSPECTIVE forms — the shutdown announced as in progress or as coming.
+# The tenses above are all COMPLETED (perfect / past / copular), so the two
+# commonest banner shapes after "has been sunset" matched nothing at all:
+#     "Our code review service is being retired. No further code reviews will
+#      be provided."
+#     "Our review bot will be shut down permanently."
+# Both are self-announced permanent shutdowns, and a missed one is the EXPENSIVE
+# direction: an undetected banner is CREDITED AS A REVIEW by the
+# never-merge-unreviewed gate (:func:`is_placeholder_review_body`), which is the
+# regression this whole cause exists to close.
+#
+# Kept OUT of :data:`_RETIRED_TENSE`, and therefore off the global-quantifier
+# group, on purpose. The future is the register a reviewer writes the DIFF'S OWN
+# CONSEQUENCES in — "all code review coverage will be permanently removed once
+# the workflow is deleted" is feedback, not a sunset — and that group has no
+# self-reference anchor to tell the two apart. These forms are admitted only
+# where a subject noun phrase already names the speaker's own service
+# (:data:`_RETIRED_SHUTDOWN_PREDICATE`).
+#
+# A prospective claim also takes one veto of its own, since unlike a completed
+# one it may describe a service that is still alive and still reviewing today:
+# a claim that names a future effective date is DISCARDED
+# (:func:`_retired_scheduled_veto`).
+_RETIRED_TENSE_PROSPECTIVE_NO_OBJECT = (
+    r"(?:(?:is|are|was|were)\s+" + _RETIRED_ADV_RUN + r"being\s+"
+    + _RETIRED_ADV_RUN
+    + r"|will\s+(?:soon\s+)?" + _RETIRED_ADV_RUN + r"be\s+" + _RETIRED_ADV_RUN
+    + r")"
+)
+_RETIRED_TENSE_PROSPECTIVE_ACTIVE = (
+    r"will\s+(?:soon\s+)?" + _RETIRED_ADV_RUN
+)
+# After "will", English takes the BASE form ("will retire", "will cease"), which
+# only two members of _RETIRED_STRONG_VERB ("sunset", "shut down") already are.
+# Used by the prospective ACTIVE branch alone — a completed tense never takes a
+# base form ("has retire" is not English), so widening the shared verb constant
+# would buy nothing and loosen every other member.
+_RETIRED_STRONG_VERB_BASE = (
+    r"(?:sunset|discontinue|decommission|retire"
+    r"|terminate|shut\s+down|shutdown|cease)"
+)
+# The prospective claims' own CONDITIONAL guard. A banner declares its shutdown
+# outright; a reviewer uses the same future tense to describe what the DIFF will
+# do at RUNTIME — "our code review service will shut down WHEN the runner
+# exits", "…will be disabled IF the token is missing" — and that sentence is
+# feedback, not a self-report. A conditional / temporal subordinate clause on
+# the predicate is the difference, so it is refused here. The completed tenses
+# do not carry this guard: "has been shut down when the runner exits" is not a
+# reading anyone writes.
+_RETIRED_UNCONDITIONAL_TAIL = (
+    r"(?!\s+(?:when|whenever|while|once|until|till|if|unless|after|before"
+    r"|as\s+soon\s+as|in\s+the\s+event|should)\b)"
 )
 # (a) CODE review only. A bare "review" noun is what made the first cut fire on
 # product reviews, peer review, performance review and moderation queues.
@@ -573,6 +657,75 @@ _RETIRED_NARROWED_REVIEW_GUARD = (
     + _RETIRED_UNRESTRICTED_TAIL + r"))"
 )
 
+# (i) THE SAME NARROWING, WITH ANY OBJECT. Guard (h) above rejects a shutdown
+# verb narrowed by a trailing REVIEW verb, but the narrowing has nothing to do
+# with the word "review" — a transitive shutdown verb swallows whatever object
+# follows it, and the object is what the cessation is about:
+#     "Our code review service has discontinued the legacy endpoint, so the
+#      adapter now returns 404."          ← a healthy reviewer describing the DIFF
+#     "Our code review bot has retired support for the v1 API."
+#     "Our review bot has terminated the legacy webhook."
+# Each says the SPEAKER'S SERVICE DID SOMETHING TO THE CODE, never that the
+# speaker is dead — and each carries no feedback-veto marker, is not deictic (so
+# the second pass never arms on an ordinary PR) and sits well under the length
+# gate, so each retired a healthy reviewer for the whole run with no retraction
+# path and dropped its finding.
+#
+# Grammar decides where the guard is needed: only an ACTIVE verb phrase can take
+# a direct object, so the guard rides the ACTIVE half of the tense split only
+# (:data:`_RETIRED_TENSE_ACTIVE`). "has been discontinued <object>" is not
+# English, so the passive/copular banner shapes — the overwhelming majority of
+# real notices — are left exactly as they were, and no unlisted continuation of
+# theirs ("has been sunset following the acquisition") can be lost to this.
+#
+# An allowlist, like every sibling guard here, and for the same reason: one
+# shape too few costs a bot awaited until quiescence, one too many silences a
+# live reviewer. What may follow an active shutdown verb is a clause end, a
+# connective / adverbial / prepositional continuation, a review verb (which
+# guard (h) then judges on its own terms), or a WHOLE-SERVICE complement that
+# narrows nothing — "has ceased operations", "has ceased all code review".
+_RETIRED_SHUTDOWN_COMPLEMENT = (
+    r"(?:all\s+|any\s+|our\s+|its\s+)?(?:" + _RETIRED_CODE_REVIEW + r"|"
+    + _RETIRED_REVIEW_OBJECT + r"|operations?|activit(?:y|ies)|business)"
+)
+_RETIRED_OBJECTLESS_TAIL = (
+    r"(?=\s*(?:[.,;:!?)\]}\"'“”‘’]|\n|$)"
+    # A trailing review verb is guard (h)'s business, not this one's: it is
+    # admitted here so the two guards stay orthogonal and cannot double-judge
+    # the same tail ("has ceased reviewing as of today" stays a match).
+    r"|\s+(?:review(?:ing|s)?"
+    r"|and|or|so|but|because|since|after|before|when|while|once|until"
+    r"|although|though|as|effective|due|pending|following|amid|per"
+    r"|in|on|at|for|from|to|by|with|via|under|within|across|without|upon"
+    r"|" + _RETIRED_PERMANENCE_ADV + r"|forever|today|immediately|already"
+    r"|globally|worldwide|everywhere|here"
+    r")\b"
+    r"|\s+" + _RETIRED_SHUTDOWN_COMPLEMENT + r"\b)"
+)
+# The self-anchored SHUTDOWN PREDICATE — every accepted tense, its verb, and
+# both object guards, in one constant. Shared by the self-referential-shutdown
+# member and the global group's escape hatch (:data:`_RETIRED_SELF_SHUTDOWN_RE`)
+# so the two can never drift apart, exactly as
+# :data:`_RETIRED_CEASED_REVIEW` is shared by the ceased-review pair.
+#
+# Four branches, one per (voice × completion) pair. The PROSPECTIVE pair (j) —
+# "is being retired", "will be shut down" — is admitted HERE and nowhere else,
+# because this is the one predicate whose subject noun phrase already names the
+# speaker's own service; and its object guard is the same one the completed
+# active branch carries, since "will sunset THE LEGACY ENDPOINT" narrows exactly
+# as "has sunset THE LEGACY ENDPOINT" does.
+_RETIRED_SHUTDOWN_PREDICATE = (
+    r"(?:" + _RETIRED_TENSE_NO_OBJECT + _RETIRED_STRONG_VERB + r"\b"
+    + r"|" + _RETIRED_TENSE_PROSPECTIVE_NO_OBJECT + _RETIRED_STRONG_VERB
+    + r"\b" + _RETIRED_UNCONDITIONAL_TAIL
+    + r"|" + _RETIRED_TENSE_ACTIVE + _RETIRED_STRONG_VERB + r"\b"
+    + _RETIRED_OBJECTLESS_TAIL
+    + r"|" + _RETIRED_TENSE_PROSPECTIVE_ACTIVE + r"(?:" + _RETIRED_STRONG_VERB
+    + r"|" + _RETIRED_STRONG_VERB_BASE + r")\b"
+    + _RETIRED_OBJECTLESS_TAIL + _RETIRED_UNCONDITIONAL_TAIL
+    + r")" + _RETIRED_NARROWED_REVIEW_GUARD
+)
+
 # (f) THE GLOBAL-QUANTIFIER GROUP — "All code review activity has officially
 # ceased." Alone among the patterns it has NO self-reference anchor: the
 # all/every quantifier was taken as a self-announcement signature on the theory
@@ -648,8 +801,7 @@ _RETIRED_SELF_SERVICE_SUBJECT = (
 )
 _RETIRED_SELF_SHUTDOWN_RE = re.compile(
     r"\b" + _RETIRED_SELF_SERVICE_SUBJECT
-    + r"\b" + _RETIRED_SUBJECT_GAP + r"\b" + _RETIRED_TENSE
-    + _RETIRED_STRONG_VERB + r"\b" + _RETIRED_NARROWED_REVIEW_GUARD,
+    + r"\b" + _RETIRED_SUBJECT_GAP + r"\b" + _RETIRED_SHUTDOWN_PREDICATE,
     re.IGNORECASE,
 )
 # A cessation SCOPED to the reader's own repo / CI / environment. A vendor
@@ -777,6 +929,77 @@ def _retired_elsewhere_veto(text: str, match: "re.Match") -> bool:
     return bool(_RETIRED_ELSEWHERE_LOCUS_RE.match(text, match.end()))
 
 
+# (j), the veto the PROSPECTIVE tenses bring with them. A completed claim says
+# the reviewer is already dead; a prospective one ("is being retired", "will be
+# shut down", "will no longer review …") describes a service that may still be
+# alive and still reviewing this PR today. Where such a claim names the date the
+# shutdown TAKES EFFECT — "our code review service will be retired on August 1",
+# "…will no longer review pull requests starting next month" — it is a
+# deprecation warning posted BY A LIVE REVIEWER, and retiring on it silences
+# that reviewer for the whole run with no retraction path.
+#
+# Keyed on the prospective marker inside the MATCHED SPAN ("will" / "being"), so
+# a completed claim is untouched however it is dated: "our code review service
+# has been shut down as of 2026-07-01" stamps a banner with the day it died and
+# stays pinned as a retirement. Dates are not compared to a clock anywhere here
+# — the detector is regex-only and has no notion of "today" — so the tense of
+# the claim, not the value of the date, is what decides.
+#
+# An undated prospective banner ("our review bot will be shut down permanently")
+# is NOT vetoed: with no effective date the notice reads as final, and it is the
+# shape the tenses were widened for.
+_RETIRED_PROSPECTIVE_MARKER_RE = re.compile(r"\b(?:will|being)\b", re.IGNORECASE)
+_RETIRED_SCHEDULE_MONTH = (
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?"
+    r"|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?"
+    r"|dec(?:ember)?)"
+)
+_RETIRED_SCHEDULE_DATE = (
+    r"(?:\d{4}-\d{1,2}-\d{1,2}|\d{1,2}[/.]\d{1,2}[/.]\d{2,4}"
+    r"|(?:the\s+)?(?:\d{1,2}(?:st|nd|rd|th)?\s+(?:of\s+)?)?"
+    + _RETIRED_SCHEDULE_MONTH + r"(?:\s+\d{1,2}(?:st|nd|rd|th)?)?"
+    r"(?:,?\s+\d{4})?"
+    r"|q[1-4](?:\s+\d{4})?"
+    r"|next\s+(?:week|month|quarter|year|release|sprint)"
+    r"|the\s+end\s+of\s+(?:the\s+)?(?:week|month|quarter|year))"
+)
+_RETIRED_SCHEDULE_RE = re.compile(
+    # Same-clause window, like every other veto here: a date in the next
+    # sentence does not date THIS claim.
+    r"[^.!?;:\n]{0,60}?"
+    r"(?:\b(?:on|from|after|by|starting|beginning|effective|as\s+of|come)\s+"
+    + _RETIRED_SCHEDULE_DATE + r"\b"
+    r"|\bin\s+(?:q[1-4]\b|\d+\s+(?:days?|weeks?|months?)\b|"
+    + _RETIRED_SCHEDULE_MONTH + r"\b)"
+    r"|\bnext\s+(?:week|month|quarter|year|release|sprint)\b"
+    r"|\b(?:later|early|late)\s+(?:this|next)\s+(?:week|month|quarter|year)\b"
+    r"|\bat\s+the\s+end\s+of\s+(?:the\s+)?(?:week|month|quarter|year)\b)",
+    re.IGNORECASE,
+)
+
+
+def _retired_scheduled_veto(text: str, match: "re.Match") -> bool:
+    """True if ``match`` is a PROSPECTIVE retirement claim scheduled for a
+    future effective date — a deprecation warning from a reviewer that is still
+    alive today, never a self-report of a shutdown that has happened.
+
+    See the block comment above :data:`_RETIRED_SCHEDULE_RE`."""
+    if not _RETIRED_PROSPECTIVE_MARKER_RE.search(match.group(0)):
+        return False
+    return bool(_RETIRED_SCHEDULE_RE.match(text, match.end()))
+
+
+def _retired_claim_vetoed(text: str, match: "re.Match") -> bool:
+    """The vetoes that apply to EVERY retirement claim, whichever pattern found
+    it: the claim is located at a third party (:func:`_retired_elsewhere_veto`),
+    or it is prospective and dated to a shutdown that has not happened yet
+    (:func:`_retired_scheduled_veto`). The repo-scope veto is NOT here — it
+    reaches only the members whose anchor is a pronoun or a quantifier
+    (:data:`_RETIRED_SCOPE_VETOED_PATTERNS`)."""
+    return (_retired_elsewhere_veto(text, match)
+            or _retired_scheduled_veto(text, match))
+
+
 # The FIRST-PERSON CESSATION member — "We have ceased all code review
 # operations." / "We have discontinued reviewing pull requests." The first
 # person is this member's self-reference anchor, so the OBJECT carries the
@@ -852,12 +1075,13 @@ _RETIRED_ANCHORED_PATTERNS = [
     # discontinued." / "Our review bot has been permanently retired."
     # _RETIRED_SUBJECT_GAP, not _RETIRED_GAP: the verb must predicate the
     # reviewer subject itself, never a nested one (see the constant). And the
-    # shutdown verb may not be narrowed by a trailing review object — "our
-    # review bot has ceased REVIEWING DEPENDENCY UPDATES" is a coverage
-    # complaint about the diff (see _RETIRED_NARROWED_REVIEW_GUARD).
+    # shutdown verb may not be narrowed by an object — neither a trailing
+    # review object ("our review bot has ceased REVIEWING DEPENDENCY UPDATES")
+    # nor any other one ("our code review service has discontinued THE LEGACY
+    # ENDPOINT"); both are coverage complaints about the diff. Predicate,
+    # verb and both guards live in _RETIRED_SHUTDOWN_PREDICATE.
     r"\b" + _RETIRED_SELF_SUBJECT + r"\b" + _RETIRED_SUBJECT_GAP + r"\b"
-    + _RETIRED_TENSE + _RETIRED_STRONG_VERB + r"\b"
-    + _RETIRED_NARROWED_REVIEW_GUARD,
+    + _RETIRED_SHUTDOWN_PREDICATE,
     # FIRST-PERSON CESSATION — spelled out above, because it is also the one
     # member here that takes the repo-scope veto
     # (:data:`_RETIRED_SCOPE_VETOED_PATTERNS`).
@@ -980,7 +1204,11 @@ def _retired_patterns_match(text: str) -> bool:
     An ANCHORED pattern names its own subject, so a hit is conclusive — unless
     the claim is located ELSEWHERE ("…has been retired upstream"), which makes
     the subject someone else's service however self-referential its determiner
-    reads (:func:`_retired_elsewhere_veto`), or unless the pattern is one whose
+    reads (:func:`_retired_elsewhere_veto`), or is PROSPECTIVE and dated to a
+    shutdown that has not happened yet ("…will be retired on August 1"), which
+    makes it a live reviewer's deprecation warning
+    (:func:`_retired_scheduled_veto`) — the two together are
+    :func:`_retired_claim_vetoed` — or unless the pattern is one whose
     anchor is a mere PRONOUN or QUANTIFIER and the claim is scoped to the
     reader's own repo / CI ("we have discontinued reviewing pull requests from
     forks in CI", "all code review support is no longer available in CI") — see
@@ -992,19 +1220,19 @@ def _retired_patterns_match(text: str) -> bool:
     :data:`_RETIRED_GLOBAL_PATTERNS`."""
     # finditer, not search, throughout: every veto here is judged per claim, so
     # a body carrying both a vetoed clause and a clean one is still a retirement.
-    if any(not _retired_elsewhere_veto(text, m)
+    if any(not _retired_claim_vetoed(text, m)
            and not (p in _RETIRED_SCOPE_VETOED_PATTERNS
                     and _retired_scope_veto(text, m))
            for p in _RETIRED_ANCHORED_PATTERNS
            for m in re.finditer(p, text)):
         return True
     hits = [m for p in _RETIRED_GLOBAL_PATTERNS for m in re.finditer(p, text)]
-    if not hits and any(not _retired_elsewhere_veto(text, m)
+    if not hits and any(not _retired_claim_vetoed(text, m)
                         for m in _RETIRED_SELF_SHUTDOWN_RE.finditer(text)):
         hits = [m for p in _RETIRED_GLOBAL_UNADVERBED_PATTERNS
                 for m in re.finditer(p, text)]
     return any(not _retired_scope_veto(text, m)
-               and not _retired_elsewhere_veto(text, m) for m in hits)
+               and not _retired_claim_vetoed(text, m) for m in hits)
 
 
 # (e) A retirement notice is a NOTICE. A body that comments on the DIFF is a

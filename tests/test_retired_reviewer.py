@@ -144,6 +144,15 @@ RETIRED_POSITIVES = [
     # already covered above by "We have ceased all code review operations").
     "We have discontinued reviewing pull requests.",
     "We have ceased reviewing all pull requests.",
+    # (j) PROSPECTIVE announcements — progressive and future. Every tense above
+    # is COMPLETED, so these two commonest banner shapes after "has been sunset"
+    # matched nothing at all and were credited as reviews by the merge gate.
+    "Our code review service is being retired. No further code reviews will be "
+    "provided.",
+    "Our review bot will be shut down permanently.",
+    "This code review service is being decommissioned.",
+    "Our code review service will be sunset.",
+    "Our review bot will shut down.",
 ]
 
 # ─────────────────────────────────────────────────────────────────────
@@ -325,6 +334,22 @@ ADVERSARIAL_FALSE_POSITIVES = [
     "condition changed.",
     "This code review service has ceased reviewing generated migrations.",
     "Our code review bot has discontinued reviewing the docs directory.",
+    # (i) The same narrowing with ANY object. Guard (h) only rejected a trailing
+    # REVIEW verb, but a transitive shutdown verb swallows whatever object
+    # follows it, and the object is what the cessation is about: each body below
+    # says the speaker's service DID SOMETHING TO THE CODE, never that the
+    # speaker is dead. None carries a feedback-veto marker, none is deictic (so
+    # the second pass never arms on an ordinary PR) and all are well under the
+    # length gate. See TestANarrowingObjectOfAnyKindDefeatsTheShutdownClaim.
+    "Our code review service has discontinued the legacy endpoint, so the "
+    "adapter now returns 404.",
+    "Our code review bot has retired support for the v1 API.",
+    "Our code review service has discontinued Python 2 support.",
+    "Our review bot has terminated the legacy webhook, so the callback never "
+    "fires.",
+    "Our code review app has shut down the staging queue for this repo.",
+    "This code review integration has decommissioned the old ratings table.",
+    "Our code review tool has sunset its JSON output format.",
 ]
 
 RETIRED_NEGATIVES = [
@@ -837,6 +862,223 @@ class TestANarrowingReviewObjectDefeatsTheShutdownClaim:
                 in detectors._RETIRED_NARROWED_REVIEW_GUARD)
         assert all(detectors._RETIRED_CEASED_REVIEW in p
                    for p in detectors._RETIRED_ANCHORED_PATTERNS[-2:])
+
+
+class TestANarrowingObjectOfAnyKindDefeatsTheShutdownClaim:
+    """(i) The narrowing has nothing to do with the word "review": a transitive
+    shutdown verb swallows whatever object follows, so "our code review service
+    has discontinued THE LEGACY ENDPOINT" reports a change in the diff, not a
+    shutdown. Only an ACTIVE verb phrase can take a direct object, so the tense
+    is split by voice and the guard rides the active half alone. See
+    _RETIRED_TENSE_NO_OBJECT / _RETIRED_OBJECTLESS_TAIL /
+    _RETIRED_SHUTDOWN_PREDICATE."""
+
+    @pytest.mark.parametrize("body", [
+        "Our code review service has discontinued the legacy endpoint, so the "
+        "adapter now returns 404.",
+        "Our code review bot has retired support for the v1 API.",
+        "Our code review service has discontinued Python 2 support.",
+        "Our review bot has terminated the legacy webhook, so the callback "
+        "never fires.",
+        "Our code review app has shut down the staging queue for this repo.",
+        "This code review integration has decommissioned the old ratings table.",
+        "Our code review tool has sunset its JSON output format.",
+    ])
+    def test_a_transitive_shutdown_verb_never_retires_anybody(self, body):
+        assert not detectors.is_retired_message(body), (
+            "a shutdown verb narrowed by a direct object describes the DIFF; "
+            "retiring on it silences a HEALTHY reviewer for the whole run with "
+            "no retraction path")
+        assert detectors.detect_signal(body) is None
+        assert not detectors.is_placeholder_review_body(body)
+
+    @pytest.mark.parametrize("body", [
+        # PASSIVE / copular — no object is grammatically possible, so these are
+        # untouched by the guard whatever follows them.
+        "This code review service has been discontinued.",
+        "Our review bot has been permanently retired; please use another tool.",
+        "Our code review service has been shut down as of 2026-07-01.",
+        "Our code review app has been sunset following the acquisition.",
+        "Our code review service is decommissioned.",
+        "Our code review service has been decommissioned in this repository.",
+        # ACTIVE but object-LESS: a clause end, an adverbial, a coordination…
+        "Our code review service has ceased.",
+        "Our code review service has ceased permanently.",
+        "Our code review bot has shut down for good.",
+        # …a whole-service complement that narrows nothing…
+        "Our code review service has ceased operations.",
+        "Our code review service has ceased all code review.",
+        # …or a trailing review verb, which guard (h) judges on its own terms.
+        "Our review bot has ceased reviewing.",
+        "Our review bot has ceased reviewing as of today.",
+        "Our review bot has ceased reviewing all pull requests.",
+    ])
+    def test_an_objectless_shutdown_still_retires(self, body):
+        assert detectors.is_retired_message(body)
+
+    def test_the_passive_half_of_the_tense_split_takes_no_object_guard(self):
+        # The guard rides _RETIRED_TENSE_ACTIVE only. Pinning the split keeps a
+        # later widening from silently pushing the passive banner shapes — the
+        # overwhelming majority of real notices — through an allowlist they
+        # never needed.
+        assert detectors._RETIRED_OBJECTLESS_TAIL in (
+            detectors._RETIRED_SHUTDOWN_PREDICATE)
+        assert detectors._RETIRED_TENSE_ACTIVE in detectors._RETIRED_TENSE
+        assert detectors._RETIRED_TENSE_NO_OBJECT in detectors._RETIRED_TENSE
+
+    def test_the_predicate_is_shared_with_the_escape_hatch(self):
+        # One constant feeds the self-referential-shutdown member and the global
+        # group's escape hatch, so the two can never drift apart.
+        assert (detectors._RETIRED_SHUTDOWN_PREDICATE
+                in detectors._RETIRED_ANCHORED_PATTERNS[0])
+        assert detectors._RETIRED_SHUTDOWN_PREDICATE in (
+            detectors._RETIRED_SELF_SHUTDOWN_RE.pattern)
+        assert not detectors._RETIRED_SELF_SHUTDOWN_RE.search(
+            "our review bot has discontinued the legacy endpoint")
+        assert detectors._RETIRED_SELF_SHUTDOWN_RE.search(
+            "our review bot has been discontinued")
+
+    def test_a_narrowed_claim_does_not_arm_the_global_escape_hatch(self):
+        # The escape hatch substitutes for the global group's missing permanence
+        # adverb, so a narrowed claim must not arm it either.
+        assert not detectors.is_retired_message(
+            "Our review bot has discontinued the legacy endpoint. All code "
+            "review activity has ceased.")
+        assert detectors.is_retired_message(
+            "Our review bot has been discontinued. All code review activity "
+            "has ceased.")
+
+
+class TestProgressiveAndFutureNoticesAreRecognized:
+    """(j) Every other tense here is COMPLETED, so a reviewer announcing its own
+    shutdown as IN PROGRESS ("is being retired") or as COMING ("will be shut
+    down permanently") matched nothing — and an undetected banner is CREDITED AS
+    A REVIEW by the never-merge-unreviewed gate, the regression this whole cause
+    exists to close. See _RETIRED_TENSE_PROSPECTIVE_NO_OBJECT."""
+
+    @pytest.mark.parametrize("body", [
+        # Progressive passive.
+        "Our code review service is being retired. No further code reviews "
+        "will be provided.",
+        "This code review service is being decommissioned.",
+        "This code review integration is being permanently retired.",
+        # Future passive.
+        "Our review bot will be shut down permanently.",
+        "Our code review service will be sunset.",
+        "Our code review app will soon be decommissioned.",
+        # Future active / intransitive.
+        "Our review bot will shut down.",
+        "Our code review service will cease permanently.",
+    ])
+    def test_a_prospective_notice_is_detected(self, body):
+        assert detectors.is_retired_message(body)
+        # …and the merge gate refuses it a commit-sha credit, which is the half
+        # the miss was actually costing.
+        assert detectors.is_placeholder_review_body(body)
+
+    def test_the_two_reported_shapes_classify_as_retired(self):
+        # The exact wordings the review flagged: neither matched `is being` nor
+        # `will be`, so is_retired_message, detect_signal and the placeholder
+        # check all returned False and the notice could take review credit.
+        for body in ("Our code review service is being retired. No further "
+                     "code reviews will be provided.",
+                     "Our review bot will be shut down permanently"):
+            assert detectors.is_retired_message(body), body
+            assert detectors.detect_signal(body) == detectors.SIGNAL_RETIRED
+            assert detectors.is_placeholder_review_body(body)
+
+    @pytest.mark.parametrize("body", [
+        "Our code review service will be retired on August 1.",
+        "Our code review service will be retired on 2026-09-01.",
+        "Our code review bot will be shut down next month.",
+        "Our review bot is being retired in Q4.",
+        "Our code review service will be sunset at the end of the quarter.",
+        "Our code review app will be decommissioned starting next release.",
+        "Our review bot will no longer review pull requests starting next month.",
+    ])
+    def test_a_scheduled_future_notice_retires_nobody(self, body):
+        # A dated prospective claim is a DEPRECATION WARNING from a reviewer
+        # that is still alive and still reviewing this PR; retiring on it
+        # silences a healthy reviewer for the whole run with no retraction path.
+        assert not detectors.is_retired_message(body), body
+        assert detectors.detect_signal(body) is None
+
+    def test_a_completed_claim_keeps_its_date(self):
+        # The veto is keyed on the PROSPECTIVE marker in the matched span, so a
+        # completed claim is untouched however it is dated — a banner routinely
+        # stamps itself with the day the service died.
+        assert detectors.is_retired_message(
+            "Our code review service has been shut down as of 2026-07-01.")
+        assert detectors.is_retired_message(
+            "Our code review service was sunset on August 1.")
+
+    @pytest.mark.parametrize("body", [
+        # The future is the register a reviewer writes the DIFF'S OWN
+        # consequences in, so the prospective tenses are admitted ONLY where a
+        # subject noun phrase already names the speaker's own service — never on
+        # the unanchored global-quantifier group.
+        "All code review coverage will be permanently removed once the "
+        "workflow is deleted.",
+        "All code review activity will be permanently disabled.",
+        "Every code review service will be shut down.",
+        # …nor on a narrowing object, exactly as the completed active tense.
+        "Our code review service will sunset the legacy endpoint.",
+        "Our review bot will shut down the staging queue.",
+        # …nor when the shutdown is somebody else's.
+        "This code review service is being retired upstream.",
+    ])
+    def test_the_widening_stops_at_the_self_anchored_predicate(self, body):
+        assert not detectors.is_retired_message(body), body
+
+    @pytest.mark.parametrize("body", [
+        # The future is also how a reviewer describes what the DIFF will do at
+        # RUNTIME. A banner declares its shutdown outright; a conditional or
+        # temporal subordinate clause on the predicate marks the other reading,
+        # and each body below would otherwise retire its healthy author.
+        "Our code review service will shut down when the runner exits.",
+        "Our review bot was being shut down while the fixture ran.",
+        "Our code review bot will be sunset if the token is missing.",
+        "Our code review service will cease once the queue drains.",
+        "Our review bot will be shut down unless the workflow is restored.",
+    ])
+    def test_a_conditional_prospective_claim_retires_nobody(self, body):
+        assert not detectors.is_retired_message(body), body
+        assert detectors.detect_signal(body) is None
+
+    def test_the_prospective_tenses_are_not_in_the_shared_tense_constant(self):
+        # Pinned: folding them into _RETIRED_TENSE would put the future tense on
+        # the global-quantifier group, which has no self-reference anchor.
+        assert (detectors._RETIRED_TENSE_PROSPECTIVE_NO_OBJECT
+                not in detectors._RETIRED_TENSE)
+        assert (detectors._RETIRED_TENSE_PROSPECTIVE_NO_OBJECT
+                in detectors._RETIRED_SHUTDOWN_PREDICATE)
+        assert (detectors._RETIRED_TENSE_PROSPECTIVE_ACTIVE
+                in detectors._RETIRED_SHUTDOWN_PREDICATE)
+
+    def test_the_escape_hatch_carries_the_prospective_tenses_too(self):
+        # One predicate constant feeds the anchored member and the global
+        # group's escape hatch, so a prospective banner arms both.
+        assert detectors._RETIRED_SELF_SHUTDOWN_RE.search(
+            "our review bot will be shut down")
+        assert detectors.is_retired_message(
+            "Our review bot will be shut down. All code review activity has "
+            "ceased.")
+        assert not detectors.is_retired_message(
+            "Our review bot will be shut down next month. All code review "
+            "activity has ceased.")
+
+    def test_the_driver_records_a_prospective_notice_end_to_end(self):
+        # The whole point of detecting it: the reviewer is recorded as retired
+        # and subtracted from the reviewed set, so a prospective banner can
+        # never satisfy the never-merge-unreviewed gate.
+        driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+        body = "Our review bot will be shut down permanently."
+        assert driver._classify_signal(
+            Comment(id="a", text=body, source="claude[bot]"), now=1.0) is None
+        assert "claude" in driver._retired
+        assert driver.store.is_excluded("claude")
+        assert "claude" not in driver.reviewed_ever
+        assert driver._genuine_reviewers() == set()
 
 
 class TestGlobalQuantifierNeedsAnnouncementRegister:
