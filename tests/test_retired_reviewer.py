@@ -278,6 +278,17 @@ ADVERSARIAL_FALSE_POSITIVES = [
     "I have discontinued reviewing generated migrations in this repository.",
     "We have ceased reviewing anything under the vendor tree, and this PR does "
     "not restore it.",
+    # Tightening (b) covered the third-party locus only in the DETERMINER slot,
+    # so the same fact stated with the locus in ADVERBIAL position left the
+    # deictic "this" free to read as self-reference. Each body below is an
+    # inline finding about a vendored integration in the DIFF, carries no
+    # feedback-veto marker, and permanently retired its healthy author.
+    # See _RETIRED_ELSEWHERE_LOCUS_RE.
+    "This code review integration has been retired upstream.",
+    "This code review action was sunset upstream, so the workflow step is a "
+    "no-op now.",
+    "This code review integration has been retired by the vendor.",
+    "This code review app was decommissioned in the upstream repo.",
 ]
 
 RETIRED_NEGATIVES = [
@@ -339,6 +350,23 @@ class TestRetiredDetector:
         assert not detectors.is_retired_message(
             "Our code review service has been sunset.\n```python\nx = 1\n```")
 
+    @pytest.mark.parametrize("fence", ["```", "~~~"])
+    def test_the_feedback_veto_covers_both_commonmark_fences(self, fence):
+        # A fenced code sample is strong "this is a review" evidence, and ``~~~``
+        # is a legal fence everywhere ``` is. While only the backtick branch
+        # existed, the identical body written with tildes skipped the veto and
+        # PERMANENTLY retired the healthy reviewer that wrote it.
+        body = (f"Our code review service has been sunset.\n\n"
+                f"{fence}python\nx = 1\n{fence}\n")
+        assert not detectors.is_retired_message(body)
+        assert detectors.detect_signal(body) is None
+        assert not detectors.is_placeholder_review_body(body)
+
+    def test_both_fences_are_feedback_markers(self):
+        for fence in ("```", "~~~"):
+            assert detectors._RETIRED_FEEDBACK_MARKER_RE.search(
+                f"{fence}\nx = 1\n{fence}"), fence
+
     def test_domain_review_nouns_never_match(self):
         # (a) CODE review only — a bare "review" noun never counts. This is what
         # removes the entire product-domain class (product reviews, peer review,
@@ -355,6 +383,34 @@ class TestRetiredDetector:
                     "the legacy", "the consumer"):
             assert not detectors.is_retired_message(
                 f"{det} code review integration has been retired."), det
+
+    def test_a_third_party_locus_beats_the_deictic_this(self):
+        # (b), adverbial half. English states the same third-party fact with the
+        # locus AFTER the verb, which frees the determiner to be the deictic
+        # "this" — and "this" then points at the integration in the DIFF, not at
+        # the speaker. Nothing in the SUBJECT distinguishes the two readings, so
+        # the locus is what decides.
+        feedback = "This code review integration has been retired upstream."
+        notice = ("Notice: this code review integration has been retired. "
+                  "No further code reviews will be posted.")
+        assert not detectors.is_retired_message(feedback)
+        assert detectors.detect_signal(feedback) is None
+        assert not detectors.is_placeholder_review_body(feedback)
+        # …and the near-identical genuine notice is untouched. This pair is the
+        # whole point: dropping "this" from _RETIRED_SELF_DET would have taken
+        # the notice down with the feedback.
+        assert detectors.is_retired_message(notice)
+
+    def test_the_locus_must_qualify_the_matched_predicate(self):
+        # Bound to THIS clause, like the repo-scope veto: an "upstream" sitting
+        # in another sentence is not the locus of the retirement claim, and
+        # vetoing on it would hide a real banner.
+        assert detectors.is_retired_message(
+            "Our code review service has been discontinued. The SDK it wrapped "
+            "lives upstream.")
+        # A date is not a locus — a banner routinely stamps itself with one.
+        assert detectors.is_retired_message(
+            "Our code review service has been shut down as of 2026-07-01.")
 
     def test_empty_body(self):
         assert not detectors.is_retired_message("")
@@ -582,6 +638,38 @@ class TestGlobalQuantifierNeedsAnnouncementRegister:
         assert detectors.is_retired_message(RETIREMENT_BANNER)
         assert not detectors._RETIRED_SCOPED_QUALIFIER_RE.search("on github")
 
+    @pytest.mark.parametrize("banner", [
+        # The banner names the PLATFORM its dead service ran on. Whole-body
+        # veto matched "on GitHub Actions" and hid the banner — and a hidden
+        # banner is credited as a review by the never-merge-unreviewed gate.
+        RETIREMENT_BANNER.replace("on GitHub", "on GitHub Actions"),
+        "Our app on GitHub Actions has been sunset and all code review "
+        "activity has officially ceased.",
+        # An unrelated qualifier in a DIFFERENT sentence of the same banner.
+        "All code review activity has officially ceased. Generated in CI.",
+    ])
+    def test_a_qualifier_outside_the_cessation_clause_does_not_veto(self, banner):
+        assert detectors.is_retired_message(banner), (
+            "a scope qualifier that does not modify the cessation clause "
+            "vetoed a real sunset banner — the notice is then credited as a "
+            "review by the reviewed-head merge gate")
+
+    @pytest.mark.parametrize("scoped", [
+        # The qualifier sits BETWEEN the global head and its own verb, so it
+        # scopes this very cessation — it must still veto even though a
+        # retirement predicate follows it directly.
+        "All code review activity in CI has been permanently disabled.",
+        "All code review activity on forks has been permanently disabled.",
+        # Fronted adjunct: a fresh subject intervenes, so it is not a
+        # subject-noun-phrase qualifier and still scopes the cessation.
+        "In this repository, all code review activity has officially ceased.",
+        # `;` is not a sentence break for the veto window.
+        "All code review activity has officially ceased; in this repository "
+        "the workflow was removed.",
+    ])
+    def test_a_qualifier_modifying_the_cessation_still_vetoes(self, scoped):
+        assert not detectors.is_retired_message(scoped)
+
     def test_the_scope_veto_does_not_reach_the_anchored_patterns(self):
         # An ANCHORED pattern names its own subject, so a hit is conclusive and
         # the global-group guards do not apply to it.
@@ -726,6 +814,33 @@ class TestRetirementIsNotAReview:
         assert driver.store.is_excluded("claude")
         assert "claude" not in driver.reviewed_ever
         assert driver._genuine_reviewers() == set()
+
+    def test_an_inline_finding_about_a_vendored_integration_keeps_its_author(self):
+        # The end-to-end shape of the deictic-"this" false positive: an ordinary
+        # inline finding on a PR whose metadata carries no retirement vocabulary,
+        # so no model disambiguation arms. Before the locus veto _classify_signal
+        # recorded RETIRED, dropped the finding, and removed the healthy reviewer
+        # AND its review credit for the whole run, with no retraction path.
+        driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+        out = driver._classify_signal(
+            Comment(id="a",
+                    text="This code review integration has been retired upstream.",
+                    source="claude[bot]", path="adapters/vendor.py",
+                    diff_hunk="@@ -1,2 +1,2 @@\n-old\n+new"),
+            now=1.0)
+        assert out == "claude"                   # the finding still flows to the kernel
+        assert "claude" not in driver._retired
+        assert not driver.store.is_excluded("claude")
+        assert "claude" in driver.reviewed_ever
+
+    def test_the_same_wording_as_a_real_notice_still_retires(self):
+        # The guard is a locus test, not a blanket amnesty for "this": the
+        # notice shape it must never stop catching.
+        driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+        assert driver._classify_signal(
+            Comment(id="a", text="This code review service has been discontinued.",
+                    source="claude[bot]"), now=1.0) is None
+        assert "claude" in driver._retired
 
     def test_a_prior_review_credit_is_revoked_when_the_notice_arrives(self):
         # A bot credited earlier in the run must LOSE that credit: a service

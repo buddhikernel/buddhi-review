@@ -544,7 +544,10 @@ _RETIRED_TRAILING_SUBJECT_LINK = (
 #   2. REPO-SCOPE VETO (_RETIRED_SCOPED_QUALIFIER_RE) — a cessation scoped to
 #      the user's own repo or CI ("in CI", "for this repository", "on forks")
 #      is an outage discovered in the diff, never a vendor sunset, so it is
-#      discarded even when it satisfies (1).
+#      discarded even when it satisfies (1). The qualifier must MODIFY the
+#      cessation clause to count: a platform name in the banner's other
+#      sentence ("…on GitHub Actions has been sunset.") is not a scope, and
+#      vetoing on it hid the real banner. See _retired_scope_veto.
 #
 # Both guards live in _retired_patterns_match, which is why this group is kept
 # in its own list. RETIRED_PATTERNS below stays the flat union, unchanged in
@@ -596,11 +599,20 @@ _RETIRED_SELF_SHUTDOWN_RE = re.compile(
 # A cessation SCOPED to the reader's own repo / CI / environment. A vendor
 # sunset is global by definition; "in CI", "for this repository", "on forks"
 # name a place inside the codebase under review, which makes the sentence
-# feedback about the diff. Scanned over the WHOLE body (bounded to
-# _RETIRED_MAX_LEN) rather than the matched clause, deliberately: the global
-# patterns carry no anchor, so the cheap false NEGATIVE is the right trade —
-# see the is_retired_message docstring. Platform names ("on GitHub") are NOT
-# qualifiers: the real observed banner says "…on GitHub has been sunset".
+# feedback about the diff.
+#
+# The qualifier must MODIFY THE CESSATION CLAIM, which is why this is not
+# scanned over the whole body (see _retired_scope_veto). A whole-body scan
+# vetoed the very banner the cause exists to catch: a real notice names the
+# platform its service ran on — "The consumer version … ON GITHUB ACTIONS has
+# been sunset. All code review activity has officially ceased." — and an
+# unrelated "in CI" footer did the same. Either way the banner went undetected,
+# and an undetected banner is CREDITED AS A REVIEW by the never-merge-unreviewed
+# gate, which is the regression this whole cause exists to close. That failure
+# is not the cheap direction, so the veto is narrowed to the clause it is about.
+# Platform names alone ("on GitHub") are not qualifiers at all — the real
+# observed banner says "…on GitHub has been sunset" — but "on GitHub Actions"
+# stays listed because a CI-scoped outage is genuinely reported that way.
 _RETIRED_SCOPED_QUALIFIER_RE = re.compile(
     r"\b(?:in|on|for|within|under|across|from)\s+"
     r"(?:"
@@ -620,6 +632,94 @@ _RETIRED_SCOPED_QUALIFIER_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+# A qualifier that is IMMEDIATELY followed by its own retirement predicate is
+# part of THAT clause's subject noun phrase — "our app ON GITHUB ACTIONS has
+# been sunset" says where the dead service lived, not where the cessation
+# applies. Immediacy is the whole test: in "IN THIS REPOSITORY, all code review
+# activity has officially ceased" a fresh subject intervenes, so the fronted
+# qualifier still scopes the cessation and still vetoes.
+_RETIRED_QUALIFIER_PREDICATE_RE = re.compile(
+    r"\s*(?:,\s*)?" + _RETIRED_TENSE
+    + r"(?:" + _RETIRED_STRONG_VERB + r"|" + _RETIRED_WEAK_VERB + r")\b",
+    re.IGNORECASE,
+)
+# Sentence boundaries for the veto window. `;` and `:` are deliberately NOT
+# breaks here (unlike _RETIRED_GAP): "…has officially ceased; in this repository
+# the workflow was removed" is still the cessation being scoped, and keeping the
+# window wide there is the conservative direction.
+_RETIRED_SENTENCE_BREAK_RE = re.compile(r"[.!?\n]")
+
+
+def _retired_scope_veto(text: str, match: "re.Match") -> bool:
+    """True if a repo/CI scope qualifier MODIFIES the global cessation claim
+    that ``match`` found, making it an outage report rather than a sunset.
+
+    The window is the SENTENCE holding the cessation clause, so an unrelated
+    qualifier elsewhere in the banner (a platform name in the sentence before,
+    an "in CI" footer in the sentence after) cannot veto it. Inside that window
+    a qualifier is skipped when it carries its own retirement predicate — with
+    one exception: a qualifier sitting INSIDE the matched span sits between the
+    global head and its own verb ("all code review activity IN CI has been
+    permanently disabled"), so it is scoping this very claim and always vetoes.
+    """
+    lo = 0
+    for brk in _RETIRED_SENTENCE_BREAK_RE.finditer(text, 0, match.start()):
+        lo = brk.end()
+    tail = _RETIRED_SENTENCE_BREAK_RE.search(text, match.end())
+    hi = tail.start() if tail else len(text)
+    for qual in _RETIRED_SCOPED_QUALIFIER_RE.finditer(text, lo, hi):
+        inside_claim = (qual.start() >= match.start()
+                        and qual.end() <= match.end())
+        if (not inside_claim
+                and _RETIRED_QUALIFIER_PREDICATE_RE.match(text, qual.end())):
+            continue
+        return True
+    return False
+
+
+# (b), adverbial half — an ELSEWHERE LOCUS attached to the retirement predicate.
+# Tightening (b) rejects a third-party service in the DETERMINER slot ("THE
+# UPSTREAM code review integration has been retired"), but English states the
+# same fact with the locus in ADVERBIAL position instead, and there the
+# determiner is free to be the deictic "this":
+#     "This code review integration has been retired UPSTREAM."
+# Posted as an inline finding, "this" points at the vendored integration IN THE
+# DIFF, not at the speaker — yet it is word-for-word the shape of a genuine
+# self-announcement ("Notice: this code review integration has been retired."),
+# so no wording rule on the subject alone can separate them. The locus is what
+# separates them: a service announcing its OWN death never says the death
+# happened upstream or at a third party. Dropping the deictic "this" from
+# _RETIRED_SELF_DET instead is not available — it is the determiner the real
+# observed banner shape uses, and removing it blinds the detector to every
+# "This code review service has been discontinued." notice.
+#
+# Kept deliberately narrow. Only an unambiguously THIRD-PARTY locus counts:
+# "upstream" (any position in the window) and a passive by-agent naming the
+# vendor/provider/publisher/supplier/third party. A generic by-agent ("retired
+# by its maintainer") is NOT listed — a first-party banner can legitimately name
+# its own publisher that way. A DATE is not a locus at all ("has been shut down
+# as of 2026-07-01" is a banner, and stays one).
+_RETIRED_ELSEWHERE_LOCUS_RE = re.compile(
+    r"[^.!?;:\n]{0,24}?"
+    r"(?:\bupstream\b"
+    r"|\bby\s+(?:the|its|their|a)\s+(?:vendor|provider|publisher|supplier"
+    r"|third[\s-]party)\b)",
+    re.IGNORECASE,
+)
+
+
+def _retired_elsewhere_veto(text: str, match: "re.Match") -> bool:
+    """True if the retirement claim ``match`` found is located ELSEWHERE — at
+    the upstream project or a named third party — which makes it a report about
+    someone else's dead service, i.e. review feedback, never a self-report.
+
+    The locus must qualify THIS predicate: it is matched immediately after the
+    matched span and may not cross a sentence or clause break. That is what
+    keeps "…has been retired UPSTREAM" (feedback) apart from "…has been retired.
+    No further code reviews will be posted." (a notice) — the two differ in
+    nothing else. See :data:`_RETIRED_ELSEWHERE_LOCUS_RE`."""
+    return bool(_RETIRED_ELSEWHERE_LOCUS_RE.match(text, match.end()))
+
 
 # Every pattern below carries its own self-reference anchor INLINE, so neither
 # guard (f) applies to it — the anchor already answers "who stopped?".
@@ -709,21 +809,28 @@ def _retired_patterns_match(text: str) -> bool:
     """True if ``text`` carries a retirement claim that survives the
     global-quantifier guards (f). ``text`` is already lower-cased/normalized.
 
-    An ANCHORED pattern names its own subject, so a hit is conclusive. A
-    GLOBAL-quantifier hit is not: it must additionally be in announcement
-    register (a permanence adverb bound to the verb, or an independent
-    self-anchored shutdown claim elsewhere in the body) and must not be scoped
-    to the reader's own repo / CI. See the block comment above
+    An ANCHORED pattern names its own subject, so a hit is conclusive — unless
+    the claim is located ELSEWHERE ("…has been retired upstream"), which makes
+    the subject someone else's service however self-referential its determiner
+    reads (:func:`_retired_elsewhere_veto`). A GLOBAL-quantifier hit is not
+    conclusive either way: it must additionally be in announcement register (a
+    permanence adverb bound to the verb, or an independent self-anchored
+    shutdown claim elsewhere in the body) and must not be scoped to the reader's
+    own repo / CI. See the block comment above
     :data:`_RETIRED_GLOBAL_PATTERNS`."""
-    if any(re.search(p, text) for p in _RETIRED_ANCHORED_PATTERNS):
+    # finditer, not search, throughout: every veto here is judged per claim, so
+    # a body carrying both a vetoed clause and a clean one is still a retirement.
+    if any(not _retired_elsewhere_veto(text, m)
+           for p in _RETIRED_ANCHORED_PATTERNS
+           for m in re.finditer(p, text)):
         return True
-    hit = any(re.search(p, text) for p in _RETIRED_GLOBAL_PATTERNS)
-    if not hit and _RETIRED_SELF_SHUTDOWN_RE.search(text):
-        hit = any(re.search(p, text)
-                  for p in _RETIRED_GLOBAL_UNADVERBED_PATTERNS)
-    if not hit:
-        return False
-    return not _RETIRED_SCOPED_QUALIFIER_RE.search(text)
+    hits = [m for p in _RETIRED_GLOBAL_PATTERNS for m in re.finditer(p, text)]
+    if not hits and any(not _retired_elsewhere_veto(text, m)
+                        for m in _RETIRED_SELF_SHUTDOWN_RE.finditer(text)):
+        hits = [m for p in _RETIRED_GLOBAL_UNADVERBED_PATTERNS
+                for m in re.finditer(p, text)]
+    return any(not _retired_scope_veto(text, m)
+               and not _retired_elsewhere_veto(text, m) for m in hits)
 
 
 # (e) A retirement notice is a NOTICE. A body that comments on the DIFF is a
@@ -734,8 +841,16 @@ def _retired_patterns_match(text: str) -> bool:
 # (which silences a healthy reviewer for the run, unrecoverably). Deliberately
 # BROADER than :data:`_REVIEW_FEEDBACK_RE` (the shared signal-suppression guard)
 # for that reason.
+#
+# BOTH CommonMark fences count. ``~~~`` is a legal fence everywhere ``` is, so a
+# genuine review that fences its code sample with tildes carries exactly the same
+# "this is a review" evidence; while only the backtick branch existed, that review
+# skipped the veto entirely and — with retirement vocabulary anywhere in it —
+# permanently retired the healthy reviewer that wrote it. Same parity gap the
+# quoted-vocabulary strip already closed for its own span regex (see
+# :data:`_RETIRED_QUOTED_VOCAB_RE`); the two must agree on what a fence is.
 _RETIRED_FEEDBACK_MARKER_RE = re.compile(
-    r"(?:```"
+    r"(?:```|~~~"
     r"|\b(?:this|the)\s+(?:pr|pull\s+request)\b"
     r"|\bthis\s+(?:change|diff|patch|module|adapter|helper"
     r"|class|function|method|file|component|call|query|loop|branch|migration"
@@ -1359,8 +1474,9 @@ def is_retired_message(body: Optional[str]) -> bool:
     :func:`_retired_patterns_match` rather than scanned raw: the
     GLOBAL-QUANTIFIER group ("all code review activity has …") is the one group
     with no inline self-reference anchor, so it additionally requires
-    announcement register and is vetoed by a repo-scoped qualifier ("has ceased
-    **in CI**"). See the block comment above :data:`_RETIRED_GLOBAL_PATTERNS`.
+    announcement register and is vetoed by a repo-scoped qualifier that
+    modifies that same cessation clause ("has ceased **in CI**"). See the block
+    comment above :data:`_RETIRED_GLOBAL_PATTERNS`.
 
     Regex-only by design (no LLM tier): the wording is a stylized service
     notice. A MISS degrades to exactly the pre-fix behavior — the bot stays
