@@ -1824,11 +1824,36 @@ def detect_signal(
     is documentary regardless of any model."""
     if not text:
         return None
+    # RETIRED is resolved BEFORE the generic feedback guard because a genuine
+    # shutdown notice routinely carries MIGRATION GUIDANCE — "…has been
+    # permanently retired. You should migrate to X.", or a bulleted list of
+    # migration steps — and _REVIEW_FEEDBACK_RE matches the bare "should" / the
+    # bullet. The guard then returned None, the PERMANENT cause was silently
+    # downgraded to actionable feedback, the driver never recorded the retirement,
+    # and the dead reviewer was credited in ``reviewed_ever``.
+    #
+    # Only a SELF-ANCHORED notice earns the exemption ("our …", a first-person
+    # cessation, the global-quantifier group): those name the SPEAKER independent
+    # of what the sentence is about, so a healthy reviewer's bulleted finding
+    # cannot borrow the anchor — and is_retired_message's own veto
+    # (_RETIRED_FEEDBACK_MARKER_RE, deliberately BROADER than this guard) still
+    # screens the body for diff feedback.
+    #
+    # A claim anchored by nothing but the deictic "this" KEEPS the guard: its
+    # subject is genuinely two-way (see _retired_claim_is_deictic_only) and is
+    # settled by the content gate below, which needs a model — with none wired,
+    # exempting it would deterministically silence a healthy reviewer whose
+    # bulleted review says "this code review integration has been retired".
+    # Missing such a notice degrades to the pre-fix behaviour, and the merge-gate
+    # half is unaffected either way: is_placeholder_review_body calls
+    # is_retired_message directly and never consults this guard.
+    retired = is_retired_message(text)
+    retired_deictic_only = retired and _retired_claim_is_deictic_only(text)
     # Guard: if the message reads as review feedback (recommendation starters,
     # bullet lists, or code blocks), it is NOT a bot status signal — skip matching
     # so "Consider handling the rate limit (429) here" is never misclassified as
     # quota-exhausted, silently dropped, and the bot permanently banned for the run.
-    if _REVIEW_FEEDBACK_RE.search(text):
+    if not (retired and not retired_deictic_only) and _REVIEW_FEEDBACK_RE.search(text):
         return None
 
     def gated(cause: str, *, ambiguous_self_reference: bool = False
@@ -1862,10 +1887,10 @@ def detect_signal(
     # (feedback veto + length gate + quoted-vocabulary strip + the anchored /
     # global-quantifier pattern split), so it defers to the causes below on
     # anything that is not an unmistakable self-announced shutdown.
-    if is_retired_message(text):
+    if retired:
         return gated(
             SIGNAL_RETIRED,
-            ambiguous_self_reference=_retired_claim_is_deictic_only(text))
+            ambiguous_self_reference=retired_deictic_only)
     if QUOTA_RE.search(text):
         return gated(SIGNAL_QUOTA)
     if PR_TOO_LARGE_RE.search(text):

@@ -1183,6 +1183,93 @@ class TestDeicticClaimsGoThroughTheContentGate:
 
 
 # ═════════════════════════════════════════════════════════════════════
+# 3c. The generic review-feedback guard vs. MIGRATION GUIDANCE.
+#
+# A real shutdown banner tells you where to go next — "You should migrate
+# to X", or a bulleted list of steps. _REVIEW_FEEDBACK_RE matches the bare
+# "should" and the bullet, so it short-circuited detect_signal ahead of the
+# retirement branch: the PERMANENT cause was silently downgraded to
+# actionable feedback and the dead reviewer was credited as having reviewed.
+# A SELF-ANCHORED notice is now exempt from that guard; a deictic-"this"
+# claim still keeps it.
+# ═════════════════════════════════════════════════════════════════════
+
+# Self-anchored ("our"), plus the one clause that used to sink it.
+NOTICE_WITH_MIGRATION_PROSE = (
+    "Our code review service has been permanently retired. "
+    "You should migrate to the new GitHub App.")
+NOTICE_WITH_MIGRATION_BULLETS = (
+    "Our code review service has been permanently retired.\n\n"
+    "- Migrate to the new GitHub App.\n"
+    "- Update your workflow triggers.")
+
+
+class TestMigrationGuidanceDoesNotDowngradeANotice:
+    @pytest.mark.parametrize("body", [NOTICE_WITH_MIGRATION_PROSE,
+                                      NOTICE_WITH_MIGRATION_BULLETS])
+    def test_the_notice_classifies_as_retired(self, body):
+        # The regression: the guard fired on "should" / the bullet and returned
+        # None, so the driver never recorded the retirement.
+        assert detectors._REVIEW_FEEDBACK_RE.search(body)   # the guard DOES match
+        assert detectors.is_retired_message(body)
+        assert detectors.detect_signal(body) == detectors.SIGNAL_RETIRED
+
+    @pytest.mark.parametrize("body", [NOTICE_WITH_MIGRATION_PROSE,
+                                      NOTICE_WITH_MIGRATION_BULLETS])
+    def test_the_exemption_does_not_bypass_the_content_gate(self, body):
+        # Exempt from the guard, still subject to the per-cause gate: on a PR
+        # about reviewer sunsetting the model gets the final word.
+        assert detectors.detect_signal(
+            body, quota_llm=_llm(False),
+            pr_title=THIS_PR_TITLE, pr_body=THIS_PR_BODY) is None
+
+    @pytest.mark.parametrize("body", [NOTICE_WITH_MIGRATION_PROSE,
+                                      NOTICE_WITH_MIGRATION_BULLETS])
+    def test_the_driver_records_the_retirement_end_to_end(self, body):
+        # The half the bug actually broke: with the notice read as ordinary
+        # feedback, _classify_signal credited the dead reviewer in
+        # reviewed_ever, where it satisfied the never-merge-unreviewed gate.
+        driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+        assert driver._classify_signal(
+            Comment(id="a", text=body, source="claude[bot]"), now=1.0) is None
+        assert "claude" in driver._retired
+        assert driver.store.is_excluded("claude")
+        assert "claude" not in driver.reviewed_ever
+        assert driver._genuine_reviewers() == set()
+
+    def test_a_deictic_claim_still_keeps_the_guard(self):
+        # The safety half. "this" does not say WHO, and the content gate that
+        # settles it needs a model — so with none wired the guard must still
+        # save the healthy reviewer whose bulleted review wrote this.
+        body = DEICTIC_FINDING + "\n\n- You should drop the vendored client."
+        assert detectors.is_retired_message(body)
+        assert detectors._retired_claim_is_deictic_only(body)
+        assert detectors.detect_signal(body) is None
+        assert detectors.detect_signal(body, quota_llm=_llm(True),
+                                       **UNRELATED_PR) is None
+
+    def test_the_guard_still_vetoes_the_recoverable_causes(self):
+        # The exemption is RETIRED-only: the three recoverable causes keep
+        # deferring to the guard, so a finding that merely discusses a rate
+        # limit / size cap / review failure is never a status signal.
+        for body in ("- Consider handling the rate limit (429) here.",
+                     "- This diff should be split; it is too large to review.",
+                     "- The review run failed check should be handled here."):
+            assert detectors._REVIEW_FEEDBACK_RE.search(body), body
+            assert detectors.detect_signal(body) is None, body
+
+    def test_a_bulleted_review_borrowing_the_vocabulary_stays_a_review(self):
+        # is_retired_message's own veto (broader than the guard) is what screens
+        # these, and it still runs first in the exemption test.
+        for body in ("Our code review bot has been retired.\n"
+                     "- fix the import on line 3",
+                     "The vendor's code review service has been discontinued.\n"
+                     "- delete the adapter"):
+            assert not detectors.is_retired_message(body), body
+            assert detectors.detect_signal(body) is None, body
+
+
+# ═════════════════════════════════════════════════════════════════════
 # 4. A retirement notice is a RESPONSE, never a REVIEW.
 # ═════════════════════════════════════════════════════════════════════
 
