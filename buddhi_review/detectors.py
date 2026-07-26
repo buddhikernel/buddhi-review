@@ -398,12 +398,21 @@ CLEAN_RESULT_RE = re.compile(
 #       construction, so it gets its own pair of guards — a required
 #       announcement register and a repo-scope veto. See
 #       _RETIRED_GLOBAL_PATTERNS.
-#   (g) That repo-scope veto also reaches the ONE anchored member whose anchor is
-#       a bare PRONOUN — first-person cessation. "We" names the speaker by
-#       grammar, but a reviewer routinely writes "we" for the PROJECT under
+#   (g) That repo-scope veto also reaches the two anchored members whose anchor
+#       is WEAKER than a subject noun phrase naming the speaker's own service.
+#       First-person cessation anchors on a bare PRONOUN: "we" names the speaker
+#       by grammar, but a reviewer routinely writes "we" for the PROJECT under
 #       review, so "we have discontinued reviewing pull requests from forks in
-#       CI" read as a self-announcement and retired its healthy author. See
-#       _RETIRED_SCOPE_VETOED_PATTERNS.
+#       CI" read as a self-announcement and retired its healthy author. The
+#       availability member's global half anchors on a QUANTIFIER, which names
+#       nobody at all — the same theory (f) retracts — so "all code review
+#       support is no longer available in CI because the workflow condition was
+#       removed" did the same. See _RETIRED_SCOPE_VETOED_PATTERNS.
+#   (h) A NARROWING OBJECT defeats a shutdown claim. A verb that ends at a bare
+#       review verb swallows whatever object follows, and an object narrows the
+#       cessation to that object — "our review bot has ceased reviewing
+#       dependency updates" complains about COVERAGE, it does not announce a
+#       shutdown. See _RETIRED_NARROWED_REVIEW_GUARD.
 # Anything that still slips through must survive the per-cause second pass in
 # ``detect_signal`` (the model confirms SELF-reporting) before it excludes.
 _RETIRED_MAX_LEN = 600
@@ -523,6 +532,47 @@ _RETIRED_TRAILING_SUBJECT_LINK = (
     r"(?:\s+" + _RETIRED_NP_WORD + r"){0,2}\s+(?:for|of)\s+"
 )
 
+# (h) A NARROWING OBJECT defeats every self-anchored shutdown claim. Same defect
+# :data:`_RETIRED_REVIEW_OBJECT` closes on the first-person member, in the two
+# places that fix did not reach: a shutdown verb that ends at a bare review verb
+# silently swallows whatever object follows it —
+#     "Our review bot has ceased reviewing dependency updates after the
+#      workflow condition changed."   ← a healthy reviewer describing the DIFF
+# and an object NARROWS the cessation to that object. A narrowed cessation
+# reports a COVERAGE defect in the diff, never a permanent shutdown. That body
+# carries no feedback-veto marker, its anchor ("our review bot") is not deictic
+# so the second pass never arms on an ordinary PR, and it is well under the
+# length gate — so it retired a healthy reviewer for the whole run, with no
+# retraction path, and its finding was dropped.
+#
+# A bare review verb therefore counts only when the cessation it reports is
+# UNRESTRICTED: nothing follows the verb but a clause end, a finality/temporal
+# adverbial ("ceased reviewing as of today" — the observed bare-tense banner
+# shape), or the trailing self-referential subject the mirror-order member
+# attaches with for/of. The explicit code/PR-wide object route stays open
+# through the shared _RETIRED_REVIEW_OBJECT, so "ceased reviewing all pull
+# requests" still matches. An allowlist, not a "that is a noun" test: admitting
+# one shape too few costs a bot awaited until quiescence, admitting one too many
+# silences a live reviewer.
+_RETIRED_UNRESTRICTED_TAIL = (
+    r"(?=\s*(?:[.,;:!?)\]}\"'“”‘’]|\n|$)"
+    r"|\s+(?:as\s+of|since|effective|and|" + _RETIRED_PERMANENCE_ADV + r")\b"
+    r"|" + _RETIRED_TRAILING_SUBJECT_LINK + _RETIRED_SELF_SUBJECT + r"\b)"
+)
+# The same rule as a GUARD, for the patterns whose predicate is a shutdown verb
+# rather than the review verb itself ("our review bot HAS CEASED …", the
+# self-referential-shutdown member and the global group's escape hatch). Those
+# read as complete on the verb alone — "our review bot has ceased" IS a
+# shutdown — so the object is only disqualifying when a review verb trails the
+# shutdown verb DIRECTLY; anything else after it ("has been sunset AND will no
+# longer …", "has been retired; use another tool") is untouched. When one does
+# trail, it must satisfy the same object/unrestricted rule as above.
+_RETIRED_NARROWED_REVIEW_GUARD = (
+    r"(?!\s+review(?:ing|s)?\b(?!"
+    r"\s+(?:all\s+|any\s+)?" + _RETIRED_REVIEW_OBJECT + r"\b|"
+    + _RETIRED_UNRESTRICTED_TAIL + r"))"
+)
+
 # (f) THE GLOBAL-QUANTIFIER GROUP — "All code review activity has officially
 # ceased." Alone among the patterns it has NO self-reference anchor: the
 # all/every quantifier was taken as a self-announcement signature on the theory
@@ -599,7 +649,7 @@ _RETIRED_SELF_SERVICE_SUBJECT = (
 _RETIRED_SELF_SHUTDOWN_RE = re.compile(
     r"\b" + _RETIRED_SELF_SERVICE_SUBJECT
     + r"\b" + _RETIRED_SUBJECT_GAP + r"\b" + _RETIRED_TENSE
-    + _RETIRED_STRONG_VERB + r"\b",
+    + _RETIRED_STRONG_VERB + r"\b" + _RETIRED_NARROWED_REVIEW_GUARD,
     re.IGNORECASE,
 )
 # A cessation SCOPED to the reader's own repo / CI / environment. A vendor
@@ -747,6 +797,52 @@ _RETIRED_FIRST_PERSON_CESSATION = (
     + _RETIRED_REVIEW_OBJECT + r")"
 )
 
+# The "no longer available" cessation, split by DETERMINER because the two
+# halves anchor differently. "this|our|my <code review> support is no longer
+# available" names the speaker's own machinery, so it is conclusive like every
+# sibling in the list below. The global "all" is not: a quantifier says nothing
+# about WHO stopped — the exact defect guard (f) exists for — so
+#     "All code review support is no longer available in CI because the
+#      workflow condition was removed."   ← a healthy reviewer describing the DIFF
+# read as a self-announcement, permanently retired its healthy author with no
+# retraction path, and dropped the finding. Nothing else caught it: no
+# feedback-veto marker appears in that wording, the claim is not deictic so the
+# second pass never arms on an ordinary PR, and it is well under the length
+# gate. The `all` half therefore takes guard (f)'s repo-scope veto, exactly as
+# the global-quantifier group and the first-person member do — see
+# :data:`_RETIRED_SCOPE_VETOED_PATTERNS`.
+#
+# Only the SCOPE half of guard (f) transplants. The announcement register
+# (_RETIRED_TENSE_FINAL) cannot: "is no longer available" has no verb slot for a
+# permanence adverb, so requiring one would delete this member rather than
+# tighten it — as would dropping "all" from the determiner outright. Both are
+# the expensive direction here, since an undetected banner is CREDITED AS A
+# REVIEW by the never-merge-unreviewed gate. Splitting the determiner keeps the
+# unscoped banner ("All code review support is no longer available.") detected
+# while the scoped outage report is discarded.
+_RETIRED_NO_LONGER_AVAILABLE_TAIL = (
+    r"\s+(?:\w+\s+){0,2}" + _RETIRED_CODE_REVIEW +
+    r"(?:\s+(?:support|service|services|activity|functionality|coverage"
+    r"|capabilit(?:y|ies)))?\s+(?:is|are|was|were)\s+no\s+longer\s+"
+    r"(?:available|supported|offered|provided|operational)\b"
+)
+_RETIRED_GLOBAL_NO_LONGER_AVAILABLE = (
+    r"\ball" + _RETIRED_NO_LONGER_AVAILABLE_TAIL
+)
+
+# The cessation predicate of the ceased-review pair below, in the order the
+# review verb IS the predicate ("… has ceased reviewing …"). Guard (h) above
+# applies here directly rather than as a lookahead: the bare "reviewing" branch
+# has to leave the cessation unrestricted (_RETIRED_UNRESTRICTED_TAIL), or take
+# an explicit code/PR-wide object. Both orders of the pair share this constant,
+# so they cannot drift apart.
+_RETIRED_CEASED_REVIEW = (
+    r"\bceas(?:ed|ing|es)\s+(?:all\s+|any\s+|our\s+)?(?:"
+    + _RETIRED_CODE_REVIEW + r"\b"
+    r"|reviewing\s+(?:all\s+|any\s+)?" + _RETIRED_REVIEW_OBJECT + r"\b"
+    r"|reviewing\b" + _RETIRED_UNRESTRICTED_TAIL + r")"
+)
+
 # Every pattern below carries its own self-reference anchor INLINE, so guard
 # (f)'s announcement register does not apply to it — the anchor already answers
 # "who stopped?". Guard (f)'s repo-scope veto reaches exactly one of them, the
@@ -755,9 +851,13 @@ _RETIRED_ANCHORED_PATTERNS = [
     # SELF-REFERENTIAL SHUTDOWN — "This code review service has been
     # discontinued." / "Our review bot has been permanently retired."
     # _RETIRED_SUBJECT_GAP, not _RETIRED_GAP: the verb must predicate the
-    # reviewer subject itself, never a nested one (see the constant).
+    # reviewer subject itself, never a nested one (see the constant). And the
+    # shutdown verb may not be narrowed by a trailing review object — "our
+    # review bot has ceased REVIEWING DEPENDENCY UPDATES" is a coverage
+    # complaint about the diff (see _RETIRED_NARROWED_REVIEW_GUARD).
     r"\b" + _RETIRED_SELF_SUBJECT + r"\b" + _RETIRED_SUBJECT_GAP + r"\b"
-    + _RETIRED_TENSE + _RETIRED_STRONG_VERB + r"\b",
+    + _RETIRED_TENSE + _RETIRED_STRONG_VERB + r"\b"
+    + _RETIRED_NARROWED_REVIEW_GUARD,
     # FIRST-PERSON CESSATION — spelled out above, because it is also the one
     # member here that takes the repo-scope veto
     # (:data:`_RETIRED_SCOPE_VETOED_PATTERNS`).
@@ -789,13 +889,14 @@ _RETIRED_ANCHORED_PATTERNS = [
     r"review(?:ing)?\s+" + _RETIRED_REVIEW_OBJECT
     + r"|(?:provide|providing|post|posting|generate|generating)\s+"
     r"(?:any\s+|further\s+|new\s+|automated\s+)?code\s+reviews?)",
-    # "Our code review support is no longer available." The self/global
-    # determiner is REQUIRED: without it "The starter plan's code review
-    # support is no longer available" — ordinary feedback — matched.
-    r"\b(?:all|this|our|my)\s+(?:\w+\s+){0,2}" + _RETIRED_CODE_REVIEW +
-    r"(?:\s+(?:support|service|services|activity|functionality|coverage"
-    r"|capabilit(?:y|ies)))?\s+(?:is|are|was|were)\s+no\s+longer\s+"
-    r"(?:available|supported|offered|provided|operational)\b",
+    # "Our code review support is no longer available." A determiner is
+    # REQUIRED: without one "The starter plan's code review support is no
+    # longer available" — ordinary feedback — matched. Split in two by
+    # determiner: only this half is self-referential and therefore conclusive;
+    # the global "all" half below takes the repo-scope veto instead. See
+    # _RETIRED_GLOBAL_NO_LONGER_AVAILABLE.
+    r"\b(?:this|our|my)" + _RETIRED_NO_LONGER_AVAILABLE_TAIL,
+    _RETIRED_GLOBAL_NO_LONGER_AVAILABLE,
     # end-of-life, self-anchored, either order. Subject-first binds through the
     # explicit copula (_RETIRED_EOL_LINK); subject-last only through a
     # prepositional attachment (_RETIRED_TRAILING_SUBJECT_LINK).
@@ -806,19 +907,21 @@ _RETIRED_ANCHORED_PATTERNS = [
     # "(has) ceased (all) code review(ing)", self-anchored like the
     # end-of-life pair above — unanchored, this matched ordinary prose about
     # an unrelated subject ("the callback ceases reviewing once the queue is
-    # empty").
+    # empty"). The bare "reviewing" verb additionally has to leave the
+    # cessation UNRESTRICTED, or take a code/PR-wide object: a narrowed one
+    # ("ceased reviewing dependency updates") is a coverage complaint about the
+    # diff. Both orders share :data:`_RETIRED_CEASED_REVIEW` so they cannot
+    # drift apart.
     r"\b" + _RETIRED_SELF_SUBJECT + r"\b" + _RETIRED_SUBJECT_GAP
-    + r"(?:" + _RETIRED_TENSE + r")?"
-    + r"\bceas(?:ed|ing|es)\s+(?:all\s+|any\s+|our\s+)?(?:"
-    + _RETIRED_CODE_REVIEW + r"|reviewing)\b",
-    r"\bceas(?:ed|ing|es)\s+(?:all\s+|any\s+|our\s+)?(?:"
-    + _RETIRED_CODE_REVIEW + r"|reviewing)\b"
+    + r"(?:" + _RETIRED_TENSE + r")?" + _RETIRED_CEASED_REVIEW,
+    _RETIRED_CEASED_REVIEW
     + _RETIRED_TRAILING_SUBJECT_LINK + r"\b"
     + _RETIRED_SELF_SUBJECT + r"\b",
 ]
 
 # The ANCHORED members that take guard (f)'s repo-scope veto on top of their own
-# inline anchor. Exactly one qualifies: FIRST-PERSON CESSATION.
+# inline anchor. Two qualify: FIRST-PERSON CESSATION, and the global "all …
+# code review support is no longer available" half of the availability member.
 #
 # Every other anchored member anchors on a self-referential SUBJECT NOUN PHRASE
 # naming a code-review SERVICE as an entity — "our code review service", "this
@@ -842,15 +945,26 @@ _RETIRED_ANCHORED_PATTERNS = [
 # deliberate — the two shapes need the same clause-bound window, and one
 # implementation cannot drift from the other.
 #
+# The availability member's global half joins for the same reason, one step
+# weaker still: "all" is not even a pronoun, so it names nobody at all. It was
+# listed beside the self-determiners as though the quantifier were itself a
+# self-announcement signature — the very theory guard (f) above was written to
+# retract — and "All code review support is no longer available in CI because
+# the workflow condition was removed." retired the healthy reviewer that wrote
+# it. See :data:`_RETIRED_GLOBAL_NO_LONGER_AVAILABLE`.
+#
 # It stops here on purpose. The subject-noun-phrase members stay conclusive —
 # "Our code review service has been decommissioned in this repository." is
 # pinned as a retirement — because their anchor already names the speaker's own
 # service; widening the veto to them would spend that pin for nothing. The cost
-# of this one addition is the cost this whole block pays on purpose: a
-# first-person banner that scopes itself ("We have permanently discontinued code
-# review for your organization.") is missed, which degrades to awaiting the bot
-# until quiescence, never to silencing a live one.
-_RETIRED_SCOPE_VETOED_PATTERNS = frozenset({_RETIRED_FIRST_PERSON_CESSATION})
+# of these two additions is the cost this whole block pays on purpose: a
+# first-person or globally-quantified banner that scopes itself ("We have
+# permanently discontinued code review for your organization.") is missed, which
+# degrades to awaiting the bot until quiescence, never to silencing a live one.
+_RETIRED_SCOPE_VETOED_PATTERNS = frozenset({
+    _RETIRED_FIRST_PERSON_CESSATION,
+    _RETIRED_GLOBAL_NO_LONGER_AVAILABLE,
+})
 
 # The flat union, in the original order (globals first). Callers that only need
 # "does any retirement pattern match this text" — the no-bot-names guard, the
@@ -867,8 +981,9 @@ def _retired_patterns_match(text: str) -> bool:
     the claim is located ELSEWHERE ("…has been retired upstream"), which makes
     the subject someone else's service however self-referential its determiner
     reads (:func:`_retired_elsewhere_veto`), or unless the pattern is one whose
-    anchor is a mere PRONOUN and the claim is scoped to the reader's own repo /
-    CI ("we have discontinued reviewing pull requests from forks in CI") — see
+    anchor is a mere PRONOUN or QUANTIFIER and the claim is scoped to the
+    reader's own repo / CI ("we have discontinued reviewing pull requests from
+    forks in CI", "all code review support is no longer available in CI") — see
     :data:`_RETIRED_SCOPE_VETOED_PATTERNS`. A GLOBAL-quantifier hit is not
     conclusive either way: it must additionally be in announcement register (a
     permanence adverb bound to the verb, or an independent self-anchored

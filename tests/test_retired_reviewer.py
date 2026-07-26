@@ -311,6 +311,20 @@ ADVERSARIAL_FALSE_POSITIVES = [
     "no-op now.",
     "This code review integration has been retired by the vendor.",
     "This code review app was decommissioned in the upstream repo.",
+    # The availability member listed the global "all" beside the self
+    # determiners, so a quantifier — which names nobody — was read as a
+    # self-announcement and the repo-scope veto never ran. See
+    # TestTheGlobalAvailabilityMemberTakesTheScopeVeto.
+    "All code review support is no longer available in CI because the workflow "
+    "condition was removed.",
+    "All code review coverage is no longer available on forks.",
+    # A shutdown verb that ends at a bare review verb swallows the OBJECT that
+    # narrows it, so a coverage complaint about the diff read as a permanent
+    # shutdown. See TestANarrowingReviewObjectDefeatsTheShutdownClaim.
+    "Our review bot has ceased reviewing dependency updates after the workflow "
+    "condition changed.",
+    "This code review service has ceased reviewing generated migrations.",
+    "Our code review bot has discontinued reviewing the docs directory.",
 ]
 
 RETIRED_NEGATIVES = [
@@ -649,13 +663,17 @@ class TestFirstPersonCessationTakesTheScopeVeto:
         assert detectors.is_retired_message(
             "Our code review service has been decommissioned in this repository.")
 
-    def test_the_vetoed_set_holds_exactly_the_member_the_list_uses(self):
-        # One constant, so the veto can never be wired to a stale copy of the
-        # pattern — and the member keeps its position in the anchored list.
-        assert detectors._RETIRED_SCOPE_VETOED_PATTERNS == frozenset(
-            {detectors._RETIRED_FIRST_PERSON_CESSATION})
+    def test_the_vetoed_set_holds_exactly_the_members_the_list_uses(self):
+        # Named constants, so the veto can never be wired to a stale copy of a
+        # pattern — and each member keeps its position in the anchored list.
+        assert detectors._RETIRED_SCOPE_VETOED_PATTERNS == frozenset({
+            detectors._RETIRED_FIRST_PERSON_CESSATION,
+            detectors._RETIRED_GLOBAL_NO_LONGER_AVAILABLE,
+        })
         assert (detectors._RETIRED_ANCHORED_PATTERNS[1]
                 == detectors._RETIRED_FIRST_PERSON_CESSATION)
+        assert (detectors._RETIRED_ANCHORED_PATTERNS[4]
+                == detectors._RETIRED_GLOBAL_NO_LONGER_AVAILABLE)
 
     def test_the_reviewer_keeps_its_voice_and_its_finding(self):
         # End to end on an ORDINARY PR: the PR meta does not arm the second pass
@@ -678,6 +696,147 @@ class TestFirstPersonCessationTakesTheScopeVeto:
         # And the notice-vs-review split agrees: this body is a REVIEW, so the
         # merge gate must credit it rather than refuse its sha.
         assert not detectors.is_placeholder_review_body(body)
+
+
+class TestTheGlobalAvailabilityMemberTakesTheScopeVeto:
+    """(g), second member. "All <code review> support is no longer available"
+    was listed beside the self-determiners as though the quantifier itself were
+    a self-announcement signature — the theory guard (f) exists to retract. A
+    quantifier says nothing about WHO stopped, so a repo/CI-scoped availability
+    report is an outage found in the diff. See
+    _RETIRED_GLOBAL_NO_LONGER_AVAILABLE."""
+
+    @pytest.mark.parametrize("scoped", [
+        "All code review support is no longer available in CI because the "
+        "workflow condition was removed.",
+        "All code review support is no longer available for this repository.",
+        "All code review coverage is no longer available on forks.",
+        "All code review functionality is no longer supported in the pipeline.",
+        "All code review activity is no longer available in staging.",
+        # Fronted adjunct: a fresh subject intervenes, so it still scopes the
+        # availability claim.
+        "In this repository, all code review support is no longer available.",
+        # `;` is not a sentence break for the veto window.
+        "All code review support is no longer available; in this repository "
+        "the workflow was removed.",
+    ])
+    def test_a_repo_scoped_availability_report_is_not_a_sunset(self, scoped):
+        assert not detectors.is_retired_message(scoped), (
+            "a repo/CI-scoped availability report is an outage found in the "
+            "diff; retiring on it silences a HEALTHY reviewer for the whole run "
+            "with no retraction path AND drops its finding")
+
+    @pytest.mark.parametrize("banner", [
+        "All code review support is no longer available.",
+        "All code review functionality is no longer offered.",
+        # A platform name is not a scope qualifier.
+        "All code review support is no longer available on GitHub.",
+    ])
+    def test_an_unscoped_global_availability_banner_still_retires(self, banner):
+        # The announcement register (_RETIRED_TENSE_FINAL) is deliberately NOT
+        # transplanted here: "is no longer available" has no verb slot for a
+        # permanence adverb, so requiring one would delete the member outright —
+        # and an undetected banner is CREDITED AS A REVIEW by the merge gate.
+        assert detectors.is_retired_message(banner)
+
+    @pytest.mark.parametrize("scoped", [
+        "Our code review support is no longer available in CI.",
+        "This code review service is no longer available for this repository.",
+    ])
+    def test_the_self_determiner_half_stays_conclusive(self, scoped):
+        # The split is by determiner precisely so the veto reaches only the
+        # quantifier. "this|our|my" names the speaker's own machinery, so a
+        # scope qualifier does not unmake the claim.
+        assert detectors.is_retired_message(scoped)
+
+    def test_the_reviewer_keeps_its_voice_and_its_finding(self):
+        # End to end on an ORDINARY PR: the PR meta does not arm the second pass
+        # and the claim is not deictic, so before the veto this classified as
+        # SIGNAL_RETIRED with no model call.
+        body = ("All code review support is no longer available in CI because "
+                "the workflow condition was removed.")
+        calls = []
+
+        def counting(prompt):
+            calls.append(prompt)
+            return {"self_reporting": True}
+
+        assert detectors.detect_signal(
+            body, quota_llm=counting,
+            pr_title="Add a null check to the parser",
+            pr_body="Fixes a crash when the payload is empty.") is None
+        assert calls == []
+        assert not detectors.is_placeholder_review_body(body)
+
+
+class TestANarrowingReviewObjectDefeatsTheShutdownClaim:
+    """(h) A shutdown verb that ends at a bare review verb swallows whatever
+    object follows, and an object NARROWS the cessation to that object. A
+    narrowed cessation reports a coverage defect in the diff, never a permanent
+    shutdown. See _RETIRED_NARROWED_REVIEW_GUARD / _RETIRED_UNRESTRICTED_TAIL."""
+
+    @pytest.mark.parametrize("body", [
+        "Our review bot has ceased reviewing dependency updates after the "
+        "workflow condition changed.",
+        "Our review bot has ceased reviewing the vendored SDK files.",
+        "This code review service has ceased reviewing generated migrations.",
+        "Our code review bot has discontinued reviewing the docs directory.",
+        "Our review bot has ceased reviewing anything under the vendor tree.",
+        "Our code review integration has stopped reviewing draft pull requests "
+        "for the docs folder.",
+    ])
+    def test_a_narrowed_cessation_never_retires_anybody(self, body):
+        assert not detectors.is_retired_message(body), (
+            "a cessation narrowed to an object is a COVERAGE complaint about "
+            "the diff; retiring on it silences a HEALTHY reviewer for the whole "
+            "run with no retraction path")
+
+    @pytest.mark.parametrize("body", [
+        # Unrestricted: nothing follows the review verb but a clause end…
+        "Our review bot has ceased reviewing.",
+        "Our review bot has ceased reviewing; use another tool.",
+        # …a finality / temporal adverbial…
+        "Our review bot ceased reviewing as of today.",
+        "Our review bot has ceased reviewing permanently.",
+        # …or an explicit code/PR-wide object.
+        "Our review bot has ceased reviewing all pull requests.",
+        "This code review service has ceased reviewing pull requests.",
+        "Our code review service has ceased all code review.",
+    ])
+    def test_an_unrestricted_or_pr_wide_cessation_still_retires(self, body):
+        assert detectors.is_retired_message(body)
+
+    @pytest.mark.parametrize("body", [
+        # The guard only bites when a review verb trails the shutdown verb
+        # DIRECTLY. Everything else after it is untouched.
+        "This code review service has been discontinued.",
+        "Our review bot has been permanently retired; please use another tool.",
+        "This code review service has been sunset and will no longer review "
+        "pull requests.",
+        "Our code review service has been shut down as of 2026-07-01.",
+    ])
+    def test_the_guard_leaves_every_other_shutdown_shape_alone(self, body):
+        assert detectors.is_retired_message(body)
+
+    def test_the_escape_hatch_carries_the_same_guard(self):
+        # _RETIRED_SELF_SHUTDOWN_RE substitutes for the global group's missing
+        # permanence adverb, so a narrowed claim must not arm it either.
+        assert not detectors.is_retired_message(
+            "Our review bot has ceased reviewing dependency updates. All code "
+            "review activity has ceased.")
+        assert detectors.is_retired_message(
+            "Our review bot has ceased reviewing. All code review activity "
+            "has ceased.")
+
+    def test_the_object_anchor_is_shared_with_the_first_person_member(self):
+        # One constant feeds the first-person member, the "will no longer
+        # review …" member and both ceased-review orders, so they cannot drift.
+        assert (detectors._RETIRED_REVIEW_OBJECT
+                in detectors._RETIRED_CEASED_REVIEW)
+        assert (detectors._RETIRED_REVIEW_OBJECT
+                in detectors._RETIRED_NARROWED_REVIEW_GUARD)
+        assert all(detectors._RETIRED_CEASED_REVIEW in p
+                   for p in detectors._RETIRED_ANCHORED_PATTERNS[-2:])
 
 
 class TestGlobalQuantifierNeedsAnnouncementRegister:
