@@ -26,7 +26,9 @@ GENERIC BY CONTRACT: no bot or vendor name appears in the detector or any cause
 table — :class:`TestNoBotNamesHardcoded` greps the shipped constants to keep it
 that way.
 """
+import json
 import re
+import subprocess
 
 import pytest
 
@@ -792,6 +794,138 @@ class TestFalsePositiveGuard:
 
 
 # ═════════════════════════════════════════════════════════════════════
+# 3b. The DEICTIC "this" — the one anchor that does not say WHO.
+#
+# "This code review integration has been retired in favor of the new App."
+# is word-for-word both a shutdown banner and an inline finding about a
+# vendored integration in the diff. The adverbial-locus veto separates the
+# two only when a third-party locus is stated ("…retired upstream"); with
+# none — or with a migration clause in its place — nothing in the wording
+# decides, so the claim is handed to the content gate instead of silencing
+# a possibly-healthy reviewer on a coin flip.
+# ═════════════════════════════════════════════════════════════════════
+
+# The reported false positive: no locus, no feedback-veto marker, short enough
+# to clear the length gate, on a PR whose metadata says nothing about
+# retirement — so nothing before this guard saves its author.
+DEICTIC_FINDING = ("This code review integration has been retired in favor of "
+                   "the new GitHub App.")
+UNRELATED_PR = {"pr_title": "Add a null check to the parser",
+                "pr_body": "Fixes a crash when the payload is empty."}
+
+
+class TestDeicticClaimsGoThroughTheContentGate:
+    def test_the_deictic_finding_is_flagged_as_deictic_only(self):
+        assert detectors._retired_claim_is_deictic_only(DEICTIC_FINDING)
+
+    def test_the_gate_keeps_a_healthy_reviewer_that_wrote_it(self):
+        # THE FIX. Before it, an unrelated PR title meant no model call at all,
+        # so this finding permanently excluded its author and dropped the
+        # actionable feedback with no retraction path.
+        assert detectors.detect_signal(
+            DEICTIC_FINDING, quota_llm=_llm(False), **UNRELATED_PR) is None
+
+    def test_the_gate_still_excludes_when_the_model_reads_it_as_a_banner(self):
+        assert detectors.detect_signal(
+            DEICTIC_FINDING, quota_llm=_llm(True), **UNRELATED_PR
+        ) == detectors.SIGNAL_RETIRED
+
+    def test_a_broken_gate_falls_back_to_the_deterministic_verdict(self):
+        # An unreachable / unparseable model is not an answer, so the regex
+        # verdict stands — exactly what happens with no quota_llm wired.
+        assert detectors.detect_signal(
+            DEICTIC_FINDING, quota_llm=_llm(None), **UNRELATED_PR
+        ) == detectors.SIGNAL_RETIRED
+        assert detectors.detect_signal(DEICTIC_FINDING) == detectors.SIGNAL_RETIRED
+
+    def test_the_merge_gate_still_refuses_the_review_credit(self):
+        # The half that must NOT move. is_placeholder_review_body is LLM-free
+        # and biased to over-block: whichever way the reference resolves, this
+        # body is not a review of the commit it rides, so the never-merge-
+        # unreviewed gate keeps refusing its sha. That is why routing the
+        # exclusion decision to the model cannot reopen the safety bug.
+        assert detectors.is_retired_message(DEICTIC_FINDING)
+        assert detectors.is_placeholder_review_body(DEICTIC_FINDING)
+
+    @pytest.mark.parametrize("body", [
+        RETIREMENT_BANNER,                                   # global quantifier
+        "Our code review bot has been permanently retired.",  # first-person det.
+        "We have ceased all code review operations on GitHub.",  # first person
+        "All automated code review activity has been permanently disabled.",
+        # Deictic AND independently anchored — the "our" clause still names the
+        # speaker with "this" neutralized, so the verdict never rested on it.
+        "This code review integration has been retired. Our code review service "
+        "has been discontinued.",
+    ])
+    def test_a_corroborated_claim_never_arms_the_gate(self, body):
+        # Only the claims that hang on "this" alone pay for a model call; every
+        # other anchor names the speaker by itself and keeps the deterministic
+        # verdict with no call at all.
+        assert not detectors._retired_claim_is_deictic_only(body), body
+        calls = []
+
+        def counting(prompt):
+            calls.append(prompt)
+            return {"self_reporting": False}
+
+        assert detectors.detect_signal(
+            body, quota_llm=counting, **UNRELATED_PR
+        ) == detectors.SIGNAL_RETIRED
+        assert calls == []
+
+    def test_the_prompt_states_the_reason_it_actually_armed(self):
+        # A framing the message does not fit biases the answer. Armed by the
+        # deictic reason on an unrelated PR, the prompt must not assert that the
+        # PR is about retirement, must name the ambiguity, and must break a tie
+        # toward "not self-reporting" — this detector's standing asymmetry.
+        prompts = []
+
+        def capture(prompt):
+            prompts.append(prompt)
+            return {"self_reporting": True}
+
+        detectors.detect_signal(DEICTIC_FINDING, quota_llm=capture,
+                                **UNRELATED_PR)
+        assert len(prompts) == 1
+        prompt = prompts[0]
+        assert "whose OWN subject involves" not in prompt
+        assert '"this"' in prompt
+        assert '{"self_reporting": false}' in prompt
+
+    def test_a_retirement_themed_pr_keeps_the_pr_subject_framing(self):
+        # Both reasons can arm at once; the PR-subject framing is still the true
+        # one there, and the deictic paragraph rides on top of it.
+        prompts = []
+
+        def capture(prompt):
+            prompts.append(prompt)
+            return {"self_reporting": True}
+
+        detectors.detect_signal(DEICTIC_FINDING, quota_llm=capture,
+                                pr_title=THIS_PR_TITLE, pr_body=THIS_PR_BODY)
+        assert len(prompts) == 1
+        assert "whose OWN subject involves" in prompts[0]
+        assert '"this"' in prompts[0]
+        assert '{"self_reporting": false}' in prompts[0]
+
+    def test_the_three_recoverable_causes_never_raise_the_deictic_reason(self):
+        # Their exclusions recover on their own, and none of them is anchored by
+        # a determiner, so the tie-breaker they are told stays "true" (exclude).
+        prompts = []
+
+        def capture(prompt):
+            prompts.append(prompt)
+            return {"self_reporting": True}
+
+        detectors.detect_signal(
+            "This pull request is too large to review.", quota_llm=capture,
+            pr_title="Handle the too-large-diff placeholder",
+            pr_body="The reviewer answers oversized diffs with a placeholder.")
+        assert len(prompts) == 1
+        assert '{"self_reporting": true}' in prompts[0]
+
+
+# ═════════════════════════════════════════════════════════════════════
 # 4. A retirement notice is a RESPONSE, never a REVIEW.
 # ═════════════════════════════════════════════════════════════════════
 
@@ -841,6 +975,35 @@ class TestRetirementIsNotAReview:
             Comment(id="a", text="This code review service has been discontinued.",
                     source="claude[bot]"), now=1.0) is None
         assert "claude" in driver._retired
+
+    def test_a_locusless_deictic_finding_keeps_its_author_through_the_gate(self):
+        # The same end-to-end shape as the test above, for the deictic claim no
+        # locus rule can settle: the driver fetches the (unrelated) PR meta,
+        # detect_signal arms the content gate on the ambiguity alone, and the
+        # model reads the message as a review of the diff. The finding reaches
+        # the kernel and its author stays live and credited.
+        pr_json = json.dumps({"title": "Add a null check to the parser",
+                              "body": "Fixes a crash when the payload is empty."})
+
+        class UnrelatedPrGh(GhRecorder):
+            def __call__(self, argv, *, cwd=None, timeout=None):
+                if "title,body" in " ".join(argv):
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=pr_json, stderr="")
+                return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+        driver, clock, gh = make_driver(
+            [], cfg=CLAUDE_ONLY, gh=UnrelatedPrGh(),
+            quota_llm=lambda prompt: {"self_reporting": False})
+        out = driver._classify_signal(
+            Comment(id="a", text=DEICTIC_FINDING, source="claude[bot]",
+                    path="adapters/vendor.py",
+                    diff_hunk="@@ -1,2 +1,2 @@\n-old\n+new"),
+            now=1.0)
+        assert out == "claude"                   # the finding still flows on
+        assert "claude" not in driver._retired
+        assert not driver.store.is_excluded("claude")
+        assert "claude" in driver.reviewed_ever
 
     def test_a_prior_review_credit_is_revoked_when_the_notice_arrives(self):
         # A bot credited earlier in the run must LOSE that credit: a service
