@@ -3047,13 +3047,34 @@ class RoundDriver:
         ERRORED is deliberately not recordable here, exactly as in ``_classify_signal``:
         an INLINE comment IS review output, so a body that trips the errored regex on a
         thread root is a finding, never a failure placeholder — and only inline roots
-        reach this method."""
+        reach this method.
+
+        RETIREMENT is the one cause that must be read even when a state is ALREADY
+        recorded — see the guard below."""
         bot = detectors.bot_for_login(comment.source)
         if bot is None:
             return
         st = self._bot_state(bot)
-        if st.signal is not None or self.store.is_excluded(bot):
-            return  # a cause is already recorded — never overwrite it
+        # A cause (or a sign-off) is already recorded — never overwrite it, with
+        # ONE carve-out: RETIREMENT, the only PERMANENT cause. Under --rr-active
+        # the restore runs BEFORE this snapshot, so a newer clean sign-off has
+        # already set st.signal = CLEAN by the time an OLDER retirement notice on
+        # a RESOLVED thread reaches here — and a resolved comment's only reader is
+        # this method. Returning early there left the dead reviewer crowned and
+        # folded into reviewed_ever, where it satisfied the never-merge-unreviewed
+        # gate alone. The equivalent LIVE run records the notice first and no later
+        # clean comment can retract it, so the restart must reach the same state.
+        #
+        # Admission is the DETERMINISTIC retirement regex, which detect_signal
+        # requires before it can ever return SIGNAL_RETIRED — a necessary
+        # condition, so no retirement is lost, and any other body still short-
+        # circuits here without paying for the full (model-gated) classification.
+        # Already-retired is nothing to redo. Anything admitted that the full path
+        # then reads as NOT retirement re-asserts the guard below.
+        recorded = st.signal is not None or self.store.is_excluded(bot)
+        if recorded and (st.signal == detectors.SIGNAL_RETIRED
+                         or not detectors.is_retired_message(comment.text)):
+            return
         if self.quota_llm is not None:
             pr_title, pr_body = self._fetch_pr_title_body()
         else:
@@ -3067,7 +3088,15 @@ class RoundDriver:
             # review AGAIN — that outlives the finding it is attached to exactly
             # as a quota cap does, and re-summoning a shut-down service would
             # burn every remaining round on a bot that cannot answer.
+            # _record_retired overwrites any weaker state on purpose: it upgrades
+            # the bot to the PERMANENT exclusion tier and revokes every review
+            # credit a clean-looking earlier message (or a restored sign-off) won.
             self._record_retired(bot)
+        elif recorded:
+            # Only the retirement carve-out above got this comment past the
+            # already-recorded guard, and the full classification disagreed — so
+            # the cause already on record stands, untouched.
+            return
         elif signal == detectors.SIGNAL_QUOTA:
             self.store.exclude_quota(bot)
             st.signal = signal

@@ -398,6 +398,12 @@ CLEAN_RESULT_RE = re.compile(
 #       construction, so it gets its own pair of guards — a required
 #       announcement register and a repo-scope veto. See
 #       _RETIRED_GLOBAL_PATTERNS.
+#   (g) That repo-scope veto also reaches the ONE anchored member whose anchor is
+#       a bare PRONOUN — first-person cessation. "We" names the speaker by
+#       grammar, but a reviewer routinely writes "we" for the PROJECT under
+#       review, so "we have discontinued reviewing pull requests from forks in
+#       CI" read as a self-announcement and retired its healthy author. See
+#       _RETIRED_SCOPE_VETOED_PATTERNS.
 # Anything that still slips through must survive the per-cause second pass in
 # ``detect_signal`` (the model confirms SELF-reporting) before it excludes.
 _RETIRED_MAX_LEN = 600
@@ -721,8 +727,30 @@ def _retired_elsewhere_veto(text: str, match: "re.Match") -> bool:
     return bool(_RETIRED_ELSEWHERE_LOCUS_RE.match(text, match.end()))
 
 
-# Every pattern below carries its own self-reference anchor INLINE, so neither
-# guard (f) applies to it — the anchor already answers "who stopped?".
+# The FIRST-PERSON CESSATION member — "We have ceased all code review
+# operations." / "We have discontinued reviewing pull requests." The first
+# person is this member's self-reference anchor, so the OBJECT carries the
+# code-review anchor, exactly as in the "will no longer review …" member below:
+# explicit "code review", or a bare "reviewing" that takes a code/PR object
+# (_RETIRED_REVIEW_OBJECT). A bare "reviewing <anything>" is ordinary
+# first-person review prose about the diff, never a retirement notice — see
+# that constant.
+#
+# Named (rather than written inline in the list below) because it is the ONE
+# anchored member that additionally takes the repo-scope veto — see
+# :data:`_RETIRED_SCOPE_VETOED_PATTERNS`.
+_RETIRED_FIRST_PERSON_CESSATION = (
+    r"\b(?:we|i)\s+(?:have|has|had)\s+(?:\w+\s+){0,2}"
+    r"(?:ceased|discontinued|retired|terminated|shut\s+down)\s+"
+    r"(?:all\s+|any\s+|our\s+)?(?:providing\s+)?(?:"
+    + _RETIRED_CODE_REVIEW + r"|reviewing\s+(?:all\s+|any\s+)?"
+    + _RETIRED_REVIEW_OBJECT + r")"
+)
+
+# Every pattern below carries its own self-reference anchor INLINE, so guard
+# (f)'s announcement register does not apply to it — the anchor already answers
+# "who stopped?". Guard (f)'s repo-scope veto reaches exactly one of them, the
+# first-person member (see :data:`_RETIRED_SCOPE_VETOED_PATTERNS`).
 _RETIRED_ANCHORED_PATTERNS = [
     # SELF-REFERENTIAL SHUTDOWN — "This code review service has been
     # discontinued." / "Our review bot has been permanently retired."
@@ -730,19 +758,10 @@ _RETIRED_ANCHORED_PATTERNS = [
     # reviewer subject itself, never a nested one (see the constant).
     r"\b" + _RETIRED_SELF_SUBJECT + r"\b" + _RETIRED_SUBJECT_GAP + r"\b"
     + _RETIRED_TENSE + _RETIRED_STRONG_VERB + r"\b",
-    # FIRST-PERSON CESSATION — "We have ceased all code review operations." /
-    # "We have discontinued reviewing pull requests."
-    # The first person is this member's self-reference anchor, so the OBJECT
-    # carries the code-review anchor, exactly as in the "will no longer
-    # review …" member below: explicit "code review", or a bare "reviewing"
-    # that takes a code/PR object (_RETIRED_REVIEW_OBJECT). A bare "reviewing
-    # <anything>" is ordinary first-person review prose about the diff, never a
-    # retirement notice — see the constant.
-    r"\b(?:we|i)\s+(?:have|has|had)\s+(?:\w+\s+){0,2}"
-    r"(?:ceased|discontinued|retired|terminated|shut\s+down)\s+"
-    r"(?:all\s+|any\s+|our\s+)?(?:providing\s+)?(?:"
-    + _RETIRED_CODE_REVIEW + r"|reviewing\s+(?:all\s+|any\s+)?"
-    + _RETIRED_REVIEW_OBJECT + r")",
+    # FIRST-PERSON CESSATION — spelled out above, because it is also the one
+    # member here that takes the repo-scope veto
+    # (:data:`_RETIRED_SCOPE_VETOED_PATTERNS`).
+    _RETIRED_FIRST_PERSON_CESSATION,
     # "will no longer review pull requests" / "will no longer provide code
     # reviews". Two anchors, both required. The OBJECT must be code / a pull
     # request — a bare "will no longer review" is too easy to hit in prose
@@ -798,6 +817,41 @@ _RETIRED_ANCHORED_PATTERNS = [
     + _RETIRED_SELF_SUBJECT + r"\b",
 ]
 
+# The ANCHORED members that take guard (f)'s repo-scope veto on top of their own
+# inline anchor. Exactly one qualifies: FIRST-PERSON CESSATION.
+#
+# Every other anchored member anchors on a self-referential SUBJECT NOUN PHRASE
+# naming a code-review SERVICE as an entity — "our code review service", "this
+# review bot". That names the speaker's own machinery, which is what a vendor
+# sunset is about. The first-person member anchors on a PRONOUN instead, and
+# that is weaker than it looks: a reviewer writes "we" for the PROJECT UNDER
+# REVIEW constantly ("we no longer do X here"), so
+#     "We have discontinued reviewing pull requests from forks in CI;
+#      restore that coverage."        ← a healthy reviewer describing the DIFF
+# is word-for-word the shape of a self-announcement. Nothing else caught it:
+# neither feedback guard fires (no fence, no "this PR", and "restore" is not a
+# recommendation verb), the claim is not deictic so the second pass does not arm
+# on an ordinary PR, and the wording is well under the length gate. The driver
+# therefore dropped the actionable finding, permanently retired a healthy
+# reviewer with no retraction path, and ignored all its later output.
+#
+# The repo/CI scope qualifier is what separates the two readings, exactly as it
+# already does for the global-quantifier group: a vendor sunset is global by
+# definition, so "from forks in CI" / "for this repository" makes the "we" the
+# project's, not the service's. Reusing :func:`_retired_scope_veto` verbatim is
+# deliberate — the two shapes need the same clause-bound window, and one
+# implementation cannot drift from the other.
+#
+# It stops here on purpose. The subject-noun-phrase members stay conclusive —
+# "Our code review service has been decommissioned in this repository." is
+# pinned as a retirement — because their anchor already names the speaker's own
+# service; widening the veto to them would spend that pin for nothing. The cost
+# of this one addition is the cost this whole block pays on purpose: a
+# first-person banner that scopes itself ("We have permanently discontinued code
+# review for your organization.") is missed, which degrades to awaiting the bot
+# until quiescence, never to silencing a live one.
+_RETIRED_SCOPE_VETOED_PATTERNS = frozenset({_RETIRED_FIRST_PERSON_CESSATION})
+
 # The flat union, in the original order (globals first). Callers that only need
 # "does any retirement pattern match this text" — the no-bot-names guard, the
 # compile check — scan this. The guarded predicate every behavioral caller goes
@@ -812,7 +866,10 @@ def _retired_patterns_match(text: str) -> bool:
     An ANCHORED pattern names its own subject, so a hit is conclusive — unless
     the claim is located ELSEWHERE ("…has been retired upstream"), which makes
     the subject someone else's service however self-referential its determiner
-    reads (:func:`_retired_elsewhere_veto`). A GLOBAL-quantifier hit is not
+    reads (:func:`_retired_elsewhere_veto`), or unless the pattern is one whose
+    anchor is a mere PRONOUN and the claim is scoped to the reader's own repo /
+    CI ("we have discontinued reviewing pull requests from forks in CI") — see
+    :data:`_RETIRED_SCOPE_VETOED_PATTERNS`. A GLOBAL-quantifier hit is not
     conclusive either way: it must additionally be in announcement register (a
     permanence adverb bound to the verb, or an independent self-anchored
     shutdown claim elsewhere in the body) and must not be scoped to the reader's
@@ -821,6 +878,8 @@ def _retired_patterns_match(text: str) -> bool:
     # finditer, not search, throughout: every veto here is judged per claim, so
     # a body carrying both a vetoed clause and a clean one is still a retirement.
     if any(not _retired_elsewhere_veto(text, m)
+           and not (p in _RETIRED_SCOPE_VETOED_PATTERNS
+                    and _retired_scope_veto(text, m))
            for p in _RETIRED_ANCHORED_PATTERNS
            for m in re.finditer(p, text)):
         return True

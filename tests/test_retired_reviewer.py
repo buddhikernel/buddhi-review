@@ -36,7 +36,8 @@ from buddhi_review import detectors, gh_ingest, round_driver
 from buddhi_review.loop import Comment
 
 from test_head_aware_merge_gate import _gate_driver, _inline, _review
-from test_round_driver import CLAUDE_ONLY, HEAD_SHA, GhRecorder, make_driver
+from test_round_driver import (
+    CLAUDE_ONLY, HEAD_SHA, FakeThreads, GhRecorder, make_driver)
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -280,6 +281,25 @@ ADVERSARIAL_FALSE_POSITIVES = [
     "I have discontinued reviewing generated migrations in this repository.",
     "We have ceased reviewing anything under the vendor tree, and this PR does "
     "not restore it.",
+    # The SAME first-person member, now carrying the code/PR object that
+    # tightening satisfied — so the object anchor no longer separates a sunset
+    # banner from ordinary feedback. It cannot: "we" is the PROJECT under review
+    # here, which is how reviewers routinely write. Neither feedback guard fires
+    # (no fence, no "this PR", and "restore" is not a recommendation verb), the
+    # claim is not deictic so the second pass never arms on an ordinary PR, and
+    # the wording is well under the length gate — so the driver dropped the
+    # finding AND permanently retired its healthy author. The repo/CI scope
+    # qualifier is what separates the two readings. See
+    # _RETIRED_SCOPE_VETOED_PATTERNS and TestFirstPersonCessationTakesTheScopeVeto.
+    "We have discontinued reviewing pull requests from forks in CI; restore "
+    "that coverage.",
+    "We have ceased reviewing code in this repository since the workflow "
+    "condition changed.",
+    "We have discontinued reviewing PRs for this repository; that drops fork "
+    "coverage.",
+    "In CI, we have discontinued reviewing pull requests.",
+    "We have ceased all code review operations in staging.",
+    "We have discontinued code review for this repo.",
     # Tightening (b) covered the third-party locus only in the DETERMINER slot,
     # so the same fact stated with the locus in ADVERBIAL position left the
     # deictic "this" free to read as self-reference. Each body below is an
@@ -580,6 +600,84 @@ class TestFirstPersonCessationNeedsACodeObject:
         # One constant feeds both members, so the two can never drift apart.
         assert detectors._RETIRED_REVIEW_OBJECT in detectors._RETIRED_ANCHORED_PATTERNS[1]
         assert detectors._RETIRED_REVIEW_OBJECT in detectors._RETIRED_ANCHORED_PATTERNS[2]
+
+
+class TestFirstPersonCessationTakesTheScopeVeto:
+    """(g) The object anchor above says WHAT stopped, never WHO stopped it, and
+    this member's subject anchor is a bare PRONOUN. A reviewer writes "we" for
+    the PROJECT under review all the time, so a cessation scoped to the reader's
+    own repo / CI is an outage report, never a vendor sunset — the same guard the
+    global-quantifier group carries. See _RETIRED_SCOPE_VETOED_PATTERNS."""
+
+    @pytest.mark.parametrize("scoped", [
+        "We have discontinued reviewing pull requests from forks in CI; "
+        "restore that coverage.",
+        "We have discontinued reviewing pull requests from forks in CI.",
+        "We have ceased reviewing code in this repository since the workflow "
+        "condition changed.",
+        "We have discontinued reviewing PRs for this repository.",
+        "We have ceased all code review operations in staging.",
+        "We have ceased reviewing code in our workflows.",
+        "We have discontinued reviewing pull requests on forks.",
+        # Fronted adjunct: the qualifier still scopes the cessation.
+        "In CI, we have discontinued reviewing pull requests.",
+        # `;` is not a sentence break for the veto window.
+        "We have discontinued reviewing pull requests; in this repository the "
+        "workflow was removed.",
+    ])
+    def test_a_repo_scoped_first_person_cessation_is_not_a_sunset(self, scoped):
+        assert not detectors.is_retired_message(scoped), (
+            "a repo/CI-scoped first-person cessation is an outage found in the "
+            "diff; retiring on it silences a HEALTHY reviewer for the whole run "
+            "with no retraction path AND drops its finding")
+
+    @pytest.mark.parametrize("banner", [
+        "We have ceased all code review operations.",
+        "We have discontinued reviewing pull requests.",
+        "We have ceased reviewing all pull requests.",
+        "We have discontinued providing code review.",
+        # A platform name is not a scope qualifier — the real observed banner
+        # names the platform its dead service ran on.
+        "We have ceased all code review operations on GitHub.",
+    ])
+    def test_an_unscoped_first_person_banner_still_retires(self, banner):
+        assert detectors.is_retired_message(banner)
+
+    def test_the_veto_reaches_only_the_first_person_member(self):
+        # The subject-noun-phrase members name the speaker's own SERVICE as an
+        # entity, so their hit stays conclusive and this stays pinned.
+        assert detectors.is_retired_message(
+            "Our code review service has been decommissioned in this repository.")
+
+    def test_the_vetoed_set_holds_exactly_the_member_the_list_uses(self):
+        # One constant, so the veto can never be wired to a stale copy of the
+        # pattern — and the member keeps its position in the anchored list.
+        assert detectors._RETIRED_SCOPE_VETOED_PATTERNS == frozenset(
+            {detectors._RETIRED_FIRST_PERSON_CESSATION})
+        assert (detectors._RETIRED_ANCHORED_PATTERNS[1]
+                == detectors._RETIRED_FIRST_PERSON_CESSATION)
+
+    def test_the_reviewer_keeps_its_voice_and_its_finding(self):
+        # End to end on an ORDINARY PR: the PR meta does not arm the second pass
+        # and the claim is not deictic, so before the veto this classified as
+        # SIGNAL_RETIRED with no model call — dropping the finding and retiring a
+        # healthy reviewer permanently.
+        body = ("We have discontinued reviewing pull requests from forks in CI; "
+                "restore that coverage.")
+        calls = []
+
+        def counting(prompt):
+            calls.append(prompt)
+            return {"self_reporting": True}
+
+        assert detectors.detect_signal(
+            body, quota_llm=counting,
+            pr_title="Add a null check to the parser",
+            pr_body="Fixes a crash when the payload is empty.") is None
+        assert calls == []
+        # And the notice-vs-review split agrees: this body is a REVIEW, so the
+        # merge gate must credit it rather than refuse its sha.
+        assert not detectors.is_placeholder_review_body(body)
 
 
 class TestGlobalQuantifierNeedsAnnouncementRegister:
@@ -1127,6 +1225,97 @@ class TestNeverMergeUnreviewedGate:
         assert driver._review_permits_merge() is True   # before the notice
         driver._record_retired("claude")
         assert driver._review_permits_merge() is False  # after it
+
+    def test_a_resolved_notice_outlives_an_rr_active_restore(self):
+        """THE RESTART HOLE. Under ``--rr-active`` the restore runs BEFORE the
+        preflight snapshot: a newer clean sign-off crowns the bot
+        (``st.signal = CLEAN``, approved, done), and the older retirement notice
+        sits on a RESOLVED thread — the one comment shape whose ONLY reader is
+        ``_fold_hard_signal``. Applying that method's "a cause is already
+        recorded" guard to retirement as well meant the notice was never
+        classified: the dead reviewer kept its crown, was folded into
+        ``reviewed_ever``, and satisfied the never-merge-unreviewed gate alone.
+
+        A live run reaches the opposite state — the notice is the OLDER message,
+        so ``_classify_signal`` records it first and the later clean comment
+        cannot retract it (:class:`TestPermanence`). The restart must agree."""
+        threads = FakeThreads().thread("T1", root_comment_id="a", is_resolved=True)
+        timeline = [
+            (0, Comment(id="a", text=RETIREMENT_BANNER, source="claude[bot]",
+                        path="x.py", diff_hunk="@@ -1 +1 @@",
+                        created_at="2026-01-01T00:00:00+00:00")),
+            (0, Comment(id="b", text="No issues found.", source="claude[bot]",
+                        created_at="2026-01-02T00:00:00+00:00")),
+        ]
+        driver, clock, gh = make_driver(
+            timeline, cfg=CLAUDE_ONLY, auto_merge=True, rr_active=True,
+            preflight=True, threads_fetch=threads.fetch,
+            resolve_thread=threads.resolve, answer_waiter=lambda esc, **k: {})
+        outcome = driver.run()
+        assert "claude" in driver._retired
+        assert driver.store.is_excluded("claude")
+        assert "claude" not in driver.approved        # the restored crown is revoked
+        assert "claude" not in driver.reviewed_ever
+        assert driver._genuine_reviewers() == set()
+        assert outcome.merged is False, (
+            "a retired reviewer's restored sign-off satisfied the "
+            "never-merge-unreviewed gate — the PR merged unreviewed")
+        assert gh.matching("gh", "merge", "--squash") == []
+
+    def test_the_same_restart_harness_merges_for_a_healthy_reviewer(self):
+        # THE CONTROL for the restart hole above. Same restart, same resolved
+        # thread, same sign-off — only the resolved comment's body differs, so a
+        # block above cannot be an artifact of --rr-active or of the thread gate.
+        threads = FakeThreads().thread("T1", root_comment_id="a", is_resolved=True)
+        timeline = [
+            (0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                        path="x.py", diff_hunk="@@ -1 +1 @@",
+                        created_at="2026-01-01T00:00:00+00:00")),
+            (0, Comment(id="b", text="No issues found.", source="claude[bot]",
+                        created_at="2026-01-02T00:00:00+00:00")),
+        ]
+        driver, clock, gh = make_driver(
+            timeline, cfg=CLAUDE_ONLY, auto_merge=True, rr_active=True,
+            preflight=True, threads_fetch=threads.fetch,
+            resolve_thread=threads.resolve, answer_waiter=lambda esc, **k: {})
+        outcome = driver.run()
+        assert "claude" not in driver._retired
+        assert outcome.merged is True
+        assert gh.matching("gh", "merge", "--squash")
+
+    def test_the_recorded_cause_carve_out_is_retirement_ONLY(self):
+        # The already-recorded guard still protects every RECOVERABLE cause: a
+        # bot excluded for one of them is never re-labelled by a resolved comment
+        # carrying another. Only retirement — permanent, and otherwise unreadable
+        # on the restart path — may overwrite what is on record.
+        driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+        st = driver._bot_state("claude")
+        st.signal = detectors.SIGNAL_ERRORED
+        driver._fold_hard_signal(
+            Comment(id="a", text="You have exceeded your monthly quota of requests.",
+                    source="claude[bot]", path="x.py", diff_hunk="@@"))
+        assert st.signal == detectors.SIGNAL_ERRORED     # not re-labelled quota
+        assert not driver.store.is_excluded("claude")
+
+    def test_a_recorded_cause_still_short_circuits_before_classification(
+            self, monkeypatch):
+        # The carve-out must not make every resolved comment on an
+        # already-decided bot pay for the full (model-gated) classification: an
+        # ordinary body returns on the cheap deterministic pre-check, and an
+        # already-retired bot has nothing left to redo.
+        calls = []
+        monkeypatch.setattr(round_driver.detectors, "detect_signal",
+                            lambda *a, **k: calls.append(a) or None)
+        driver, clock, gh = make_driver([], cfg=CLAUDE_ONLY)
+        driver._bot_state("claude").signal = detectors.SIGNAL_CLEAN
+        driver._fold_hard_signal(
+            Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
+                    path="x.py", diff_hunk="@@"))
+        driver._record_retired("claude")
+        driver._fold_hard_signal(
+            Comment(id="b", text=RETIREMENT_BANNER, source="claude[bot]",
+                    path="x.py", diff_hunk="@@"))
+        assert calls == []
 
 
 # ═════════════════════════════════════════════════════════════════════
