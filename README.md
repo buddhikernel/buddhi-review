@@ -10,15 +10,18 @@ sends each PR to a cross-vendor panel of AI reviewers, classifies their findings
 applies fixes, and repeats until the pull request is ready to land. It auto-merges
 only when you opt in.
 
-**One model reviewing its own work once is not enough.** LLMs tend to evaluate their
-own output more favorably, and a single review pass can leave many bugs undiscovered.
-That is why Buddhi uses a [cross-vendor panel and re-reviews the code after each
-round of fixes](#why-a-panel-and-why-rounds).
+**The author model—the model used to produce the code—should not be the only
+reviewer.** Research documents **self-preference bias**, in which an LLM evaluator
+can favor output from the same model. A single review pass can also leave many bugs
+undiscovered. That is why Buddhi uses a [cross-vendor panel and re-reviews the code
+after each round of fixes](#why-a-panel-and-why-rounds).
 
 Across [88 qualifying internal runs](#what-real-review-runs-show) on a codebase
 written with Claude Code, the four-reviewer panel—Claude, Codex, Gemini, and
-Copilot—found 681 valid bugs. Claude found just 3.8% of them, and half surfaced only
-in round 2 or later.
+Copilot—found 681 valid bugs. Claude, the author model in these runs, found 3.8% of
+them; reviewers from other vendors found 96.2%, and half of the valid bugs surfaced
+only in round 2 or later. This result measures Claude in the author-model role on
+this codebase; it is not a general ranking of Claude's code-review ability.
 
 <br>
 
@@ -178,9 +181,9 @@ These results come from Buddhi review loops on a large private repository, where
 the code under review was written with Claude Code. For every bug that was verified
 and fixed, the loop recorded its severity, the reviewer that found it, and the round
 in which it was found. The 88 runs that meet the selection criteria below contain
-681 such bugs. Two patterns stand out: models are less critical of their own output,
-and many bugs surface only after earlier fixes are applied. The research discussed
-in [Why a panel and why rounds](#why-a-panel-and-why-rounds) helps explain both
+681 such bugs. Two patterns stand out: the author model found 3.8% of the valid bugs,
+and 50.1% surfaced only after earlier fixes were applied. The research discussed in
+[Why a panel and why rounds](#why-a-panel-and-why-rounds) provides context for both
 patterns.
 
 <details markdown="1">
@@ -199,28 +202,31 @@ notices were detected with the loop's own signal patterns.
 
 </details>
 
-### "Just have Claude review it again" is not adversarial review
+### What cross-vendor review added when Claude was the author model
 
-Across the 88 qualifying runs, Claude found 26 of the 681 valid bugs (3.8%).
-Reviewers from other vendors found the remaining 96.2%. Claude found 18 of the 189
-high- or critical-severity bugs (9.5%), and of the high- or critical-severity bugs
-found in round 2 or later, 93.5% came from a reviewer other than Claude.
+Across the 88 qualifying runs, Claude—the author model in this dataset—found 26 of
+the 681 valid bugs (3.8%). Reviewers from other vendors found the remaining 96.2%.
+Claude found 18 of the 189 high- or critical-severity bugs (9.5%), and of the high-
+or critical-severity bugs found in round 2 or later, 93.5% came from a reviewer
+other than Claude.
 
-This pattern is consistent with the self-preference effect
-[[2]](https://arxiv.org/abs/2404.13076): models tend to evaluate their own output
-more favorably. In these runs, Claude missed most of the valid bugs found by the
-cross-vendor panel.
+This pattern is consistent with **self-preference bias**
+[[2]](https://proceedings.neurips.cc/paper_files/paper/2024/hash/7f1f0218e45f5414c79c0679633e47bc-Abstract-Conference.html):
+the documented tendency for an LLM evaluator to favor output from the same model.
+The cited study evaluated summaries, not code review, and these runs did not test
+Claude on code written by other models or humans. The result therefore shows what
+cross-vendor review added in this dataset, not Claude's general code-review ability.
 
 <picture>
   <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.mobile.dark.svg">
   <source media="(max-width: 600px)" srcset="docs/assets/who-catches-the-bugs.mobile.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.dark.svg">
-  <img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
+  <img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of valid bugs as the author-model reviewer on code written with Claude Code, per review run, with the all-runs aggregate line" width="100%">
 </picture>
 
 - **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
-  such runs.
-- **Line:** Claude's share across all 88 qualifying runs, which is 3.8%.
+  such runs. Claude was the author model in every run.
+- **Line:** the author model's share across all 88 qualifying runs, which is 3.8%.
 
 ### One round is not a complete review
 
@@ -350,8 +356,10 @@ found nothing further to act on within the configured review budget.
   largest, most accurate models. Cross-vendor diversity helps, but the benefit is
   smaller at the frontier, which is one reason Buddhi caps its review rounds.
 - **[2] Self-preference bias.** Panickssery et al.,
-  [*LLM Evaluators Recognize and Favor Their Own Generations*](https://arxiv.org/abs/2404.13076):
-  an LLM rates text it wrote more favorably than another model's.
+  [*LLM Evaluators Recognize and Favor Their Own Generations*](https://proceedings.neurips.cc/paper_files/paper/2024/hash/7f1f0218e45f5414c79c0679633e47bc-Abstract-Conference.html):
+  an LLM evaluator can favor output generated by the same model. The study evaluated
+  summaries, not code review; Buddhi's run data are a separate observation and do
+  not establish that self-preference caused the gap.
 - **[3] Rounds plateau.** Multi-agent debate gains saturate after a few rounds (Du et
   al., [*Improving Factuality and Reasoning through Multiagent Debate*](https://arxiv.org/abs/2305.14325));
   pushing further tends to entrench errors rather than remove them.
