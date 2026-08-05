@@ -10,7 +10,7 @@ sends each PR to a cross-vendor panel of AI reviewers, classifies their findings
 applies fixes, and repeats until the pull request is ready to land. It auto-merges
 only when you opt in.
 
-**The author model, the model used to produce the code, should not be the only
+**The author-model, the model used to produce the code, should not be the only
 reviewer.** Research documents **self-preference bias**, in which an LLM evaluator
 can favor output from the same model. A single review pass can also leave many bugs
 undiscovered. That is why Buddhi uses a [cross-vendor panel and re-reviews the code
@@ -18,7 +18,7 @@ after each round of fixes](#why-a-panel-and-why-rounds).
 
 Across [88 qualifying internal runs](#what-real-review-runs-show) on a codebase
 written with Claude Code, the four-reviewer panel of Claude, Codex, Gemini, and
-Copilot found 681 valid bugs. Claude, the author model in these runs, found 3.8% of
+Copilot found 681 valid bugs. Claude, the author-model in these runs, found 3.8% of
 them; reviewers from other vendors found 96.2%, and half of the valid bugs surfaced
 only in round 2 or later. This result measures Claude in the author-model role on
 this codebase; it is not a general ranking of Claude's code-review ability.
@@ -181,8 +181,8 @@ These results come from Buddhi review loops on a large private repository, where
 the code under review was written with Claude Code. For every bug that was verified
 and fixed, the loop recorded its severity, the reviewer that found it, and the round
 in which it was found. The 88 runs that meet the selection criteria below contain
-681 such bugs. Two patterns stand out: the author model, the model used to produce
-the code, is less critical of its own work, and a significant fraction of the bugs
+681 such bugs. Two patterns stand out: the author-model, the model used to produce
+the code, is less critical of its own work, and half of the bugs
 surface only after earlier fixes are applied. The research discussed in
 [Why a panel and why rounds](#why-a-panel-and-why-rounds) helps explain both
 patterns.
@@ -203,29 +203,29 @@ notices were detected with the loop's own signal patterns.
 
 </details>
 
-### What cross-vendor review added when Claude was the author model
+### What cross-vendor review added when Claude was the author-model
 
-Across the 88 qualifying runs, Claude, the author model in this dataset, found 26 of
+Across the 88 qualifying runs, Claude, the author-model in this dataset, found 26 of
 the 681 valid bugs (3.8%). Reviewers from other vendors found the remaining 96.2%.
 Claude found 18 of the 189 high- or critical-severity bugs (9.5%), and of the high-
 or critical-severity bugs found in round 2 or later, 93.5% came from a reviewer
 other than Claude.
 
-This pattern is consistent with the self-preference effect
+This pattern is consistent with the self-preference bias
 [[2]](https://arxiv.org/abs/2404.13076): models tend to evaluate their own output
-more favorably. In these runs, Claude, the author model, missed most of the valid
+more favorably. In these runs, Claude, the author-model, missed most of the valid
 bugs found by the cross-vendor panel.
 
 <picture>
   <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.mobile.dark.svg">
   <source media="(max-width: 600px)" srcset="docs/assets/who-catches-the-bugs.mobile.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.dark.svg">
-  <img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of valid bugs as the author-model reviewer on code written with Claude Code, per review run, with the all-runs aggregate line" width="100%">
+  <img src="docs/assets/who-catches-the-bugs.svg" alt="The author-model's share of valid bugs per review run on code written with Claude Code, with the all-runs aggregate line" width="100%">
 </picture>
 
 - **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
-  such runs. Claude was the author model in every run.
-- **Line:** the author model's share across all 88 qualifying runs, which is 3.8%.
+  such runs. Claude was the author-model in every run.
+- **Line:** the author-model's share across all 88 qualifying runs, which is 3.8%.
 
 ### One round is not a complete review
 
