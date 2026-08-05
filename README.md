@@ -266,7 +266,7 @@ in total, reviewer by reviewer.
   <img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
 </picture>
 
-| Run | Valid bugs | Found by Claude | Claude % | Found in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
+| Run | Valid bugs | Found by Author-model (Claude) | Author-model % | Found in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
 |---|---|---|---|---|---|---|---|
 | A | 21 | 0&Dagger; | 0.0% | 17 | 81.0% | 7 | 5 (71.4%) |
 | B | 47 | 0&Dagger; | 0.0% | 41 | 87.2% | 14 | 10 (71.4%) |
@@ -277,10 +277,10 @@ in total, reviewer by reviewer.
 | G | 20 | 0&dagger; | 0.0% | 4 | 20.0% | 2 | 0 (0.0%) |
 | **All 88 qualifying runs** | **681** | **26** | **3.8%** | **341** | **50.1%** | **189** | **93 (49.2%)** |
 
-&dagger; On Runs C, F, and G, Claude posted an explicit all-clear (“No issues
+&dagger; On Runs C, F, and G, the author-model (Claude) posted an explicit all-clear (“No issues
 found.”); the other reviewers subsequently identified 66 valid bugs.
 
-&Dagger; On Runs A and B, Claude left review comments rather than an all-clear, but
+&Dagger; On Runs A and B, the author-model left review comments rather than an all-clear, but
 none of those comments identified a valid bug.
 
 Notes and caveats:
@@ -289,8 +289,9 @@ Notes and caveats:
   numbers are taken from the loop's per-bug ledger, which records each verified,
   fixed bug with its severity, the reviewer that caught it, and the round it was
   caught in.
-- Severity is assigned by the loop's classifier, which also runs on Claude; the
-  severity labels therefore do not introduce an obvious anti-Claude bias.
+- Severity is assigned by the loop's classifier, which also runs on the
+  author-model (Claude); the severity labels therefore do not introduce an obvious
+  anti-author bias.
 - Each bug is credited to the reviewer recorded as having found it. Claude's raw
   comment counts on the underlying PRs match the ledger's counts, so every bug
   Claude found is credited.
