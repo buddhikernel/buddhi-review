@@ -10,15 +10,18 @@ sends each PR to a cross-vendor panel of AI reviewers, classifies their findings
 applies fixes, and repeats until the pull request is ready to land. It auto-merges
 only when you opt in.
 
-**One model reviewing its own work once is not enough.** LLMs tend to evaluate their
-own output more favorably, and a single review pass can leave many bugs undiscovered.
-That is why Buddhi uses a [cross-vendor panel and re-reviews the code after each
-round of fixes](#why-a-panel-and-why-rounds).
+**The author-model, the model used to produce the code, should not be the only
+reviewer.** Research documents **self-preference bias**, in which an LLM evaluator
+can favor output from the same model. A single review pass can also leave many bugs
+undiscovered. That is why Buddhi uses a [cross-vendor panel and re-reviews the code
+after each round of fixes](#why-a-panel-and-why-rounds).
 
 Across [88 qualifying internal runs](#what-real-review-runs-show) on a codebase
-written with Claude Code, the four-reviewer panel—Claude, Codex, Gemini, and
-Copilot—found 681 valid bugs. Claude found just 3.8% of them, and half surfaced only
-in round 2 or later.
+written with Claude Code, the four-reviewer panel of Claude, Codex, Gemini, and
+Copilot found 681 valid bugs. Claude, the author-model in these runs, found 3.8% of
+them; reviewers from other vendors found 96.2%, and half of the valid bugs surfaced
+only in round 2 or later. This result measures Claude in the author-model role on
+this codebase; it is not a general ranking of Claude's code-review ability.
 
 <br>
 
@@ -178,9 +181,10 @@ These results come from Buddhi review loops on a large private repository, where
 the code under review was written with Claude Code. For every bug that was verified
 and fixed, the loop recorded its severity, the reviewer that found it, and the round
 in which it was found. The 88 runs that meet the selection criteria below contain
-681 such bugs. Two patterns stand out: models are less critical of their own output,
-and many bugs surface only after earlier fixes are applied. The research discussed
-in [Why a panel and why rounds](#why-a-panel-and-why-rounds) helps explain both
+681 such bugs. Two patterns stand out: the author-model, the model used to produce
+the code, is less critical of its own work, and half of the bugs
+surface only after earlier fixes are applied. The research discussed in
+[Why a panel and why rounds](#why-a-panel-and-why-rounds) helps explain both
 patterns.
 
 <details markdown="1">
@@ -199,28 +203,29 @@ notices were detected with the loop's own signal patterns.
 
 </details>
 
-### "Just have Claude review it again" is not adversarial review
+### What cross-vendor review added when Claude was the author-model
 
-Across the 88 qualifying runs, Claude found 26 of the 681 valid bugs (3.8%).
-Reviewers from other vendors found the remaining 96.2%. Claude found 18 of the 189
-high- or critical-severity bugs (9.5%), and of the high- or critical-severity bugs
-found in round 2 or later, 93.5% came from a reviewer other than Claude.
+Across the 88 qualifying runs, Claude, the author-model in this dataset, found 26 of
+the 681 valid bugs (3.8%). Reviewers from other vendors found the remaining 96.2%.
+Claude found 18 of the 189 high- or critical-severity bugs (9.5%), and of the high-
+or critical-severity bugs found in round 2 or later, 93.5% came from a reviewer
+other than Claude.
 
-This pattern is consistent with the self-preference effect
+This pattern is consistent with the self-preference bias
 [[2]](https://arxiv.org/abs/2404.13076): models tend to evaluate their own output
-more favorably. In these runs, Claude missed most of the valid bugs found by the
-cross-vendor panel.
+more favorably. In these runs, Claude, the author-model, missed most of the valid
+bugs found by the cross-vendor panel.
 
 <picture>
   <source media="(max-width: 600px) and (prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.mobile.dark.svg">
   <source media="(max-width: 600px)" srcset="docs/assets/who-catches-the-bugs.mobile.svg">
   <source media="(prefers-color-scheme: dark)" srcset="docs/assets/who-catches-the-bugs.dark.svg">
-  <img src="docs/assets/who-catches-the-bugs.svg" alt="Claude's share of the valid bugs, per review run, with the all-runs aggregate line" width="100%">
+  <img src="docs/assets/who-catches-the-bugs.svg" alt="The author-model's share of valid bugs per review run on code written with Claude Code, with the all-runs aggregate line" width="100%">
 </picture>
 
 - **Bars:** one bar per qualifying run with 10 or more valid bugs; there are 20
-  such runs.
-- **Line:** Claude's share across all 88 qualifying runs, which is 3.8%.
+  such runs. Claude was the author-model in every run.
+- **Line:** the author-model's share across all 88 qualifying runs, which is 3.8%.
 
 ### One round is not a complete review
 
@@ -261,7 +266,7 @@ in total, reviewer by reviewer.
   <img src="docs/assets/reviewer-drilldown.svg" alt="Valid bugs caught by each reviewer, per run, for the seven qualifying runs with 20 or more bugs" width="100%">
 </picture>
 
-| Run | Valid bugs | Found by Claude | Claude % | Found in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
+| Run | Valid bugs | Found by Author-model (Claude) | Author-model % | Found in round 2+ | Round 2+ % | High/critical | High/crit in round 2+ |
 |---|---|---|---|---|---|---|---|
 | A | 21 | 0&Dagger; | 0.0% | 17 | 81.0% | 7 | 5 (71.4%) |
 | B | 47 | 0&Dagger; | 0.0% | 41 | 87.2% | 14 | 10 (71.4%) |
@@ -272,10 +277,10 @@ in total, reviewer by reviewer.
 | G | 20 | 0&dagger; | 0.0% | 4 | 20.0% | 2 | 0 (0.0%) |
 | **All 88 qualifying runs** | **681** | **26** | **3.8%** | **341** | **50.1%** | **189** | **93 (49.2%)** |
 
-&dagger; On Runs C, F, and G, Claude posted an explicit all-clear (“No issues
+&dagger; On Runs C, F, and G, the author-model (Claude) posted an explicit all-clear (“No issues
 found.”); the other reviewers subsequently identified 66 valid bugs.
 
-&Dagger; On Runs A and B, Claude left review comments rather than an all-clear, but
+&Dagger; On Runs A and B, the author-model left review comments rather than an all-clear, but
 none of those comments identified a valid bug.
 
 Notes and caveats:
@@ -284,8 +289,9 @@ Notes and caveats:
   numbers are taken from the loop's per-bug ledger, which records each verified,
   fixed bug with its severity, the reviewer that caught it, and the round it was
   caught in.
-- Severity is assigned by the loop's classifier, which also runs on Claude; the
-  severity labels therefore do not introduce an obvious anti-Claude bias.
+- Severity is assigned by the loop's classifier, which also runs on the
+  author-model (Claude); the severity labels therefore do not introduce an obvious
+  anti-author bias.
 - Each bug is credited to the reviewer recorded as having found it. Claude's raw
   comment counts on the underlying PRs match the ledger's counts, so every bug
   Claude found is credited.
