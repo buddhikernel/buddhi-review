@@ -33,7 +33,7 @@
 <rect x="742.3" y="379.2" width="29.6" height="70.8" fill="#C2410C" opacity="1"/>
 <rect x="780.4" y="447" width="29.6" height="3" fill="#C2410C" opacity="0.55"/>
 <line x1="55.0" y1="417.7" x2="810.0" y2="417.7" stroke="#c9d1d9" stroke-width="2.5"/>
-<text x="215.0" y="407.0" font-size="11.5" font-weight="700" fill="#e6edf3">Author-model: 3.8%</text>
+<text x="448.75" y="407.0" font-size="11.5" font-weight="700" fill="#e6edf3" text-anchor="middle">Author-model: 3.8%</text>
 <text x="55.0" y="472" font-size="11" fill="#8b949e">Flat stubs are zero. In 14 of these 20 runs, the author-model reviewer (Claude) found no valid bug.</text>
 <text x="55.0" y="500" font-size="11.5" font-weight="700" fill="#C2410C">Across these 88 runs, where Claude was the author-model, it found 3.8% of the valid bugs; reviewers from other vendors found 96.2%.</text>
 <text x="55.0" y="520" font-size="10.5" fill="#8b949e">The author-model reviewer found 18 of 189 high- or critical-severity bugs (9.5%). Of those found in round 2 or later,</text>
