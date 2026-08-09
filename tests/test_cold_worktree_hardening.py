@@ -14,6 +14,7 @@ never run from poisoning the round.
    the global-only behaviour (no extra pre-run runner detection either).
 """
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -162,6 +163,7 @@ def test_runner_exclude_pathspec_set_is_fixed_and_small():
     specs = commit_push._runner_exclude_pathspecs()
     assert specs == commit_push._runner_exclude_pathspecs()   # deterministic
     expected = (2 * len(commit_push._RUNNER_DROPPING_DIRS)
+                + len(commit_push._RUNNER_DROPPING_PARENT_DIRS)   # contents glob only
                 + 2 * len(commit_push._RUNNER_DROPPING_DOTNET_DIRS)
                 * len(commit_push._RUNNER_DROPPING_DOTNET_CONFIGS)
                 + len(commit_push._RUNNER_DROPPING_FILES))
@@ -506,7 +508,7 @@ def test_per_file_recovery_argv_is_batched_under_arg_max(git_repo):
         _write(git_repo, f"node_modules/pkg{i}/a-fairly-long-vendored-path-{i}.js", "//\n")
     _git(git_repo, "add", "-A")
     _git(git_repo, "commit", "-qm", "vendored")
-    subprocess.run(["rm", "-rf", str(git_repo / "node_modules")], check=True)
+    shutil.rmtree(str(git_repo / "node_modules"))
     _write(git_repo, "real.txt", "the fix\n")
 
     calls = []
@@ -628,6 +630,232 @@ def test_clean_tree_tripwire_ignores_cold_gate_artifacts(git_repo, capsys):
     assert len(notices) == 1
     assert "lost.py" in notices[0][1]
     assert "node_modules" not in notices[0][1]
+
+
+# ── 1e. A file NAMED like a runner dir is source, not an artifact ────────────────
+
+
+# `build`, `target`, `deps` and `coverage` are perfectly ordinary FILE names in
+# Go/C/Make repos. A git pathspec matches paths, not types, so the bare `**/build`
+# glob withheld `scripts/build` from the fix commit exactly as it withheld the
+# `build/` output tree — and the tripwire, reading the same predicate, hid it.
+_RUNNER_NAMED_FILES = [
+    "scripts/build", "build", "tools/deps", "deps",
+    "coverage", "bin/coverage", "target", "make/target",
+]
+
+
+@pytest.mark.parametrize("path", _RUNNER_NAMED_FILES)
+def test_a_file_named_like_a_runner_dir_is_not_a_dropping(path):
+    """REGRESSION. The LAST segment must never match a file-name-shaped runner dir
+    — only a path UNDER one is an artifact."""
+    assert commit_push._is_runner_dropping(path) is False
+    assert commit_push._is_runner_dropping(f"{path}/out.o") is True   # …under it, yes
+
+
+def test_a_file_named_like_a_runner_dir_reaches_the_commit(git_repo):
+    """REGRESSION (silent no-op round). A reviewer asks the fixer to add
+    `scripts/build`; the glob held it out, `_held_back_new_artifacts` hid it from the
+    tripwire, and the round reported `pushed` with the fix missing — so the next
+    round saw the comment unaddressed and looped."""
+    _write(git_repo, "scripts/build", "#!/bin/sh\nmake all\n")
+    _write(git_repo, "coverage", "#!/bin/sh\ngo test -cover\n")
+    _write(git_repo, "build/out.o", "OBJ\n")            # the real artifact
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"scripts/build", "coverage"}
+    # …and the tripwire still sees the real fix as committed, not as residue.
+    _git(git_repo, "commit", "-qm", "fix")
+    tripwire = []
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(tripwire))
+    assert tripwire == []
+
+
+def test_the_unambiguous_names_keep_their_bare_glob():
+    """The bare form is load-bearing for a tracked `node_modules` SYMLINK a real
+    install replaces — those names are never a plausible source file."""
+    globs = commit_push._runner_globs()
+    for d in commit_push._RUNNER_DROPPING_DIRS:
+        assert f"**/{d}" in globs and f"**/{d}/**" in globs
+    for d in commit_push._RUNNER_DROPPING_PARENT_DIRS:
+        assert f"**/{d}" not in globs and f"**/{d}/**" in globs
+
+
+# ── 1f. An UNSTAGED rename INTO a runner dir keeps both halves ───────────────────
+
+
+def test_an_unstaged_rename_into_a_runner_dir_holds_both_halves(git_repo):
+    """REGRESSION (silent data loss). `mv src/old.py build/new.py` reaches the guard
+    as `D src/old.py` + `?? build/new.py` — git does NO rename detection when the
+    destination has no index entry. The glob held the destination back while
+    `git add -A` staged the source's DELETION, and `_held_back_new_artifacts` then
+    hid the destination from the tripwire: the PR dropped the file outright."""
+    _write(git_repo, "src/old.py", "PRECIOUS = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "build").mkdir()
+    (git_repo / "src/old.py").rename(git_repo / "build/new.py")
+    _write(git_repo, "real.txt", "the fix\n")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    # The deletion is NOT committed alone — both halves stay as residue.
+    assert _staged(git_repo) == {"real.txt"}
+    assert any(n[2] == "stop" and "src/old.py" in n[1] for n in notices), notices
+
+
+def test_a_rename_inside_a_repos_own_tracked_build_dir_holds_both_halves(git_repo):
+    """Same defect, the likelier shape: a repo whose `build/` is real tracked source.
+    The source half is itself runner-classified, so the per-file RECOVERY would have
+    staged its deletion even though the destination stays held back."""
+    _write(git_repo, "build/old.sh", "echo PRECIOUS\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build scripts")
+
+    (git_repo / "build/old.sh").rename(git_repo / "build/new.sh")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == set()
+    assert any(n[2] == "stop" and "build/old.sh" in n[1] for n in notices), notices
+
+
+def test_an_unrelated_deletion_beside_an_artifact_still_commits(git_repo):
+    """The pairing is by CONTENT, not by co-occurrence: a fixer's ordinary deletion
+    in a cold worktree must still reach the PR."""
+    _write(git_repo, "src/gone.py", "OLD = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "src/gone.py").unlink()
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "build/out.o", "OBJ\n")
+    _write(git_repo, "real.txt", "the fix\n")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"src/gone.py", "real.txt"}
+    assert not [n for n in notices if "moved INTO" in n[1]], notices
+
+
+def test_the_move_probe_never_hashes_a_size_mismatched_tree(git_repo):
+    """THE cost guard: a cold `node_modules` must be stat'd, never READ. Only a
+    candidate whose size already matches a deleted blob is handed to
+    `git hash-object`."""
+    _write(git_repo, "src/gone.py", "OLD = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "src/gone.py").unlink()
+    for i in range(300):
+        _write(git_repo, f"node_modules/pkg{i}/index.js", f"// a distinctly longer {i}\n")
+
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"src/gone.py"}
+    assert not [c for c in calls if c[:2] == ["git", "hash-object"]], calls
+    for argv in calls:
+        assert sum(len(a.encode("utf-8")) + 1 for a in argv) <= \
+            commit_push._PATHSPEC_ARGV_BUDGET + 4096, argv[:4]
+
+
+def test_a_failed_move_probe_leaves_the_guard_unchanged(git_repo):
+    """Best-effort: a git failure inside the probe must never fail the round — the
+    guard falls back to exactly its pre-probe behaviour."""
+    _write(git_repo, "src/old.py", "PRECIOUS = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "build").mkdir()
+    (git_repo / "src/old.py").rename(git_repo / "build/new.py")
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if argv[:2] == ["git", "hash-object"]:
+            raise OSError(7, "Argument list too long")
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+
+
+# ── 1g. The exit rebase tolerates exactly what the guard withheld ────────────────
+
+
+def _rebase_repo(tmp_path):
+    """A branch pushed to a local `origin` whose base has advanced — the shape
+    `exit_rebase` is called on after a manual-landing outcome."""
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work = tmp_path / "work"
+    _write(work, "seed.py")
+    _git(work, "init", "-q", "-b", "main")
+    _git(work, "config", "user.email", "t@example.com")
+    _git(work, "config", "user.name", "t")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "seed")
+    _git(work, "remote", "add", "origin", str(origin))
+    _git(work, "push", "-q", "-u", "origin", "main")
+    _git(work, "checkout", "-q", "-b", "feature")
+    _write(work, "feat.py", "f = 1\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "feat")
+    _git(work, "push", "-q", "-u", "origin", "feature")
+    # main advances behind us, so a real rebase has something to do.
+    _git(work, "checkout", "-q", "main")
+    _write(work, "other.py", "o = 1\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "other")
+    _git(work, "push", "-q", "origin", "main")
+    _git(work, "checkout", "-q", "feature")
+    return work
+
+
+def test_exit_rebase_tolerates_the_artifacts_the_guard_withheld(tmp_path):
+    """REGRESSION. A cold-worktree round ENDS with the runner artifacts the staging
+    guard intentionally withheld still untracked. `exit_rebase` rejected any nonempty
+    porcelain, so the automatic base rebase skipped on exactly the runs this
+    hardening targets — leaving the PR stranded behind its base."""
+    work = _rebase_repo(tmp_path)
+    _write(work, "node_modules/left-pad/index.js", "// dep\n")
+    _write(work, "build/out.o", "OBJ\n")
+    _write(work, "stale.bak", "backup\n")
+
+    status, detail = commit_push.exit_rebase(
+        str(work), base="main", notice=_rec_notice([]))
+    assert status == "rebased", detail
+
+
+def test_exit_rebase_still_skips_on_a_genuinely_dirty_tree(tmp_path):
+    """The relaxation is EXACTLY the held-back set: a real uncommitted edit, and the
+    held-back half of a risky-delete pair (a tracked deletion — which would make the
+    rebase itself fail), must both keep skipping."""
+    work = _rebase_repo(tmp_path)
+    _write(work, "node_modules/left-pad/index.js", "// dep\n")
+    _write(work, "feat.py", "f = 2\n")                    # a real uncommitted edit
+    status, detail = commit_push.exit_rebase(
+        str(work), base="main", notice=_rec_notice([]))
+    assert status == "skipped" and "uncommitted changes" in detail
+
+    _git(work, "checkout", "--", "feat.py")
+    (work / "feat.py").rename(work / "feat.py.bak")        # D feat.py + ?? feat.py.bak
+    status, detail = commit_push.exit_rebase(
+        str(work), base="main", notice=_rec_notice([]))
+    assert status == "skipped" and "uncommitted changes" in detail
 
 
 # ── 2. Per-runner gate timeout ───────────────────────────────────────────────────

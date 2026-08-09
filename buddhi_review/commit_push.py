@@ -54,9 +54,12 @@ import fnmatch
 import os
 import re
 import shlex
+import stat
 import subprocess
 import sys
-from typing import Callable, Iterator, List, Optional, Sequence, Set, Tuple
+from typing import (
+    Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple,
+)
 
 from buddhi_review import config, lang_syntax, merge, test_runner
 from buddhi_review.notifier import Ask, ConsoleNotifier, Notifier
@@ -124,24 +127,44 @@ _BACKUP_SUFFIXES: Tuple[str, ...] = (".bak", "~", ".orig")
 # (so a JS workspace's ``packages/*/node_modules`` is caught too). Held back only
 # when UNTRACKED; a fixer's edit to a TRACKED file under one still lands (it is
 # recovered per-file after the glob exclude in :func:`_stage_all`).
+#
+# These names are UNAMBIGUOUS — nothing but a runner output tree is ever called
+# `node_modules` or `.pytest_cache` — so the segment matches at ANY position,
+# including the LAST one. That final-segment match is load-bearing: a monorepo's
+# tracked `node_modules` SYMLINK, replaced by a real install, is itself the path
+# whose deletion has to be recovered.
 _RUNNER_DROPPING_DIRS = frozenset({
     "node_modules",       # npm / yarn / pnpm / bun install
-    "target",             # cargo (and Maven) build output
     "__pycache__",        # CPython bytecode cache
     ".pytest_cache",      # pytest's cache plugin
-    # `build` is matched at ANY depth (unlike dotnet bin/obj, narrowed to a
-    # build-config child): Gradle/CMake output has no fixed child segment to key
-    # on, and a source-`build/`-vs-output-`build/` split is not expressible in the
-    # git-pathspec exclude layer that does the real holding-back. A TRACKED file
-    # under a source `build/` still lands via the per-file recovery; only a NEW
-    # untracked file under a `build/` stays out.
-    "build",              # Gradle / CMake / generic build output
     ".gradle",            # Gradle project-local cache
-    "deps", "_build",     # mix (Elixir) dependency + build trees
-    "coverage",           # JS coverage output (nyc / jest / vitest)
+    "_build",             # mix (Elixir) build tree
     "htmlcov",            # coverage.py HTML report
     ".nyc_output",        # nyc raw coverage
     ".tox", ".nox",       # tox / nox environment trees
+})
+
+# Runner-output dirs whose name is also a perfectly ordinary FILE name — `scripts/
+# build`, a Go/Make repo's `deps` or `coverage` entrypoint script. Matched ONLY
+# when a child segment follows (`build/classes/Main.class`), never as the last
+# segment, so a plain file that happens to be *called* `build` is committed like
+# any other source file instead of being silently withheld from the fix commit
+# (which the tripwire would then also hide, leaving the round to report `pushed`
+# with the fix missing). Exactly the shape the dotnet dirs below already use.
+# :func:`_runner_globs` keeps the two layers in step by emitting only the
+# `**/<d>/**` contents glob for these — never the bare `**/<d>`, which git matches
+# against a file of that name just as readily as against the directory.
+#
+# Within a runner dir the depth stays unrestricted: Gradle/CMake output has no
+# fixed child segment to key on, and a source-`build/`-vs-output-`build/` split is
+# not expressible in the git-pathspec exclude layer that does the real holding-
+# back. A TRACKED file under a source `build/` still lands via the per-file
+# recovery; only a NEW untracked file under a `build/` stays out.
+_RUNNER_DROPPING_PARENT_DIRS = frozenset({
+    "build",              # Gradle / CMake / generic build output
+    "target",             # cargo (and Maven) build output
+    "deps",               # mix (Elixir) dependency tree
+    "coverage",           # JS coverage output (nyc / jest / vitest)
 })
 
 # dotnet build output dirs. A bare ``bin``/``obj`` segment collides with real
@@ -179,12 +202,14 @@ def _is_dropping(path: str) -> bool:
 
 def _is_runner_dropping(path: str) -> bool:
     """True iff ``path`` is — or lies under — a :data:`_RUNNER_DROPPING_DIRS`
-    directory, a dotnet ``bin/{Debug,Release}`` / ``obj/{Debug,Release}``
-    build-output dir, or is a :data:`_RUNNER_DROPPING_FILES` coverage file, by
-    path SEGMENT at any depth. Kept exactly in step with
-    :func:`_runner_exclude_pathspecs` (what ``git add`` actually holds back) so
-    the held-back set, the tracked-file recovery, and the clean-tree tripwire
-    never drift from the real staging behaviour.
+    directory, lies UNDER a :data:`_RUNNER_DROPPING_PARENT_DIRS` directory (those
+    names double as ordinary file names, so they count only with a child segment
+    after them — a plain ``scripts/build`` script is NOT an artifact), lies under a
+    dotnet ``bin/{Debug,Release}`` / ``obj/{Debug,Release}`` build-output dir, or is
+    a :data:`_RUNNER_DROPPING_FILES` coverage file, by path SEGMENT at any depth.
+    Kept exactly in step with :func:`_runner_exclude_pathspecs` (what ``git add``
+    actually holds back) so the held-back set, the tracked-file recovery, and the
+    clean-tree tripwire never drift from the real staging behaviour.
 
     ``/`` is the ONLY separator recognised, deliberately: ``git status``'s
     porcelain emits ``/``-separated paths on every platform (Windows included)
@@ -199,6 +224,10 @@ def _is_runner_dropping(path: str) -> bool:
     segs = norm.split("/")
     if any(s in _RUNNER_DROPPING_DIRS for s in segs):
         return True
+    # ``segs[:-1]`` only — a name that is also a plausible FILE name counts as a
+    # runner dir solely when something lives under it.
+    if any(s in _RUNNER_DROPPING_PARENT_DIRS for s in segs[:-1]):
+        return True
     for i, s in enumerate(segs[:-1]):
         if (s in _RUNNER_DROPPING_DOTNET_DIRS
                 and segs[i + 1] in _RUNNER_DROPPING_DOTNET_CONFIGS):
@@ -207,15 +236,23 @@ def _is_runner_dropping(path: str) -> bool:
 
 
 def _runner_globs() -> List[str]:
-    """The raw repo-root-relative glob bodies for every RUNNER dropping (a dir at
-    any depth + its contents, dotnet ``bin``/``obj`` only under a build-config
-    child, coverage files), sorted for a deterministic order. Wrapped in the right
-    pathspec magic by :func:`_runner_exclude_pathspecs` (exclude, for ``git add``)
-    and by :func:`_stage_all`'s reset (include, to un-stage pre-staged runner
-    content)."""
+    """The raw repo-root-relative glob bodies for every RUNNER dropping (an
+    unambiguous dir at any depth + its contents, a file-name-shaped dir's CONTENTS
+    only, dotnet ``bin``/``obj`` only under a build-config child, coverage files),
+    sorted for a deterministic order. Wrapped in the right pathspec magic by
+    :func:`_runner_exclude_pathspecs` (exclude, for ``git add``) and by
+    :func:`_stage_all`'s reset (include, to un-stage pre-staged runner content).
+
+    A git pathspec matches PATHS, not types, so a bare ``**/build`` excludes the
+    ``scripts/build`` shell script exactly as readily as the ``build/`` output
+    tree. :data:`_RUNNER_DROPPING_PARENT_DIRS` therefore gets ONLY the ``/**``
+    contents form — mirroring :func:`_is_runner_dropping`'s ``segs[:-1]`` test, so
+    the predicate and the exclude layer agree on every path."""
     globs: List[str] = []
     for d in sorted(_RUNNER_DROPPING_DIRS):
         globs.append(f"**/{d}")
+        globs.append(f"**/{d}/**")
+    for d in sorted(_RUNNER_DROPPING_PARENT_DIRS):
         globs.append(f"**/{d}/**")
     for d in sorted(_RUNNER_DROPPING_DOTNET_DIRS):
         for c in sorted(_RUNNER_DROPPING_DOTNET_CONFIGS):
@@ -232,8 +269,9 @@ def _runner_exclude_pathspecs() -> List[str]:
     thousands of untracked ``node_modules`` files is held back by ONE pathspec,
     not thousands (which would blow git's argv). ``:(top,exclude,glob)`` anchors
     to the repo root and lets ``**`` span path components, matching
-    :func:`_stage_all`'s ``:/`` scope; the bare dir form covers the dir itself,
-    the ``/**`` twin its contents."""
+    :func:`_stage_all`'s ``:/`` scope; where a bare dir form is emitted it covers
+    the dir entry itself (a tracked ``node_modules`` symlink), the ``/**`` twin its
+    contents."""
     return [f":(top,exclude,glob){g}" for g in _runner_globs()]
 
 
@@ -895,6 +933,24 @@ def _risky_delete_pairs(entries: Sequence[Tuple[str, str]]) -> Set[str]:
     return deleted & sources
 
 
+def _dirty_beyond_held_back(porcelain_z: str) -> bool:
+    """True iff ``git status --porcelain -z --untracked-files=all`` output shows an
+    uncommitted change BEYOND the NEW artifacts the staging guard deliberately
+    withheld from the fix commit (:func:`_held_back_new_artifacts`) — the
+    rebase-precondition twin of :func:`_assert_clean_after_commit`'s residue
+    filter, reading the same porcelain form through the same predicate so the two
+    can never disagree about what counts as residue.
+
+    Only an UNTRACKED (``??``) held-back path is tolerated. An untracked file never
+    blocks ``git rebase``; anything carrying an index or tracked-worktree delta —
+    including the held-back half of a risky-delete / moved-into-a-runner-dir pair,
+    deliberately absent from that set — would make the rebase itself fail, so it
+    still counts as dirty."""
+    entries = list(_iter_porcelain_z(porcelain_z or ""))
+    held_back = _held_back_new_artifacts(entries)
+    return any(xy != "??" or path not in held_back for xy, path in entries)
+
+
 def _held_back_new_artifacts(entries: Sequence[Tuple[str, str]]) -> Set[str]:
     """The NEW-to-HEAD paths :func:`_stage_all` deliberately holds out of the fix
     commit: an editor/backup dropping (:func:`_is_dropping`) and — for a cold
@@ -970,6 +1026,130 @@ def _run_batched(
     return last
 
 
+def _run_batched_stdout(
+    run: Run, argv_prefix: Sequence[str], args: Sequence[str], *, cwd: str,
+) -> Optional[str]:
+    """The READ-ONLY twin of :func:`_run_batched`: run ``argv_prefix + <args>`` in
+    the same ``ARG_MAX``-bounded batches and return the CONCATENATED stdout of every
+    invocation, in argument order. Returns ``None`` the moment any invocation fails
+    or exits non-zero, so a PARTIAL read is never mistaken for a complete one by a
+    caller that is about to draw a conclusion from it."""
+    out: List[str] = []
+    batch: List[str] = []
+    size = 0
+
+    def _flush() -> bool:
+        nonlocal batch, size
+        if not batch:
+            return True
+        try:
+            r = run([*argv_prefix, *batch], cwd=cwd)
+        except OSError:
+            return False
+        if getattr(r, "returncode", 1) != 0:
+            return False
+        out.append(getattr(r, "stdout", "") or "")
+        batch, size = [], 0
+        return True
+
+    for arg in args:
+        cost = len(arg.encode("utf-8", "surrogateescape")) + 1
+        if batch and size + cost > _PATHSPEC_ARGV_BUDGET:
+            if not _flush():
+                return None
+        batch.append(arg)
+        size += cost
+    return "".join(out) if _flush() else None
+
+
+def _renamed_into_runner_sources(
+    cwd: str, entries: Sequence[Tuple[str, str]], *, run: Run = _default_run,
+) -> Set[str]:
+    """Deleted, still-tracked source paths from ``entries`` whose exact content is
+    sitting in a NEW runner-classified path (:func:`_is_runner_dropping`) the glob
+    exclude is about to hold back — an UNSTAGED rename INTO a runner dir (``mv
+    src/old.py build/new.py``, or a fixer's ``mv build/old.sh build/new.sh`` inside
+    a repo's own tracked ``build/``).
+
+    Git does NO rename detection here: the destination has no index entry, so
+    porcelain reports a plain ``D <src>`` + ``?? <dest>`` pair, not the ``R``
+    record :func:`_stage_all`'s staged-rename decomposition keys on. Left alone,
+    the ``git add -A`` stages the source's DELETION while the exclude holds its
+    replacement back, and :func:`_held_back_new_artifacts` then hides that
+    destination from the clean-tree tripwire — so the pushed PR silently drops the
+    file with nothing to show for it. ``_stage_all`` holds the source back too,
+    giving the pair the SAME two-half protection a backup-then-replace move gets
+    from :func:`_risky_delete_pairs`: both halves stay uncommitted residue, and the
+    tripwire fires on the still-deleted source so a human resolves it.
+
+    Paired by CONTENT IDENTITY — the destination's blob hash equals the source's
+    INDEX blob hash — never by name: a move that also renames the file carries no
+    name relationship to key on, so a name-based pair would be a guess, not a fact
+    (cf. :func:`_backup_source`). Cost is bounded: the probe runs at all only when
+    the tree holds BOTH a worktree deletion and a new runner artifact, and only
+    candidates whose SIZE already matches a deleted blob are hashed — a cold
+    ``node_modules`` of thousands of files is stat'd, never read. Best-effort: any
+    git/OS failure returns an empty set, leaving the guard exactly as it was."""
+    deleted = sorted({path for xy, path in entries
+                      if len(xy) > 1 and xy[1] == "D" and not _new_to_head(xy)})
+    candidates = [path for xy, path in entries
+                  if _is_runner_dropping(path) and _new_to_head(xy)]
+    if not deleted or not candidates:
+        return set()
+    try:
+        # Porcelain paths are repo-root-relative while ``cwd`` may be a subdirectory
+        # (hence ``:/`` on the add), so the filesystem probes below resolve against
+        # the top level, never against ``cwd``.
+        top = run(["git", "rev-parse", "--show-toplevel"], cwd=cwd)
+        root = (getattr(top, "stdout", "") or "").strip()
+        if getattr(top, "returncode", 1) != 0 or not root:
+            return set()
+        listing = _run_batched_stdout(
+            run, ["git", "ls-files", "-s", "-z", "--"],
+            [f":(top,literal){p}" for p in deleted], cwd=cwd)
+        if listing is None:
+            return set()
+        blobs: Dict[str, str] = {}          # deleted path -> its INDEX blob sha
+        for rec in listing.split("\0"):
+            meta, sep, path = rec.partition("\t")
+            fields = meta.split()
+            if sep and path and len(fields) >= 2:
+                blobs[path] = fields[1]
+        sizes: Set[int] = set()
+        for sha in sorted(set(blobs.values())):
+            r = run(["git", "cat-file", "-s", sha], cwd=cwd)
+            if getattr(r, "returncode", 1) != 0:
+                continue
+            try:
+                sizes.add(int((getattr(r, "stdout", "") or "").strip()))
+            except ValueError:
+                continue
+        if not sizes:
+            return set()
+        # The SIZE gate is what keeps this cheap: a size mismatch rules a candidate
+        # out without reading a byte of it, so only the handful that could actually
+        # BE the moved file is hashed. ``lstat`` (not ``stat``) so a symlink is
+        # judged as itself rather than as whatever it points at.
+        probe: List[str] = []
+        for path in candidates:
+            try:
+                info = os.lstat(os.path.join(root, path))
+            except OSError:
+                continue
+            if stat.S_ISREG(info.st_mode) and info.st_size in sizes:
+                probe.append(os.path.join(root, path))
+        if not probe:
+            return set()
+        hashed = _run_batched_stdout(
+            run, ["git", "hash-object", "--"], probe, cwd=cwd)
+        if hashed is None:
+            return set()
+        destinations = set(hashed.split())
+        return {src for src, sha in blobs.items() if sha in destinations}
+    except (subprocess.SubprocessError, OSError, UnicodeDecodeError, ValueError):
+        return set()
+
+
 def _fmt_droppings(paths: Sequence[str], limit: int = 6) -> str:
     """A compact, bounded rendering of the excluded paths for the log line."""
     shown = ", ".join(paths[:limit])
@@ -982,8 +1162,9 @@ def _stage_all(
     notice: Callable[..., str] = automation_notice,
 ) -> "subprocess.CompletedProcess[str]":
     """``git add -A`` for the round's commit, minus editor/backup droppings, any
-    deleted source file paired with one (:func:`_risky_delete_pairs`), and — for a
-    cold worktree — every UNTRACKED runner artifact (:func:`_is_runner_dropping`:
+    deleted source file paired with one (:func:`_risky_delete_pairs`) or moved into
+    a runner dir by an unstaged rename (:func:`_renamed_into_runner_sources`), and
+    — for a cold worktree — every UNTRACKED runner artifact (:func:`_is_runner_dropping`:
     ``node_modules/``, ``target/``, ``build/``, ``bin/Debug/``, coverage output,
     …). Runner artifacts are held back by a FIXED, count-INDEPENDENT glob pathspec
     set (:func:`_runner_exclude_pathspecs`), so a tree with thousands of untracked
@@ -1016,12 +1197,23 @@ def _stage_all(
         if (xy[0] in "RC" or xy[1] in "RC") and _is_dropping(path)
     })
     if rename_droppings:
-        _run_batched(run, ["git", "reset", "-q", "--"],
+        reset_result = _run_batched(run, ["git", "reset", "-q", "--"],
                      [f":(top,literal){p}" for p in rename_droppings], cwd=cwd)
+        if reset_result is not None and getattr(reset_result, "returncode", 1) != 0:
+            return reset_result
         entries = _status_entries(cwd, run=run)
     droppings = [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
     risky = _risky_delete_pairs(entries)
-    excluded = droppings + sorted(risky)  # editor droppings: per-file
+    # An UNSTAGED rename INTO a runner dir (``mv src/old.py build/new.py``) arrives
+    # as ``D src/old.py`` + ``?? build/new.py`` — no ``R`` record, so the staged-
+    # rename decomposition above never sees it. The runner glob below holds the
+    # DESTINATION back, so staging the source's deletion on its own would drop the
+    # file from the PR outright. Hold the source back too (:func:`_renamed_into_
+    # runner_sources`), the same two-half protection a backup-then-replace pair
+    # gets. Paths already held back as a risky-delete pair are dropped here so the
+    # operator gets ONE notice about them, not two.
+    moved_into_runner = _renamed_into_runner_sources(cwd, entries, run=run) - risky
+    excluded = droppings + sorted(risky | moved_into_runner)  # per-file holds
 
     # ── Runner droppings (cold-worktree hardening) ───────────────────────────────
     # A cold worktree's gate run drops dependency-install / build / cache /
@@ -1065,7 +1257,7 @@ def _stage_all(
     tracked_runner = sorted({path for xy, path in entries
                              if _is_runner_dropping(path) and not _new_to_head(xy)
                              and xy[1] != " "}
-                            - risky)
+                            - risky - moved_into_runner)
     prestaged_runner = sorted({
         path for xy, path in entries
         if _is_runner_dropping(path) and _new_to_head(xy) and xy != "??"})
@@ -1091,7 +1283,9 @@ def _stage_all(
     # already used for the ``git add`` exclude below.
     resets = [f":(top,literal){p}" for p in excluded + prestaged_runner]
     if resets:
-        _run_batched(run, ["git", "reset", "-q", "--"], resets, cwd=cwd)
+        reset_result = _run_batched(run, ["git", "reset", "-q", "--"], resets, cwd=cwd)
+        if reset_result is not None and getattr(reset_result, "returncode", 1) != 0:
+            return reset_result
     # The runner glob excludes are ALWAYS applied from here on (even with no editor
     # excludes), so an untracked ``node_modules`` never rides in; when nothing
     # matches them the add is behaviourally a plain ``git add -A``.
@@ -1160,6 +1354,15 @@ def _stage_all(
                    f"excluded backup dropping — looks like an in-place rewrite that "
                    f"failed mid-way (moved to a backup, never recreated); resolve "
                    f"manually: {_fmt_droppings(sorted_risky)}",
+                   status="stop")
+        if moved_into_runner:
+            sorted_moved = sorted(moved_into_runner)
+            notice("stage",
+                   f"held back {len(moved_into_runner)} deleted source file(s) whose "
+                   f"content was moved INTO a runner artifact dir "
+                   f"(node_modules/target/build/coverage/…) — that destination is NOT "
+                   f"committed, so committing the deletion alone would drop the file "
+                   f"from the PR; resolve manually: {_fmt_droppings(sorted_moved)}",
                    status="stop")
     return add
 
@@ -1417,14 +1620,27 @@ def exit_rebase(
                            "(detached HEAD or no upstream) — not rebasing")
 
     # 2. The worktree MUST be clean — a rebase needs it, and a dirty tree is a
-    #    poisoned/unverifiable state we never rebase or force-push.
+    #    poisoned/unverifiable state we never rebase or force-push. The ONE
+    #    tolerated residue is what the staging guard deliberately withheld from the
+    #    fix commit (:func:`_held_back_new_artifacts` — a cold worktree's untracked
+    #    ``node_modules/`` / ``target/`` / coverage tree, an editor dropping). A
+    #    cold-worktree round ENDS in exactly that state by design, so reading it as
+    #    "dirty" would silently skip the base rebase on every such PR and strand it
+    #    behind its base — while :func:`_assert_clean_after_commit`, reading the
+    #    same worktree through the same predicate, calls it legitimate.
+    #    See :func:`_dirty_beyond_held_back` for exactly what stays intolerable.
+    #    ``-z --untracked-files=all`` matches :func:`_assert_clean_after_commit`
+    #    byte for byte, so the two can never disagree about what is residue: plain
+    #    porcelain C-quotes a non-ASCII name, which would read as unrecognised
+    #    residue and skip a rebase that is in fact fine.
     try:
-        st = run(["git", "status", "--porcelain"], cwd=cwd)
+        st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                 cwd=cwd)
     except (subprocess.SubprocessError, OSError) as exc:
         return "skipped", f"could not read the worktree state ({exc}) — not rebasing"
     if getattr(st, "returncode", 1) != 0:
         return "skipped", "could not read the worktree state — not rebasing"
-    if (getattr(st, "stdout", "") or "").strip():
+    if _dirty_beyond_held_back(getattr(st, "stdout", "") or ""):
         return "skipped", "the worktree has uncommitted changes — not rebasing"
 
     # 3. Snapshot the pre-rebase SHA so any failure restores the branch exactly.
@@ -1543,9 +1759,15 @@ def exit_rebase(
 
     # 6b. A clean rebase leaves a clean tree. If anything is dirty (should never
     #     happen on a zero exit), restore and bail rather than force-push a mess.
+    #     Read through the SAME filter as the step-2 precondition: the held-back
+    #     runner artifacts we entered with are still sitting there afterwards, so
+    #     counting them as dirty here would roll every cold-worktree rebase straight
+    #     back and report ``error`` for a rebase that in fact succeeded.
     try:
-        st2 = run(["git", "status", "--porcelain"], cwd=cwd)
-        dirty_after = bool((getattr(st2, "stdout", "") or "").strip())
+        st2 = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                  cwd=cwd)
+        dirty_after = (getattr(st2, "returncode", 1) != 0
+                       or _dirty_beyond_held_back(getattr(st2, "stdout", "") or ""))
     except (subprocess.SubprocessError, OSError):
         dirty_after = True
     if dirty_after:
