@@ -1084,6 +1084,66 @@ def test_an_unrelated_deletion_beside_an_artifact_still_commits(git_repo):
     assert not [n for n in notices if "moved INTO" in n[1]], notices
 
 
+def test_an_empty_deletion_is_never_paired_with_an_empty_artifact(git_repo):
+    """A 0-byte blob is not an identity. EVERY empty file hashes to `e69de29…`, so a
+    deleted empty source (`__init__.py`, `py.typed`, `.gitkeep`) sitting beside any
+    empty untracked artifact (cargo's 0-byte `target/debug/.cargo-lock`) would pair
+    on that shared sha and hold a real deletion out of the PR — a silent no-op round
+    the tripwire then reports as `pushed`. The size gate must skip the degenerate
+    size entirely: no hash probe runs, and the deletion commits like any other."""
+    _write(git_repo, "src/pkg/__init__.py", "")
+    _write(git_repo, "src/pkg/mod.py", "OLD = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "src/pkg/__init__.py").unlink()          # an ORDINARY deletion
+    _write(git_repo, "target/debug/.cargo-lock", "")     # cargo's 0-byte dropping
+    _write(git_repo, "real.txt", "the fix\n")
+
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    entries = commit_push._status_entries(str(git_repo), run=run)
+    assert commit_push._renamed_into_runner_sources(
+        str(git_repo), entries, run=run) == set()
+    assert not [c for c in calls if c[:2] == ["git", "hash-object"]], calls
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"src/pkg/__init__.py", "real.txt"}
+    assert not [n for n in notices if "moved INTO" in n[1]], notices
+
+
+def test_a_non_empty_move_still_pairs_beside_an_empty_deletion(git_repo):
+    """The 0-byte skip is surgical, not a disabling: with BOTH an empty deletion and
+    a real move into a runner dir in one tree, the empty one is ignored and the real
+    pair is still caught and held back."""
+    _write(git_repo, "src/pkg/py.typed", "")
+    _write(git_repo, "src/old.py", "PRECIOUS = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "src/pkg/py.typed").unlink()
+    (git_repo / "target").mkdir()
+    (git_repo / "src/old.py").rename(git_repo / "target/new.py")
+    _write(git_repo, "target/debug/.cargo-lock", "")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert commit_push._renamed_into_runner_sources(
+        str(git_repo), entries) == {"src/old.py"}
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"src/pkg/py.typed"}     # the real pair held back
+    assert any(n[2] == "stop" and "src/old.py" in n[1] for n in notices), notices
+
+
 def test_the_move_probe_never_hashes_a_size_mismatched_tree(git_repo):
     """THE cost guard: a cold `node_modules` must be stat'd, never READ. Only a
     candidate whose size already matches a deleted blob is handed to

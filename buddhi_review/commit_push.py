@@ -1219,7 +1219,10 @@ def _renamed_into_runner_sources(
     Paired by CONTENT IDENTITY — the destination's blob hash equals the source's
     INDEX blob hash — never by name: a move that also renames the file carries no
     name relationship to key on, so a name-based pair would be a guess, not a fact
-    (cf. :func:`_backup_source`). Cost is bounded: the probe runs at all only when
+    (cf. :func:`_backup_source`). An EMPTY deleted blob is never paired at all, for
+    the same reason: every empty file in existence hashes to one sha, so matching it
+    is not evidence of a move — a deleted ``__init__.py`` beside any 0-byte runner
+    artifact would otherwise read as one. Cost is bounded: the probe runs at all only when
     the tree holds BOTH a worktree deletion and a new runner artifact, and only
     candidates whose SIZE already matches a deleted blob are hashed — a cold
     ``node_modules`` of thousands of files is stat'd, never read. Best-effort: any
@@ -1274,7 +1277,15 @@ def _renamed_into_runner_sources(
                 blob_sizes[sha] = int((getattr(r, "stdout", "") or "").strip())
             except ValueError:
                 continue
-        sizes: Set[int] = set(blob_sizes.values())
+        # A 0-byte blob is NO identity at all: EVERY empty file hashes to the same
+        # sha (``e69de29…``), so admitting that size would let any empty untracked
+        # artifact (cargo's 0-byte ``target/debug/.cargo-lock``, an empty file an
+        # npm package ships) "match" an unrelated deleted empty source (a package's
+        # ``__init__.py``, ``py.typed``, ``.gitkeep``) and hold that deletion out of
+        # the fix commit. Content identity is a FACT only for a non-empty blob;
+        # pairing on the degenerate one is exactly the guess this function refuses
+        # to make, so the size gate never admits it.
+        sizes: Set[int] = {n for n in blob_sizes.values() if n}
         if not sizes:
             return set()
         # The SIZE gate is what keeps this cheap: a size mismatch rules a candidate
