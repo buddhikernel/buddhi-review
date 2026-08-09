@@ -1783,17 +1783,53 @@ def commit_and_push(
     arbiter. ``answer_wait`` is the
     :func:`buddhi_review.escalation_wait.wait_for_answer` seam. ``repo``
     (``owner/repo``) scopes the gate's per-repo ``test_command`` resolution."""
-    status = run(["git", "status", "--porcelain"], cwd=cwd)
+    # Is there anything to do at all? Read through the SAME ``-z
+    # --untracked-files=all`` form and the SAME residue predicate
+    # (:func:`_dirty_beyond_held_back`) as the clean-tree tripwire
+    # (:func:`_assert_clean_after_commit`) and the rebase precondition
+    # (:func:`exit_rebase`), so all three agree on what counts as an uncommitted
+    # change. A bare ``.strip()`` over raw porcelain was self-healing only while
+    # ``git add -A`` swept runner output into the commit: now that a cold worktree's
+    # untracked ``node_modules/`` / ``target/`` / coverage tree is held back
+    # PERMANENTLY (:func:`_held_back_new_artifacts`), porcelain reports it as
+    # uncommitted on EVERY round of every JS/Rust/JVM/Python repo — so a genuinely
+    # no-op round (a fixer that reported ``fixed`` but changed nothing on disk)
+    # would fall through to the minutes-long test gate, and a suite that is red for
+    # pre-existing reasons would escalate and let the operator's "stop" end a run
+    # that changed nothing.
+    try:
+        status = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                     cwd=cwd)
+    # ``UnicodeDecodeError`` (a ValueError, so NOT covered by the other two) is
+    # reachable only because of the ``-z`` above: plain porcelain C-quotes a
+    # non-UTF-8 path into pure ASCII, ``-z`` emits those bytes verbatim and
+    # ``_default_run`` decodes strictly. Same tuple :func:`_status_entries` uses for
+    # this exact command shape.
+    except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
+        return "error"
     if status.returncode != 0:
         return "error"
-    if not (status.stdout or "").strip():
+    if not _dirty_beyond_held_back(status.stdout or "", cwd, run=run):
         return "nothing"
 
     # Shift-left advisory: name a fixer-introduced syntax error in the round's
     # changed files in milliseconds, before the (possibly minutes-long) test gate.
     # ADVISORY ONLY — it never blocks the commit/push, and runs even when the gate
     # is disabled so the off-mode bypass can't defeat it.
-    _advisory_syntax_precheck(cwd, status.stdout or "", notice=notice)
+    # It gets its OWN read, in the LINE-based porcelain form, rather than reusing
+    # the ``status`` above: :func:`_changed_paths_from_porcelain` parses lines, which
+    # the NUL-separated ``-z`` output has none of, and ``--untracked-files=all``
+    # would hand the checker every individual file of a cold worktree's untracked
+    # ``node_modules`` tree in place of the single collapsed ``node_modules/``
+    # directory entry its isfile filter drops for free. Best-effort: any failure
+    # yields an empty porcelain, i.e. no advisory — never a blocked commit.
+    try:
+        line_status = run(["git", "status", "--porcelain"], cwd=cwd)
+        porcelain = (getattr(line_status, "stdout", "") or ""
+                     if getattr(line_status, "returncode", 1) == 0 else "")
+    except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
+        porcelain = ""
+    _advisory_syntax_precheck(cwd, porcelain, notice=notice)
 
     if test_gate:
         reruns = 0

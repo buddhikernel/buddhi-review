@@ -19,7 +19,7 @@ import subprocess
 
 import pytest
 
-from buddhi_review import commit_push, test_runner
+from buddhi_review import commit_push, round_driver, test_runner
 
 
 def _git(cwd, *args):
@@ -1527,6 +1527,87 @@ def test_exit_rebase_still_skips_on_a_genuinely_dirty_tree(tmp_path):
     status, detail = commit_push.exit_rebase(
         str(work), base="main", notice=_rec_notice([]))
     assert status == "skipped" and "uncommitted changes" in detail
+
+
+# ── 1h. The round's "is there anything to do?" reads the same filter ─────────────
+
+
+def test_an_artifacts_only_round_is_still_a_no_op(tmp_path, monkeypatch):
+    """REGRESSION. `commit_and_push`'s entry short-circuit was self-healing only
+    while `git add -A` swept the runner output into the commit. With the artifacts
+    held back PERMANENTLY, a raw-porcelain check reports `?? node_modules/` on every
+    round of every JS/Rust/JVM repo — so a round with nothing to commit would fall
+    through to the (minutes-long) test gate, and a suite red for pre-existing
+    reasons would escalate and let the operator's "stop" end a no-op run."""
+    work = _rebase_repo(tmp_path)
+    _write(work, "node_modules/left-pad/index.js", "// dep\n")
+    _write(work, "build/out.o", "OBJ\n")
+    _write(work, "stale.bak", "backup\n")
+
+    def never(*a, **k):
+        raise AssertionError("the test gate ran on a round with nothing to commit")
+
+    monkeypatch.setattr(commit_push, "run_test_gate", never)
+    assert commit_push.commit_and_push(
+        str(work), message="m", notice=_rec_notice([])) == "nothing"
+
+
+def test_a_clean_tree_is_still_a_no_op(tmp_path, monkeypatch):
+    """The relaxation never weakens the original short-circuit: a genuinely clean
+    worktree returns `nothing` without reaching the gate, exactly as before."""
+    work = _rebase_repo(tmp_path)
+
+    def never(*a, **k):
+        raise AssertionError("the test gate ran on a clean worktree")
+
+    monkeypatch.setattr(commit_push, "run_test_gate", never)
+    assert commit_push.commit_and_push(
+        str(work), message="m", notice=_rec_notice([])) == "nothing"
+
+
+def test_a_real_edit_beside_the_artifacts_still_commits(tmp_path):
+    """The filter is EXACTLY the held-back set: a real edit sitting next to the
+    withheld artifacts still reaches the commit and the push."""
+    work = _rebase_repo(tmp_path)
+    _write(work, "node_modules/left-pad/index.js", "// dep\n")
+    _write(work, "feat.py", "f = 2\n")
+
+    assert commit_push.commit_and_push(
+        str(work), message="m", test_gate=False, notice=_rec_notice([])) == "pushed"
+    landed = subprocess.run(["git", "show", "--name-only", "--format=", "HEAD"],
+                            cwd=work, capture_output=True, text=True, check=True)
+    assert "feat.py" in landed.stdout and "node_modules" not in landed.stdout
+
+
+def test_the_syntax_precheck_still_reads_a_parseable_porcelain(tmp_path):
+    """REGRESSION GUARD for the `-z` switch above: `_changed_paths_from_porcelain`
+    parses LINES, so feeding it the NUL-separated status would silently disable the
+    advisory. The precheck keeps its own line-based read."""
+    work = _rebase_repo(tmp_path)
+    _write(work, "feat.py", "def broken(:\n")
+    notices = []
+
+    commit_push.commit_and_push(str(work), message="m", test_gate=False,
+                                notice=_rec_notice(notices))
+    assert any(a == "syntax pre-check" and "feat.py" in d for a, d, _ in notices)
+
+
+def test_worktree_has_changes_ignores_the_held_back_artifacts(tmp_path):
+    """The driver's has-file-changes probe is `or`'d into `take_substantive_round`,
+    so a raw-porcelain read of a permanently-dirty cold worktree would make every
+    round look substantive and advance `_last_substantive_head` to a head that never
+    moved."""
+    work = _rebase_repo(tmp_path)
+    _write(work, "node_modules/left-pad/index.js", "// dep\n")
+    _write(work, "build/out.o", "OBJ\n")
+
+    driver = round_driver.RoundDriver.__new__(round_driver.RoundDriver)
+    driver.cwd = str(work)
+    driver.gh_run = commit_push._default_run
+    assert driver._worktree_has_changes() is False
+
+    _write(work, "feat.py", "f = 2\n")                    # a real uncommitted edit
+    assert driver._worktree_has_changes() is True
 
 
 # ── 2. Per-runner gate timeout ───────────────────────────────────────────────────
