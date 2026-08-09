@@ -58,7 +58,7 @@ import stat
 import subprocess
 import sys
 from typing import (
-    Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple,
+    AbstractSet, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple,
 )
 
 from buddhi_review import config, lang_syntax, merge, test_runner
@@ -159,7 +159,11 @@ _RUNNER_DROPPING_DIRS = frozenset({
 # fixed child segment to key on, and a source-`build/`-vs-output-`build/` split is
 # not expressible in the git-pathspec exclude layer that does the real holding-
 # back. A TRACKED file under a source `build/` still lands via the per-file
-# recovery; only a NEW untracked file under a `build/` stays out.
+# recovery, and a NEW file the fixer added DIRECTLY BESIDE committed source in one
+# of these dirs is recovered the same way (`_tracked_source_dirs` — the repo having
+# committed content in that exact directory is the evidence that it is source, not
+# runner output). Only a NEW file under a directory holding no committed content at
+# all — every real Gradle/CMake/cargo output tree — stays out.
 _RUNNER_DROPPING_PARENT_DIRS = frozenset({
     "build",              # Gradle / CMake / generic build output
     "target",             # cargo (and Maven) build output
@@ -200,7 +204,26 @@ def _is_dropping(path: str) -> bool:
     return any(fnmatch.fnmatchcase(base, g) for g in _DROPPING_GLOBS)
 
 
-def _is_runner_dropping(path: str) -> bool:
+def _is_hard_runner_dropping(segs: Sequence[str]) -> bool:
+    """The UNAMBIGUOUS half of :func:`_is_runner_dropping`, split out so the
+    ambiguous half can be overridden without ever weakening this one: an
+    :data:`_RUNNER_DROPPING_DIRS` segment (nothing but a runner tree is called
+    ``node_modules`` or ``.pytest_cache``), a dotnet ``bin/{Debug,Release}`` /
+    ``obj/{Debug,Release}`` build-output dir, or an :data:`_RUNNER_DROPPING_FILES`
+    coverage file. No repo evidence can make one of these source, so a
+    ``build/node_modules/x.js`` inside the repo's own committed ``build/`` stays an
+    artifact."""
+    if any(s in _RUNNER_DROPPING_DIRS for s in segs):
+        return True
+    for i, s in enumerate(segs[:-1]):
+        if (s in _RUNNER_DROPPING_DOTNET_DIRS
+                and segs[i + 1] in _RUNNER_DROPPING_DOTNET_CONFIGS):
+            return True
+    return segs[-1] in _RUNNER_DROPPING_FILES
+
+
+def _is_runner_dropping(path: str, *,
+                        source_dirs: AbstractSet[str] = frozenset()) -> bool:
     """True iff ``path`` is — or lies under — a :data:`_RUNNER_DROPPING_DIRS`
     directory, lies UNDER a :data:`_RUNNER_DROPPING_PARENT_DIRS` directory (those
     names double as ordinary file names, so they count only with a child segment
@@ -211,6 +234,20 @@ def _is_runner_dropping(path: str) -> bool:
     actually holds back) so the held-back set, the tracked-file recovery, and the
     clean-tree tripwire never drift from the real staging behaviour.
 
+    ``source_dirs`` (from :func:`_tracked_source_dirs`) is the ONE thing that can
+    overturn a match, and only the AMBIGUOUS ``build``/``target``/``deps``/
+    ``coverage`` one: a directory that DIRECTLY holds files committed in HEAD is
+    source by the repo's own evidence, so a fixer's new ``build/new_rule.py``
+    sitting beside a committed ``build/existing.py`` is a real edit, not runner
+    output. Without
+    that escape the guard held such a file out of the fix commit AND hid it from
+    the clean-tree tripwire, so the round reported ``pushed`` with the fix missing.
+    Callers that cannot consult the repo (or are asking what the FIXED glob layer
+    holds back, which knows nothing of tracked-ness) pass nothing and get the
+    unchanged path-only answer. The override never applies to a porcelain
+    directory entry (a trailing ``/`` — an untracked nested git repo), which must
+    keep being held back rather than staged as a stray gitlink.
+
     ``/`` is the ONLY separator recognised, deliberately: ``git status``'s
     porcelain emits ``/``-separated paths on every platform (Windows included)
     and :func:`_runner_globs` emits ``/``-only globs, so treating a literal
@@ -218,21 +255,19 @@ def _is_runner_dropping(path: str) -> bool:
     this predicate claim a file (basename ``bin\\Debug\\App.dll``) that the git
     exclude layer cannot match, which would report the file as held back while it
     rode into the commit."""
-    norm = (path or "").strip("/")
+    raw = path or ""
+    norm = raw.strip("/")
     if not norm:
         return False
     segs = norm.split("/")
-    if any(s in _RUNNER_DROPPING_DIRS for s in segs):
+    if _is_hard_runner_dropping(segs):
         return True
     # ``segs[:-1]`` only — a name that is also a plausible FILE name counts as a
     # runner dir solely when something lives under it.
-    if any(s in _RUNNER_DROPPING_PARENT_DIRS for s in segs[:-1]):
-        return True
-    for i, s in enumerate(segs[:-1]):
-        if (s in _RUNNER_DROPPING_DOTNET_DIRS
-                and segs[i + 1] in _RUNNER_DROPPING_DOTNET_CONFIGS):
-            return True
-    return segs[-1] in _RUNNER_DROPPING_FILES
+    if not any(s in _RUNNER_DROPPING_PARENT_DIRS for s in segs[:-1]):
+        return False
+    return not (source_dirs and not raw.endswith("/")
+                and "/".join(segs[:-1]) in source_dirs)
 
 
 def _runner_globs() -> List[str]:
@@ -715,7 +750,8 @@ def _assert_clean_after_commit(
     # (:func:`_held_back_new_artifacts`) so the two can never drift. A
     # genuinely-lost non-dropping edit still fires the tripwire.
     entries = list(_iter_porcelain_z(getattr(r, "stdout", "") or ""))
-    held_back = _held_back_new_artifacts(entries)
+    held_back = _held_back_new_artifacts(
+        entries, source_dirs=_tracked_source_dirs(cwd, entries, run=run))
     residue = [path for _xy, path in entries if path not in held_back]
     if not residue:
         return
@@ -933,7 +969,8 @@ def _risky_delete_pairs(entries: Sequence[Tuple[str, str]]) -> Set[str]:
     return deleted & sources
 
 
-def _dirty_beyond_held_back(porcelain_z: str) -> bool:
+def _dirty_beyond_held_back(porcelain_z: str, cwd: Optional[str] = None, *,
+                            run: Run = _default_run) -> bool:
     """True iff ``git status --porcelain -z --untracked-files=all`` output shows an
     uncommitted change BEYOND the NEW artifacts the staging guard deliberately
     withheld from the fix commit (:func:`_held_back_new_artifacts`) — the
@@ -945,13 +982,22 @@ def _dirty_beyond_held_back(porcelain_z: str) -> bool:
     blocks ``git rebase``; anything carrying an index or tracked-worktree delta —
     including the held-back half of a risky-delete / moved-into-a-runner-dir pair,
     deliberately absent from that set — would make the rebase itself fail, so it
-    still counts as dirty."""
+    still counts as dirty.
+
+    ``cwd`` lets the same tracked-source-dir question be asked here as at staging
+    time (:func:`_tracked_source_dirs`); without it the two predicates would part
+    ways, and an uncommitted new file beside committed source in a ``build/`` would
+    read as a withheld artifact and let a rebase run over it."""
     entries = list(_iter_porcelain_z(porcelain_z or ""))
-    held_back = _held_back_new_artifacts(entries)
+    source_dirs = _tracked_source_dirs(cwd, entries, run=run) if cwd else frozenset()
+    held_back = _held_back_new_artifacts(entries, source_dirs=source_dirs)
     return any(xy != "??" or path not in held_back for xy, path in entries)
 
 
-def _held_back_new_artifacts(entries: Sequence[Tuple[str, str]]) -> Set[str]:
+def _held_back_new_artifacts(
+    entries: Sequence[Tuple[str, str]], *,
+    source_dirs: AbstractSet[str] = frozenset(),
+) -> Set[str]:
     """The NEW-to-HEAD paths :func:`_stage_all` deliberately holds out of the fix
     commit: an editor/backup dropping (:func:`_is_dropping`) and — for a cold
     worktree — an untracked RUNNER artifact (:func:`_is_runner_dropping`:
@@ -963,9 +1009,16 @@ def _held_back_new_artifacts(entries: Sequence[Tuple[str, str]]) -> Set[str]:
     artifact reads as a legitimate no-op, not as a fixer's lost edits. The
     risky-delete pair (:func:`_risky_delete_pairs`) is deliberately NOT in this
     set — that deletion IS a lost real-file change and must keep firing the
-    tripwire."""
+    tripwire.
+
+    ``source_dirs`` (:func:`_tracked_source_dirs`) must be the SAME answer
+    :func:`_stage_all` staged by, or this set over-claims: a new file beside
+    committed source in a ``build/`` is recovered into the commit, so calling it
+    held-back would hide a genuinely lost edit from the tripwire. Callers pass what
+    the repo says; the empty default is the path-only reading."""
     return {path for xy, path in entries
-            if (_is_dropping(path) or _is_runner_dropping(path))
+            if (_is_dropping(path)
+                or _is_runner_dropping(path, source_dirs=source_dirs))
             and _new_to_head(xy)}
 
 
@@ -1062,14 +1115,95 @@ def _run_batched_stdout(
     return "".join(out) if _flush() else None
 
 
+def _ambiguous_runner_parents(
+    entries: Sequence[Tuple[str, str]],
+) -> Dict[str, str]:
+    """``{immediate parent dir -> outermost ambiguous-dir prefix}`` for every NEW
+    path in ``entries`` that is runner-classified ONLY by the ambiguous
+    :data:`_RUNNER_DROPPING_PARENT_DIRS` rule — the candidates
+    :func:`_tracked_source_dirs` has to ask HEAD about, and the ONLY paths a
+    ``source_dirs`` answer can rescue.
+
+    The prefix is the LOOKUP SCOPE, not the answer: one ``git ls-tree`` over
+    ``build`` enumerates every committed file below it, so a tree with a thousand
+    output subdirectories still costs one pathspec. NEW-only because a TRACKED file
+    under a runner dir already reaches the commit via
+    :func:`_stage_all`'s per-file recovery; a porcelain DIRECTORY entry (trailing
+    ``/`` — an untracked nested repo, the one thing ``--untracked-files=all`` does
+    not expand) is skipped so it can never be staged as a stray gitlink."""
+    parents: Dict[str, str] = {}
+    for xy, path in entries:
+        raw = path or ""
+        if raw.endswith("/") or not _new_to_head(xy):
+            continue
+        segs = raw.strip("/").split("/")
+        if len(segs) < 2 or _is_hard_runner_dropping(segs):
+            continue
+        for i, seg in enumerate(segs[:-1]):
+            if seg in _RUNNER_DROPPING_PARENT_DIRS:
+                parents.setdefault("/".join(segs[:-1]), "/".join(segs[: i + 1]))
+                break
+    return parents
+
+
+def _tracked_source_dirs(
+    cwd: str, entries: Sequence[Tuple[str, str]], *, run: Run = _default_run,
+) -> Set[str]:
+    """Of the ambiguous runner-dir parents in ``entries``
+    (:func:`_ambiguous_runner_parents`), those that DIRECTLY hold at least one file
+    COMMITTED IN HEAD — the repo's own evidence that it keeps SOURCE in that exact
+    directory, so a NEW file the fixer put there is an edit to commit, not runner
+    output to withhold (see :func:`_is_runner_dropping`'s ``source_dirs``).
+
+    DIRECTLY is the whole discriminator, and it is what keeps the escape hatch from
+    swallowing real build output: a repo that commits ``build/scripts/deploy.sh``
+    proves ``build/scripts`` is source, NOT ``build`` — so Gradle's fresh
+    ``build/classes/Main.class`` (whose parent holds nothing committed) is still
+    held back.
+
+    ``ls-tree HEAD``, never ``ls-files``, is LOAD-BEARING: the INDEX is writable by
+    the very actors this guard defends against, so a fixer's ``git add -N
+    build/artifact.js`` (or a plain ``git add -A`` over a cold tree) would
+    manufacture its own proof that ``build/`` is a source dir and walk the whole
+    artifact subtree into the PR. HEAD is written only by a commit, so the evidence
+    always predates the round.
+
+    Best-effort by design: any git/OS failure — including the unborn HEAD of a
+    repo with no commits — returns an empty set, which is exactly the pre-existing
+    (hold-everything-back) behaviour."""
+    parents = _ambiguous_runner_parents(entries)
+    if not parents:
+        return set()
+    try:
+        listing = _run_batched_stdout(
+            run, ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--"],
+            [f":(top,literal){d}" for d in sorted(set(parents.values()))], cwd=cwd)
+    except (subprocess.SubprocessError, OSError, UnicodeDecodeError, ValueError):
+        return set()
+    if listing is None:
+        return set()
+    # ``rpartition`` (not a segment rebuild) so a committed FILE named ``build``
+    # yields ``""`` — it is emphatically not evidence that a ``build/`` DIRECTORY
+    # holds source; that shape is the runner-replaced-a-build-script case whose
+    # whole subtree must keep being held back.
+    holding = {p.rpartition("/")[0] for p in listing.split("\0") if p}
+    return set(parents) & holding
+
+
 def _renamed_into_runner_sources(
     cwd: str, entries: Sequence[Tuple[str, str]], *, run: Run = _default_run,
+    source_dirs: AbstractSet[str] = frozenset(),
 ) -> Set[str]:
     """Deleted, still-tracked source paths from ``entries`` whose exact content is
     sitting in a NEW runner-classified path (:func:`_is_runner_dropping`) the glob
     exclude is about to hold back — an UNSTAGED rename INTO a runner dir (``mv
-    src/old.py build/new.py``, or a fixer's ``mv build/old.sh build/new.sh`` inside
-    a repo's own tracked ``build/``).
+    src/old.py build/new.py``).
+
+    ``source_dirs`` (:func:`_tracked_source_dirs`) is threaded through to that
+    predicate, so a move INSIDE the repo's own committed ``build/`` (``mv
+    build/old.sh build/new.sh``) is not a candidate at all: that destination is
+    recovered into the commit as ordinary source, making the move an ordinary
+    rename rather than a pair to withhold and hand to a human.
 
     Git does NO rename detection here: the destination has no index entry, so
     porcelain reports a plain ``D <src>`` + ``?? <dest>`` pair, not the ``R``
@@ -1089,11 +1223,25 @@ def _renamed_into_runner_sources(
     the tree holds BOTH a worktree deletion and a new runner artifact, and only
     candidates whose SIZE already matches a deleted blob are hashed — a cold
     ``node_modules`` of thousands of files is stat'd, never read. Best-effort: any
-    git/OS failure returns an empty set, leaving the guard exactly as it was."""
+    git/OS failure returns an empty set, leaving the guard exactly as it was.
+
+    A SYMLINK destination (``mv src/link build/link``) is paired the same way but
+    through a second, separate route, because ``git hash-object`` FOLLOWS a symlink
+    — handed ``build/link`` it returns the hash of whatever the link POINTS AT, so
+    routing symlinks through the regular probe would not merely miss the pair, it
+    could invent one. Git stores a symlink as a blob holding the link TARGET, so
+    the honest comparison is ``os.readlink`` against the deleted entry's own index
+    blob (``git cat-file -p``), restricted to index entries whose MODE is
+    ``120000``. That restriction makes the symlink route purely additive: it can
+    only find pairs the regular route structurally cannot, never re-pair or unpair
+    anything the regular route already decided. ``lstat``'s ``st_size`` for a
+    symlink IS the target's byte length, so the same size gate bounds this route
+    too."""
     deleted = sorted({path for xy, path in entries
                       if len(xy) > 1 and xy[1] == "D" and not _new_to_head(xy)})
     candidates = [path for xy, path in entries
-                  if _is_runner_dropping(path) and _new_to_head(xy)]
+                  if _is_runner_dropping(path, source_dirs=source_dirs)
+                  and _new_to_head(xy)]
     if not deleted or not candidates:
         return set()
     try:
@@ -1110,44 +1258,110 @@ def _renamed_into_runner_sources(
         if listing is None:
             return set()
         blobs: Dict[str, str] = {}          # deleted path -> its INDEX blob sha
+        modes: Dict[str, str] = {}          # deleted path -> its INDEX mode
         for rec in listing.split("\0"):
             meta, sep, path = rec.partition("\t")
             fields = meta.split()
             if sep and path and len(fields) >= 2:
                 blobs[path] = fields[1]
-        sizes: Set[int] = set()
+                modes[path] = fields[0]
+        blob_sizes: Dict[str, int] = {}     # blob sha -> its byte length
         for sha in sorted(set(blobs.values())):
             r = run(["git", "cat-file", "-s", sha], cwd=cwd)
             if getattr(r, "returncode", 1) != 0:
                 continue
             try:
-                sizes.add(int((getattr(r, "stdout", "") or "").strip()))
+                blob_sizes[sha] = int((getattr(r, "stdout", "") or "").strip())
             except ValueError:
                 continue
+        sizes: Set[int] = set(blob_sizes.values())
         if not sizes:
             return set()
         # The SIZE gate is what keeps this cheap: a size mismatch rules a candidate
         # out without reading a byte of it, so only the handful that could actually
         # BE the moved file is hashed. ``lstat`` (not ``stat``) so a symlink is
-        # judged as itself rather than as whatever it points at.
+        # judged as itself rather than as whatever it points at — and so the two
+        # kinds can be told apart and sent down the probe that fits each.
         probe: List[str] = []
+        links: List[str] = []
         for path in candidates:
             try:
                 info = os.lstat(os.path.join(root, path))
             except OSError:
                 continue
-            if stat.S_ISREG(info.st_mode) and info.st_size in sizes:
+            if info.st_size not in sizes:
+                continue
+            if stat.S_ISREG(info.st_mode):
                 probe.append(os.path.join(root, path))
-        if not probe:
+            elif stat.S_ISLNK(info.st_mode):
+                links.append(os.path.join(root, path))
+        if not probe and not links:
             return set()
-        hashed = _run_batched_stdout(
-            run, ["git", "hash-object", "--"], probe, cwd=cwd)
-        if hashed is None:
-            return set()
-        destinations = set(hashed.split())
-        return {src for src, sha in blobs.items() if sha in destinations}
+        destinations: Set[str] = set()
+        if probe:
+            hashed = _run_batched_stdout(
+                run, ["git", "hash-object", "--"], probe, cwd=cwd)
+            if hashed is None:
+                return set()
+            destinations = set(hashed.split())
+        matched = {src for src, sha in blobs.items() if sha in destinations}
+        if links:
+            matched |= _symlink_renamed_sources(
+                links, blobs, modes, blob_sizes, cwd=cwd, run=run)
+        return matched
     except (subprocess.SubprocessError, OSError, UnicodeDecodeError, ValueError):
         return set()
+
+
+# A git index/tree entry mode of ``120000`` is a SYMLINK; its blob holds the link
+# TARGET, not any file's contents.
+_GIT_SYMLINK_MODE = "120000"
+
+
+def _symlink_renamed_sources(
+    links: Sequence[str], blobs: Dict[str, str], modes: Dict[str, str],
+    blob_sizes: Dict[str, int], *, cwd: str, run: Run = _default_run,
+) -> Set[str]:
+    """The SYMLINK half of :func:`_renamed_into_runner_sources`: of its deleted
+    tracked paths (``blobs``: path -> index blob sha, ``modes``: path -> index
+    mode), those recorded as symlinks whose link TARGET is exactly what one of the
+    size-matched new symlink destinations ``links`` (absolute paths) points at.
+
+    Separate from the regular-file route because ``git hash-object`` dereferences a
+    symlink — it would compare the wrong bytes entirely. Both sides are read as the
+    link target instead: ``os.readlink`` on the destination, ``git cat-file -p`` on
+    the source's index blob (a symlink blob is the target string, no trailing
+    newline). Only ``120000`` sources are considered, so a deleted regular FILE
+    whose contents happen to spell a path is never mistaken for a moved symlink.
+
+    ``cat-file -p`` is reached only for a blob whose byte length equals some
+    destination link's target length, keeping the "never read a big blob" bound;
+    an unreadable or non-text blob is skipped, not fatal."""
+    targets: Set[str] = set()
+    for abs_path in links:
+        try:
+            targets.add(os.readlink(abs_path))
+        except OSError:
+            continue
+    if not targets:
+        return set()
+    target_sizes = {len(t.encode("utf-8", "surrogateescape")) for t in targets}
+    contents: Dict[str, Optional[str]] = {}
+    matched: Set[str] = set()
+    for src, sha in blobs.items():
+        if (modes.get(src) != _GIT_SYMLINK_MODE
+                or blob_sizes.get(sha) not in target_sizes):
+            continue
+        if sha not in contents:
+            try:
+                r = run(["git", "cat-file", "-p", sha], cwd=cwd)
+                contents[sha] = ((getattr(r, "stdout", "") or "")
+                                 if getattr(r, "returncode", 1) == 0 else None)
+            except (subprocess.SubprocessError, OSError, UnicodeDecodeError):
+                contents[sha] = None
+        if contents[sha] in targets:
+            matched.add(src)
+    return matched
 
 
 def _fmt_droppings(paths: Sequence[str], limit: int = 6) -> str:
@@ -1169,7 +1383,10 @@ def _stage_all(
     …). Runner artifacts are held back by a FIXED, count-INDEPENDENT glob pathspec
     set (:func:`_runner_exclude_pathspecs`), so a tree with thousands of untracked
     ``node_modules`` files never blows git's argv; a fixer's edit to a TRACKED file
-    under such a dir is recovered per-file and still committed.
+    under such a dir is recovered per-file and still committed, as is a NEW file the
+    fixer added beside committed source in an ambiguously-named ``build``/``target``/
+    ``deps``/``coverage`` dir (:func:`_tracked_source_dirs` — the glob is
+    source-blind, so those need the same per-file recovery).
 
     With nothing to exclude this is byte-identical to a plain ``git add -A``.
     Otherwise it stages the whole worktree (``:/`` — the top of the tree, so the
@@ -1204,6 +1421,11 @@ def _stage_all(
         entries = _status_entries(cwd, run=run)
     droppings = [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
     risky = _risky_delete_pairs(entries)
+    # Which ambiguously-named dirs (``build``/``target``/``deps``/``coverage``) this
+    # repo keeps SOURCE in, asked of the index ONCE and threaded through every
+    # runner classification below, so the staging decision, the notice, the move
+    # probe and the tripwire all read the same answer.
+    source_dirs = _tracked_source_dirs(cwd, entries, run=run)
     # An UNSTAGED rename INTO a runner dir (``mv src/old.py build/new.py``) arrives
     # as ``D src/old.py`` + ``?? build/new.py`` — no ``R`` record, so the staged-
     # rename decomposition above never sees it. The runner glob below holds the
@@ -1212,7 +1434,8 @@ def _stage_all(
     # runner_sources`), the same two-half protection a backup-then-replace pair
     # gets. Paths already held back as a risky-delete pair are dropped here so the
     # operator gets ONE notice about them, not two.
-    moved_into_runner = _renamed_into_runner_sources(cwd, entries, run=run) - risky
+    moved_into_runner = _renamed_into_runner_sources(
+        cwd, entries, run=run, source_dirs=source_dirs) - risky
     excluded = droppings + sorted(risky | moved_into_runner)  # per-file holds
 
     # ── Runner droppings (cold-worktree hardening) ───────────────────────────────
@@ -1251,22 +1474,44 @@ def _stage_all(
     #     per-file recovery below only ever sees porcelain's rename DESTINATION — the
     #     origin's deletion would silently never reach the commit, resurrecting the
     #     renamed-away file.
+    #   • ``source_children`` — a NEW file the fixer added DIRECTLY BESIDE committed
+    #     source in an ambiguously-named dir (``build/new_rule.py`` next to a
+    #     committed ``build/existing.py``). The FIXED glob layer knows nothing of
+    #     tracked-ness, so ``**/build/**`` holds it back exactly like real output;
+    #     it is RECOVERED per-file below with a plain ``git add`` (``-u`` cannot —
+    #     the path is untracked). Left out, the guard withheld the fixer's own new
+    #     file, the tripwire hid it, and the round reported ``pushed`` with the fix
+    #     missing. Editor droppings and both held-back pair halves are subtracted:
+    #     a ``build/src.py.bak`` must stay out however source-y its directory is.
     runner_excludes = _runner_exclude_pathspecs()
     untracked_runner = [path for xy, path in entries
-                        if _is_runner_dropping(path) and _new_to_head(xy)]
+                        if _is_runner_dropping(path, source_dirs=source_dirs)
+                        and _new_to_head(xy)]
+    # NO ``source_dirs`` here, deliberately: this list is "what the GLOB held back
+    # that must be put back", and the glob is source-blind. Narrowing it would
+    # strand a tracked ``build/keep.txt`` edit — excluded by the glob, then never
+    # recovered — which is the very loss this whole guard exists to prevent.
     tracked_runner = sorted({path for xy, path in entries
                              if _is_runner_dropping(path) and not _new_to_head(xy)
                              and xy[1] != " "}
                             - risky - moved_into_runner)
     prestaged_runner = sorted({
         path for xy, path in entries
-        if _is_runner_dropping(path) and _new_to_head(xy) and xy != "??"})
+        if _is_runner_dropping(path, source_dirs=source_dirs)
+        and _new_to_head(xy) and xy != "??"})
+    source_children = sorted(
+        {path for xy, path in entries
+         if _new_to_head(xy) and _is_runner_dropping(path)
+         and not _is_runner_dropping(path, source_dirs=source_dirs)}
+        - set(excluded))
 
     # Nothing to hold back of EITHER kind → a bare ``git add -A``, byte-identical to
     # a no-guard fix commit. The runner exclude globs are applied ONLY when the scan
     # actually found a runner path — a repo with none (the common case: its
     # ``.gitignore`` already covers node_modules/target, so they never reach the
-    # scan) pays no extra pathspecs.
+    # scan) pays no extra pathspecs. ``source_children`` is deliberately NOT a
+    # reason to leave this branch: with nothing else to withhold, the bare ``git
+    # add -A`` stages those files as the ordinary source they are.
     if (not excluded and not untracked_runner and not tracked_runner
             and not prestaged_runner):
         return run(["git", "add", "-A"], cwd=cwd)
@@ -1335,6 +1580,18 @@ def _stage_all(
             [f":(top,literal){p}" for p in tracked_runner], cwd=cwd)
         if recovered is not None:
             add = recovered
+    # Recover the fixer's NEW files added beside committed source in an
+    # ambiguously-named dir. A plain ``git add`` (no ``-u``, which only ever touches
+    # tracked paths, and no ``-A``, whose directory recursion is what leaked an
+    # artifact subtree before): every path here came from ``--untracked-files=all``
+    # porcelain as an individual FILE, and a porcelain DIRECTORY entry is excluded
+    # upstream in :func:`_is_runner_dropping`, so no pathspec here can name a tree.
+    if getattr(add, "returncode", 1) == 0 and source_children:
+        kept = _run_batched(
+            run, ["git", "add", "--"],
+            [f":(top,literal){p}" for p in source_children], cwd=cwd)
+        if kept is not None:
+            add = kept
     if getattr(add, "returncode", 1) == 0:
         if droppings:
             notice("stage",
@@ -1640,7 +1897,7 @@ def exit_rebase(
         return "skipped", f"could not read the worktree state ({exc}) — not rebasing"
     if getattr(st, "returncode", 1) != 0:
         return "skipped", "could not read the worktree state — not rebasing"
-    if _dirty_beyond_held_back(getattr(st, "stdout", "") or ""):
+    if _dirty_beyond_held_back(getattr(st, "stdout", "") or "", cwd, run=run):
         return "skipped", "the worktree has uncommitted changes — not rebasing"
 
     # 3. Snapshot the pre-rebase SHA so any failure restores the branch exactly.
@@ -1767,7 +2024,8 @@ def exit_rebase(
         st2 = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
                   cwd=cwd)
         dirty_after = (getattr(st2, "returncode", 1) != 0
-                       or _dirty_beyond_held_back(getattr(st2, "stdout", "") or ""))
+                       or _dirty_beyond_held_back(
+                           getattr(st2, "stdout", "") or "", cwd, run=run))
     except (subprocess.SubprocessError, OSError):
         dirty_after = True
     if dirty_after:

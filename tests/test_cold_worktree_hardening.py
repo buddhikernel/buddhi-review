@@ -674,6 +674,223 @@ def test_a_file_named_like_a_runner_dir_reaches_the_commit(git_repo):
     assert tripwire == []
 
 
+# ── 1e-bis. A NEW file beside COMMITTED source in a `build/` is source ───────────
+
+
+def test_a_new_file_beside_committed_source_is_not_an_artifact(git_repo):
+    """REGRESSION (silent no-op round). A fixer asked to add `build/new_rule.py`
+    next to a committed `build/existing.py` had it classified as runner output: the
+    glob held it out, `_held_back_new_artifacts` hid it from the tripwire, and the
+    round reported `pushed` with the fix missing."""
+    _write(git_repo, "build/existing.py", "x = 1\n")
+    _write(git_repo, "build/scripts/deploy.sh", "#!/bin/sh\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build scripts")
+
+    _write(git_repo, "build/new_rule.py", "def rule(): pass\n")       # the fix
+    _write(git_repo, "build/scripts/rollback.sh", "#!/bin/sh\n")      # …one dir down
+    _write(git_repo, "build/classes/Main.class", "CAFEBABE\n")        # REAL output
+    _write(git_repo, "build/out.o", "OBJ\n")                          # …beside source
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    # `build/out.o` sits DIRECTLY in a committed-source dir, so it is source by the
+    # same evidence — the discriminator is the directory, never the file name.
+    assert _staged(git_repo) == {"build/new_rule.py", "build/scripts/rollback.sh",
+                                 "build/out.o"}
+    _git(git_repo, "commit", "-qm", "fix")
+    tripwire = []
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(tripwire))
+    assert tripwire == []
+
+
+def test_a_fresh_output_subtree_under_a_committed_build_dir_stays_out(git_repo):
+    """THE limit of the escape hatch. Committed source in `build/scripts` proves
+    `build/scripts` is source — never `build`, and never Gradle's own fresh
+    subtrees. Widening it to the whole `build/` tree walks every artifact into the
+    customer's PR."""
+    _write(git_repo, "build/scripts/deploy.sh", "#!/bin/sh\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build scripts")
+
+    _write(git_repo, "build/classes/java/Main.class", "CAFEBABE\n")
+    _write(git_repo, "build/libs/app.jar", "JAR\n")
+    _write(git_repo, "build/report.html", "<html>\n")   # directly in `build/` — no
+    _write(git_repo, "real.py", "the fix\n")            #   committed sibling there
+
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"real.py"}
+
+
+def test_the_source_dir_evidence_comes_from_HEAD_not_the_index(git_repo):
+    """REGRESSION (artifact leak). The index is writable by the very actors this
+    guard defends against: a fixer's `git add -N build/artifact.js` (or a blanket
+    `git add -A` over a cold tree) would otherwise manufacture its own proof that
+    `build/` is a source dir and walk the whole output tree into the PR."""
+    _write(git_repo, "app.py", "v = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "seed2")
+
+    _write(git_repo, "build/artifact.js", "RUNNER-ARTIFACT-SECRET\n")
+    _write(git_repo, "build/sub/deep.min.js", "DEEP\n")
+    _git(git_repo, "add", "-N", "build/artifact.js")     # the faked evidence
+    _git(git_repo, "add", "build/sub/deep.min.js")       # …and a full one
+    _write(git_repo, "app.py", "v = 2\n")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert commit_push._tracked_source_dirs(str(git_repo), entries) == set()
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"app.py"}
+
+
+def test_an_unambiguous_artifact_inside_a_committed_build_dir_stays_out(git_repo):
+    """No repo evidence can make `node_modules`, `__pycache__` or a coverage file
+    source — the escape hatch reaches ONLY the file-name-shaped dirs."""
+    _write(git_repo, "build/existing.py", "x = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build source")
+
+    _write(git_repo, "build/node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "build/__pycache__/m.cpython-311.pyc", "pyc\n")
+    _write(git_repo, "build/.coverage", "cov\n")
+    _write(git_repo, "build/keep.py", "the fix\n")
+
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"build/keep.py"}
+
+
+def test_a_nested_untracked_repo_in_a_committed_build_dir_is_never_staged(git_repo):
+    """`--untracked-files=all` expands every untracked directory EXCEPT a nested git
+    repo, which stays a `?? build/vendored/` entry. Staging that pathspec records a
+    stray gitlink, so the escape hatch never applies to a directory entry."""
+    _write(git_repo, "build/existing.py", "x = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build source")
+
+    _write(git_repo, "build/vendored/thing.py", "y = 2\n")
+    _git(git_repo / "build/vendored", "init", "-q", ".")
+    _write(git_repo, "build/new_rule.py", "the fix\n")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert ("??", "build/vendored/") in entries, entries
+    assert commit_push._is_runner_dropping(
+        "build/vendored/", source_dirs={"build"}) is True
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"build/new_rule.py"}
+
+
+def test_source_dirs_never_overturns_a_hard_classification():
+    """Unit-level twin of the two tests above: `source_dirs` reaches the ambiguous
+    rule and nothing else."""
+    dirs = {"build", "build/sub", "src/target", "coverage", "deps"}
+    for path in ("build/new_rule.py", "build/sub/x.py", "src/target/y.rs",
+                 "coverage/report.md", "deps/vendored.ex"):
+        assert commit_push._is_runner_dropping(path) is True
+        assert commit_push._is_runner_dropping(path, source_dirs=dirs) is False
+    for path in ("build/node_modules/x.js", "build/__pycache__/m.pyc",
+                 "build/.coverage", "build/lcov.info", "build/vendored/"):
+        assert commit_push._is_runner_dropping(path, source_dirs=dirs) is True
+    # ...and a dir whose evidence is one level up is untouched.
+    assert commit_push._is_runner_dropping(
+        "build/classes/Main.class", source_dirs=dirs) is True
+
+
+def test_a_committed_file_named_build_is_not_evidence_of_a_source_dir(git_repo):
+    """REGRESSION. HEAD tracks a FILE named `build`; the runner replaces it with an
+    output tree. Reading that blob as "`build/` holds committed content" would hand
+    the whole subtree the source escape hatch."""
+    _write(git_repo, "build", "#!/bin/sh\nmake\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build script")
+
+    (git_repo / "build").unlink()
+    _write(git_repo, "build/a.o", "obj\n")
+    _write(git_repo, "real.txt", "the fix\n")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert commit_push._tracked_source_dirs(str(git_repo), entries) == set()
+    assert commit_push._stage_all(str(git_repo), notice=_rec_notice([])).returncode == 0
+    assert _staged(git_repo) == {"build", "real.txt"}       # the DELETION, not the tree
+
+
+def test_a_failed_source_dir_probe_holds_everything_back(git_repo):
+    """Best-effort: a git failure inside the probe must fall back to the
+    pre-existing (withhold) behaviour, never fail the round."""
+    _write(git_repo, "build/existing.py", "x = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build source")
+    _write(git_repo, "build/new_rule.py", "the fix\n")
+
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if argv[:2] == ["git", "ls-tree"]:
+            raise OSError(7, "Argument list too long")
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == set()
+
+
+def test_the_source_dir_probe_costs_one_pathspec_per_ambiguous_root(git_repo):
+    """The probe must not reintroduce per-file argv growth: one `git ls-tree`
+    pathspec per ambiguous ROOT dir, whatever the planted tree's size."""
+    _write(git_repo, "build/existing.py", "x = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build source")
+    for i in range(400):
+        _write(git_repo, f"build/classes/pkg{i}/Main{i}.class", f"// {i}\n")
+
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0
+    trees = [c for c in calls if c[:2] == ["git", "ls-tree"]]
+    assert trees, calls
+    for argv in trees:
+        assert len([a for a in argv if a.startswith(":(top,")]) == 1, argv
+    assert _staged(git_repo) == set()          # all 400 are real output
+
+
+def test_the_held_back_set_drops_a_committed_source_dir_child():
+    entries = [("??", "build/new_rule.py"), ("??", "build/classes/Main.class"),
+               ("??", "node_modules/x.js"), ("??", "build/new_rule.py.bak")]
+    assert commit_push._held_back_new_artifacts(entries) == {
+        "build/new_rule.py", "build/classes/Main.class", "node_modules/x.js",
+        "build/new_rule.py.bak"}
+    assert commit_push._held_back_new_artifacts(entries, source_dirs={"build"}) == {
+        "build/classes/Main.class", "node_modules/x.js", "build/new_rule.py.bak"}
+
+
+def test_the_tripwire_reports_a_lost_source_dir_child(git_repo):
+    """The `at minimum` half of the same defect: if the file somehow does NOT reach
+    the commit, the tripwire must name it rather than filter it out as an artifact."""
+    _write(git_repo, "build/existing.py", "x = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build source")
+
+    _write(git_repo, "build/new_rule.py", "the fix\n")   # never staged
+    _write(git_repo, "build/classes/Main.class", "CAFEBABE\n")
+
+    notices = []
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(notices))
+    assert len(notices) == 1, notices
+    assert "build/new_rule.py" in notices[0][1]
+    assert "build/classes/Main.class" not in notices[0][1]
+
+
 def test_the_unambiguous_names_keep_their_bare_glob():
     """The bare form is load-bearing for a tracked `node_modules` SYMLINK a real
     install replaces — those names are never a plausible source file."""
@@ -709,10 +926,15 @@ def test_an_unstaged_rename_into_a_runner_dir_holds_both_halves(git_repo):
     assert any(n[2] == "stop" and "src/old.py" in n[1] for n in notices), notices
 
 
-def test_a_rename_inside_a_repos_own_tracked_build_dir_holds_both_halves(git_repo):
-    """Same defect, the likelier shape: a repo whose `build/` is real tracked source.
-    The source half is itself runner-classified, so the per-file RECOVERY would have
-    staged its deletion even though the destination stays held back."""
+def test_a_rename_inside_a_repos_own_committed_build_dir_lands_whole(git_repo):
+    """Same defect, the likelier shape: a repo whose `build/` is real COMMITTED
+    source. The source half is itself runner-classified, so the per-file RECOVERY
+    would have staged its deletion even though the destination stayed held back.
+
+    Both halves now reach the commit — `build/` holding committed source makes the
+    destination ordinary source too (`_tracked_source_dirs`), so this is a plain
+    rename, not a pair to withhold and hand to a human. The invariant under test is
+    unchanged and stronger: the deletion is NEVER committed without its content."""
     _write(git_repo, "build/old.sh", "echo PRECIOUS\n")
     _git(git_repo, "add", "-A")
     _git(git_repo, "commit", "-qm", "build scripts")
@@ -722,8 +944,125 @@ def test_a_rename_inside_a_repos_own_tracked_build_dir_holds_both_halves(git_rep
     notices = []
     add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
     assert add.returncode == 0, getattr(add, "stderr", "")
-    assert _staged(git_repo) == set()
-    assert any(n[2] == "stop" and "build/old.sh" in n[1] for n in notices), notices
+    assert _staged(git_repo) == {"build/new.sh"}     # git renders the pair as R100
+    _git(git_repo, "commit", "-qm", "fix")
+    tree = subprocess.run(["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=git_repo,
+                          capture_output=True, text=True, check=True).stdout
+    assert "build/new.sh" in tree and "build/old.sh" not in tree, tree
+    assert not [n for n in notices if n[2] == "stop"], notices
+
+
+def test_a_symlink_renamed_into_a_runner_dir_holds_both_halves(git_repo):
+    """REGRESSION (silent data loss). The rename probe was regular-files-only, so
+    `mv src/link build/link` staged a bare `D src/link` while the glob held the new
+    symlink back and the tripwire hid it — the PR dropped the link outright."""
+    _write(git_repo, "src/real.txt", "the pointed-at file\n")
+    os.symlink("real.txt", git_repo / "src/link")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "build").mkdir()
+    shutil.move(str(git_repo / "src/link"), str(git_repo / "build/link"))
+    _write(git_repo, "real.txt", "the fix\n")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"real.txt"}
+    assert any(n[2] == "stop" and "src/link" in n[1] for n in notices), notices
+
+
+def test_git_hash_object_is_never_trusted_for_a_symlink(git_repo):
+    """THE reason the symlink route exists. `git hash-object build/link` returns the
+    hash of what the link POINTS AT, so routing symlinks through the regular probe
+    does not merely miss the pair — here it would invent one, pairing the deleted
+    `src/payload.txt` with a symlink that is not its content at all."""
+    _write(git_repo, "src/payload.txt", "the pointed-at file\n")
+    _write(git_repo, "src/other.txt", "the pointed-at file\n")   # same bytes
+    os.symlink("other.txt", git_repo / "src/link")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "src/payload.txt").unlink()          # an ORDINARY deletion
+    (git_repo / "build").mkdir()
+    shutil.move(str(git_repo / "src/link"), str(git_repo / "build/link"))
+
+    entries = commit_push._status_entries(str(git_repo))
+    # `build/link` -> `other.txt`, whose bytes equal the deleted payload's, so a
+    # dereferencing hash pairs them. Reading the LINK pairs only the real move.
+    assert commit_push._renamed_into_runner_sources(str(git_repo), entries) == {
+        "src/link"}
+
+
+def test_a_deleted_regular_file_is_not_paired_with_a_new_symlink(git_repo):
+    """The `120000` mode gate: a deleted regular file whose contents happen to spell
+    a path must never read as a moved symlink."""
+    _write(git_repo, "src/pathlike.txt", "real.txt")   # no newline — 8 bytes
+    _write(git_repo, "real.txt", "target\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "src/pathlike.txt").unlink()
+    (git_repo / "build").mkdir()
+    os.symlink("real.txt", git_repo / "build/link")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert commit_push._renamed_into_runner_sources(str(git_repo), entries) == set()
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"src/pathlike.txt"}   # an ordinary deletion, committed
+
+
+def test_the_symlink_route_never_reads_a_size_mismatched_blob(git_repo):
+    """Same cost guard as the regular route: a `cat-file -p` only for a blob whose
+    length matches a destination link's target."""
+    _write(git_repo, "src/big.txt", "a considerably longer file than any link\n")
+    os.symlink("elsewhere.txt", git_repo / "src/link")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "src/big.txt").unlink()               # deleted, but far too long
+    (git_repo / "src/link").unlink()
+    (git_repo / "build").mkdir()
+    os.symlink("elsewhere.txt", git_repo / "build/link")
+
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    entries = commit_push._status_entries(str(git_repo), run=run)
+    assert commit_push._renamed_into_runner_sources(
+        str(git_repo), entries, run=run) == {"src/link"}
+    reads = [c for c in calls if c[:3] == ["git", "cat-file", "-p"]]
+    assert len(reads) == 1, calls          # the link blob only, never big.txt's
+
+
+def test_a_failed_symlink_blob_read_leaves_the_guard_unchanged(git_repo):
+    """Best-effort: a git failure inside the symlink route must never fail the
+    round — it falls back to the regular route's answer."""
+    _write(git_repo, "src/real.txt", "the pointed-at file\n")
+    os.symlink("real.txt", git_repo / "src/link")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "build").mkdir()
+    shutil.move(str(git_repo / "src/link"), str(git_repo / "build/link"))
+
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if argv[:3] == ["git", "cat-file", "-p"]:
+            raise OSError(7, "Argument list too long")
+        return real_run(argv, **kw)
+
+    entries = commit_push._status_entries(str(git_repo), run=run)
+    assert commit_push._renamed_into_runner_sources(
+        str(git_repo), entries, run=run) == set()
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
 
 
 def test_an_unrelated_deletion_beside_an_artifact_still_commits(git_repo):
@@ -838,6 +1177,29 @@ def test_exit_rebase_tolerates_the_artifacts_the_guard_withheld(tmp_path):
     status, detail = commit_push.exit_rebase(
         str(work), base="main", notice=_rec_notice([]))
     assert status == "rebased", detail
+
+
+def test_exit_rebase_skips_on_an_uncommitted_child_of_a_committed_build_dir(tmp_path):
+    """The precondition reads the SAME tracked-source-dir answer the staging guard
+    stages by. Without it the two part ways: a fixer's new file beside committed
+    source in a `build/` would read as a withheld artifact and the rebase would run
+    straight over the uncommitted fix."""
+    work = _rebase_repo(tmp_path)
+    _write(work, "build/existing.py", "x = 1\n")
+    _git(work, "add", "-A")
+    _git(work, "commit", "-qm", "build source")
+    _git(work, "push", "-q", "origin", "feature")
+
+    # A fresh output subtree under the same `build/` is still tolerated…
+    _write(work, "build/classes/Main.class", "CAFEBABE\n")
+    status, detail = commit_push.exit_rebase(
+        str(work), base="main", notice=_rec_notice([]))
+    assert status == "rebased", detail
+
+    _write(work, "build/new_rule.py", "the fix\n")
+    status, detail = commit_push.exit_rebase(
+        str(work), base="main", notice=_rec_notice([]))
+    assert status == "skipped" and "uncommitted changes" in detail
 
 
 def test_exit_rebase_still_skips_on_a_genuinely_dirty_tree(tmp_path):
