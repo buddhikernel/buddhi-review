@@ -878,8 +878,20 @@ def _diagnose_commit_failure(
 # The per-round commit stages with ``git add -A``, which would sweep any editor/
 # backup dropping (:data:`_DROPPING_GLOBS`) a fixer left behind into the PR. This
 # guard keeps them out of staging while leaving every legitimate change untouched.
-# It is best-effort and FAIL-OPEN: a status probe that errors just falls back to
-# the plain ``git add -A`` so the guard can never block a commit.
+#
+# The contract is SPLIT. The per-file editor/backup and paired-delete holds are
+# best-effort and FAIL-OPEN: they are derived from :func:`_status_entries`, which
+# returns ``[]`` on a failed scan — indistinguishable from "nothing to hold
+# back" — so an errored probe just means no per-file excludes are applied. The
+# runner-artifact holds are FAIL-CLOSED: the FIXED glob set
+# (:func:`_runner_exclude_pathspecs`) is applied to every ``git add`` regardless
+# of what the scan returned, so a failed probe can never fall back to a bare
+# ``git add -A`` that sweeps an untracked ``node_modules``/``target`` tree into
+# the commit. And the guard can now block a commit outright: when a reset it
+# depends on (un-staging a rename dropping, an editor exclude, or a prestaged
+# runner artifact) itself fails, ``_stage_all`` returns that non-zero result
+# instead of falling through, and :func:`commit_and_push` turns it into
+# ``"error"`` rather than shipping a partially-staged commit.
 #
 # One paired case needs more than a plain exclude: a fixer/editor doing an
 # in-place rewrite via backup-then-replace (move ``src.py`` to ``src.py.bak``,
@@ -1320,27 +1332,36 @@ def _renamed_into_runner_sources(
                 if sep and path and len(fields) >= 2:
                     blobs[path] = fields[1]
                     modes[path] = fields[0]
+        blob_sizes: Dict[str, int] = {}     # blob sha -> its byte length
         if staged_deleted:
-            # ``<mode> <type> <sha>\t<path>`` — a DIFFERENT field order from
+            # ``<mode> <type> <sha> <size>\t<path>`` — a DIFFERENT field order from
             # ``ls-files`` above, and the only place the staged-away content is
             # still readable. ``blob`` only: a pathspec can never name a tree here
             # (every path came from a porcelain FILE record), and checking the type
             # keeps a tree's sha from being mistaken for file content if one ever
             # did. ``--full-tree`` for the same cwd-relative-output reason as the
-            # ``ls-files`` call above.
+            # ``ls-files`` call above. ``-l`` adds the SIZE field git already has on
+            # hand, so this one call also answers the size lookup below for these
+            # blobs — instead of one extra ``cat-file -s`` spawn per staged deletion.
             listing = _run_batched_stdout(
-                run, ["git", "ls-tree", "--full-tree", "-z", "HEAD", "--"],
+                run, ["git", "ls-tree", "-l", "--full-tree", "-z", "HEAD", "--"],
                 [f":(top,literal){p}" for p in staged_deleted], cwd=cwd)
             if listing is None:
                 return set()
             for rec in listing.split("\0"):
                 meta, sep, path = rec.partition("\t")
                 fields = meta.split()
-                if sep and path and len(fields) >= 3 and fields[1] == "blob":
+                if sep and path and len(fields) >= 4 and fields[1] == "blob":
                     blobs[path] = fields[2]
                     modes[path] = fields[0]
-        blob_sizes: Dict[str, int] = {}     # blob sha -> its byte length
-        for sha in sorted(set(blobs.values())):
+                    try:
+                        blob_sizes[fields[2]] = int(fields[3])
+                    except ValueError:
+                        pass
+        # Only the WORKTREE-deletion blobs (from ``ls-files`` above, which carries no
+        # size field) still need a spawn here — the STAGED-deletion blobs already got
+        # their size from ``ls-tree -l`` above, at no extra process.
+        for sha in sorted(set(blobs.values()) - set(blob_sizes)):
             r = run(["git", "cat-file", "-s", sha], cwd=cwd)
             if getattr(r, "returncode", 1) != 0:
                 continue
@@ -1386,6 +1407,29 @@ def _renamed_into_runner_sources(
             if hashed is None:
                 return set()
             destinations = set(hashed.split())
+        # EXACT blob identity, and a rename that also EDITS the file (``mv
+        # src/old.py build/new.py`` followed by a rewrite) is a KNOWN, ACCEPTED
+        # miss rather than an oversight — do not "fix" it with a similarity /
+        # rename-detection match. Every candidate here is a path inside a runner
+        # OUTPUT dir, and runner output is DERIVED FROM the repo's own source: a
+        # transpiled ``build/app.js``, a ``coverage/``/``htmlcov/`` report that
+        # embeds each measured source file verbatim, a ``target/`` copy. "Closely
+        # resembles a deleted source file" is therefore the NORM among candidates,
+        # not evidence of a move, so a similarity floor would pair ORDINARY
+        # deletions with ORDINARY build output — holding a real deletion out of the
+        # fix commit and firing a manual-resolution ``stop`` on cold rounds that
+        # merely deleted a file. That is the mirror-image loss, not a smaller one.
+        # Git's own rename detection is unavailable for the same structural reason
+        # the pair needs finding at all: the destination has NO index entry (hence
+        # the ``D``+``??`` porcelain shape instead of an ``R`` record), and
+        # manufacturing one with ``git add -N`` would both pollute the index this
+        # guard exists to defend and defeat the stat-never-read cost bound
+        # (``test_the_move_probe_never_hashes_a_size_mismatched_tree``) — a cold
+        # ``node_modules`` would have to be READ, not stat'd, to be scored.
+        # The STAGED form of the very same move already lands WHOLE and needs
+        # nothing here: ``git mv src/old.py build/new.py`` + an edit arrives as a
+        # single ``RM`` record, which :func:`_stage_all`'s tracked-runner per-file
+        # recovery commits with both halves.
         matched = {src for src, sha in blobs.items() if sha in destinations}
         if links:
             matched |= _symlink_renamed_sources(
