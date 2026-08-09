@@ -274,9 +274,13 @@ def test_stage_all_no_droppings_is_a_plain_add(git_repo):
 
     out = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice(notices))
     assert out.returncode == 0
-    # No droppings → the byte-identical plain `git add -A`, no exclude pathspec.
-    assert ["git", "add", "-A"] in calls
-    assert not any("(exclude" in " ".join(c) for c in calls)
+    # No droppings → behaviourally a plain `git add -A`: the FIXED runner globs ride
+    # along unconditionally (the guard is fail-CLOSED for artifacts — an empty scan
+    # can mean the scan FAILED), but nothing matches them, and no PER-FILE exclude
+    # pathspec is emitted.
+    assert ["git", "add", "-A", "--", ":/",
+            *commit_push._runner_exclude_pathspecs()] in calls
+    assert not any("(top,exclude,literal)" in " ".join(c) for c in calls)
     assert notices == []  # nothing excluded → no log line
     staged = subprocess.run(["git", "diff", "--cached", "--name-only"],
                             cwd=git_repo, capture_output=True, text=True).stdout
@@ -382,7 +386,12 @@ def test_stage_all_leaves_a_legitimate_rename_staged(git_repo):
     assert notices == []  # nothing excluded → no log line
 
 
-def test_stage_all_fail_open_when_status_probe_errors():
+def test_stage_all_fail_closed_for_artifacts_when_status_probe_errors():
+    """REGRESSION. A failed status probe yields `[]` entries, which is
+    INDISTINGUISHABLE from "nothing to hold back" — so the guard must still apply
+    the fixed runner globs. It used to fall back to a bare `git add -A`, which on
+    the cold worktree this guard exists for swept the whole `node_modules/` /
+    `target/` tree into the customer's PR at exactly the moment it was needed."""
     calls = []
 
     def run(argv, *, cwd=None, timeout=None):
@@ -395,8 +404,29 @@ def test_stage_all_fail_open_when_status_probe_errors():
     notices = []
     out = commit_push._stage_all("x", run=run, notice=_rec_notice(notices))
     assert out.returncode == 0
-    assert calls == [["git", "add", "-A"]]  # fell back to the plain add
-    assert notices == []
+    assert calls == [["git", "add", "-A", "--", ":/",
+                      *commit_push._runner_exclude_pathspecs()]]
+    assert notices == []  # nothing was IDENTIFIED as held back → no log line
+
+
+def test_stage_all_fail_closed_when_status_probe_raises_unicode_error():
+    """REGRESSION, the trigger the fail-open was found through: `-z` porcelain emits
+    path bytes VERBATIM and `_default_run` decodes strictly, so one latin-1 name in a
+    freshly-installed `node_modules/` raises `UnicodeDecodeError` — which
+    `_status_entries` converts to `[]`. The artifact globs must survive that."""
+    calls = []
+
+    def run(argv, *, cwd=None, timeout=None):
+        argv = list(argv)
+        if "status" in argv:
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    out = commit_push._stage_all("x", run=run, notice=_rec_notice([]))
+    assert out.returncode == 0
+    assert calls == [["git", "add", "-A", "--", ":/",
+                      *commit_push._runner_exclude_pathspecs()]]
 
 
 # ── End-to-end through commit_and_push: droppings never reach the commit ───────

@@ -2332,17 +2332,33 @@ class RoundDriver:
         self.polishing -= surviving
 
     def _worktree_has_changes(self) -> bool:
-        """True when ``git status --porcelain`` reports any change in the loop's
-        worktree — the has-file-changes probe for the substantive re-review gate
-        when pushing is off (with pushing on, the commit step's result is
-        authoritative). Any git error → False (no change proven, conservatively)."""
+        """True when the loop's worktree holds an uncommitted change BEYOND the new
+        artifacts the staging guard deliberately withheld from the fix commit
+        (:func:`commit_push._dirty_beyond_held_back`) — the has-file-changes probe
+        for the substantive re-review gate when pushing is off (with pushing on, the
+        commit step's result is authoritative). Any git error → False (no change
+        proven, conservatively).
+
+        Raw porcelain is deliberately NOT the predicate: a cold worktree's untracked
+        ``node_modules/`` / ``target/`` / coverage tree is now held back
+        PERMANENTLY, so it would read as "changed files" on every round forever —
+        and since this is ``or``'d into ``take_substantive_round``, a round that
+        committed nothing would still be taken as substantive and would advance
+        ``_last_substantive_head`` to a head that never moved. ``-z
+        --untracked-files=all`` matches the form that predicate expects."""
         try:
-            proc = self.gh_run(["git", "status", "--porcelain"], cwd=self.cwd)
-        except (subprocess.SubprocessError, OSError):
+            proc = self.gh_run(
+                ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                cwd=self.cwd)
+        # ``UnicodeDecodeError`` is a ValueError (neither of the other two) and is
+        # reachable only via ``-z``, which emits a non-UTF-8 path's bytes verbatim
+        # instead of C-quoting them into ASCII.
+        except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
             return False
         if getattr(proc, "returncode", 1) != 0:
             return False
-        return bool((getattr(proc, "stdout", "") or "").strip())
+        return commit_push._dirty_beyond_held_back(
+            getattr(proc, "stdout", "") or "", self.cwd, run=self.gh_run)
 
     # --------------------------------------------------- --rr-active restart
 
