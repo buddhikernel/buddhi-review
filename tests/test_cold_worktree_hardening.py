@@ -381,9 +381,11 @@ def test_prestaged_runner_artifact_is_unstaged(git_repo):
     assert _staged(git_repo) == {"fix.py"}
 
 
-def test_clean_repo_still_takes_the_bare_add_short_circuit(git_repo):
-    """No droppings of EITHER kind → a plain `git add -A`, byte-identical to a
-    no-guard fix commit (no `:/`, no exclude pathspecs)."""
+def test_clean_repo_still_stages_exactly_the_fix(git_repo):
+    """No droppings of EITHER kind → the FIXED runner globs still ride along (the
+    guard is fail-CLOSED: an empty scan is indistinguishable from a FAILED one), but
+    nothing matches them, so the outcome equals a no-guard fix commit and no PER-FILE
+    exclude pathspec is emitted."""
     _write(git_repo, "fix.py", "z = 3\n")
     calls = []
     real_run = commit_push._default_run
@@ -394,9 +396,33 @@ def test_clean_repo_still_takes_the_bare_add_short_circuit(git_repo):
 
     add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
     assert add.returncode == 0
-    assert ["git", "add", "-A"] in calls
-    assert not any(len(c) > 3 and c[:3] == ["git", "add", "-A"] for c in calls)
+    adds = [c for c in calls if c[:3] == ["git", "add", "-A"]]
+    assert adds == [["git", "add", "-A", "--", ":/",
+                     *commit_push._runner_exclude_pathspecs()]]
+    assert not any("(top,exclude,literal)" in " ".join(c) for c in calls)
     assert _staged(git_repo) == {"fix.py"}
+
+
+def test_a_failed_status_scan_still_holds_artifacts_back(git_repo):
+    """REGRESSION, on a REAL repo. `_status_entries` is best-effort and returns `[]`
+    on any read failure (a non-UTF-8 name under `-z`, a `git status` timeout), which
+    empties all four gating lists — the same shape as a clean repo. The old bare
+    `git add -A` short-circuit therefore committed the entire cold `node_modules/` /
+    `target/` tree precisely when the guard was needed."""
+    for i in range(5):
+        _write(git_repo, f"node_modules/pkg{i}/index.js", f"// {i}\n")
+    _write(git_repo, "target/debug/app", "bin\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if "status" in argv:                      # the porcelain scan blows up
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"fix.py"}        # the artifacts stayed OUT
 
 
 def test_editor_dropping_guard_still_holds_with_runner_artifacts_present(git_repo):
@@ -668,6 +694,49 @@ def test_a_file_named_like_a_runner_dir_reaches_the_commit(git_repo):
     assert add.returncode == 0, getattr(add, "stderr", "")
     assert _staged(git_repo) == {"scripts/build", "coverage"}
     # …and the tripwire still sees the real fix as committed, not as residue.
+    _git(git_repo, "commit", "-qm", "fix")
+    tripwire = []
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(tripwire))
+    assert tripwire == []
+
+
+@pytest.mark.parametrize("path", _RUNNER_NAMED_FILES)
+def test_a_collapsed_runner_dir_entry_is_still_a_dropping(path):
+    """The twin of the test above, and the reason it keys on a trailing `/`:
+    `--untracked-files=all` expands every untracked directory EXCEPT a nested git
+    repo, so a build step that clones straight into `deps/` leaves ONE `?? deps/`
+    record whose ambiguous name is the LAST segment. The slash says "directory" as
+    conclusively as a child segment would, so it is an artifact even though the
+    same name without it is an ordinary file."""
+    assert commit_push._is_runner_dropping(f"{path}/") is True
+    # …and no repo evidence rescues a directory entry into the commit.
+    assert commit_push._is_runner_dropping(
+        f"{path}/", source_dirs={path, path.rpartition("/")[0]}) is True
+
+
+def test_a_nested_repo_cloned_at_an_ambiguous_root_is_never_staged(git_repo):
+    """REGRESSION (gitlink leak). A dependency step clones a repo directly at
+    `deps/`; porcelain collapses it to `?? deps/`, and with the entry unclassified
+    nothing else was held back, so `_stage_all` took its bare `git add -A` shortcut
+    and staged the checkout as a mode-160000 embedded repo in the customer's PR."""
+    _write(git_repo, "deps/vendor_lib/mod.py", "y = 2\n")
+    _git(git_repo / "deps", "init", "-q", ".")
+    _write(git_repo, "real.py", "the fix\n")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert ("??", "deps/") in entries, entries
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"real.py"}
+    ls = subprocess.run(["git", "ls-files", "-s"], cwd=git_repo,
+                        capture_output=True, text=True, check=True)
+    assert "160000" not in ls.stdout, ls.stdout
+    assert any("deps/" in d for _, d, _ in notices), notices
+
+    # …and the tripwire reads the leftover checkout as a withheld artifact, not as
+    # a fixer's lost edits.
     _git(git_repo, "commit", "-qm", "fix")
     tripwire = []
     commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(tripwire))

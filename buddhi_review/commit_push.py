@@ -227,7 +227,9 @@ def _is_runner_dropping(path: str, *,
     """True iff ``path`` is — or lies under — a :data:`_RUNNER_DROPPING_DIRS`
     directory, lies UNDER a :data:`_RUNNER_DROPPING_PARENT_DIRS` directory (those
     names double as ordinary file names, so they count only with a child segment
-    after them — a plain ``scripts/build`` script is NOT an artifact), lies under a
+    after them — a plain ``scripts/build`` script is NOT an artifact — or when the
+    path is itself a porcelain DIRECTORY entry, a trailing ``/``, which says
+    "directory" just as conclusively as a child segment does), lies under a
     dotnet ``bin/{Debug,Release}`` / ``obj/{Debug,Release}`` build-output dir, or is
     a :data:`_RUNNER_DROPPING_FILES` coverage file, by path SEGMENT at any depth.
     Kept exactly in step with :func:`_runner_exclude_pathspecs` (what ``git add``
@@ -263,8 +265,19 @@ def _is_runner_dropping(path: str, *,
     if _is_hard_runner_dropping(segs):
         return True
     # ``segs[:-1]`` only — a name that is also a plausible FILE name counts as a
-    # runner dir solely when something lives under it.
-    if not any(s in _RUNNER_DROPPING_PARENT_DIRS for s in segs[:-1]):
+    # runner dir solely when something lives under it. The ONE exception is a
+    # porcelain DIRECTORY entry (trailing ``/``), where the LAST segment counts
+    # too: ``--untracked-files=all`` expands every untracked directory EXCEPT a
+    # nested git repo, which it collapses to a single ``?? deps/`` record, so a
+    # build step that clones straight into an ambiguous root leaves the artifact
+    # name as the final segment with no child to key on. The trailing slash is
+    # itself the disambiguation that child segment was standing in for — the entry
+    # is a DIRECTORY, never the ``scripts/build`` FILE this rule protects — and
+    # without the exception the whole checkout rides into the customer's PR as a
+    # mode-160000 gitlink (nothing else flags it, so ``_stage_all`` takes its bare
+    # ``git add -A`` shortcut).
+    ambiguous = segs if raw.endswith("/") else segs[:-1]
+    if not any(s in _RUNNER_DROPPING_PARENT_DIRS for s in ambiguous):
         return False
     return not (source_dirs and not raw.endswith("/")
                 and "/".join(segs[:-1]) in source_dirs)
@@ -282,7 +295,11 @@ def _runner_globs() -> List[str]:
     ``scripts/build`` shell script exactly as readily as the ``build/`` output
     tree. :data:`_RUNNER_DROPPING_PARENT_DIRS` therefore gets ONLY the ``/**``
     contents form — mirroring :func:`_is_runner_dropping`'s ``segs[:-1]`` test, so
-    the predicate and the exclude layer agree on every path."""
+    the predicate and the exclude layer agree on every path. That contents form
+    also covers the collapsed nested-repo entry (``?? deps/``) the predicate's
+    trailing-slash exception classifies: git's traversal drops the whole
+    would-be-gitlink directory rather than staging it, verified against ``git add
+    -A -- :/ :(top,exclude,glob)**/deps/**``."""
     globs: List[str] = []
     for d in sorted(_RUNNER_DROPPING_DIRS):
         globs.append(f"**/{d}")
@@ -1453,8 +1470,11 @@ def _stage_all(
     ``deps``/``coverage`` dir (:func:`_tracked_source_dirs` — the glob is
     source-blind, so those need the same per-file recovery).
 
-    With nothing to exclude this is byte-identical to a plain ``git add -A``.
-    Otherwise it stages the whole worktree (``:/`` — the top of the tree, so the
+    The FIXED runner glob set is applied UNCONDITIONALLY — the guard must stay
+    fail-CLOSED for artifacts even when the porcelain scan came back empty because
+    it FAILED (see the comment above the exclude assembly), and with nothing
+    actually matching them the add is behaviourally a plain ``git add -A``. It
+    stages the whole worktree (``:/`` — the top of the tree, so the
     scope matches a bare ``git add -A`` regardless of ``cwd``) with one
     ``:(top,exclude,literal)`` pathspec per excluded path — a repo-root-anchored
     LITERAL exact-path exclude (not a glob), aligning with the repo-root-relative
@@ -1570,16 +1590,24 @@ def _stage_all(
          and not _is_runner_dropping(path, source_dirs=source_dirs)}
         - set(excluded))
 
-    # Nothing to hold back of EITHER kind → a bare ``git add -A``, byte-identical to
-    # a no-guard fix commit. The runner exclude globs are applied ONLY when the scan
-    # actually found a runner path — a repo with none (the common case: its
-    # ``.gitignore`` already covers node_modules/target, so they never reach the
-    # scan) pays no extra pathspecs. ``source_children`` is deliberately NOT a
-    # reason to leave this branch: with nothing else to withhold, the bare ``git
-    # add -A`` stages those files as the ordinary source they are.
-    if (not excluded and not untracked_runner and not tracked_runner
-            and not prestaged_runner):
-        return run(["git", "add", "-A"], cwd=cwd)
+    # There is deliberately NO "nothing to hold back → bare ``git add -A``"
+    # short-circuit here. Every list above is derived from :func:`_status_entries`,
+    # which is best-effort and returns ``[]`` on ANY read failure — a non-UTF-8
+    # filename in a freshly-installed ``node_modules/`` (``-z`` emits path bytes
+    # verbatim and ``_default_run`` decodes strictly), or a ``git status`` timeout
+    # while enumerating thousands of untracked artifact files. "All four lists are
+    # empty" therefore means EITHER "nothing to withhold" OR "the scan failed", and
+    # the two are indistinguishable from here — so a bare ``git add -A`` on that
+    # branch would sweep the whole cold ``node_modules/``/``target/`` tree into the
+    # customer's PR precisely when the guard is needed most. Falling through keeps
+    # it fail-CLOSED at zero cost: the runner glob set is FIXED, count-independent
+    # and < 4 KB of argv (``test_runner_exclude_pathspec_set_is_fixed_and_small``),
+    # ``resets`` is empty, ``excludes == runner_excludes``, and the per-file
+    # ``source_children`` recovery below still runs — which a short-circuiting
+    # ``return`` would skip, silently dropping the fixer's own new file in an
+    # ambiguously-named source dir. On a genuinely clean repo the resulting
+    # ``git add -A -- :/ <fixed globs>`` is behaviourally a plain ``git add -A``.
+    #
     # An exclude pathspec only tells ``git add`` NOT to (re-)add a path — it never
     # UNstages one already in the index. A dropping a fixer had itself ``git add``-ed
     # (or a source deletion a fixer had itself staged) would otherwise survive the
@@ -1958,7 +1986,12 @@ def exit_rebase(
     try:
         st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
                  cwd=cwd)
-    except (subprocess.SubprocessError, OSError) as exc:
+    # ``UnicodeDecodeError`` (a ValueError, so NOT covered by the other two) is
+    # reachable only because of the ``-z`` above: plain porcelain C-quotes a
+    # non-UTF-8 path into pure ASCII, ``-z`` emits those bytes verbatim and
+    # ``_default_run`` decodes strictly. Same tuple :func:`_status_entries` uses
+    # for this exact command shape.
+    except (subprocess.SubprocessError, UnicodeDecodeError, OSError) as exc:
         return "skipped", f"could not read the worktree state ({exc}) — not rebasing"
     if getattr(st, "returncode", 1) != 0:
         return "skipped", "could not read the worktree state — not rebasing"
@@ -2091,7 +2124,12 @@ def exit_rebase(
         dirty_after = (getattr(st2, "returncode", 1) != 0
                        or _dirty_beyond_held_back(
                            getattr(st2, "stdout", "") or "", cwd, run=run))
-    except (subprocess.SubprocessError, OSError):
+    # ``UnicodeDecodeError`` belongs here for the same ``-z`` reason as the step-2
+    # read, and it matters MORE: this read runs AFTER a successful rebase, so an
+    # escaping exception would skip the ``dirty_after`` → :func:`_restore_branch`
+    # path entirely and leave the branch rebased locally but never force-pushed —
+    # a silent local/remote divergence reported only as an "unexpected error".
+    except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
         dirty_after = True
     if dirty_after:
         _restore_branch(cwd, head, run=run)

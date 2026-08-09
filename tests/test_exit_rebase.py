@@ -146,6 +146,58 @@ def test_dirty_worktree_is_skipped(repo):
     assert (repo / "feature.py").read_text() == "y = 999  # uncommitted edit\n"
 
 
+def test_an_undecodable_status_read_is_caught_and_skips_the_rebase(repo):
+    """REGRESSION. Switching the step-2 precondition read to `-z` made
+    `UnicodeDecodeError` reachable — `-z` emits path bytes verbatim where plain
+    porcelain C-quotes them, and `_default_run` decodes strictly. It is a
+    `ValueError`, so `(SubprocessError, OSError)` let it escape the hand-back
+    entirely instead of reporting an unreadable worktree."""
+    _advance_base(repo)
+    pre = _sha(repo)
+
+    class Boom(Rec):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            if "status" in argv:
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1,
+                                         "invalid start byte")
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+    rec = Boom()
+    status, detail = commit_push.exit_rebase(
+        str(repo), base="main", run=rec, notice=_silent_notice)
+    assert status == "skipped"
+    assert "could not read the worktree state" in detail
+    assert rec.pushes() == [] and rec.rebases() == []
+    assert _sha(repo) == pre
+
+
+def test_an_undecodable_post_rebase_read_restores_the_branch(repo):
+    """REGRESSION, the worse of the two sites: the step-6b read runs AFTER a
+    successful rebase. An escaping `UnicodeDecodeError` skipped the `dirty_after`
+    → `_restore_branch` path, leaving the branch rebased locally but never
+    force-pushed — a silent local/remote divergence."""
+    _advance_base(repo)
+    pre = _sha(repo)
+    seen = []
+
+    class BoomAfterRebase(Rec):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            if "status" in argv and "rebase" in seen:
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1,
+                                         "invalid start byte")
+            if argv[:2] == ["git", "rebase"] and "--abort" not in argv:
+                seen.append("rebase")
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+    rec = BoomAfterRebase()
+    status, detail = commit_push.exit_rebase(
+        str(repo), base="main", run=rec, notice=_silent_notice)
+    assert status == "error"
+    assert "dirty tree" in detail
+    assert rec.pushes() == []      # never force-push an unverifiable tree
+    assert _sha(repo) == pre       # the branch was restored
+
+
 # ── Conflict → abort + restore EXACT pre-rebase SHA + manual diagnosis ───────────
 def test_conflict_aborts_and_restores_pre_rebase_sha(repo):
     # feat/x edits shared.py; main edits the SAME line differently → conflict.
