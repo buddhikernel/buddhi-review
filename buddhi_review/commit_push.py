@@ -1176,7 +1176,8 @@ def _tracked_source_dirs(
         return set()
     try:
         listing = _run_batched_stdout(
-            run, ["git", "ls-tree", "-r", "--name-only", "-z", "HEAD", "--"],
+            run, ["git", "ls-tree", "-r", "--full-tree", "--name-only", "-z",
+                  "HEAD", "--"],
             [f":(top,literal){d}" for d in sorted(set(parents.values()))], cwd=cwd)
     except (subprocess.SubprocessError, OSError, UnicodeDecodeError, ValueError):
         return set()
@@ -1187,6 +1188,17 @@ def _tracked_source_dirs(
     # holds source; that shape is the runner-replaced-a-build-script case whose
     # whole subtree must keep being held back.
     holding = {p.rpartition("/")[0] for p in listing.split("\0") if p}
+    # An EXACT-parent intersection, never an ancestor walk — deliberately, and it is
+    # the reason a new file in a NEW subdirectory of a source ``build/``
+    # (``build/sub/new.py`` beside a committed ``build/existing.py``) is still held
+    # back. Recovering descendants would need only ONE committed file anywhere in
+    # ``build/`` to declare the WHOLE subtree source, so every Gradle/CMake output
+    # dir under it (``build/classes/…``, ``build/libs/…``) would ride into the
+    # customer's PR — the exact leak this guard exists to stop, and a far worse
+    # failure than withholding a file the operator is told about. Nothing
+    # distinguishes a fixer's new ``build/sub/new.py`` from Gradle's fresh
+    # ``build/classes/Main.class``: both are new files under a directory holding no
+    # committed content, so the ambiguity resolves toward holding back.
     return set(parents) & holding
 
 
@@ -1207,7 +1219,15 @@ def _renamed_into_runner_sources(
 
     Git does NO rename detection here: the destination has no index entry, so
     porcelain reports a plain ``D <src>`` + ``?? <dest>`` pair, not the ``R``
-    record :func:`_stage_all`'s staged-rename decomposition keys on. Left alone,
+    record :func:`_stage_all`'s staged-rename decomposition keys on. BOTH deletion
+    columns count as that source half: a bare ``mv`` leaves the deletion unstaged
+    (`` D``), while a fixer that followed it with ``git add -u`` (or ``git rm``)
+    leaves the identical pair with the deletion already in the INDEX (``D ``) —
+    same move, same loss, and reading only the worktree column would let the
+    ``add -u`` shape through. The staged half's content lives in HEAD rather than
+    the index (a staged deletion has no ``ls-files`` entry at all), so its blob is
+    read with ``ls-tree HEAD``; the unstaged half keeps its ``ls-files`` read,
+    whose index blob is the pre-deletion content. Left alone,
     the ``git add -A`` stages the source's DELETION while the exclude holds its
     replacement back, and :func:`_held_back_new_artifacts` then hides that
     destination from the clean-tree tripwire — so the pushed PR silently drops the
@@ -1240,12 +1260,21 @@ def _renamed_into_runner_sources(
     anything the regular route already decided. ``lstat``'s ``st_size`` for a
     symlink IS the target's byte length, so the same size gate bounds this route
     too."""
-    deleted = sorted({path for xy, path in entries
-                      if len(xy) > 1 and xy[1] == "D" and not _new_to_head(xy)})
+    # The two shapes the SAME move arrives in, split by where the deleted content
+    # can still be read from. WORKTREE column ``D``: the deletion is unstaged, so
+    # the path keeps an index entry holding its pre-deletion blob. INDEX column
+    # ``D`` (a fixer's ``git add -u`` / ``git rm`` after the move): the index entry
+    # is GONE, so ``ls-files`` returns nothing for it and only HEAD still has the
+    # blob. An unmerged ``DD`` stays on the worktree route it has always taken.
+    worktree_deleted = sorted({path for xy, path in entries
+                               if len(xy) > 1 and xy[1] == "D" and not _new_to_head(xy)})
+    staged_deleted = sorted({path for xy, path in entries
+                             if len(xy) > 1 and xy[0] == "D" and xy[1] != "D"
+                             and not _new_to_head(xy)})
     candidates = [path for xy, path in entries
                   if _is_runner_dropping(path, source_dirs=source_dirs)
                   and _new_to_head(xy)]
-    if not deleted or not candidates:
+    if not (worktree_deleted or staged_deleted) or not candidates:
         return set()
     try:
         # Porcelain paths are repo-root-relative while ``cwd`` may be a subdirectory
@@ -1255,19 +1284,44 @@ def _renamed_into_runner_sources(
         root = (getattr(top, "stdout", "") or "").strip()
         if getattr(top, "returncode", 1) != 0 or not root:
             return set()
-        listing = _run_batched_stdout(
-            run, ["git", "ls-files", "-s", "-z", "--"],
-            [f":(top,literal){p}" for p in deleted], cwd=cwd)
-        if listing is None:
-            return set()
-        blobs: Dict[str, str] = {}          # deleted path -> its INDEX blob sha
-        modes: Dict[str, str] = {}          # deleted path -> its INDEX mode
-        for rec in listing.split("\0"):
-            meta, sep, path = rec.partition("\t")
-            fields = meta.split()
-            if sep and path and len(fields) >= 2:
-                blobs[path] = fields[1]
-                modes[path] = fields[0]
+        blobs: Dict[str, str] = {}          # deleted path -> its pre-deletion blob sha
+        modes: Dict[str, str] = {}          # deleted path -> its recorded file mode
+        if worktree_deleted:
+            # ``<mode> <sha> <stage>\t<path>`` — the index still holds the blob.
+            # ``--full-name``: like ``ls-tree`` below, ``ls-files`` prints paths
+            # relative to ``cwd`` unless told otherwise, while ``worktree_deleted``
+            # (and ``blobs``/``modes``, keyed off it) come from porcelain's
+            # repo-root-relative paths.
+            listing = _run_batched_stdout(
+                run, ["git", "ls-files", "-s", "-z", "--full-name", "--"],
+                [f":(top,literal){p}" for p in worktree_deleted], cwd=cwd)
+            if listing is None:
+                return set()
+            for rec in listing.split("\0"):
+                meta, sep, path = rec.partition("\t")
+                fields = meta.split()
+                if sep and path and len(fields) >= 2:
+                    blobs[path] = fields[1]
+                    modes[path] = fields[0]
+        if staged_deleted:
+            # ``<mode> <type> <sha>\t<path>`` — a DIFFERENT field order from
+            # ``ls-files`` above, and the only place the staged-away content is
+            # still readable. ``blob`` only: a pathspec can never name a tree here
+            # (every path came from a porcelain FILE record), and checking the type
+            # keeps a tree's sha from being mistaken for file content if one ever
+            # did. ``--full-tree`` for the same cwd-relative-output reason as the
+            # ``ls-files`` call above.
+            listing = _run_batched_stdout(
+                run, ["git", "ls-tree", "--full-tree", "-z", "HEAD", "--"],
+                [f":(top,literal){p}" for p in staged_deleted], cwd=cwd)
+            if listing is None:
+                return set()
+            for rec in listing.split("\0"):
+                meta, sep, path = rec.partition("\t")
+                fields = meta.split()
+                if sep and path and len(fields) >= 3 and fields[1] == "blob":
+                    blobs[path] = fields[2]
+                    modes[path] = fields[0]
         blob_sizes: Dict[str, int] = {}     # blob sha -> its byte length
         for sha in sorted(set(blobs.values())):
             r = run(["git", "cat-file", "-s", sha], cwd=cwd)

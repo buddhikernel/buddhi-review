@@ -864,6 +864,30 @@ def test_the_source_dir_probe_costs_one_pathspec_per_ambiguous_root(git_repo):
     assert _staged(git_repo) == set()          # all 400 are real output
 
 
+def test_source_dir_rescue_works_when_cwd_is_a_subdirectory(git_repo):
+    """REGRESSION. `git ls-tree` prints paths relative to (and limited to) `cwd`
+    unless `--full-tree` is passed — `:(top,literal)` anchors the MATCH to the repo
+    root, not the output. `--cwd` is a documented CLI option, so invoking the round
+    from a subdirectory turned the listing into `../`-prefixed paths that could
+    never intersect the root-relative `parents` dict: the rescue silently failed and
+    a fixer's new file beside committed `build/` source was held back exactly like
+    real runner output."""
+    _write(git_repo, "build/existing.py", "x = 1\n")
+    _write(git_repo, "sub/placeholder.py", "y = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build source and a subdir")
+
+    _write(git_repo, "build/new_rule.py", "the fix\n")
+    sub_cwd = str(git_repo / "sub")
+
+    entries = commit_push._status_entries(sub_cwd)
+    assert commit_push._tracked_source_dirs(sub_cwd, entries) == {"build"}
+
+    add = commit_push._stage_all(sub_cwd, notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"build/new_rule.py"}
+
+
 def test_the_held_back_set_drops_a_committed_source_dir_child():
     entries = [("??", "build/new_rule.py"), ("??", "build/classes/Main.class"),
                ("??", "node_modules/x.js"), ("??", "build/new_rule.py.bak")]
@@ -924,6 +948,162 @@ def test_an_unstaged_rename_into_a_runner_dir_holds_both_halves(git_repo):
     # The deletion is NOT committed alone — both halves stay as residue.
     assert _staged(git_repo) == {"real.txt"}
     assert any(n[2] == "stop" and "src/old.py" in n[1] for n in notices), notices
+
+
+def test_an_unstaged_rename_into_a_runner_dir_pairs_from_a_subdirectory_cwd(git_repo):
+    """REGRESSION. `git ls-files` prints paths relative to `cwd` unless `--full-name`
+    is given — `:(top,literal)` only anchors the MATCH, not the output. `deleted`
+    comes from root-relative porcelain, so without `--full-name` the two path spaces
+    only coincided when `cwd` was the repo root: from a subdirectory the `../`-
+    prefixed `ls-files` keys could never match, the pair went undetected, and the
+    source's deletion was staged alone while the runner glob held its destination
+    back — the exact silent file-loss this guard exists to prevent."""
+    _write(git_repo, "src/old.py", "PRECIOUS = 1\n")
+    _write(git_repo, "sub/placeholder.py", "y = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source and a subdir")
+
+    (git_repo / "build").mkdir()
+    (git_repo / "src/old.py").rename(git_repo / "build/new.py")
+    _write(git_repo, "real.txt", "the fix\n")
+    sub_cwd = str(git_repo / "sub")
+
+    entries = commit_push._status_entries(sub_cwd)
+    assert commit_push._renamed_into_runner_sources(sub_cwd, entries) == {
+        "src/old.py"}
+
+    notices = []
+    add = commit_push._stage_all(sub_cwd, notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"real.txt"}
+    assert any(n[2] == "stop" and "src/old.py" in n[1] for n in notices), notices
+
+
+def test_a_move_into_a_runner_dir_holds_both_halves_after_git_add_u(git_repo):
+    """REGRESSION (silent data loss). The SAME move as above, from a fixer that ran
+    `git add -u` (or `git rm`) after it: porcelain reports the deletion in the INDEX
+    column (`D `), not the worktree one (` D`). Reading only the worktree column let
+    this shape past the pair probe, so `git add -A` committed the deletion while the
+    glob held the destination back and the tripwire hid it."""
+    _write(git_repo, "src/old.py", "PRECIOUS = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "build").mkdir()
+    (git_repo / "src/old.py").rename(git_repo / "build/new.py")
+    _git(git_repo, "add", "-u")                  # the deletion is now STAGED
+    _write(git_repo, "real.txt", "the fix\n")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert ("D ", "src/old.py") in entries, entries
+    assert commit_push._renamed_into_runner_sources(str(git_repo), entries) == {
+        "src/old.py"}
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    # The staged deletion is un-staged again — only the real fix commits.
+    assert _staged(git_repo) == {"real.txt"}
+    assert any(n[2] == "stop" and "src/old.py" in n[1] for n in notices), notices
+
+    # …and the still-deleted source is residue the tripwire names, so the round
+    # cannot report success over a file it dropped.
+    _git(git_repo, "commit", "-qm", "fix")
+    tripwire = []
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(tripwire))
+    assert len(tripwire) == 1, tripwire
+    assert "src/old.py" in tripwire[0][1]
+    assert "build/new.py" not in tripwire[0][1]   # that half IS deliberately withheld
+
+
+def test_a_staged_move_into_a_runner_dir_pairs_from_a_subdirectory_cwd(git_repo):
+    """REGRESSION, same class as the `ls-files` case above but for the STAGED-
+    deletion half: `git ls-tree HEAD` also prints `cwd`-relative paths unless
+    `--full-tree` is given, so the same `../`-prefixed-keys failure applied to a
+    fixer's `git add -u`/`git rm` after the move when the round ran from a
+    subdirectory."""
+    _write(git_repo, "src/old.py", "PRECIOUS = 1\n")
+    _write(git_repo, "sub/placeholder.py", "y = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source and a subdir")
+
+    (git_repo / "build").mkdir()
+    (git_repo / "src/old.py").rename(git_repo / "build/new.py")
+    _git(git_repo, "add", "-u")                  # the deletion is now STAGED
+    _write(git_repo, "real.txt", "the fix\n")
+    sub_cwd = str(git_repo / "sub")
+
+    entries = commit_push._status_entries(sub_cwd)
+    assert ("D ", "src/old.py") in entries, entries
+    assert commit_push._renamed_into_runner_sources(sub_cwd, entries) == {
+        "src/old.py"}
+
+    notices = []
+    add = commit_push._stage_all(sub_cwd, notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"real.txt"}
+    assert any(n[2] == "stop" and "src/old.py" in n[1] for n in notices), notices
+
+
+def test_a_staged_symlink_move_into_a_runner_dir_holds_both_halves(git_repo):
+    """The symlink route reads the deleted entry's MODE, which for a staged deletion
+    comes from HEAD rather than the index — a `120000` source must still pair."""
+    _write(git_repo, "src/real.txt", "the pointed-at file\n")
+    os.symlink("real.txt", git_repo / "src/link")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    (git_repo / "build").mkdir()
+    shutil.move(str(git_repo / "src/link"), str(git_repo / "build/link"))
+    _git(git_repo, "add", "-u")
+    _write(git_repo, "real.txt", "the fix\n")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert commit_push._renamed_into_runner_sources(str(git_repo), entries) == {
+        "src/link"}
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"real.txt"}
+    assert any(n[2] == "stop" and "src/link" in n[1] for n in notices), notices
+
+
+def test_a_staged_deletion_with_no_moved_content_still_commits(git_repo):
+    """The widened deletion predicate must not hold back an ORDINARY staged
+    deletion: pairing is still by CONTENT, so a `git rm`-ed file beside an unrelated
+    artifact commits its deletion exactly as before."""
+    _write(git_repo, "src/gone.py", "TO BE DELETED\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "source")
+
+    _git(git_repo, "rm", "-q", "src/gone.py")
+    _write(git_repo, "build/artifact.js", "SOMETHING ELSE ENTIRELY\n")
+    _write(git_repo, "real.txt", "the fix\n")
+
+    entries = commit_push._status_entries(str(git_repo))
+    assert commit_push._renamed_into_runner_sources(str(git_repo), entries) == set()
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"src/gone.py", "real.txt"}
+    assert not [n for n in notices if n[2] == "stop"], notices
+
+
+def test_a_staged_move_inside_a_committed_build_dir_lands_whole(git_repo):
+    """`source_dirs` still overrules the widened predicate: a staged move INSIDE the
+    repo's own committed `build/` is an ordinary rename, not a pair to withhold."""
+    _write(git_repo, "build/old.sh", "echo PRECIOUS\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build scripts")
+
+    (git_repo / "build/old.sh").rename(git_repo / "build/new.sh")
+    _git(git_repo, "add", "-u")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"build/new.sh"}
+    assert not [n for n in notices if n[2] == "stop"], notices
 
 
 def test_a_rename_inside_a_repos_own_committed_build_dir_lands_whole(git_repo):
