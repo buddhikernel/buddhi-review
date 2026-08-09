@@ -1533,7 +1533,7 @@ def test_exit_rebase_still_skips_on_a_genuinely_dirty_tree(tmp_path):
 
 
 def test_an_artifacts_only_round_is_still_a_no_op(tmp_path, monkeypatch):
-    """REGRESSION. `commit_and_push`'s entry short-circuit was self-healing only
+    """REGRESSION. `commit_and_push`'s entry short-circuit was masking this only
     while `git add -A` swept the runner output into the commit. With the artifacts
     held back PERMANENTLY, a raw-porcelain check reports `?? node_modules/` on every
     round of every JS/Rust/JVM repo — so a round with nothing to commit would fall

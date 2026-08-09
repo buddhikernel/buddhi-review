@@ -1788,7 +1788,7 @@ def commit_and_push(
     # (:func:`_dirty_beyond_held_back`) as the clean-tree tripwire
     # (:func:`_assert_clean_after_commit`) and the rebase precondition
     # (:func:`exit_rebase`), so all three agree on what counts as an uncommitted
-    # change. A bare ``.strip()`` over raw porcelain was self-healing only while
+    # change. A bare ``.strip()`` over raw porcelain masked this only while
     # ``git add -A`` swept runner output into the commit: now that a cold worktree's
     # untracked ``node_modules/`` / ``target/`` / coverage tree is held back
     # PERMANENTLY (:func:`_held_back_new_artifacts`), porcelain reports it as
