@@ -1810,6 +1810,21 @@ def commit_and_push(
     if status.returncode != 0:
         return "error"
     if not _dirty_beyond_held_back(status.stdout or "", cwd, run=run):
+        # Nothing BEYOND the held-back set, but the held-back set itself may
+        # include a fixer-authored file :func:`_tracked_source_dirs` could not
+        # tell apart from real runner output (an ambiguous dir with no directly
+        # committed sibling). ``_stage_all`` would notice() this same set on any
+        # round it actually runs on; mirror that here so a round that never
+        # reaches ``_stage_all`` still names what it left uncommitted.
+        entries = list(_iter_porcelain_z(status.stdout or ""))
+        source_dirs = _tracked_source_dirs(cwd, entries, run=run)
+        held_back = _held_back_new_artifacts(entries, source_dirs=source_dirs)
+        if held_back:
+            notice("stage",
+                   f"excluded {len(held_back)} artifact(s)/dropping(s) from this "
+                   f"no-op round (nothing else changed): "
+                   f"{_fmt_droppings(sorted(held_back))}",
+                   status="skip")
         return "nothing"
 
     # Shift-left advisory: name a fixer-introduced syntax error in the round's

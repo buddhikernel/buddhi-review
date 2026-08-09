@@ -636,6 +636,65 @@ def test_a_spawn_failure_returns_nonzero_instead_of_crashing(git_repo):
     assert add.returncode != 0
 
 
+def test_a_failed_rename_dropping_reset_blocks_the_commit(git_repo):
+    """REGRESSION. A failed reset guarding a staged rename INTO a dropping name
+    (``git mv src.py src.py.bak``) must block the round instead of falling
+    through and committing from an index the guard failed to clean."""
+    _write(git_repo, "src.py", "x = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "seed src")
+    _git(git_repo, "mv", "src.py", "src.py.bak")   # staged rename INTO a dropping name
+
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if argv[:4] == ["git", "reset", "-q", "--"]:
+            return subprocess.CompletedProcess(argv, returncode=1, stdout="",
+                                               stderr="reset failed")
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode != 0
+
+
+def test_a_failed_exclude_reset_blocks_the_commit(git_repo):
+    """REGRESSION. A failed reset guarding an editor/backup dropping (the
+    un-stage before the main ``git add``) must likewise block the round rather
+    than let the subsequent add ship whatever a dirty index leaves staged."""
+    _write(git_repo, "foo.bak", "stray\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if argv[:4] == ["git", "reset", "-q", "--"]:
+            return subprocess.CompletedProcess(argv, returncode=1, stdout="",
+                                               stderr="reset failed")
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode != 0
+
+
+def test_a_failed_reset_propagates_as_error_through_commit_and_push(git_repo):
+    """REGRESSION. `commit_and_push` must turn a failed staging reset into
+    `"error"` rather than shipping a partially-staged commit."""
+    _write(git_repo, "foo.bak", "stray\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if argv[:4] == ["git", "reset", "-q", "--"]:
+            return subprocess.CompletedProcess(argv, returncode=1, stdout="",
+                                               stderr="reset failed")
+        return real_run(argv, **kw)
+
+    out = commit_push.commit_and_push(
+        str(git_repo), message="m", run=run, test_gate=False, notice=_rec_notice([]))
+    assert out == "error"
+
+
 def test_held_back_set_covers_new_runner_artifacts_only():
     entries = [("??", "node_modules/left-pad/index.js"), ("??", "foo.bak"),
                ("M ", "node_modules/vendored/patch.js"), ("??", "fix.py")]
