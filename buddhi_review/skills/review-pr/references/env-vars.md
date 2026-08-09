@@ -13,6 +13,7 @@ are sane; the skill works with no env vars at all.
 | `BUDDHI_BOT_QUIESCENCE_SECS` | Silence window (seconds) after a bot's last comment before it is done for the round | 60 | positive int wins; `0`/negative/garbage/blank → default |
 | `BUDDHI_MAX_WAIT_TOTAL` | Hard ceiling (seconds) on how long one round waits for reviewer bots | 1800 (30 min) | clamped ≥ 1; garbage/blank → default |
 | `BUDDHI_TEST_GATE_TIMEOUT_SECS` | Hard timeout (seconds) on the pre-push local test-gate subprocess | 600 (10 min) | positive int wins; `0`/negative/garbage/blank → default |
+| `BUDDHI_TEST_GATE_TIMEOUT_SECS_<RUNNER>` | The same ceiling for ONE runner only, so a slow JVM/native suite gets more time without inflating pytest's. `<RUNNER>` is the detected runner upper-cased with every non-alphanumeric character replaced by `_` — e.g. `..._PYTEST`, `..._GRADLE`, `..._CARGO`, `..._NODE_TEST` | the global above | ⚠ **clamped ≥ 1**, unlike the global: `0`/negative give a **1-second** gate, which reds a passing suite. garbage/blank → the global |
 | `BUDDHI_CLASSIFY_TIMEOUT` | Per-comment classify subprocess timeout (seconds) | 120 | clamped ≥ 1; garbage/blank → default |
 | `BUDDHI_CLASSIFY_RETRIES` | Retries on a failed comment classification (`0` disables the retry) | 1 | clamped ≥ 0; garbage/blank → default |
 | `BUDDHI_FIX_RETRIES` | Retries on a transient per-comment fix failure (timeout / non-zero rc; `0` disables; SKIP/success are never retried) | 1 | clamped ≥ 0; garbage/blank → default |

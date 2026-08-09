@@ -1,0 +1,737 @@
+"""Cold-worktree hardening: the two guards that keep a worktree whose gate has
+never run from poisoning the round.
+
+1. **Runner-dropping ignore hygiene** — a fix commit never sweeps a dependency-
+   install / build / cache / coverage artifact (`node_modules/`, `target/`,
+   `build/`, `bin/Debug/`, `.coverage`, …) into the customer's PR, and the
+   exclusion costs a FIXED number of git pathspecs no matter how many files the
+   tree holds (a cold `node_modules` is thousands of untracked files —
+   enumerating them per file would blow git's argv). Only UNTRACKED artifacts are
+   held back: a fixer's edit to a TRACKED file under a runner dir must still reach
+   the commit, and a real `src/bin/` is never swept.
+2. **Per-runner gate timeout** — `BUDDHI_TEST_GATE_TIMEOUT_SECS_<RUNNER>` lifts
+   ONE runner's ceiling; with no per-runner var set the gate is byte-identical to
+   the global-only behaviour (no extra pre-run runner detection either).
+"""
+import os
+import subprocess
+
+import pytest
+
+from buddhi_review import commit_push, test_runner
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def _write(root, rel, text="x = 1\n"):
+    p = root / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(text)
+    return p
+
+
+def _rec_notice(store):
+    def notice(action, detail="", *, status="do", hint=None):
+        store.append((action, detail, status))
+        return ""
+    return notice
+
+
+def _staged(cwd):
+    """The paths in the index that differ from HEAD, as a set. ``-z`` for VERBATIM
+    names — plain output C-quotes any path holding a backslash or a non-ASCII byte.
+    A staged RENAME is reported by its DESTINATION only (git's rename detection),
+    so a test about a rename's two halves asserts on the resulting commit instead."""
+    r = subprocess.run(["git", "diff", "--cached", "--name-only", "-z"], cwd=cwd,
+                       capture_output=True, text=True, check=True)
+    return {p for p in r.stdout.split("\0") if p}
+
+
+@pytest.fixture
+def git_repo(tmp_path):
+    """A minimal git worktree with one committed file."""
+    _write(tmp_path, "seed.py")
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.email", "t@example.com")
+    _git(tmp_path, "config", "user.name", "t")
+    _git(tmp_path, "add", "-A")
+    _git(tmp_path, "commit", "-qm", "seed")
+    return tmp_path
+
+
+# ── 1. Runner-dropping classification ────────────────────────────────────────────
+
+_RUNNER_PATHS = [
+    "node_modules/left-pad/index.js",
+    "packages/web/node_modules/react/index.js",   # workspace, nested
+    "target/debug/app",
+    "pkg/__pycache__/mod.cpython-311.pyc",
+    ".pytest_cache/v/cache/lastfailed",
+    "build/classes/Main.class",
+    ".gradle/7.6/fileHashes.bin",
+    "deps/plug/mix.exs",
+    "_build/dev/lib/app.beam",
+    "coverage/lcov-report/index.html",
+    "htmlcov/index.html",
+    ".nyc_output/out.json",
+    ".tox/py311/bin/python",
+    ".nox/tests/bin/python",
+    "src/App/bin/Debug/net8.0/App.dll",           # dotnet, under a config child
+    "src/App/obj/Release/project.assets.json",
+    ".coverage",
+    "sub/coverage.xml",
+    "js/lcov.info",
+]
+
+# Legitimate source paths that must NEVER be classified as runner droppings.
+_RUNNER_DECOYS = [
+    "src/bin/main.rs",            # a Rust multi-binary tree — bare `bin/`
+    "src/bin/tool/helper.rs",
+    "bin/release-notes.sh",       # a repo's own scripts dir
+    "src/obj/loader.c",           # bare `obj/`
+    "app/builder.py",             # `build` as a SUBSTRING, not a segment
+    "app/rebuild/x.py",
+    "targets/list.txt",
+    "docs/coverage-policy.md",
+    "src/node_modules_shim.js",
+    "lcov.info.md",
+    "seed.py",
+]
+
+
+@pytest.mark.parametrize("path", _RUNNER_PATHS)
+def test_runner_dropping_matched_at_any_depth(path):
+    assert commit_push._is_runner_dropping(path) is True
+
+
+@pytest.mark.parametrize("path", _RUNNER_DECOYS)
+def test_legitimate_paths_are_not_runner_droppings(path):
+    assert commit_push._is_runner_dropping(path) is False
+
+
+def test_dotnet_bin_obj_only_under_a_build_config_child():
+    """A bare `bin/`/`obj/` segment collides with real source layouts, so dotnet
+    output counts ONLY under a Debug/Release child."""
+    for d in ("bin", "obj"):
+        for cfg in ("Debug", "Release"):
+            assert commit_push._is_runner_dropping(f"App/{d}/{cfg}/App.dll") is True
+            assert commit_push._is_runner_dropping(f"App/{d}/{cfg}") is True
+        assert commit_push._is_runner_dropping(f"App/{d}/Custom/App.dll") is False
+        assert commit_push._is_runner_dropping(f"App/{d}/main.rs") is False
+
+
+def test_runner_dropping_handles_edge_paths():
+    assert commit_push._is_runner_dropping("") is False
+    assert commit_push._is_runner_dropping(None) is False
+    assert commit_push._is_runner_dropping("node_modules/") is True   # porcelain dir form
+    assert commit_push._is_runner_dropping("/node_modules/x") is True
+
+
+def test_a_literal_backslash_is_not_a_separator(git_repo):
+    """REGRESSION. `\\` must NOT be normalized to `/`: porcelain emits `/` on every
+    platform (Windows included) and `_runner_globs` emits `/`-only globs, so a file
+    whose BASENAME literally contains backslashes can never be matched by the git
+    exclude layer. Claiming it in the Python predicate alone made the guard report
+    the file as excluded while it rode into the commit."""
+    weird = "bin\\Debug\\App.dll"
+    assert commit_push._is_runner_dropping(weird) is False
+    assert commit_push._is_runner_dropping("pkg\\__pycache__\\m.pyc") is False
+
+    # The two layers must AGREE on a real repo: whatever the predicate claims is
+    # exactly what the git exclude pathspecs actually hold back.
+    _write(git_repo, weird, "dll\n")
+    _write(git_repo, "node_modules/real.js", "// dep\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+    notices = []
+    assert commit_push._stage_all(str(git_repo), notice=_rec_notice(notices)).returncode == 0
+    staged = _staged(git_repo)
+    assert "node_modules/real.js" not in staged
+    assert weird in staged                       # git cannot exclude it → it commits
+    runner_notes = [n for n in notices if "runner artifact" in n[1]]
+    assert weird not in (runner_notes[0][1] if runner_notes else "")   # and we don't lie
+
+
+# ── 1b. The exclusion is count-INDEPENDENT (argv safety) ─────────────────────────
+
+
+def test_runner_exclude_pathspec_set_is_fixed_and_small():
+    """The pathspec set is derived from the pattern constants alone — nothing about
+    a worktree can grow it."""
+    specs = commit_push._runner_exclude_pathspecs()
+    assert specs == commit_push._runner_exclude_pathspecs()   # deterministic
+    expected = (2 * len(commit_push._RUNNER_DROPPING_DIRS)
+                + 2 * len(commit_push._RUNNER_DROPPING_DOTNET_DIRS)
+                * len(commit_push._RUNNER_DROPPING_DOTNET_CONFIGS)
+                + len(commit_push._RUNNER_DROPPING_FILES))
+    assert len(specs) == expected
+    assert all(s.startswith(":(top,exclude,glob)") for s in specs)
+    assert sum(len(s) for s in specs) < 4096          # nowhere near an argv limit
+
+
+@pytest.mark.parametrize("n_files", [5, 400])
+def test_stage_all_argv_does_not_scale_with_planted_tree_size(git_repo, n_files):
+    """THE argv guard: a cold worktree's thousands of untracked runner files must
+    cost the same, fixed pathspec count as a handful. Asserted on the RECORDED
+    `git add` argv, at two tree sizes, so a regression to per-file enumeration
+    fails here."""
+    for i in range(n_files):
+        _write(git_repo, f"node_modules/pkg{i}/index.js", f"// {i}\n")
+    _write(git_repo, "real.py", "y = 2\n")
+
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0
+    adds = [c for c in calls if c[:3] == ["git", "add", "-A"]]
+    assert adds, calls
+    argv = adds[0]
+    # The argv holds the fixed exclude set (+ `:/`) and NOTHING per planted file.
+    assert len(argv) == 5 + len(commit_push._runner_exclude_pathspecs())
+    assert not any("pkg0/index.js" in a for a in argv)
+    assert sum(len(a) for a in argv) < 8192
+    # ...and the outcome is right: the real edit staged, no artifact swept in.
+    assert _staged(git_repo) == {"real.py"}
+
+
+# ── 1c. Staging behaviour on a real repo ─────────────────────────────────────────
+
+
+def test_nested_artifacts_are_held_back_at_the_GIT_layer(git_repo):
+    """REGRESSION. The any-depth promise has to be pinned on the git EXCLUDE layer,
+    not only on the Python predicate — the globs are what actually hold files back.
+    Reverting `_runner_globs`' `**/` prefix to a root-anchored glob passes every
+    predicate test while four NESTED artifacts ride into the customer's PR."""
+    _write(git_repo, "packages/web/node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "packages/api/target/debug/blob.bin", "bin\n")
+    _write(git_repo, "sub/dir/deep/htmlcov/index.html", "<html>\n")
+    _write(git_repo, "svc/one/__pycache__/m.cpython-311.pyc", "pyc\n")
+    _write(git_repo, "src/app.js", "the fix\n")
+
+    assert commit_push._stage_all(str(git_repo), notice=_rec_notice([])).returncode == 0
+    assert _staged(git_repo) == {"src/app.js"}
+    _git(git_repo, "commit", "-qm", "fix")
+    tree = subprocess.run(["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=git_repo,
+                          capture_output=True, text=True, check=True).stdout
+    for nested in ("node_modules", "target/", "htmlcov", "__pycache__"):
+        assert nested not in tree, tree
+
+
+def test_a_git_add_spawn_failure_returns_nonzero_instead_of_crashing(git_repo):
+    """REGRESSION. The OSError guard on the main `git add -A` was untested — without
+    it an E2BIG on a pathological tree raises out of the round instead of handing
+    back a return code the caller can read."""
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if argv[:3] == ["git", "add", "-A"] and "--" in argv:
+            raise OSError(7, "Argument list too long")
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode != 0
+    assert "Argument list too long" in (add.stderr or "")
+
+
+def test_the_unstage_reset_argv_is_batched_too(git_repo):
+    """REGRESSION. Only the recovery list was argv-bounded; the un-stage RESET list
+    grows with the number of pre-staged artifacts just as fast. Unbatched this
+    produces a quarter-megabyte argv."""
+    n = 2500
+    for i in range(n):
+        _write(git_repo, f"node_modules/pkg{i}/a-fairly-long-artifact-name-{i}.js", "//\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+    _git(git_repo, "add", "-A")                       # the fixer pre-staged them all
+
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"fix.py"}
+    resets = [c for c in calls if c[:2] == ["git", "reset"]]
+    assert resets
+    for argv in calls:
+        assert sum(len(a.encode("utf-8")) + 1 for a in argv) <= \
+            commit_push._PATHSPEC_ARGV_BUDGET + 4096, argv[:4]
+
+
+def test_a_huge_per_file_exclude_list_falls_back_instead_of_blowing_argv(git_repo):
+    """REGRESSION. The main `git add -A -- :/ <excludes>` is the one argv that cannot
+    be split — every exclude must share one pathspec set. Its per-file half grows
+    with the worktree, and appending the fixed runner globs pushed a band of trees
+    that used to stage cleanly over the OS limit. Past the budget it now falls back
+    to add-with-globs + a batched un-stage, which reaches the identical end state."""
+    long_name = "d" * 180
+    for i in range(700):
+        _write(git_repo, f"s/{long_name}{i:04d}.bak", "backup\n")
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "README.md", "THE REAL FIX\n")
+
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"README.md"}      # droppings + artifact both held out
+    for argv in calls:
+        assert sum(len(a.encode("utf-8")) + 1 for a in argv) <= \
+            commit_push._PATHSPEC_ARGV_BUDGET + 4096, argv[:4]
+
+
+def test_a_tracked_only_runner_change_announces_nothing(git_repo):
+    """REGRESSION. The notice must never claim it withheld a file that is in fact in
+    the commit. Dropping the `_new_to_head` filter on the held-back list makes the
+    log contradict the commit — the worst possible failure for an audit trail."""
+    _write(git_repo, "node_modules/vendored/x.js", "// v1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "vendored")
+    _write(git_repo, "node_modules/vendored/x.js", "// v2 the fix\n")
+
+    notices = []
+    assert commit_push._stage_all(str(git_repo), notice=_rec_notice(notices)).returncode == 0
+    assert _staged(git_repo) == {"node_modules/vendored/x.js"}   # it IS committed
+    assert not [n for n in notices if "runner artifact" in n[1]], notices
+
+
+def test_untracked_runner_artifacts_are_held_back_and_announced(git_repo):
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "target/debug/app", "bin\n")
+    _write(git_repo, "src/App/bin/Debug/App.dll", "dll\n")
+    _write(git_repo, ".coverage", "cov\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"fix.py"}
+    runner_notes = [n for n in notices if "runner artifact" in n[1]]
+    assert len(runner_notes) == 1
+    assert runner_notes[0][2] == "skip"
+
+
+def test_tracked_file_under_a_runner_dir_is_still_committed(git_repo):
+    """A vendored/committed file under a runner dir is a REAL tracked file — a
+    fixer's edit to it must reach the commit, never be held back."""
+    _write(git_repo, "node_modules/vendored/patch.js", "// v1\n")
+    _write(git_repo, "build/keep.txt", "v1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "vendor")
+
+    _write(git_repo, "node_modules/vendored/patch.js", "// v2 — the fixer's edit\n")
+    _write(git_repo, "build/keep.txt", "v2\n")
+    _write(git_repo, "node_modules/left-pad/index.js", "// fresh install\n")  # untracked
+
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"node_modules/vendored/patch.js", "build/keep.txt"}
+
+
+def test_tracked_file_under_a_runner_dir_deletion_is_committed(git_repo):
+    _write(git_repo, "node_modules/vendored/patch.js", "// v1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "vendor")
+    (git_repo / "node_modules/vendored/patch.js").unlink()
+
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"node_modules/vendored/patch.js"}
+
+
+def test_src_bin_is_never_swept(git_repo):
+    """A Rust `src/bin/` multi-binary tree is source, not dotnet output."""
+    _write(git_repo, "src/bin/main.rs", "fn main() {}\n")
+    _write(git_repo, "src/bin/tool.rs", "fn main() {}\n")
+    _write(git_repo, "bin/release.sh", "#!/bin/sh\n")
+
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"src/bin/main.rs", "src/bin/tool.rs",
+                                 "bin/release.sh"}
+
+
+def test_prestaged_runner_artifact_is_unstaged(git_repo):
+    """A prior `git add -A` that already staged an untracked node_modules must not
+    survive — an exclude pathspec alone never un-stages."""
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+    _git(git_repo, "add", "-A")
+    assert "node_modules/left-pad/index.js" in _staged(git_repo)
+
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"fix.py"}
+
+
+def test_clean_repo_still_takes_the_bare_add_short_circuit(git_repo):
+    """No droppings of EITHER kind → a plain `git add -A`, byte-identical to a
+    no-guard fix commit (no `:/`, no exclude pathspecs)."""
+    _write(git_repo, "fix.py", "z = 3\n")
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0
+    assert ["git", "add", "-A"] in calls
+    assert not any(len(c) > 3 and c[:3] == ["git", "add", "-A"] for c in calls)
+    assert _staged(git_repo) == {"fix.py"}
+
+
+def test_editor_dropping_guard_still_holds_with_runner_artifacts_present(git_repo):
+    """The pre-existing editor/backup guard is preserved alongside the new one."""
+    _write(git_repo, "foo.bak", "backup\n")
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "fix.py", "z = 3\n")
+
+    notices = []
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert add.returncode == 0
+    assert _staged(git_repo) == {"fix.py"}
+    assert any("editor/backup dropping" in n[1] for n in notices)
+    assert any("runner artifact" in n[1] for n in notices)
+
+
+# ── 1d. Regressions the adversarial pass proved reachable ────────────────────────
+
+
+def test_a_tracked_path_replaced_by_an_artifact_dir_never_leaks_its_subtree(git_repo):
+    """REGRESSION (proven to reach a real remote). HEAD tracks a FILE named `build`
+    (a build script); the round deletes it and the runner drops a `build/` output
+    tree. The per-file recovery names `build`, which is now a DIRECTORY — with
+    `git add -A` that pathspec recursively staged every untracked artifact under it,
+    while the [auto] line told the operator they were excluded."""
+    _write(git_repo, "build", "#!/bin/sh\nmake\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build script")
+
+    (git_repo / "build").unlink()
+    _write(git_repo, "build/a.o", "obj\n")
+    _write(git_repo, "build/CMakeFiles/huge.bin", "big\n")
+    _write(git_repo, "real.txt", "the fix\n")
+
+    assert commit_push._stage_all(str(git_repo), notice=_rec_notice([])).returncode == 0
+    assert _staged(git_repo) == {"build", "real.txt"}   # the DELETION, not the tree
+    _git(git_repo, "commit", "-qm", "fix")
+    r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=git_repo,
+                       capture_output=True, text=True, check=True)
+    assert "build/a.o" not in r.stdout
+    assert "build/CMakeFiles/huge.bin" not in r.stdout
+
+
+def test_a_tracked_symlink_replaced_by_an_install_tree_never_leaks(git_repo):
+    """REGRESSION, same class: the common monorepo `node_modules` SYMLINK that a
+    real install replaces with a directory."""
+    (git_repo / "vendor").mkdir()
+    _write(git_repo, "vendor/keep.js", "// v\n")
+    os.symlink("vendor", git_repo / "node_modules")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "symlinked deps")
+
+    (git_repo / "node_modules").unlink()
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+    _write(git_repo, "node_modules/.bin/x", "bin\n")
+    _write(git_repo, "real.txt", "the fix\n")
+
+    assert commit_push._stage_all(str(git_repo), notice=_rec_notice([])).returncode == 0
+    assert _staged(git_repo) == {"node_modules", "real.txt"}
+
+
+def test_a_staged_rename_under_a_runner_dir_keeps_both_halves(git_repo):
+    """REGRESSION. A glob-based un-stage of pre-staged runner content also decomposed
+    a staged RENAME, and the per-file recovery only ever sees porcelain's rename
+    DESTINATION — so the origin's deletion never reached the commit and the
+    renamed-away file was resurrected."""
+    _write(git_repo, "build/old.txt", "PRECIOUS SOURCE\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "vendored")
+
+    _git(git_repo, "mv", "build/old.txt", "build/new.txt")
+    _write(git_repo, "node_modules/fresh/a.js", "// dep\n")
+    _git(git_repo, "add", "node_modules/fresh/a.js")      # a fixer's own `git add -A`
+    _write(git_repo, "real.txt", "the fix\n")
+
+    assert commit_push._stage_all(str(git_repo), notice=_rec_notice([])).returncode == 0
+    _git(git_repo, "commit", "-qm", "fix")
+    r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=git_repo,
+                       capture_output=True, text=True, check=True)
+    assert "build/old.txt" not in r.stdout          # NOT resurrected
+    assert "build/new.txt" in r.stdout
+    assert "node_modules/fresh/a.js" not in r.stdout
+
+
+def test_a_risky_delete_pair_under_a_runner_dir_is_not_re_staged(git_repo):
+    """REGRESSION (silent data loss). A backup-then-replace rewrite that failed
+    mid-way, under a runner dir: the guard announced it was holding the deletion
+    back, then the recovery re-staged it — committing the file's removal while its
+    only surviving copy sat in the excluded, uncommitted `.bak`."""
+    _write(git_repo, "build/src.py", "PRECIOUS = 1\n")
+    _write(git_repo, "keep.txt", "k\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "vendored")
+
+    (git_repo / "build/src.py").rename(git_repo / "build/src.py.bak")
+
+    notices = []
+    commit_push._stage_all(str(git_repo), notice=_rec_notice(notices))
+    assert "build/src.py" not in _staged(git_repo)
+    assert any(n[2] == "stop" and "build/src.py" in n[1] for n in notices)
+
+
+def test_per_file_recovery_argv_is_batched_under_arg_max(git_repo):
+    """REGRESSION (E2BIG). A runner that reinstalls a VENDORED, tracked tree makes
+    the per-file recovery list scale with the file count. Unbatched, ~10k paths
+    raised `OSError: Argument list too long` straight out of the round."""
+    n = 3000
+    for i in range(n):
+        _write(git_repo, f"node_modules/pkg{i}/a-fairly-long-vendored-path-{i}.js", "//\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "vendored")
+    subprocess.run(["rm", "-rf", str(git_repo / "node_modules")], check=True)
+    _write(git_repo, "real.txt", "the fix\n")
+
+    calls = []
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        calls.append(list(argv))
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode == 0
+    for argv in calls:
+        assert sum(len(a) + 1 for a in argv) < 200_000, argv[:4]
+    assert len(_staged(git_repo)) == n + 1        # every deletion + the fix
+    assert any(c[:3] == ["git", "add", "-u"] for c in calls)
+
+
+def test_a_fixer_staged_deletion_under_a_runner_dir_does_not_abort_the_round(git_repo):
+    """REGRESSION (round-killer). A fixer that deletes a stale committed artifact
+    under `build/` and stages it itself leaves `D ` — no index entry, no worktree
+    file. Recovering that path made `git add` exit 128 (`pathspec did not match any
+    files`), so `_stage_all` returned non-zero and the WHOLE round became an
+    `error` that never shipped the fix. It also re-reproduced on every later round."""
+    _write(git_repo, "build/stale.txt", "old\n")
+    _write(git_repo, "src/main.py", "def f():\n    return 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "seed2")
+
+    _git(git_repo, "rm", "-q", "build/stale.txt")            # the fixer stages it
+    _write(git_repo, "src/main.py", "def f():\n    return 2\n")
+    _git(git_repo, "add", "-A")
+
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    assert _staged(git_repo) == {"build/stale.txt", "src/main.py"}
+
+
+def test_an_intent_to_add_runner_artifact_never_leaks(git_repo):
+    """REGRESSION. `git add -N` creates a real INDEX ENTRY whose staged column is a
+    SPACE (` A`), so it escaped the un-stage — and the per-file recovery's `git add
+    -u` then filled that stub in with the artifact's FULL content (proven to reach a
+    remote), while the guard logged it as excluded."""
+    _write(git_repo, "build", "#!/bin/sh\nmake\n")
+    _write(git_repo, "app.py", "v = 1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "build script")
+
+    (git_repo / "build").unlink()
+    _write(git_repo, "build/artifact.js", "RUNNER-ARTIFACT-SECRET\n")
+    _write(git_repo, "build/sub/deep.min.js", "DEEP\n")
+    _write(git_repo, "app.py", "v = 2\n")
+    _git(git_repo, "add", "-N", "build/artifact.js", "build/sub/deep.min.js")
+
+    add = commit_push._stage_all(str(git_repo), notice=_rec_notice([]))
+    assert add.returncode == 0, getattr(add, "stderr", "")
+    _git(git_repo, "commit", "-qm", "fix")
+    r = subprocess.run(["git", "ls-tree", "-r", "--name-only", "HEAD"], cwd=git_repo,
+                       capture_output=True, text=True, check=True)
+    assert "build/artifact.js" not in r.stdout
+    assert "build/sub/deep.min.js" not in r.stdout
+    assert "app.py" in r.stdout
+
+
+def test_batching_counts_utf8_bytes_not_characters():
+    """REGRESSION. The kernel counts the ENCODED argv — measuring characters
+    under-counted a 4-byte-UTF-8 tree by up to 4x, straight into E2BIG."""
+    wide = "𝔫" * 500                       # 500 chars, 2000 UTF-8 bytes
+    specs = [f":(top,literal){wide}/{i}" for i in range(200)]
+    calls = []
+
+    def run(argv, **kw):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    commit_push._run_batched(run, ["git", "reset", "--"], specs, cwd=".")
+    assert len(calls) > 1                   # it actually split
+    for argv in calls:
+        assert sum(len(a.encode("utf-8")) + 1 for a in argv) <= \
+            commit_push._PATHSPEC_ARGV_BUDGET + 2048
+
+
+def test_a_spawn_failure_returns_nonzero_instead_of_crashing(git_repo):
+    """The staging guard's caller reads a RETURN CODE — an OSError from a git spawn
+    must become a non-zero result, never kill the round."""
+    _write(git_repo, "node_modules/vendored/x.js", "// v1\n")
+    _git(git_repo, "add", "-A")
+    _git(git_repo, "commit", "-qm", "vendored")
+    _write(git_repo, "node_modules/vendored/x.js", "// v2\n")
+    _write(git_repo, "node_modules/fresh/y.js", "// dep\n")
+
+    real_run = commit_push._default_run
+
+    def run(argv, **kw):
+        if argv[:3] == ["git", "add", "-u"]:
+            raise OSError(7, "Argument list too long")
+        return real_run(argv, **kw)
+
+    add = commit_push._stage_all(str(git_repo), run=run, notice=_rec_notice([]))
+    assert add.returncode != 0
+
+
+def test_held_back_set_covers_new_runner_artifacts_only():
+    entries = [("??", "node_modules/left-pad/index.js"), ("??", "foo.bak"),
+               ("M ", "node_modules/vendored/patch.js"), ("??", "fix.py")]
+    assert commit_push._held_back_new_artifacts(entries) == {
+        "node_modules/left-pad/index.js", "foo.bak"}
+
+
+def test_clean_tree_tripwire_ignores_cold_gate_artifacts(git_repo, capsys):
+    """A round whose only worktree residue is a cold-gate artifact is a legitimate
+    no-op, not "a fixer wrote outside the committed set"."""
+    _write(git_repo, "node_modules/left-pad/index.js", "// dep\n")
+    notices = []
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(notices))
+    assert notices == []
+
+    _write(git_repo, "lost.py", "orphan = 1\n")
+    commit_push._assert_clean_after_commit(str(git_repo), notice=_rec_notice(notices))
+    assert len(notices) == 1
+    assert "lost.py" in notices[0][1]
+    assert "node_modules" not in notices[0][1]
+
+
+# ── 2. Per-runner gate timeout ───────────────────────────────────────────────────
+
+
+def test_per_runner_timeout_override_is_honoured(monkeypatch):
+    monkeypatch.delenv("BUDDHI_TEST_GATE_TIMEOUT_SECS", raising=False)
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS_GRADLE", "1800")
+    default = commit_push._TEST_TIMEOUT_DEFAULT
+    assert commit_push._test_gate_timeout(test_runner.GRADLE) == 1800
+    assert commit_push._test_gate_timeout(test_runner.PYTEST) == default  # untouched
+    assert commit_push._test_gate_timeout() == default
+    assert commit_push._per_runner_timeout_configured() is True
+
+
+def test_per_runner_env_key_sanitizes_non_alnum(monkeypatch):
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS_NODE_TEST", "900")
+    assert commit_push._test_gate_timeout(test_runner.NODE_TEST) == 900
+
+
+def test_per_runner_override_layers_over_a_custom_global(monkeypatch):
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS", "120")
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS_CARGO", "900")
+    assert commit_push._test_gate_timeout(test_runner.CARGO) == 900
+    assert commit_push._test_gate_timeout(test_runner.PYTEST) == 120
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "1e3"])
+def test_per_runner_garbage_falls_back_to_the_global(monkeypatch, raw):
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS", "300")
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS_PYTEST", raw)
+    assert commit_push._test_gate_timeout(test_runner.PYTEST) == 300
+
+
+def test_per_runner_value_is_clamped_to_one_second(monkeypatch):
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS_PYTEST", "-5")
+    assert commit_push._test_gate_timeout(test_runner.PYTEST) == 1
+
+
+def test_unset_per_runner_is_byte_identical_to_today(monkeypatch):
+    """No per-runner var anywhere → the global is used AND no pre-run
+    `detect_runner` call is made (the cheap guard keeps the call order today's)."""
+    for k in list(os.environ):
+        if k.startswith("BUDDHI_TEST_GATE_TIMEOUT_SECS_"):
+            monkeypatch.delenv(k, raising=False)
+    monkeypatch.delenv("BUDDHI_TEST_GATE_TIMEOUT_SECS", raising=False)
+    monkeypatch.setenv("BUDDHI_TEST_COMMAND", "pytest -q")
+    assert commit_push._per_runner_timeout_configured() is False
+
+    detects = []
+    real_detect = test_runner.detect_runner
+
+    def spy(cwd, cmd):
+        detects.append(cmd)
+        return real_detect(cwd, cmd)
+
+    monkeypatch.setattr(test_runner, "detect_runner", spy)
+    seen = {}
+
+    def run(argv, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return subprocess.CompletedProcess(argv, 0, "1 passed\n", "")
+
+    status, _ = commit_push.run_test_gate(".", run=run, notice=lambda *a, **k: "")
+    assert status == "green"
+    assert seen["timeout"] == commit_push._TEST_TIMEOUT_DEFAULT
+    assert len(detects) == 1          # POST-run detection only, exactly as before
+
+
+def test_gate_applies_the_per_runner_timeout(monkeypatch):
+    monkeypatch.setenv("BUDDHI_TEST_COMMAND", "pytest -q")
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS_PYTEST", "42")
+    seen = {}
+
+    def run(argv, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return subprocess.CompletedProcess(argv, 0, "1 passed\n", "")
+
+    status, _ = commit_push.run_test_gate(".", run=run, notice=lambda *a, **k: "")
+    assert status == "green"
+    assert seen["timeout"] == 42
+
+
+def test_a_detect_runner_explosion_never_breaks_the_gate(monkeypatch):
+    monkeypatch.delenv("BUDDHI_TEST_GATE_TIMEOUT_SECS", raising=False)
+    monkeypatch.setenv("BUDDHI_TEST_COMMAND", "pytest -q")
+    monkeypatch.setenv("BUDDHI_TEST_GATE_TIMEOUT_SECS_PYTEST", "42")
+    calls = {"n": 0}
+    real_detect = test_runner.detect_runner
+
+    def boom(cwd, cmd):
+        calls["n"] += 1
+        if calls["n"] == 1:                       # only the PRE-run resolution
+            raise RuntimeError("detection bug")
+        return real_detect(cwd, cmd)
+
+    monkeypatch.setattr(test_runner, "detect_runner", boom)
+    seen = {}
+
+    def run(argv, **kw):
+        seen["timeout"] = kw.get("timeout")
+        return subprocess.CompletedProcess(argv, 0, "1 passed\n", "")
+
+    status, _ = commit_push.run_test_gate(".", run=run, notice=lambda *a, **k: "")
+    assert status == "green"
+    assert seen["timeout"] == commit_push._TEST_TIMEOUT_DEFAULT   # fell back
+

@@ -33,6 +33,20 @@ or an upstream-less worktree; either way the push stays non-force.
 
 The console panels and phase-break spacing honour ``NO_COLOR`` /
 ``BUDDHI_LOOP_NO_COLOR`` (the same env names the rest of the pipeline honours).
+
+Cold-worktree hardening. A worktree whose gate has never run is COLD: the first
+gate invocation installs dependencies and builds, dropping ``node_modules/`` /
+``target/`` / ``build/`` / coverage trees into it. Two guards keep that from
+poisoning the round:
+
+  * the fix commit never sweeps a runner artifact in (:data:`_RUNNER_DROPPING_DIRS`,
+    held back by a FIXED count-independent glob pathspec set — a tree with
+    thousands of untracked ``node_modules`` files costs ONE pathspec, never one
+    per file, so git's argv is never blown; a fixer's edit to a TRACKED file
+    under such a dir is still committed, recovered per-file);
+  * one runner's suite can be given its own ceiling
+    (``BUDDHI_TEST_GATE_TIMEOUT_SECS_<RUNNER>``) without inflating every other
+    runner's — unset is byte-identical to the global-only behaviour.
 """
 from __future__ import annotations
 
@@ -105,6 +119,45 @@ _DROPPING_GLOBS: Tuple[str, ...] = (
 # "source" would be a guess, not a fact (see `_backup_source`).
 _BACKUP_SUFFIXES: Tuple[str, ...] = (".bak", "~", ".orig")
 
+# Runner droppings: dependency-install / build / cache / coverage DIRS a test or
+# build runner drops into a COLD worktree, matched as a path SEGMENT at any depth
+# (so a JS workspace's ``packages/*/node_modules`` is caught too). Held back only
+# when UNTRACKED; a fixer's edit to a TRACKED file under one still lands (it is
+# recovered per-file after the glob exclude in :func:`_stage_all`).
+_RUNNER_DROPPING_DIRS = frozenset({
+    "node_modules",       # npm / yarn / pnpm / bun install
+    "target",             # cargo (and Maven) build output
+    "__pycache__",        # CPython bytecode cache
+    ".pytest_cache",      # pytest's cache plugin
+    # `build` is matched at ANY depth (unlike dotnet bin/obj, narrowed to a
+    # build-config child): Gradle/CMake output has no fixed child segment to key
+    # on, and a source-`build/`-vs-output-`build/` split is not expressible in the
+    # git-pathspec exclude layer that does the real holding-back. A TRACKED file
+    # under a source `build/` still lands via the per-file recovery; only a NEW
+    # untracked file under a `build/` stays out.
+    "build",              # Gradle / CMake / generic build output
+    ".gradle",            # Gradle project-local cache
+    "deps", "_build",     # mix (Elixir) dependency + build trees
+    "coverage",           # JS coverage output (nyc / jest / vitest)
+    "htmlcov",            # coverage.py HTML report
+    ".nyc_output",        # nyc raw coverage
+    ".tox", ".nox",       # tox / nox environment trees
+})
+
+# dotnet build output dirs. A bare ``bin``/``obj`` segment collides with real
+# source layouts (a Rust ``src/bin/`` multi-binary tree, a repo's own ``bin/``
+# scripts dir), so these count as droppings ONLY when immediately followed by a
+# build-config segment (``bin/Debug/…``, ``obj/Release/…``).
+_RUNNER_DROPPING_DOTNET_DIRS = frozenset({"bin", "obj"})
+_RUNNER_DROPPING_DOTNET_CONFIGS = frozenset({"Debug", "Release"})
+
+# Coverage-artifact FILE basenames excluded the same way, at any depth.
+_RUNNER_DROPPING_FILES = frozenset({
+    ".coverage",          # coverage.py data file
+    "coverage.xml",       # coverage.py / pytest-cov XML report
+    "lcov.info",          # lcov / JS coverage report
+})
+
 Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
@@ -124,6 +177,66 @@ def _is_dropping(path: str) -> bool:
     return any(fnmatch.fnmatchcase(base, g) for g in _DROPPING_GLOBS)
 
 
+def _is_runner_dropping(path: str) -> bool:
+    """True iff ``path`` is — or lies under — a :data:`_RUNNER_DROPPING_DIRS`
+    directory, a dotnet ``bin/{Debug,Release}`` / ``obj/{Debug,Release}``
+    build-output dir, or is a :data:`_RUNNER_DROPPING_FILES` coverage file, by
+    path SEGMENT at any depth. Kept exactly in step with
+    :func:`_runner_exclude_pathspecs` (what ``git add`` actually holds back) so
+    the held-back set, the tracked-file recovery, and the clean-tree tripwire
+    never drift from the real staging behaviour.
+
+    ``/`` is the ONLY separator recognised, deliberately: ``git status``'s
+    porcelain emits ``/``-separated paths on every platform (Windows included)
+    and :func:`_runner_globs` emits ``/``-only globs, so treating a literal
+    backslash as a separator could never help a real path — it would only make
+    this predicate claim a file (basename ``bin\\Debug\\App.dll``) that the git
+    exclude layer cannot match, which would report the file as held back while it
+    rode into the commit."""
+    norm = (path or "").strip("/")
+    if not norm:
+        return False
+    segs = norm.split("/")
+    if any(s in _RUNNER_DROPPING_DIRS for s in segs):
+        return True
+    for i, s in enumerate(segs[:-1]):
+        if (s in _RUNNER_DROPPING_DOTNET_DIRS
+                and segs[i + 1] in _RUNNER_DROPPING_DOTNET_CONFIGS):
+            return True
+    return segs[-1] in _RUNNER_DROPPING_FILES
+
+
+def _runner_globs() -> List[str]:
+    """The raw repo-root-relative glob bodies for every RUNNER dropping (a dir at
+    any depth + its contents, dotnet ``bin``/``obj`` only under a build-config
+    child, coverage files), sorted for a deterministic order. Wrapped in the right
+    pathspec magic by :func:`_runner_exclude_pathspecs` (exclude, for ``git add``)
+    and by :func:`_stage_all`'s reset (include, to un-stage pre-staged runner
+    content)."""
+    globs: List[str] = []
+    for d in sorted(_RUNNER_DROPPING_DIRS):
+        globs.append(f"**/{d}")
+        globs.append(f"**/{d}/**")
+    for d in sorted(_RUNNER_DROPPING_DOTNET_DIRS):
+        for c in sorted(_RUNNER_DROPPING_DOTNET_CONFIGS):
+            globs.append(f"**/{d}/{c}")
+            globs.append(f"**/{d}/{c}/**")
+    for f in sorted(_RUNNER_DROPPING_FILES):
+        globs.append(f"**/{f}")
+    return globs
+
+
+def _runner_exclude_pathspecs() -> List[str]:
+    """``git add`` exclude pathspecs for every RUNNER dropping — a FIXED,
+    count-INDEPENDENT dir/file glob set (never per-file), so a cold worktree with
+    thousands of untracked ``node_modules`` files is held back by ONE pathspec,
+    not thousands (which would blow git's argv). ``:(top,exclude,glob)`` anchors
+    to the repo root and lets ``**`` span path components, matching
+    :func:`_stage_all`'s ``:/`` scope; the bare dir form covers the dir itself,
+    the ``/**`` twin its contents."""
+    return [f":(top,exclude,glob){g}" for g in _runner_globs()]
+
+
 def _rerun_limit() -> int:
     try:
         return max(0, int(os.environ.get("BUDDHI_TEST_FAILURE_RERUNS",
@@ -132,11 +245,41 @@ def _rerun_limit() -> int:
         return _RERUN_LIMIT_DEFAULT
 
 
-def _test_gate_timeout() -> int:
-    """The pre-push test-gate timeout (seconds): ``BUDDHI_TEST_GATE_TIMEOUT_SECS``
-    when set to a positive int, else :data:`_TEST_TIMEOUT_DEFAULT`. A non-positive
-    or unparseable value falls back to the default (an infinite/zero gate is
-    meaningless)."""
+# Per-runner override for the gate timeout:
+# BUDDHI_TEST_GATE_TIMEOUT_SECS_<RUNNER> (the `test_runner` constant upper-cased,
+# every non-alphanumeric character → "_": _GRADLE, _CARGO, _NODE_TEST, …) gives ONE
+# runner's suite its own ceiling, so a slow JVM/native suite can get more time
+# without inflating pytest's. Resolved per gate call; with NO per-runner var set,
+# every path uses the global BUDDHI_TEST_GATE_TIMEOUT_SECS / default below —
+# byte-identical to the behaviour before this override existed.
+_PER_RUNNER_TIMEOUT_ENV_PREFIX = "BUDDHI_TEST_GATE_TIMEOUT_SECS_"
+
+
+def _per_runner_timeout_configured() -> bool:
+    """True iff ANY per-runner timeout override is present in the environment —
+    the cheap guard that keeps the unset path byte-identical (no pre-run
+    ``detect_runner`` call is made unless an override could actually apply)."""
+    return any(k.startswith(_PER_RUNNER_TIMEOUT_ENV_PREFIX) for k in os.environ)
+
+
+def _test_gate_timeout(runner: Optional[str] = None) -> int:
+    """The pre-push test-gate timeout (seconds) for ``runner``:
+    ``BUDDHI_TEST_GATE_TIMEOUT_SECS_<RUNNER>`` when set (clamped to a 1s minimum;
+    blank/unparseable is ignored → the global), else the global
+    ``BUDDHI_TEST_GATE_TIMEOUT_SECS`` when set to a positive int, else
+    :data:`_TEST_TIMEOUT_DEFAULT`. A non-positive or unparseable global falls back
+    to the default (an infinite/zero gate is meaningless). ``runner`` is a
+    :mod:`test_runner` constant (``"pytest"``, ``"gradle"``, …); ``None`` / an
+    unknown runner / no override reads the global exactly as before."""
+    if runner:
+        key = _PER_RUNNER_TIMEOUT_ENV_PREFIX + re.sub(
+            r"[^A-Za-z0-9]", "_", str(runner)).upper()
+        raw = os.environ.get(key)
+        if raw not in (None, ""):
+            try:
+                return max(1, int(raw))
+            except (TypeError, ValueError):
+                pass
     try:
         value = int(os.environ.get("BUDDHI_TEST_GATE_TIMEOUT_SECS", ""))
     except (TypeError, ValueError):
@@ -447,7 +590,18 @@ def run_test_gate(
                    status="skip", hint="set BUDDHI_TEST_COMMAND to enable the gate")
             return "skipped", ""
         print(f"[local-tests] running {' '.join(cmd)} before push …", flush=True)
-        proc = run(cmd, cwd=cwd, timeout=_test_gate_timeout())
+        timeout_secs = _test_gate_timeout()
+        if _per_runner_timeout_configured():
+            # Resolve the runner BEFORE the run ONLY when a per-runner override
+            # exists — the unset path keeps today's exact call order (detection
+            # stays post-run); `detect_runner` is read-only, so the extra call is
+            # side-effect-free. The post-run detection below is unchanged.
+            try:
+                timeout_secs = _test_gate_timeout(
+                    test_runner.detect_runner(cwd, cmd).runner)
+            except Exception:  # noqa: BLE001 — a detection bug must never break the gate
+                pass
+        proc = run(cmd, cwd=cwd, timeout=timeout_secs)
     except subprocess.TimeoutExpired as exc:
         # A real timeout kills the process before `run()` returns, so it never
         # reaches the `classify()` call below. Route it through the SAME
@@ -514,13 +668,17 @@ def _assert_clean_after_commit(
     if getattr(r, "returncode", 1) != 0:
         return
     # The sweep guard (:func:`_stage_all`) deliberately leaves a NEW (untracked or
-    # freshly-added) editor/backup dropping unstaged — that's not a lost fixer edit,
-    # so it must not trip this "edits are not on the PR" alarm. A tracked dropping's
-    # own modification/deletion IS staged and committed like any other change (see
+    # freshly-added) editor/backup dropping — and a NEW untracked RUNNER artifact a
+    # cold-worktree gate run dropped — unstaged; that's not a lost fixer edit, so it
+    # must not trip this "edits are not on the PR" alarm. A tracked dropping's own
+    # modification/deletion IS staged and committed like any other change (see
     # :func:`_new_to_head`), so it never shows up here as residue in the first
-    # place. A genuinely-lost non-dropping edit still fires the tripwire.
-    residue = [path for xy, path in _iter_porcelain_z(getattr(r, "stdout", "") or "")
-               if not (_is_dropping(path) and _new_to_head(xy))]
+    # place. The held-back set is read from the guard's own single source
+    # (:func:`_held_back_new_artifacts`) so the two can never drift. A
+    # genuinely-lost non-dropping edit still fires the tripwire.
+    entries = list(_iter_porcelain_z(getattr(r, "stdout", "") or ""))
+    held_back = _held_back_new_artifacts(entries)
+    residue = [path for _xy, path in entries if path not in held_back]
     if not residue:
         return
     shown = ", ".join(residue[:8])
@@ -737,6 +895,81 @@ def _risky_delete_pairs(entries: Sequence[Tuple[str, str]]) -> Set[str]:
     return deleted & sources
 
 
+def _held_back_new_artifacts(entries: Sequence[Tuple[str, str]]) -> Set[str]:
+    """The NEW-to-HEAD paths :func:`_stage_all` deliberately holds out of the fix
+    commit: an editor/backup dropping (:func:`_is_dropping`) and — for a cold
+    worktree — an untracked RUNNER artifact (:func:`_is_runner_dropping`:
+    ``node_modules/``, ``target/``, coverage output, …).
+
+    This is the guard's OWN single-source list of what it withholds, so the
+    clean-tree tripwire (:func:`_assert_clean_after_commit`) can never lag the
+    guard's staging behaviour: a round whose only worktree residue is a cold-gate
+    artifact reads as a legitimate no-op, not as a fixer's lost edits. The
+    risky-delete pair (:func:`_risky_delete_pairs`) is deliberately NOT in this
+    set — that deletion IS a lost real-file change and must keep firing the
+    tripwire."""
+    return {path for xy, path in entries
+            if (_is_dropping(path) or _is_runner_dropping(path))
+            and _new_to_head(xy)}
+
+
+# Byte budget for ONE git invocation's pathspec arguments. Every PER-FILE pathspec
+# list the staging guard builds (the un-stage resets, the tracked-runner recovery)
+# is bounded by the worktree's file COUNT, so a big enough tree — a vendored
+# ``node_modules`` of 20k tracked files that a runner just reinstalled — would
+# otherwise exceed the OS ``ARG_MAX`` and raise ``OSError: [Errno 7] Argument list
+# too long`` straight out of the round. 100 KB is an order of magnitude under the
+# smallest ``ARG_MAX`` in practice (Linux/macOS are ≥ 256 KB), so the batching is
+# invisible in the common case (one call) and merely issues a few more calls on a
+# huge tree. The FIXED glob-exclude set is count-independent and never batched.
+_PATHSPEC_ARGV_BUDGET = 100_000
+
+
+def _run_batched(
+    run: Run, argv_prefix: Sequence[str], pathspecs: Sequence[str], *, cwd: str,
+) -> Optional["subprocess.CompletedProcess[str]"]:
+    """Run ``argv_prefix + <pathspecs>`` in as many invocations as it takes to keep
+    every argv well under the OS ``ARG_MAX`` (:data:`_PATHSPEC_ARGV_BUDGET`),
+    stopping at the first non-zero result and returning it. An empty
+    ``pathspecs`` runs nothing and returns ``None``.
+
+    An ``OSError`` from the spawn itself (``E2BIG`` on a pathological path, a
+    missing git) is converted into a non-zero :class:`~subprocess.CompletedProcess`
+    rather than propagated: the staging guard's contract is that its caller reads a
+    return code, so a crash here would kill the round instead of handing back
+    cleanly."""
+    last: Optional["subprocess.CompletedProcess[str]"] = None
+    batch: List[str] = []
+    size = 0
+
+    def _flush() -> bool:
+        nonlocal last, batch, size
+        if not batch:
+            return True
+        argv = [*argv_prefix, *batch]
+        try:
+            last = run(argv, cwd=cwd)
+        except OSError as exc:
+            last = subprocess.CompletedProcess(
+                args=argv, returncode=1, stdout="",
+                stderr=f"git invocation failed: {exc}")
+        batch, size = [], 0
+        return getattr(last, "returncode", 1) == 0
+
+    for spec in pathspecs:
+        # BYTES, not characters: the kernel counts the encoded argv, so a tree of
+        # 4-byte-UTF-8 paths would otherwise be measured at a quarter of its real
+        # size and sail past the budget straight into ``E2BIG``.
+        cost = len(spec.encode("utf-8", "surrogateescape")) + 1
+        if batch and size + cost > _PATHSPEC_ARGV_BUDGET:
+            if not _flush():
+                return last
+        batch.append(spec)
+        size += cost
+    _flush()
+    return last
+
+
 def _fmt_droppings(paths: Sequence[str], limit: int = 6) -> str:
     """A compact, bounded rendering of the excluded paths for the log line."""
     shown = ", ".join(paths[:limit])
@@ -748,8 +981,14 @@ def _stage_all(
     cwd: str, *, run: Run = _default_run,
     notice: Callable[..., str] = automation_notice,
 ) -> "subprocess.CompletedProcess[str]":
-    """``git add -A`` for the round's commit, minus editor/backup droppings and
-    any deleted source file paired with one (:func:`_risky_delete_pairs`).
+    """``git add -A`` for the round's commit, minus editor/backup droppings, any
+    deleted source file paired with one (:func:`_risky_delete_pairs`), and — for a
+    cold worktree — every UNTRACKED runner artifact (:func:`_is_runner_dropping`:
+    ``node_modules/``, ``target/``, ``build/``, ``bin/Debug/``, coverage output,
+    …). Runner artifacts are held back by a FIXED, count-INDEPENDENT glob pathspec
+    set (:func:`_runner_exclude_pathspecs`), so a tree with thousands of untracked
+    ``node_modules`` files never blows git's argv; a fixer's edit to a TRACKED file
+    under such a dir is recovered per-file and still committed.
 
     With nothing to exclude this is byte-identical to a plain ``git add -A``.
     Otherwise it stages the whole worktree (``:/`` — the top of the tree, so the
@@ -777,13 +1016,67 @@ def _stage_all(
         if (xy[0] in "RC" or xy[1] in "RC") and _is_dropping(path)
     })
     if rename_droppings:
-        run(["git", "reset", "-q", "--",
-             *(f":(top,literal){p}" for p in rename_droppings)], cwd=cwd)
+        _run_batched(run, ["git", "reset", "-q", "--"],
+                     [f":(top,literal){p}" for p in rename_droppings], cwd=cwd)
         entries = _status_entries(cwd, run=run)
     droppings = [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
     risky = _risky_delete_pairs(entries)
-    excluded = droppings + sorted(risky)
-    if not excluded:
+    excluded = droppings + sorted(risky)  # editor droppings: per-file
+
+    # ── Runner droppings (cold-worktree hardening) ───────────────────────────────
+    # A cold worktree's gate run drops dependency-install / build / cache /
+    # coverage trees (``node_modules/``, ``target/``, ``build/``, ``bin/Debug/``,
+    # …). They are held back by a FIXED dir/file GLOB set
+    # (:func:`_runner_exclude_pathspecs`) applied to the SAME ``git add`` as the
+    # editor excludes — count-INDEPENDENT, so a tree with thousands of untracked
+    # ``node_modules`` files costs ONE pathspec, not thousands (which would blow
+    # git's argv if enumerated per-file the way editor droppings are). Only
+    # UNTRACKED runner artifacts are held back:
+    #   • ``untracked_runner`` — new, held back (for the LOG only; membership is
+    #     decided by the glob exclude, not this list, so its size never reaches an
+    #     argv).
+    #   • ``tracked_runner``   — a fixer's edit to a TRACKED file under a runner
+    #     dir (a vendored tree, a source ``build/``) that is still UNSTAGED
+    #     (``xy[1] != " "``); the glob excludes it, so it is RECOVERED per-file
+    #     below. That list is bounded by the worktree's file count, so it is issued
+    #     in ARG_MAX-bounded batches (:func:`_run_batched`) — a runner reinstalling
+    #     a 20k-file VENDORED tree would otherwise blow git's argv. Two exclusions
+    #     are load-bearing: a path already held back as a risky-delete pair (staging
+    #     it would commit the very deletion the guard just told the operator it was
+    #     withholding), and a change the fixer ALREADY staged (``xy[1] == " "``).
+    #     The latter needs no recovery — ``git add`` never un-stages, so it survives
+    #     the exclude untouched — and recovering it would be fatal: a staged
+    #     DELETION (``D ``, a fixer's own ``git rm``) has no index entry and no
+    #     worktree file, so its pathspec matches nothing and ``git add`` exits 128,
+    #     turning the whole round into an ``error`` that never ships the fix.
+    #   • ``prestaged_runner`` — NEW runner droppings already carrying an index
+    #     entry (``xy != "??"``: a fixer's ``git add -A``, or an intent-to-add
+    #     ``git add -N`` stub, whose ``  A`` staged column is a SPACE yet is still an
+    #     index entry the recovery would happily fill in with full content). Each is
+    #     un-staged BY ITS OWN LITERAL PATH so it cannot ride the commit — an
+    #     exclude alone never un-stages. Deliberately NOT an include-glob reset: a
+    #     glob also decomposes a staged RENAME touching a runner dir, and the
+    #     per-file recovery below only ever sees porcelain's rename DESTINATION — the
+    #     origin's deletion would silently never reach the commit, resurrecting the
+    #     renamed-away file.
+    runner_excludes = _runner_exclude_pathspecs()
+    untracked_runner = [path for xy, path in entries
+                        if _is_runner_dropping(path) and _new_to_head(xy)]
+    tracked_runner = sorted({path for xy, path in entries
+                             if _is_runner_dropping(path) and not _new_to_head(xy)
+                             and xy[1] != " "}
+                            - risky)
+    prestaged_runner = sorted({
+        path for xy, path in entries
+        if _is_runner_dropping(path) and _new_to_head(xy) and xy != "??"})
+
+    # Nothing to hold back of EITHER kind → a bare ``git add -A``, byte-identical to
+    # a no-guard fix commit. The runner exclude globs are applied ONLY when the scan
+    # actually found a runner path — a repo with none (the common case: its
+    # ``.gitignore`` already covers node_modules/target, so they never reach the
+    # scan) pays no extra pathspecs.
+    if (not excluded and not untracked_runner and not tracked_runner
+            and not prestaged_runner):
         return run(["git", "add", "-A"], cwd=cwd)
     # An exclude pathspec only tells ``git add`` NOT to (re-)add a path — it never
     # UNstages one already in the index. A dropping a fixer had itself ``git add``-ed
@@ -796,15 +1089,69 @@ def _stage_all(
     # the WRONG path (or miss its own); wrap each in ``:(top,literal)`` — an exact,
     # repo-root-anchored match — mirroring the ``:(top,exclude,literal)`` form
     # already used for the ``git add`` exclude below.
-    resets = [f":(top,literal){p}" for p in excluded]
-    run(["git", "reset", "-q", "--", *resets], cwd=cwd)
-    excludes = [f":(top,exclude,literal){p}" for p in excluded]
-    add = run(["git", "add", "-A", "--", ":/", *excludes], cwd=cwd)
+    resets = [f":(top,literal){p}" for p in excluded + prestaged_runner]
+    if resets:
+        _run_batched(run, ["git", "reset", "-q", "--"], resets, cwd=cwd)
+    # The runner glob excludes are ALWAYS applied from here on (even with no editor
+    # excludes), so an untracked ``node_modules`` never rides in; when nothing
+    # matches them the add is behaviourally a plain ``git add -A``.
+    per_file_excludes = [f":(top,exclude,literal){p}" for p in excluded]
+    excludes = per_file_excludes + runner_excludes
+    # This ``add`` is the one argv that cannot be split — every exclude must be in
+    # the SAME pathspec set, or a later invocation re-adds what an earlier one held
+    # out. Its per-file half is bounded by the worktree's file count, so on a tree
+    # with tens of thousands of editor droppings it approaches the OS ``ARG_MAX``.
+    # When it would, fall back to an equivalent two-step: add with only the FIXED
+    # runner globs, then un-stage the per-file paths in bounded batches. The end
+    # state is identical — a reset returns each path to its HEAD state in the index,
+    # exactly what excluding it from the add achieves — and both halves are then
+    # argv-safe. Below the budget nothing changes, so the common path keeps its
+    # single call.
+    if sum(len(s.encode("utf-8", "surrogateescape")) + 1
+           for s in excludes) > _PATHSPEC_ARGV_BUDGET:
+        try:
+            add = run(["git", "add", "-A", "--", ":/", *runner_excludes], cwd=cwd)
+        except OSError as exc:
+            return subprocess.CompletedProcess(
+                args=["git", "add", "-A"], returncode=1, stdout="",
+                stderr=f"git invocation failed: {exc}")
+        if getattr(add, "returncode", 1) == 0 and excluded:
+            undo = _run_batched(run, ["git", "reset", "-q", "--"],
+                                [f":(top,literal){p}" for p in excluded], cwd=cwd)
+            if undo is not None and getattr(undo, "returncode", 1) != 0:
+                return undo
+    else:
+        try:
+            add = run(["git", "add", "-A", "--", ":/", *excludes], cwd=cwd)
+        except OSError as exc:
+            return subprocess.CompletedProcess(
+                args=["git", "add", "-A"], returncode=1, stdout="",
+                stderr=f"git invocation failed: {exc}")
+    # Recover a fixer's edit to a TRACKED file under a runner dir that the glob just
+    # held out. ``-u`` (not ``-A``) is LOAD-BEARING: it stages a tracked path's
+    # modification/deletion and NEVER adds an untracked file. With ``-A``, a tracked
+    # entry the runner replaced with a directory — a ``build`` SCRIPT overwritten by a
+    # ``build/`` output tree, a vendored ``node_modules`` SYMLINK replaced by a real
+    # install — becomes a directory pathspec that recursively stages the whole
+    # untracked artifact tree the exclude had just held back (proven to reach a
+    # remote). ``-u`` records that path's deletion and nothing else.
+    if getattr(add, "returncode", 1) == 0 and tracked_runner:
+        recovered = _run_batched(
+            run, ["git", "add", "-u", "--"],
+            [f":(top,literal){p}" for p in tracked_runner], cwd=cwd)
+        if recovered is not None:
+            add = recovered
     if getattr(add, "returncode", 1) == 0:
         if droppings:
             notice("stage",
                    f"excluded {len(droppings)} editor/backup dropping(s) from the fix "
                    f"commit: {_fmt_droppings(droppings)}",
+                   status="skip")
+        if untracked_runner:
+            notice("stage",
+                   f"excluded {len(untracked_runner)} runner artifact(s) "
+                   f"(node_modules/target/build/coverage/…) from the fix commit: "
+                   f"{_fmt_droppings(sorted(untracked_runner))}",
                    status="skip")
         if risky:
             sorted_risky = sorted(risky)
