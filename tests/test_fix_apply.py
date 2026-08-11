@@ -237,6 +237,258 @@ def test_restore_preserves_mode(repo):
 
 
 # ---------------------------------------------------------------------------
+# Ignore-aware rollback: a failed attempt that breaks the ignore rules must not
+# turn the restore into a shredder for files it never captured.
+#
+# The removal pass runs BEFORE the checkout (so an attempt's file cannot shadow
+# a tracked path), which means it sees the ignore rules as the FAILED ATTEMPT
+# left them. Ignored files are never hashed into the object store, so deleting
+# one destroys the only copy in existence — hence every case below drives real
+# git and asserts the exact surviving bytes, not merely existence.
+# ---------------------------------------------------------------------------
+
+def _ignored_repo(repo, rule, rel, content):
+    """Commit `rule` as the top-level .gitignore, then create an ignored file."""
+    (repo / ".gitignore").write_text(rule)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "ignore"], cwd=repo, check=True,
+                   capture_output=True)
+    p = repo / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content)
+    return p
+
+
+def test_snapshot_records_ignored_paths(repo):
+    # The snapshot must know the ignore state it was taken under; nothing
+    # downstream can reconstruct it once a failed attempt has edited the rules.
+    _ignored_repo(repo, ".env\n", ".env", "SECRET_KEY=hunter2\n")
+    snap = snapshot_worktree(str(repo))
+    assert snap is not None
+    assert ".env" not in snap[1]      # ignored ⇒ deliberately never hashed
+    assert ".env" in snap[2]          # …so its identity is recorded instead
+
+
+def test_restore_keeps_ignored_file_when_attempt_deleted_gitignore(repo):
+    # The shipped defect: a failed attempt deletes .gitignore, so git no longer
+    # reports .env as excluded, the restore reads it as an attempt leftover, and
+    # unlinks a file that was never written to the object store.
+    env = _ignored_repo(repo, ".env\nnode_modules/\n", ".env",
+                        "SECRET_KEY=hunter2\nDB_PASSWORD=prod\n")
+    snap = snapshot_worktree(str(repo))
+    assert snap is not None
+
+    (repo / ".gitignore").unlink()          # what the failed attempt did
+
+    assert restore_worktree(str(repo), snap)
+    assert env.read_text() == "SECRET_KEY=hunter2\nDB_PASSWORD=prod\n"
+
+
+def test_restore_keeps_ignored_directory_tree_when_gitignore_deleted(repo):
+    # Same defect one level up: every file under an ignored directory is listed
+    # individually once the rule is gone, and the empty-parent sweep then takes
+    # the directories with them — `node_modules/` vanishes entirely.
+    dep = _ignored_repo(repo, "node_modules/\n", "node_modules/left-pad/index.js",
+                        "module.exports = 1\n")
+    snap = snapshot_worktree(str(repo))
+    (repo / ".gitignore").unlink()
+
+    assert restore_worktree(str(repo), snap)
+    assert dep.read_text() == "module.exports = 1\n"
+
+
+def test_restore_keeps_nested_repo_inside_ignored_dir(repo):
+    # git lists an untracked nested repository as a single directory entry
+    # ("vendor/pkg/"), which the removal pass would hand to shutil.rmtree —
+    # deleting a whole repository, its history included, in one call.
+    _ignored_repo(repo, "vendor/\n", "vendor/keep.txt", "keep\n")
+    subprocess.run(["git", "init", "-q", "vendor/pkg"], cwd=repo, check=True,
+                   capture_output=True)
+    (repo / "vendor" / "pkg" / "src.py").write_text("payload\n")
+    snap = snapshot_worktree(str(repo))
+    (repo / ".gitignore").unlink()
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / "vendor" / "pkg" / ".git").is_dir()
+    assert (repo / "vendor" / "pkg" / "src.py").read_text() == "payload\n"
+
+
+def test_restore_still_deletes_genuinely_new_file_with_ignore_rules_broken(repo):
+    # The other half of the contract: protecting ignored files must not stop the
+    # rollback from rolling back. A file the attempt actually created is removed
+    # even in the scenario where the ignore rules were destroyed.
+    env = _ignored_repo(repo, ".env\n", ".env", "SECRET_KEY=hunter2\n")
+    snap = snapshot_worktree(str(repo))
+    (repo / ".gitignore").unlink()
+    (repo / "attempt-leftover.txt").write_text("junk\n")
+    (repo / "sub").mkdir()
+    (repo / "sub" / "nested-leftover.txt").write_text("junk\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "attempt-leftover.txt").exists()
+    assert not (repo / "sub" / "nested-leftover.txt").exists()
+    assert env.read_text() == "SECRET_KEY=hunter2\n"   # and the user's file stayed
+
+
+def test_restore_leaves_an_ignored_artifact_the_attempt_created(repo):
+    # Ignored paths are out of the snapshot's scope in BOTH directions: never
+    # captured, so never deleted. A fixer that runs the test suite or a build
+    # leaves ignored artifacts behind (a __pycache__, an installed dependency
+    # tree), and a rollback that shredded those would be a second destructive
+    # bug wearing the first one's clothes. Pins the deliberate choice not to
+    # widen deletion to a class of file the old code also left alone.
+    _ignored_repo(repo, "build/\n", "build/old.o", "stale\n")
+    snap = snapshot_worktree(str(repo))
+
+    (repo / "build" / "fresh.o").write_text("from the failed attempt\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / "build" / "fresh.o").read_text() == "from the failed attempt\n"
+    assert (repo / "build" / "old.o").read_text() == "stale\n"
+
+
+# --- the ignore SOURCES covered: whatever git itself honours ---------------
+# The snapshot asks git which paths are ignored rather than parsing rules, so
+# each source below is covered by the same mechanism. One test per source, each
+# destroying that source specifically, proves it is the recorded verdict doing
+# the work and not the rule surviving by luck.
+
+def test_restore_covers_nested_gitignore_source(repo):
+    # A .gitignore in a SUBDIRECTORY — the rule that a top-level-only fix misses.
+    (repo / "svc").mkdir()
+    (repo / "svc" / ".gitignore").write_text("local.conf\n")
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True, capture_output=True)
+    subprocess.run(["git", "commit", "-qm", "nested"], cwd=repo, check=True,
+                   capture_output=True)
+    conf = repo / "svc" / "local.conf"
+    conf.write_text("token = abc123\n")
+    snap = snapshot_worktree(str(repo))
+
+    (repo / "svc" / ".gitignore").unlink()          # the attempt broke the rule
+
+    assert restore_worktree(str(repo), snap)
+    assert conf.read_text() == "token = abc123\n"
+
+
+def test_restore_covers_git_info_exclude_source(repo):
+    # .git/info/exclude — a per-clone rule `git checkout` can never restore.
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("scratch.txt\n")
+    scratch = repo / "scratch.txt"
+    scratch.write_text("working notes\n")
+    snap = snapshot_worktree(str(repo))
+    assert "scratch.txt" in snap[2]
+
+    (repo / ".git" / "info" / "exclude").write_text("")   # rule destroyed
+
+    assert restore_worktree(str(repo), snap)
+    assert scratch.read_text() == "working notes\n"
+
+
+def test_restore_covers_core_excludesfile_source(repo, tmp_path_factory):
+    # core.excludesFile — a global ignore file living outside the worktree, so
+    # nothing inside the repo can restore it either.
+    globl = tmp_path_factory.mktemp("gitglobal") / "ignore"
+    globl.write_text("*.secret\n")
+    subprocess.run(["git", "config", "core.excludesFile", str(globl)],
+                   cwd=repo, check=True, capture_output=True)
+    keys = repo / "prod.secret"
+    keys.write_text("api-key\n")
+    snap = snapshot_worktree(str(repo))
+    assert "prod.secret" in snap[2]
+
+    subprocess.run(["git", "config", "--unset", "core.excludesFile"],
+                   cwd=repo, check=True, capture_output=True)
+
+    assert restore_worktree(str(repo), snap)
+    assert keys.read_text() == "api-key\n"
+
+
+# --- the contract is reported honestly, or not claimed at all --------------
+
+def test_restore_returns_false_on_snapshot_without_ignore_state(repo):
+    # A snapshot lacking the ignored set cannot honour "never delete an ignored
+    # file". Fail closed: returning True here is exactly how the destruction
+    # went unnoticed, because the caller reads True as a clean rollback.
+    (repo / "untracked.txt").write_text("content\n")
+    snap = snapshot_worktree(str(repo))
+    legacy = (snap[0], snap[1])                      # the pre-fix shape
+    assert restore_worktree(str(repo), legacy) is False
+
+
+def test_restore_returns_false_when_a_leftover_cannot_be_removed(repo):
+    # A removal that fails leaves attempt residue behind. The rollback is then
+    # partial, and must not be reported as clean — the caller turns False into
+    # rollback_failed and halts before the push.
+    snap = snapshot_worktree(str(repo))
+    locked = repo / "locked"
+    locked.mkdir()
+    (locked / "leftover.txt").write_text("junk\n")
+    os.chmod(locked, 0o500)                          # unlink of the child fails
+    try:
+        if os.access(locked / "leftover.txt", os.W_OK) and os.getuid() == 0:
+            pytest.skip("running as root — directory permissions not enforced")
+        assert restore_worktree(str(repo), snap) is False
+        assert (locked / "leftover.txt").read_text() == "junk\n"   # really stuck
+    finally:
+        os.chmod(locked, 0o700)
+
+
+def test_restore_tolerates_a_leftover_that_vanished_before_removal(repo,
+                                                                   monkeypatch):
+    # A path git listed that is already gone by the time we unlink it has
+    # reached the removal's goal, so it must NOT be scored as a failure — the
+    # rollback stays clean and the round is not halted for a benign race.
+    # (git stays real here; only the unlink is forced to lose the race.)
+    snap = snapshot_worktree(str(repo))
+    (repo / "leftover.txt").write_text("junk\n")
+    real_unlink = os.unlink
+
+    def racing_unlink(path, *a, **kw):
+        real_unlink(path, *a, **kw)
+        raise FileNotFoundError(path)     # as if another process got there first
+
+    monkeypatch.setattr(os, "unlink", racing_unlink)
+    assert restore_worktree(str(repo), snap) is True
+    assert not (repo / "leftover.txt").exists()
+
+
+def test_restore_still_restores_tracked_files_when_a_removal_fails(repo):
+    # False means "do not trust this worktree", not "I gave up": the rest of the
+    # rollback still runs, so the worktree is left as close to the snapshot as
+    # possible for the human who has to look at it.
+    snap = snapshot_worktree(str(repo))
+    (repo / "tracked.py").write_text("corrupted\n")
+    locked = repo / "locked"
+    locked.mkdir()
+    (locked / "leftover.txt").write_text("junk\n")
+    os.chmod(locked, 0o500)
+    try:
+        if os.access(locked / "leftover.txt", os.W_OK) and os.getuid() == 0:
+            pytest.skip("running as root — directory permissions not enforced")
+        assert restore_worktree(str(repo), snap) is False
+        assert (repo / "tracked.py").read_text() == "original\n"
+    finally:
+        os.chmod(locked, 0o700)
+
+
+def test_snapshot_degrades_to_none_when_ignore_state_cannot_be_read(repo,
+                                                                    monkeypatch):
+    # Without the ignore state the restore cannot keep its promise, so the
+    # snapshot degrades (None ⇒ proceed with no rollback net) rather than
+    # handing back a snapshot whose restore would delete the user's files.
+    real = fix_apply._git
+
+    def fail_ignored(cwd, *args, **kwargs):
+        if "--ignored" in args:
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_ignored)
+    assert snapshot_worktree(str(repo)) is None
+
+
+# ---------------------------------------------------------------------------
 # The attempt loop: retry-same, restore-always, escalate rather than retry on another model
 # ---------------------------------------------------------------------------
 

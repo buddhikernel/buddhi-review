@@ -54,7 +54,7 @@ import stat
 import subprocess
 import sys
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Sequence, TextIO, Tuple
+from typing import Callable, Dict, FrozenSet, Optional, Sequence, TextIO, Tuple
 
 from buddhi_review import lang_syntax, unicode_repair
 from buddhi_review.classify import extract_json_object as _extract_json_object
@@ -440,7 +440,14 @@ def skip_kind(reason: str) -> str:
 # Snapshot / restore
 # ---------------------------------------------------------------------------
 
-Snapshot = Tuple[str, Dict[str, tuple]]
+# (tracked_ref, untracked-file contents, paths git IGNORED at snapshot time).
+# The third member is the rollback's ignore-blindfold: it records what the
+# ignore rules said WHEN THE SNAPSHOT WAS TAKEN, so a failed attempt that
+# deletes or narrows a ``.gitignore`` cannot make the restore mistake the
+# user's ignored files for its own leftovers. Paths only — ignored files are
+# deliberately never hashed (a `node_modules/` would be ruinous to capture),
+# which is precisely why they must never be deleted either.
+Snapshot = Tuple[str, Dict[str, tuple], FrozenSet[str]]
 
 
 def _git(cwd: str, *args: str, text: bool = True,
@@ -459,14 +466,27 @@ def snapshot_worktree(cwd: str) -> Optional[Snapshot]:
     with its type/mode — a symlink is captured as its target (hash-object would
     follow it), a regular file as (blob sha, mode). Returns None when the state
     cannot be captured — the fix then proceeds WITHOUT a rollback safety net
-    (a degrade, not a refusal): see :func:`_restore_or_degrade`."""
+    (a degrade, not a refusal): see :func:`_restore_or_degrade`.
+
+    It ALSO records which paths git considered IGNORED at this moment, so the
+    restore can tell the user's ignored files from the attempt's leftovers even
+    when the attempt has destroyed the ignore rules. Asking git for the verdict
+    — rather than parsing ignore files ourselves — is what makes every source
+    git honours (a ``.gitignore`` at any depth, ``.git/info/exclude``,
+    ``core.excludesFile``) covered for free. Failing to enumerate them returns
+    None: without that set the restore cannot promise to leave ignored files
+    alone, and degrading to no rollback beats a rollback that may delete the
+    user's ``.env``."""
     try:
         s = _git(cwd, "stash", "create")
         u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard")
+        i = _git(cwd, "ls-files", "-z", "--others", "--ignored",
+                 "--exclude-standard")
     except (subprocess.TimeoutExpired, OSError):
         return None
-    if s.returncode != 0 or u.returncode != 0:
+    if s.returncode != 0 or u.returncode != 0 or i.returncode != 0:
         return None
+    ignored: FrozenSet[str] = frozenset(p for p in i.stdout.split("\0") if p)
     tracked_ref = s.stdout.strip() or "HEAD"
     untracked: Dict[str, tuple] = {}
     blob_paths = []
@@ -499,7 +519,7 @@ def snapshot_worktree(cwd: str) -> Optional[Snapshot]:
             shas.extend(chunk_shas)
         for rel, sha in zip(blob_paths, shas):
             untracked[rel] = ("blob", sha, untracked[rel][2])
-    return (tracked_ref, untracked)
+    return (tracked_ref, untracked, ignored)
 
 
 def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
@@ -507,24 +527,49 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     created, restore tracked files (``git checkout <ref> -- .`` — HEAD/branch
     untouched), and rewrite each snapshot untracked file to its exact content,
     type and mode. New-untracked removal runs BEFORE the checkout so a failed
-    attempt's file cannot shadow a tracked path."""
+    attempt's file cannot shadow a tracked path.
+
+    That pre-checkout ordering means the removal pass runs while the ignore
+    rules are still whatever the FAILED ATTEMPT left them — so "is this path
+    new?" must never be asked of git's *current* exclusion verdict. A path the
+    snapshot recorded as ignored is left strictly alone: it was never captured
+    (see :func:`snapshot_worktree`), so deleting it destroys the only copy that
+    exists. A rollback that deletes the user's ``.env`` because a failed attempt
+    happened to delete ``.gitignore`` is worse than no rollback at all.
+
+    Returns False when the rollback could not be honoured in full — including a
+    snapshot too old to carry the ignored set, and any deletion that failed for
+    a reason other than the path already being gone. The caller turns False into
+    ``rollback_failed`` and halts before the push, so a partial rollback must
+    never be reported as a clean one."""
     if not snapshot:
         return False
-    tracked_ref, pre_untracked = snapshot
+    if len(snapshot) < 3:
+        # No ignored set ⇒ the promise above cannot be kept. Fail closed rather
+        # than silently falling back to the ignore-blind removal this guards.
+        return False
+    tracked_ref, pre_untracked, pre_ignored = snapshot
+    honoured = True
     try:
         u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard")
         if u.returncode != 0:
             return False
         for rel in (p for p in u.stdout.split("\0") if p):
-            if rel not in pre_untracked:
+            if rel not in pre_untracked and rel not in pre_ignored:
                 full_path = os.path.join(cwd, rel)
                 try:
                     if os.path.isdir(full_path) and not os.path.islink(full_path):
                         shutil.rmtree(full_path)
                     else:
                         os.unlink(full_path)
+                except FileNotFoundError:
+                    pass  # already gone — the removal's goal, reached early
                 except OSError:
-                    pass
+                    # A leftover we promised to remove is still there. Press on
+                    # with the rest of the rollback (a maximally-restored
+                    # worktree beats an abandoned one) but report the failure,
+                    # so the caller halts instead of pushing the residue.
+                    honoured = False
                 else:
                     # Remove now-empty parent dirs so they cannot shadow a tracked
                     # path and cause the subsequent git checkout to fail.
@@ -561,7 +606,7 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
                 with open(full, "wb") as f:
                     f.write(blob.stdout)
                 os.chmod(full, mode)
-        return True
+        return honoured
     except (subprocess.TimeoutExpired, OSError):
         return False
 
