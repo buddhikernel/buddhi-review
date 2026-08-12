@@ -632,6 +632,53 @@ def test_restore_spares_the_ignored_files_under_a_reincludable_root(repo):
     assert (repo / "foo" / "sub" / "deep.o").read_text() == "compiled\n"
 
 
+def test_restore_removes_a_leftover_under_a_root_the_attempt_re_collapsed(repo):
+    # The evasion the sealed-root gate closes: with `foo/**` + `!foo/keep.txt`
+    # the snapshot records `foo/` as a plain entry (git descended into it, so it
+    # is NOT sealed). An attempt that widens the rule to `foo/` makes git
+    # collapse the whole tree back to that one entry — so a skip on "the
+    # snapshot recorded `foo/`" spares everything under it, including the
+    # foo/keep.txt the attempt just created. The checkout then restores the
+    # exception, un-ignoring the leftover for commit_push's `git add -A`.
+    _ignored_repo(repo, _REINCLUDE, "foo/junk.txt", "build residue\n")
+    snap = snapshot_worktree(str(repo))
+    assert "foo/" in snap[2] and fix_apply._sealed_roots(snap[2]) == ()
+
+    (repo / ".gitignore").write_text("foo/\n")     # the attempt widened the rule
+    (repo / "foo" / "keep.txt").write_text("attempt leftover\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "foo" / "keep.txt").exists()
+    # The expansion weighs each descendant against the snapshot's record, so the
+    # file that WAS ignored under foo/ is still spared.
+    assert (repo / "foo" / "junk.txt").read_text() == "build residue\n"
+
+
+def test_removal_candidates_skips_a_sealed_root_without_expanding_it(repo):
+    # The other half: a sealed root stays the cheap single-entry skip the
+    # collapse exists for — it is never expanded, so a populated node_modules/
+    # cannot cost the rollback an enumeration that outruns the git timeout.
+    _ignored_repo(repo, "node_modules/\n", "node_modules/left-pad/index.js",
+                  "module.exports = 1\n")
+    snap = snapshot_worktree(str(repo))
+    assert fix_apply._sealed_roots(snap[2]) == ("node_modules/",)
+    real = fix_apply._git
+    expansions = []
+
+    def watch(cwd, *args, **kwargs):
+        if "ls-files" in args and "--ignored" in args and "--" in args:
+            expansions.append(args)
+        return real(cwd, *args, **kwargs)
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(fix_apply, "_git", watch)
+        candidates = fix_apply._removal_candidates(
+            str(repo), fix_apply._ignored_matcher(snap[2]),
+            fix_apply._sealed_roots(snap[2]))
+    assert expansions == []
+    assert not any(c.startswith("node_modules/") for c in candidates)
+
+
 def test_restore_spares_a_new_file_under_a_sealed_root_nested_in_foo(repo):
     # foo/sub/ was collapsed WITHOUT git listing its contents — git refused to
     # descend, because a file cannot be re-included once a parent directory is
@@ -931,10 +978,17 @@ def test_attempt_diff_stays_untruncated_while_the_rules_are_intact(repo):
     assert "the real fix" in diff
 
 
-def test_apply_fix_forces_verify_when_the_attempt_unignores_a_file(repo):
-    # End-to-end: verify_mode="off" would normally skip the pass entirely, and a
-    # benign one-line fix trips no wire — the un-ignored .env is the ONLY reason
-    # the verify pass runs, which is what stops the round shipping it unseen.
+# --- …and withholding is only half the answer -----------------------------
+# Forcing the verify pass cannot save an attempt that EXPOSED an ignored file:
+# the prompt withholds the very path in question, so the verifier is judging a
+# change it cannot see, and its CONFIRM — or an ordinary fail-open — returns
+# "applied", after which commit_push's repo-wide `git add -A` stages the
+# now-visible secret into the customer's PR. The attempt is refused instead.
+
+def test_apply_fix_rejects_an_attempt_that_unignores_a_file(repo):
+    # End-to-end: the verifier is never even asked. It would be asked about a
+    # diff with .env deliberately withheld, so a CONFIRM here means nothing —
+    # and CONFIRM is what a verifier hands back for a benign one-line fix.
     _ignored_repo(repo, ".env\n", ".env", _SECRET)
     verify_calls = []
 
@@ -949,10 +1003,16 @@ def test_apply_fix_forces_verify_when_the_attempt_unignores_a_file(repo):
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
                     verify_runner=verify, verify_mode="off")
-    assert out.status == "applied"
-    assert len(verify_calls) == 1                # forced, not selected
-    assert _SECRET_BYTES not in verify_calls[0]  # …and still no contents
-    assert "attempt diff exceeded the scan budget" in out.detail
+    assert out.status == "rejected"
+    assert ".env" in out.detail
+    assert verify_calls == []                    # no model call on a doomed attempt
+    assert _SECRET_BYTES not in out.diff         # …and still no contents
+    # Rolled back in full: the rule is back, so the file is ignored again, and
+    # the attempt's own edit is gone with it.
+    assert not out.rollback_failed
+    assert (repo / ".gitignore").read_text() == ".env\n"
+    assert (repo / ".env").read_text() == _SECRET
+    assert (repo / "tracked.py").read_text() == "original\n"
 
 
 def test_apply_fix_diff_never_carries_ignored_file_contents(repo):
@@ -965,9 +1025,69 @@ def test_apply_fix_diff_never_carries_ignored_file_contents(repo):
         return 0, "done"
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
-    assert out.status == "applied"
+    assert out.status == "rejected"          # the exposure disqualifies it
     assert _SECRET_BYTES not in out.diff
-    assert "the real fix" in out.diff
+    assert "the real fix" in out.diff        # the attempt's own change is on record
+
+
+# --- the same exposure through the INDEX ------------------------------------
+# `git add -f .env` reaches the same page by the opposite route: the file stops
+# being "other", so the untracked enumeration cannot see it — while `git diff
+# <ref>` starts reporting it as a new file, contents and all, and `git checkout
+# <ref> -- .` leaves the index entry behind for the next `git add -A`.
+
+def _force_add(repo, rel):
+    subprocess.run(["git", "add", "-f", rel], cwd=repo, check=True,
+                   capture_output=True)
+
+
+def test_attempt_diff_excludes_a_force_staged_ignored_file(repo):
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    (repo / "tracked.py").write_text("the real fix\n")
+    _force_add(repo, ".env")                     # what the failed attempt did
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert _SECRET_BYTES not in diff             # the bytes, not the path name
+    assert "+++ b/.env" not in diff              # and no hunk for the file at all
+    assert "the real fix" in diff                # the attempt's own change rides
+    assert truncated                             # the round cannot ship unverified
+
+
+def test_attempt_diff_leaks_a_staged_secret_when_the_ignored_set_is_empty(repo):
+    # The control, and the reason the assertion above means anything: the same
+    # fixture with an ignored set that matches nothing does put the staged
+    # secret's bytes in the tracked patch. This pins the reproduction, NOT a
+    # behaviour anyone should want.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    _force_add(repo, ".env")
+
+    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1], frozenset())
+    assert _SECRET_BYTES in diff
+
+
+def test_apply_fix_rejects_and_unstages_a_force_added_ignored_file(repo):
+    # The rollback must undo the STAGING without touching the file: the copy on
+    # disk is the user's, and the index entry is what would ride `git add -A`.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "tracked.py").write_text("the real fix\n")
+        _force_add(repo, ".env")
+        return 0, "done"
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
+    assert out.status == "rejected"
+    assert ".env" in out.detail
+    assert not out.rollback_failed
+    assert _SECRET_BYTES not in out.diff
+    assert (repo / ".env").read_text() == _SECRET      # the user's file, untouched
+    staged = subprocess.run(["git", "diff", "--cached", "--name-only"], cwd=repo,
+                            capture_output=True, text=True).stdout
+    assert ".env" not in staged                        # …and no longer staged
+    assert (repo / "tracked.py").read_text() == "original\n"
 
 
 # --- an UNKNOWN ignore state fails closed, not open ------------------------
@@ -1067,8 +1187,10 @@ def test_apply_fix_unicode_recompute_does_not_reintroduce_the_leak(repo):
         return 0, "done"
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
-    assert out.status == "applied"
-    assert nbsp not in (repo / "tracked.py").read_text(encoding="utf-8")  # recompute ran
+    assert out.status == "rejected"          # the un-ignored .env disqualifies it
+    # The recorded diff is the RECOMPUTED one — the cleanup's own edit is in it,
+    # and the rollback that follows is why the worktree can no longer show that.
+    assert "def f():" in out.diff and nbsp not in out.diff
     assert _SECRET_BYTES not in out.diff
 
 
@@ -1114,9 +1236,12 @@ def test_leak_filter_survives_a_snapshot_that_died_hashing_blobs(repo,
         return 0, "done"
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
-    assert out.status == "applied"
     assert _SECRET_BYTES not in out.diff             # …the filter did not
     assert "the real fix" in out.diff
+    # The exposure is caught on this path too — and with no snapshot there was
+    # no rollback, so the round driver is told to halt before the push.
+    assert out.status == "rejected"
+    assert out.rollback_failed
 
 
 # --- a pathname is bytes: decoding it must never be able to raise ----------
