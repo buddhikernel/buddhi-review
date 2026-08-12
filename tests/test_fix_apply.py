@@ -485,6 +485,47 @@ def test_restore_spares_an_unrecorded_ignored_file_when_the_attempt_broke_the_ru
     assert not (repo / "attempt-leftover.txt").exists()      # still a rollback
 
 
+def test_restore_spares_the_users_file_when_the_broken_rule_was_untracked(repo):
+    # The same scenario as the test above with ONE difference: the .gitignore is
+    # UNTRACKED. `stash create` records tracked changes only, so it is in no ref
+    # and `git checkout <ref> -- .` cannot bring it back — which means pass 2's
+    # premise ("the user's own rules are back") holds only because the recorded
+    # rule files are rewritten BEFORE it runs. Without that, pass 2 enumerates
+    # under no rule at all, `.env.local` is an ordinary "other", and the only
+    # copy of a live credential is unlinked while this returns True.
+    (repo / ".gitignore").write_text(".env*\n")        # never committed
+    snap = snapshot_worktree(str(repo))
+    assert ".gitignore" in snap[1]                     # recorded as untracked…
+    assert ".env.local" not in snap[2]                 # …and it does not exist yet
+
+    (repo / ".env.local").write_text("AWS_SECRET=live-prod-key\n")   # theirs
+    (repo / "attempt-leftover.txt").write_text("junk\n")             # ours
+    (repo / ".gitignore").unlink()                     # what the attempt did
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / ".env.local").read_text() == "AWS_SECRET=live-prod-key\n"
+    assert (repo / ".gitignore").read_text() == ".env*\n"    # the rule is back
+    assert not (repo / "attempt-leftover.txt").exists()      # still a rollback
+
+
+def test_restore_clears_a_leftover_occupying_a_recorded_untracked_dir(repo):
+    # The ordering the fix above must NOT disturb: the general rewrite of the
+    # untracked record stays AFTER pass 2, because pass 2 is what clears a
+    # leftover FILE sitting on a path the record needs as a DIRECTORY. Rewriting
+    # everything early would make `os.makedirs` collide with that file and fail
+    # the whole rollback.
+    (repo / "dir").mkdir()
+    (repo / "dir" / "file.txt").write_text("mine\n")
+    snap = snapshot_worktree(str(repo))
+    assert "dir/file.txt" in snap[1]
+
+    shutil.rmtree(repo / "dir")
+    (repo / "dir").write_text("leftover written over the directory\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / "dir" / "file.txt").read_text() == "mine\n"
+
+
 def test_restore_removes_a_leftover_shadowing_a_tracked_path(repo):
     # What the pre-checkout pass still does, and the only reason it runs before
     # the checkout: the attempt turned a tracked FILE into a directory, so the
@@ -1533,7 +1574,11 @@ def test_restore_still_deletes_leftovers_when_a_sealed_root_is_intact(repo):
 
 
 def test_apply_fix_never_shows_a_verifier_a_file_moved_out_of_a_sealed_root(repo):
-    # End-to-end on the real path, with the fixer doing the moving.
+    # End-to-end on the real path, with the fixer doing the moving. The move is
+    # REFUSED rather than verified: the prompt withholds the destination's bytes,
+    # so a verify pass here would be a verdict on the one change that matters,
+    # taken without seeing it — and a CONFIRM would return "applied" and hand
+    # `notes.txt` to commit_push's `git add -A`.
     _sealed_repo(repo)
     verify_calls = []
 
@@ -1548,10 +1593,13 @@ def test_apply_fix_never_shows_a_verifier_a_file_moved_out_of_a_sealed_root(repo
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
                     verify_runner=verify, verify_mode="off")
-    assert len(verify_calls) == 1                  # forced by the withheld content
-    assert _SECRET_BYTES not in verify_calls[0]
+    assert out.status == "rejected"
+    assert verify_calls == []                      # no model call on a doomed attempt
     assert _SECRET_BYTES not in out.diff
     assert (repo / "notes.txt").read_text() == _SECRET   # never destroyed
+    # The destination is the only copy left, so the rollback declines to remove
+    # it and says so — the round driver halts before the push on that False.
+    assert out.rollback_failed
 
 
 def test_restore_reads_a_snapshot_with_no_descendant_member(repo):
@@ -1649,7 +1697,10 @@ def test_attempt_diff_keeps_the_appendix_while_no_ignored_path_moved(repo):
 
 
 def test_apply_fix_never_shows_a_verifier_a_renamed_ignored_file(repo):
-    # End-to-end on the real path, with the fixer doing the renaming.
+    # End-to-end on the real path, with the fixer doing the renaming. Withholding
+    # the destination's bytes and then asking a verifier to CONFIRM would be a
+    # verdict on the one change that matters, taken without seeing it — so the
+    # attempt is REFUSED before any model call instead.
     _ignored_repo(repo, ".env\n", ".env", _SECRET)
     verify_calls = []
 
@@ -1664,10 +1715,11 @@ def test_apply_fix_never_shows_a_verifier_a_renamed_ignored_file(repo):
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
                     verify_runner=verify, verify_mode="off")
-    assert len(verify_calls) == 1                  # forced by the withheld content
-    assert _SECRET_BYTES not in verify_calls[0]
+    assert out.status == "rejected"
+    assert verify_calls == []                      # no model call on a doomed attempt
     assert _SECRET_BYTES not in out.diff
     assert (repo / "notes.txt").read_text() == _SECRET   # never destroyed
+    assert out.rollback_failed                     # the round halts before the push
 
 
 # --- an unknown ignore state withholds the TRACKED adds too ----------------
@@ -1976,6 +2028,40 @@ def test_apply_fix_rejects_an_attempt_that_strips_a_rule_matching_nothing(repo):
     staged = subprocess.run(["git", "add", "-A", "--dry-run"], cwd=repo,
                             capture_output=True, text=True).stdout
     assert ".env.local" not in staged
+
+
+def test_apply_fix_rejects_an_attempt_that_MOVED_an_ignored_file(repo):
+    # The third shape, and the one neither path-matched gate can see: the rule
+    # is untouched, the source is simply gone, and the destination is a name no
+    # record holds. Left to run, the verify prompt withholds `notes.txt` outright
+    # (a source is missing, so the whole appendix and the tracked added side go),
+    # a CONFIRM returns "applied", and commit_push's repo-wide `git add -A` puts
+    # the user's credential in the customer's PR.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    verify_calls = []
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        os.rename(repo / ".env", repo / "notes.txt")          # the attempt
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=verify, verify_mode="off")
+    assert out.status == "rejected"
+    assert "previously-ignored path" in out.detail
+    assert verify_calls == []                    # no model call on a doomed attempt
+    # The tracked half rolls back, and `notes.txt` deliberately does NOT: the
+    # source is already gone, so it is the only copy of the user's bytes in
+    # existence and removing it would destroy what the refusal exists to protect.
+    # The rollback says so rather than reporting clean, and the round driver
+    # halts on that — which is what keeps `git add -A` from ever running.
+    assert (repo / "tracked.py").read_text() == "original\n"
+    assert (repo / "notes.txt").read_text() == _SECRET
+    assert out.rollback_failed
 
 
 def test_apply_fix_still_applies_a_fix_that_only_ADDS_an_ignore_rule(repo):

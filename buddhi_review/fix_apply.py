@@ -615,9 +615,31 @@ def _ignored_paths_missing(cwd: str, ignored: FrozenSet[str],
 
     So the missing source raises the flag, and its callers stop treating an
     un-ignored path as PROVABLY the attempt's own for the rest of that pass. A
-    genuinely deleted ignored file raises it too — nothing distinguishes a delete
-    from a move once the source is gone — which costs a spared leftover and a
-    forced verify pass, against a destroyed ``.env`` and a leaked secret.
+    genuinely DELETED ignored file raises it too — nothing distinguishes a delete
+    from a move once the source is gone — and that conflation is not cheap. On
+    the FAILURE path the removal pass declines to judge, so
+    :func:`restore_worktree` reports itself unclean, the round driver HALTS
+    before the push, and the attempt's genuine leftovers stay in the shared
+    worktree for the next comment's attempt to inherit. On the SUCCESS path
+    :func:`apply_fix` REJECTS the attempt outright. A fixer that runs the
+    project's build or test suite pays that whenever a recorded artifact is
+    removed and not recreated — a ``make clean``, a `.pytest_cache/` entry a
+    passing run drops — so the honest price is a re-reviewed comment and a halted
+    round, not the spared leftover it would be if this only softened a heuristic.
+
+    Deliberately NOT narrowed all the same, there being no sound way to. "Count
+    only a vanished FILE entry" changes nothing: a root small enough to have
+    recorded descendants loses those FILES too when it is cleaned, and one too
+    large recorded none to lose. "Count it only where an un-ignored candidate
+    exists" is already how the removal pass reads the flag — a pass with nothing
+    doomed never consults it — and carrying that test to the success path would
+    have to treat every path the attempt touched as a possible destination, since
+    a move can overwrite a TRACKED file as readily as create an untracked one,
+    which is every successful fix there is. Content-matching the destination
+    (hashing the recorded ignored files at snapshot time) is the one test that
+    would genuinely separate the two, and a single appended byte defeats it. So
+    the flag stays blunt, and its cost is paid where the alternative is a
+    destroyed ``.env`` or a leaked secret.
 
     `descendants` (:func:`sealed_descendants`) is what the collapsed roots would
     otherwise cost this check. A root stands for every path beneath it, but it
@@ -1175,6 +1197,50 @@ def _remove_leftovers(cwd: str, pre_untracked: Dict[str, tuple],
     return honoured
 
 
+def _restore_untracked(cwd: str, entries: Dict[str, tuple]) -> bool:
+    """Rewrite each recorded untracked path to its exact content, type and mode.
+    False when a recorded blob could not be read back out of the object store.
+
+    Rewrite by REPLACEMENT, never in place: whatever occupies the path is removed
+    first, so a symlink the attempt left is not written THROUGH, and a directory
+    it created where a file belongs does not turn the write into a silent
+    ``IsADirectoryError``.
+
+    Idempotent, which is what lets :func:`restore_worktree` call it twice — once
+    early for the recorded ignore-RULE files, once at the end for everything."""
+    for rel, entry in entries.items():
+        full = os.path.join(cwd, rel)
+        os.makedirs(os.path.dirname(full) or cwd, exist_ok=True)
+        try:
+            if os.path.isdir(full) and not os.path.islink(full):
+                shutil.rmtree(full)
+            else:
+                os.unlink(full)
+        except OSError:
+            pass
+        if entry[0] == "link":
+            os.symlink(entry[1], full)
+        else:
+            _, sha, mode = entry
+            blob = _git(cwd, "cat-file", "blob", sha, text=False)
+            if blob.returncode != 0:
+                return False
+            with open(full, "wb") as f:
+                f.write(blob.stdout)
+            os.chmod(full, mode)
+    return True
+
+
+def _untracked_rule_files(pre_untracked: Dict[str, tuple]) -> Dict[str, tuple]:
+    """The recorded untracked entries that are themselves ignore RULE files.
+
+    Same basename test :func:`restore_worktree`'s pass 1 uses to remove an
+    attempt-CREATED ``.gitignore``, applied to the mirror case: a rule file the
+    snapshot RECORDED, which pass 2 needs back before it may judge anything."""
+    return {rel: entry for rel, entry in pre_untracked.items()
+            if rel.rsplit("/", 1)[-1] == ".gitignore"}
+
+
 def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     """Roll back to a snapshot: delete untracked files the failed attempt
     created, restore tracked files (``git checkout <ref> -- .`` — HEAD/branch
@@ -1190,8 +1256,10 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     something of a different kind (:func:`_shadows_tracked_path`) — plus an
     untracked ``.gitignore``, whose whole effect is to hide OTHER leftovers from
     the pass that would remove them. GENERAL removal waits for pass 2, which
-    runs once the checkout has put the user's own rules back and every verdict
-    is therefore honest.
+    runs once the user's own rules are back and every verdict is therefore
+    honest. "Back" is the checkout for a TRACKED rule file and an explicit
+    rewrite for an untracked one (:func:`_untracked_rule_files`), since a ref
+    holds no untracked path and a checkout can restore only what it holds.
 
     Rules NARROWED (the attempt deleted ``.gitignore``): every path the restored
     rules ignore is left strictly alone — the ones the snapshot RECORDED and the
@@ -1312,33 +1380,28 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         # enumeration failure (residue cannot be ruled out) but press on: the
         # checkout has already landed, and finishing the restore beats
         # abandoning it half-done.
+        # …but the checkout only writes what the REF holds, and ``stash create``
+        # records tracked changes alone — so an UNTRACKED ``.gitignore`` the
+        # attempt deleted is in no ref and no checkout can bring it back. Pass 2
+        # would then run with the user's rules still missing, which is precisely
+        # the state pass 1 refuses to judge in: their uncaptured `.env.local` is
+        # offered as an ordinary "other", and deleting it destroys the only copy
+        # in existence while this returns True. So the recorded rule files are put
+        # back FIRST, on the same terms pass 1 removes an attempt-created one — a
+        # rule is not uncaptured content, and the snapshot hashed its bytes. Only
+        # these, not the whole record: the general rewrite must stay AFTER pass 2,
+        # which is what clears a leftover occupying a path the record needs as a
+        # directory. Fail closed if the rules cannot be restored (the caller
+        # halts) rather than letting pass 2 judge without them.
+        rule_files = _untracked_rule_files(pre_untracked)
+        if rule_files and not _restore_untracked(cwd, rule_files):
+            return False
         second = _remove_leftovers(cwd, pre_untracked, was_ignored,
                                    ignored_moved)
         if second is not True:
             honoured = False
-        for rel, entry in pre_untracked.items():
-            full = os.path.join(cwd, rel)
-            os.makedirs(os.path.dirname(full) or cwd, exist_ok=True)
-            try:
-                if os.path.isdir(full) and not os.path.islink(full):
-                    # A failed attempt may have created a directory at this path;
-                    # os.unlink would raise IsADirectoryError (a silent OSError),
-                    # leaving the directory in place and making open() fail below.
-                    shutil.rmtree(full)
-                else:
-                    os.unlink(full)  # rewrite by replacement: never write THROUGH a symlink
-            except OSError:
-                pass
-            if entry[0] == "link":
-                os.symlink(entry[1], full)
-            else:
-                _, sha, mode = entry
-                blob = _git(cwd, "cat-file", "blob", sha, text=False)
-                if blob.returncode != 0:
-                    return False
-                with open(full, "wb") as f:
-                    f.write(blob.stdout)
-                os.chmod(full, mode)
+        if not _restore_untracked(cwd, pre_untracked):
+            return False
         return honoured
     except (subprocess.TimeoutExpired, OSError):
         return False
@@ -2268,6 +2331,13 @@ def apply_fix(
     on the same terms (:func:`_ignore_coverage_stripped`), for the exposure that
     check cannot name: a rule matching nothing when the snapshot was taken is in
     no record, so a file written under it mid-attempt is nobody's to vouch for.
+    An attempt that MOVED one — leaving a recorded ignored path missing
+    (:func:`_ignored_paths_missing`) — is refused for the third time on the same
+    terms: both checks above match by PATH, and a rename produces a destination
+    no record names out of a source nothing enumerates, with no rule touched to
+    give it away. This is the same signal the FAILURE path already halts the
+    round on (:func:`restore_worktree`), and the success path is where the file
+    would actually ship, so the two are held to one standard.
     When either check cannot be RUN at all the attempt is
     rolled back too, as ``transient-failed`` (an evaluation that did not happen,
     not a verdict on the patch) — treating an unanswerable question as an
@@ -2529,6 +2599,31 @@ def apply_fix(
             # a rule change measured against no baseline is not a verdict.
             stripped = (_ignore_coverage_stripped(cwd, ref, snap_untracked)
                         if snap_ignored is not None else False)
+            # …and the same refusal again for the third shape, which is the one
+            # NEITHER check above can see. Both match by PATH: the staged/
+            # un-ignored gate names recorded paths, the coverage gate reads rule
+            # files. A MOVE has neither — `.env` renamed to `notes.txt` leaves a
+            # source that is simply gone (so nothing enumerates it) under a
+            # destination no record holds and no rule was touched to produce.
+            # What gives it away is the missing SOURCE
+            # (:func:`_ignored_paths_missing`), already computed for the leak
+            # filter, and the failure path treats that signal as serious enough
+            # to halt the round (:func:`restore_worktree`). The SUCCESS path is
+            # where the secret actually ships — nothing puts the file back before
+            # ``commit_push``'s repo-wide ``git add -A`` stages `notes.txt` into
+            # the customer's PR — so it must not be the laxer of the two.
+            #
+            # Refusal rather than a forced verify pass, for the reason the gate
+            # above gives and which applies here with MORE force: the prompt
+            # withholds the whole untracked appendix AND the tracked patch's
+            # added side while a source is missing (:func:`_attempt_diff`), so
+            # the destination's bytes are exactly what the verifier cannot be
+            # shown. Asking it to CONFIRM a diff scrubbed of the only change that
+            # matters is not a check; rolling back is, and it puts the moved file
+            # back where its rule still covers it.
+            moved = (snap_ignored is not None
+                     and _ignored_paths_missing(cwd, snap_ignored,
+                                                snap_descendants or frozenset()))
             # None is "the check could not be RUN" — a git failure, not a verdict.
             # It must not read as the empty list's all-clear: the exposure it
             # would have found is invisible everywhere else, so the attempt is
@@ -2541,6 +2636,7 @@ def apply_fix(
             # diff. This is NOT a tripwire — the ⚠ alarm below stays scoped to ``trip``.
             run_verify = (
                 verify_runner is not None and not exposed and not stripped
+                and not moved
                 and not exposure_unknown   # about to roll back — spend no model call
                 and (guided_active
                      or should_verify(verify_mode, diff, tripwired=bool(trip),
@@ -2596,7 +2692,7 @@ def apply_fix(
                     attempts=total_attempts + attempt,
                     rollback_failed=not trustworthy or snap is None,
                 )
-            if exposed or stripped:
+            if exposed or stripped or moved:
                 # TERMINAL, and never guided-retried: the objection is not a
                 # defect in the patch the fixer could correct — the attempt tore
                 # a hole in the user's ignore rules, and re-dispatching the same
@@ -2609,13 +2705,19 @@ def apply_fix(
                 # A stripped RULE (:func:`_ignore_coverage_stripped`) is the same
                 # refusal without a path list: what it exposed is whatever was
                 # written under that rule while the attempt ran, which by
-                # definition no record names.
+                # definition no record names. A MISSING recorded ignored path
+                # (:func:`_ignored_paths_missing`) is the same again, and without
+                # even a rule change to point at: the destination of a move is a
+                # name nothing on either list can hold.
                 if exposed:
                     shown = (", ".join(exposed[:3])
                              + ("…" if len(exposed) > 3 else ""))
                     what = f"exposed previously-ignored path(s): {shown}"
-                else:
+                elif stripped:
                     what = "removed ignore-rule coverage it was snapshotted under"
+                else:
+                    what = ("lost a previously-ignored path the snapshot recorded "
+                            "— it may have been moved to an un-ignored name")
                 _status_line(
                     "✗", f"attempt {what} — rolling back", colour=_YELLOW)
                 trustworthy = _restore_or_degrade(
@@ -2829,10 +2931,11 @@ def _attempt_diff(cwd: str, tracked_ref: str,
     attempt EXPOSED one of the user's ignored files, which :func:`apply_fix`
     rejects outright (:func:`_unignored_exposures`). A MOVE is the case that
     gate cannot reach — it matches paths, and the destination is a name no
-    record holds — so what a missing source buys is the contents staying out of
-    the model's prompt and the forced verify pass, NOT a refusal; a moved file
-    that the attempt then leaves in place is still staged by ``commit_push``'s
-    ``git add -A``, the same as any other new file the fixer writes.
+    record holds — so the missing SOURCE is what :func:`apply_fix` refuses on
+    instead, reading the same `ignored_moved` this text withholds for. The two
+    halves are deliberately one decision: withholding alone would leave the
+    moved file to ``commit_push``'s ``git add -A`` after a verifier had been
+    asked to judge a diff scrubbed of the only change that mattered.
     `--no-ext-diff` keeps
     an external diff driver from replacing the hunk text the tripwire scans;
     errors="replace" keeps one non-UTF-8 file from blanking the whole scan."""
