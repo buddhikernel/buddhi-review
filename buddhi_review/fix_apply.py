@@ -736,71 +736,89 @@ def _prune_empty_parents(cwd: str, full_path: str) -> None:
         parent = os.path.dirname(parent)
 
 
-def _removal_candidates(cwd: str, was_ignored: Callable[[str], bool],
-                        sealed: Tuple[str, ...] = ()) -> Optional[list]:
-    """Every untracked path the removal pass must weigh — the ones git calls new
-    right now PLUS the ones a failed attempt hid behind ignore rules it widened
-    itself. None when git could not be asked.
+def _removal_candidates(cwd: str) -> Optional[list]:
+    """The untracked paths a removal pass may weigh: the ones git calls new right
+    now, under the ignore rules in force at THIS moment. None when git could not
+    be asked.
 
-    ``--others --exclude-standard`` answers "what is new?" through whatever
-    ignore rules the ATTEMPT left behind, so an attempt that appended `build/`
-    to a tracked ``.gitignore`` has made that answer omit its own
-    `build/`\\ `evil.py`. The checkout that follows puts the original
-    ``.gitignore`` back, un-ignoring the leftover moments after the only pass
-    that would have removed it: residue in the shared worktree, reported as a
-    clean rollback, and swept into the customer's PR by ``commit_push``'s
-    repo-wide ``git add -A``. Enumerating the ignored side too is what closes
-    that evasion — and the SNAPSHOT's record, never git's current verdict, is
-    what decides which of those paths to spare.
+    Deliberately only the un-ignored side. An ignored path is never hashed into
+    the object store (see :func:`snapshot_worktree`), so deleting one destroys
+    the only copy in existence — and "the snapshot did not record it" is NOT
+    evidence that the attempt created it. This is the shared worktree the round
+    driver reuses: a `.env.local` the developer's editor or a ``direnv`` hook
+    writes while the attempt runs, or a `__pycache__/` the fixer's own test run
+    leaves, is unrecorded and ignored and none of the rollback's business.
+    Judging membership against the snapshot's RECORD would shred all three.
 
-    That second enumeration is collapsed with ``--directory`` for the same
-    reason the snapshot's is: a populated `node_modules/` must not be listed
-    file-by-file. Only a root the SNAPSHOT SEALED (:func:`_sealed_roots` —
-    ``sealed``) is dropped whole, because sealing is git's own statement that
-    nothing under it could ever be re-included, so every path it holds now was
-    ignored then. Every other collapsed root is EXPANDED and weighed path by
-    path — rmtree-ing it on the strength of the attempt's own rules is exactly
-    the destruction this mechanism exists to prevent, and skipping it wholesale
-    is exactly the evasion the mechanism exists to close:
+    What the snapshot's record IS good for is the mirror case, and that stays:
+    a path git no longer ignores because the ATTEMPT broke the rule is spared by
+    ``was_ignored`` in :func:`_remove_leftovers`.
 
-    * a directory that merely BECAME ignored can hold paths the snapshot
-      recorded individually (a `svc/local.conf` under a newly-ignored `svc/`);
-    * a root the snapshot recorded but did NOT seal (`foo/` under `foo/**` plus
-      `!foo/`\\ `keep.txt`) covers only the descendants git listed alongside it.
-      An attempt that widens the rule to `foo/` re-collapses the tree — git now
-      offers one `foo/` entry — so matching that entry against the snapshot's
-      record and skipping would spare a `foo/`\\ `keep.txt` the attempt created,
-      which the checkout then un-ignores by restoring the exception.
+    Which leaves the evasion the ignored side used to cover — an attempt that
+    appends `build/` to a tracked ``.gitignore`` and writes `build/`\\ `evil.py`,
+    hiding its own leftover from the pass that would remove it. That is closed
+    by WHEN this is called rather than by what it enumerates:
+    :func:`restore_worktree` runs it a second time AFTER the checkout has put
+    the tracked ignore files back, and the leftover the attempt's rule hid is
+    plainly "other" again the moment the original rules return. The discriminator
+    is exact — ignored under the attempt's rules but not under the user's own —
+    where the record-based test could not tell that leftover from the user's
+    `.env.local`.
 
-    Expanding costs nothing where the collapse exists to help: a sealed
-    `node_modules/` is still one entry skipped on a single string test."""
+    Residue: an attempt that widens `.git/info/exclude` or ``core.excludesFile``
+    escapes both passes, because no checkout restores a file outside the tree.
+    Nothing of it reaches the customer's PR — ``git add -A`` will not stage a
+    path git still ignores — so what survives is worktree untidiness, which is
+    the smaller harm by a wide margin than deleting the user's uncaptured
+    files."""
     u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard",
              errors="surrogateescape")
     if u.returncode != 0:
         return None
-    candidates = [p for p in u.stdout.split("\0") if p]
-    ig = _git(cwd, "ls-files", "-z", "--others", "--ignored",
-              "--exclude-standard", "--directory", errors="surrogateescape")
-    if ig.returncode != 0:
+    return [p for p in u.stdout.split("\0") if p]
+
+
+def _remove_leftovers(cwd: str, pre_untracked: Dict[str, tuple],
+                      was_ignored: Callable[[str], bool]) -> Optional[bool]:
+    """Delete the untracked paths the snapshot did not record, pruning the
+    directories that leaves empty. True when every removal landed, False when
+    one was refused (the rollback is then partial and must not be reported
+    clean), None when the enumeration itself failed.
+
+    Run twice by :func:`restore_worktree`, once on each side of the checkout;
+    the second call sees the ignore rules restored (:func:`_removal_candidates`)
+    and is idempotent over the first — a path the first pass removed is not
+    enumerated again."""
+    candidates = _removal_candidates(cwd)
+    if candidates is None:
         return None
-    for rel in (p for p in ig.stdout.split("\0") if p):
-        if not rel.endswith("/"):
-            if not was_ignored(rel):
-                candidates.append(rel)
-            continue          # the snapshot's own record — never ours to touch
-        if rel.startswith(sealed):
-            # A sealed root speaks for every path beneath it, so the whole tree
-            # was ignored at snapshot time and none of it is this rollback's.
+    honoured = True
+    for rel in candidates:
+        if rel in pre_untracked or was_ignored(rel):
             continue
-        # ":(literal)" so a directory whose name carries pathspec magic
-        # ("bui[1]ld/") is matched as the name it is, not as a glob.
-        sub = _git(cwd, "ls-files", "-z", "--others", "--ignored",
-                   "--exclude-standard", "--", f":(literal){rel}",
-                   errors="surrogateescape")
-        if sub.returncode != 0:
-            return None
-        candidates.extend(p for p in sub.stdout.split("\0") if p)
-    return candidates
+        full_path = os.path.join(cwd, rel)
+        try:
+            if os.path.isdir(full_path) and not os.path.islink(full_path):
+                shutil.rmtree(full_path)
+            else:
+                os.unlink(full_path)
+        except FileNotFoundError:
+            # Already gone — the removal's goal, reached early. The parents
+            # still need sweeping: whoever won the race removed the file, not
+            # the directories the attempt created around it, and this rollback
+            # must land in the same worktree state either way rather than
+            # leaving stray empty dirs behind.
+            _prune_empty_parents(cwd, full_path)
+        except OSError:
+            # A leftover we promised to remove is still there. Press on with the
+            # rest of the rollback (a maximally-restored worktree beats an
+            # abandoned one) but report the failure, so the caller halts instead
+            # of pushing the residue. No pruning here: the leftover survives, so
+            # its parents are not empty and are not ours to remove.
+            honoured = False
+        else:
+            _prune_empty_parents(cwd, full_path)
+    return honoured
 
 
 def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
@@ -810,20 +828,30 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     type and mode. New-untracked removal runs BEFORE the checkout so a failed
     attempt's file cannot shadow a tracked path.
 
-    That pre-checkout ordering means the removal pass runs while the ignore
-    rules are still whatever the FAILED ATTEMPT left them — so "is this path
-    new?" must never be asked of git's *current* exclusion verdict, in EITHER
-    direction. Rules NARROWED (the attempt deleted ``.gitignore``): a path the
-    snapshot recorded as ignored is left strictly alone, because it was never
-    captured (see :func:`snapshot_worktree`) and deleting it destroys the only
-    copy that exists — a rollback that deletes the user's ``.env`` is worse than
-    no rollback at all. Rules WIDENED (the attempt appended to ``.gitignore``):
-    a path git now hides is still a candidate for removal, or an attempt could
-    evade its own rollback by writing one line into an ignore file
+    That pre-checkout ordering means the first removal pass runs while the
+    ignore rules are still whatever the FAILED ATTEMPT left them, so the pass is
+    run TWICE — once on each side of the checkout — and each direction of the
+    ignore-rule question is answered by the side that can answer it honestly.
+    Rules NARROWED (the attempt deleted ``.gitignore``): a path the snapshot
+    recorded as ignored is left strictly alone in both passes, because it was
+    never captured (see :func:`snapshot_worktree`) and deleting it destroys the
+    only copy that exists — a rollback that deletes the user's ``.env`` is worse
+    than no rollback at all. Rules WIDENED (the attempt appended to
+    ``.gitignore``): the leftover it hid is invisible to the first pass, and the
+    SECOND pass is what removes it — the checkout has restored the tracked
+    ignore files by then, so a path the attempt's rule hid is "other" again
+    while everything the USER's own rules cover stays ignored and untouched
     (:func:`_removal_candidates`). Rules BYPASSED (the attempt ran ``git add -f
-    .env``): the file is not "other" any more, so neither enumeration sees it —
-    the INDEX entry is dropped instead, which leaves the user's file on disk and
+    .env``): the file is not "other" any more, so neither pass sees it — the
+    INDEX entry is dropped instead, which leaves the user's file on disk and
     stops the staged copy riding the next ``git add -A``.
+
+    What is emphatically NOT the rule is "unrecorded ⇒ the attempt's own". This
+    is the shared worktree the round driver reuses, and an attempt takes minutes
+    during which the developer's editor, a dev server, a ``direnv`` hook and the
+    fixer's own test run all write to it. An ignored path that the snapshot's
+    record does not name is far more often theirs than the attempt's, and it is
+    exactly the class of file no rollback can put back.
 
     Returns False when the rollback could not be honoured in full — including a
     snapshot too old to carry the ignored set, and any deletion that failed for
@@ -838,42 +866,16 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         return False
     tracked_ref, pre_untracked, pre_ignored = snapshot
     was_ignored = _ignored_matcher(pre_ignored)
-    honoured = True
     try:
-        # Both directions of the ignore-rule question are covered here: a path
-        # git NOW calls ignored but the snapshot did not is still the attempt's
-        # leftover (see :func:`_removal_candidates`), and a path the snapshot
-        # recorded as ignored stays untouched however the attempt left the rules.
-        candidates = _removal_candidates(cwd, was_ignored,
-                                         _sealed_roots(pre_ignored))
-        if candidates is None:
+        # PASS 1, pre-checkout: remove what git calls new under the rules the
+        # ATTEMPT left behind, sparing anything the snapshot recorded as ignored
+        # however it left them. Running before the checkout is what stops an
+        # attempt's file shadowing a tracked path; pass 2 below covers what the
+        # attempt's own rules hid from this one.
+        honoured = _remove_leftovers(cwd, pre_untracked, was_ignored)
+        if honoured is None:
             return False
-        for rel in candidates:
-            if rel not in pre_untracked and not was_ignored(rel):
-                full_path = os.path.join(cwd, rel)
-                try:
-                    if os.path.isdir(full_path) and not os.path.islink(full_path):
-                        shutil.rmtree(full_path)
-                    else:
-                        os.unlink(full_path)
-                except FileNotFoundError:
-                    # Already gone — the removal's goal, reached early. The
-                    # parents still need sweeping: whoever won the race removed
-                    # the file, not the directories the attempt created around
-                    # it, and this rollback must land in the same worktree state
-                    # either way rather than leaving stray empty dirs behind.
-                    _prune_empty_parents(cwd, full_path)
-                except OSError:
-                    # A leftover we promised to remove is still there. Press on
-                    # with the rest of the rollback (a maximally-restored
-                    # worktree beats an abandoned one) but report the failure,
-                    # so the caller halts instead of pushing the residue. No
-                    # pruning here: the leftover survives, so its parents are
-                    # not empty and are not ours to remove.
-                    honoured = False
-                else:
-                    _prune_empty_parents(cwd, full_path)
-        # Neither enumeration above can see a path the attempt STAGED (``git add
+        # Neither pass above can see a path the attempt STAGED (``git add
         # -f .env`` makes it cease to be "other"), and the checkout below writes
         # only the paths the ref holds — so an ignored file the attempt forced
         # into the index survives this rollback in the index and rides
@@ -895,6 +897,16 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         co = _git(cwd, "checkout", tracked_ref, "--", ".")
         if co.returncode != 0:
             return False
+        # PASS 2, post-checkout: the tracked ignore files are back, so a leftover
+        # the attempt hid by WIDENING a rule is plainly "other" again and goes
+        # out here — while a path the user's own unchanged rules cover was never
+        # offered to either pass and survives untouched. Fail closed on an
+        # enumeration failure (residue cannot be ruled out) but press on: the
+        # checkout has already landed, and finishing the restore beats
+        # abandoning it half-done.
+        second = _remove_leftovers(cwd, pre_untracked, was_ignored)
+        if second is not True:
+            honoured = False
         for rel, entry in pre_untracked.items():
             full = os.path.join(cwd, rel)
             os.makedirs(os.path.dirname(full) or cwd, exist_ok=True)

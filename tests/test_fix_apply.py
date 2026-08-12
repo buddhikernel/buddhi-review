@@ -242,9 +242,11 @@ def test_restore_preserves_mode(repo):
 #
 # The removal pass runs BEFORE the checkout (so an attempt's file cannot shadow
 # a tracked path), which means it sees the ignore rules as the FAILED ATTEMPT
-# left them. Ignored files are never hashed into the object store, so deleting
-# one destroys the only copy in existence — hence every case below drives real
-# git and asserts the exact surviving bytes, not merely existence.
+# left them — so it runs a SECOND time after the checkout, once the tracked
+# ignore files are back and the two verdicts can be told apart. Ignored files
+# are never hashed into the object store, so deleting one destroys the only copy
+# in existence — hence every case below drives real git and asserts the exact
+# surviving bytes, not merely existence.
 # ---------------------------------------------------------------------------
 
 def _ignored_repo(repo, rule, rel, content):
@@ -331,12 +333,20 @@ def test_restore_still_deletes_genuinely_new_file_with_ignore_rules_broken(repo)
 
 
 def test_restore_leaves_an_ignored_artifact_the_attempt_created(repo):
-    # Ignored paths are out of the snapshot's scope in BOTH directions: never
-    # captured, so never deleted. A fixer that runs the test suite or a build
-    # leaves ignored artifacts behind (a __pycache__, an installed dependency
-    # tree), and a rollback that shredded those would be a second destructive
-    # bug wearing the first one's clothes. Pins the deliberate choice not to
-    # widen deletion to a class of file the old code also left alone.
+    # The rule the removal pass actually applies, to every path it weighs:
+    # RECORDED ⇒ spared, UNRECORDED ⇒ deleted. `build/` is a recorded root, so
+    # `build/fresh.o` is spared by the record — and `build/old.o` with it.
+    #
+    # What the pass never even weighs is the second half of the policy: only
+    # paths git does NOT ignore once the checkout has restored the rules are
+    # offered as candidates at all (see _removal_candidates). So an unrecorded
+    # path still ignored under the user's own rules is out of scope rather than
+    # deleted — the case
+    # test_restore_spares_an_unrecorded_ignored_file_created_after_the_snapshot
+    # pins. A fixer that runs the test suite or a build leaves ignored artifacts
+    # behind (a __pycache__, an installed dependency tree), and a rollback that
+    # shredded those would be a second destructive bug wearing the first one's
+    # clothes.
     _ignored_repo(repo, "build/\n", "build/old.o", "stale\n")
     snap = snapshot_worktree(str(repo))
 
@@ -407,25 +417,68 @@ def test_restore_still_spares_a_recorded_root_the_attempt_kept_ignored(repo):
     assert (repo / "build" / "fresh.o").read_text() == "from the failed attempt\n"
 
 
-def test_restore_removes_an_ignored_tree_the_attempt_created_from_nothing(repo):
-    # The boundary this sweep moves, stated on purpose. The snapshot's RECORD is
-    # the arbiter, not git's live verdict, so an ignored directory that did not
-    # exist when the snapshot was taken is the attempt's own and goes back out —
-    # which is what "restore the worktree" means. Nothing of the user's is at
-    # risk: anything they had was either recorded ignored (spared above) or
-    # enumerated as untracked and hashed (restored below). Contrast
-    # test_restore_still_spares_a_recorded_root_the_attempt_kept_ignored, where
-    # the root pre-existed and its artifacts survive untouched.
+def test_restore_spares_an_ignored_tree_created_under_the_users_own_rules(repo):
+    # Where the boundary actually sits, stated on purpose: "unrecorded" is NOT
+    # evidence that the attempt created it, and being ignored is not something
+    # the rollback may punish. `build/` did not exist at snapshot time, so it is
+    # in neither half of the record — yet the user's own `build/` rule is
+    # untouched, so this tree is precisely what a fixer that ran the build
+    # leaves behind, and nothing can put it back if deleted. It also cannot
+    # reach the customer's PR: `git add -A` does not stage a path git ignores.
+    # Contrast test_restore_deletes_a_leftover_the_attempt_hid_by_widening_
+    # gitignore, where the ATTEMPT wrote the rule and the leftover does go out.
     _ignored_repo(repo, "build/\n", "keep.txt", "mine\n")     # no build/ yet
     snap = snapshot_worktree(str(repo))
     assert "build/" not in snap[2]
 
-    (repo / "build").mkdir()                                  # the attempt's
-    (repo / "build" / "out.o").write_text("from the failed attempt\n")
+    (repo / "build").mkdir()
+    (repo / "build" / "out.o").write_text("a build artifact\n")
 
     assert restore_worktree(str(repo), snap)
-    assert not (repo / "build").exists()
+    assert (repo / "build" / "out.o").read_text() == "a build artifact\n"
     assert (repo / "keep.txt").read_text() == "mine\n"
+
+
+def test_restore_spares_an_unrecorded_ignored_file_created_after_the_snapshot(repo):
+    # The regression this narrowing exists for. An attempt occupies the SHARED
+    # worktree for minutes, and the developer's editor, a dev server, a direnv
+    # hook and the fixer's own test run all keep writing to it. `.env*` was the
+    # user's rule all along and the attempt never touched it — so `.env.local`
+    # is theirs, was never hashed (ignored files deliberately are not), and a
+    # record-based "unrecorded ⇒ the attempt's own ⇒ delete" would destroy the
+    # only copy of a live credential while reporting a clean rollback.
+    _ignored_repo(repo, ".env*\n", ".env", "SECRET_KEY=hunter2\n")
+    snap = snapshot_worktree(str(repo))
+    assert ".env.local" not in snap[2]        # it does not exist yet
+
+    (repo / ".env.local").write_text("AWS_SECRET=live-prod-key\n")   # not ours
+    (repo / "attempt-leftover.txt").write_text("junk\n")             # ours
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / ".env.local").read_text() == "AWS_SECRET=live-prod-key\n"
+    assert (repo / ".env").read_text() == "SECRET_KEY=hunter2\n"
+    assert not (repo / "attempt-leftover.txt").exists()   # rollback still rolls back
+
+
+def test_restore_tells_the_attempts_rule_from_the_users_in_one_worktree(repo):
+    # The discriminator itself, both halves side by side under one restore:
+    # `build/` is the ATTEMPT's rule (it appended it), `.env*` is the USER's
+    # (untouched). The second removal pass runs after the checkout has put
+    # .gitignore back, so the attempt's rule is gone by then and its leftover is
+    # plainly "other" — while the user's rule is still in force and everything
+    # under it was never a candidate.
+    _ignored_repo(repo, ".env*\n", ".env", "SECRET_KEY=hunter2\n")
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".gitignore").write_text(".env*\nbuild/\n")    # the attempt's rule
+    (repo / "build").mkdir()
+    (repo / "build" / "evil.py").write_text("residue\n")
+    (repo / ".env.local").write_text("AWS_SECRET=live-prod-key\n")  # the user's
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "build").exists()                  # the attempt's: gone
+    assert (repo / ".env.local").read_text() == "AWS_SECRET=live-prod-key\n"
+    assert (repo / ".gitignore").read_text() == ".env*\n"
 
 
 def test_restore_deletes_a_leftover_hidden_by_a_new_nested_gitignore(repo):
@@ -654,29 +707,28 @@ def test_restore_removes_a_leftover_under_a_root_the_attempt_re_collapsed(repo):
     assert (repo / "foo" / "junk.txt").read_text() == "build residue\n"
 
 
-def test_removal_candidates_skips_a_sealed_root_without_expanding_it(repo):
-    # The other half: a sealed root stays the cheap single-entry skip the
-    # collapse exists for — it is never expanded, so a populated node_modules/
-    # cannot cost the rollback an enumeration that outruns the git timeout.
+def test_removal_candidates_never_enumerates_the_ignored_side(repo):
+    # The ignored side is not weighed and not even ASKED FOR. Two things follow:
+    # no ignored path can become a deletion candidate by being absent from the
+    # snapshot's record, and a populated node_modules/ cannot cost the rollback
+    # an enumeration that outruns the git timeout.
     _ignored_repo(repo, "node_modules/\n", "node_modules/left-pad/index.js",
                   "module.exports = 1\n")
-    snap = snapshot_worktree(str(repo))
-    assert fix_apply._sealed_roots(snap[2]) == ("node_modules/",)
+    (repo / "leftover.txt").write_text("junk\n")
     real = fix_apply._git
-    expansions = []
+    ignored_queries = []
 
     def watch(cwd, *args, **kwargs):
-        if "ls-files" in args and "--ignored" in args and "--" in args:
-            expansions.append(args)
+        if "ls-files" in args and "--ignored" in args:
+            ignored_queries.append(args)
         return real(cwd, *args, **kwargs)
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(fix_apply, "_git", watch)
-        candidates = fix_apply._removal_candidates(
-            str(repo), fix_apply._ignored_matcher(snap[2]),
-            fix_apply._sealed_roots(snap[2]))
-    assert expansions == []
+        candidates = fix_apply._removal_candidates(str(repo))
+    assert ignored_queries == []
     assert not any(c.startswith("node_modules/") for c in candidates)
+    assert "leftover.txt" in candidates      # and it still finds real leftovers
 
 
 def test_restore_spares_a_new_file_under_a_sealed_root_nested_in_foo(repo):
