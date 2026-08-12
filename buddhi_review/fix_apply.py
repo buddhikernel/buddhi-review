@@ -1715,7 +1715,9 @@ def apply_fix(
             # verify over this attempt's diff (the FULL scan text — the 60KB cap is
             # applied only to the verify-prompt artifact by _compose_verify_diff).
             snap_untracked = snap[1] if snap is not None else None
-            diff, scan_truncated = _attempt_diff(cwd, ref, snap_untracked)
+            snap_ignored = snap[2] if snap is not None else None
+            diff, scan_truncated = _attempt_diff(cwd, ref, snap_untracked,
+                                                 snap_ignored)
             if _unicode_cleanup_enabled():
                 files_n, chars_n = deterministic_unicode_cleanup(
                     cwd, added_lines_by_file(diff))
@@ -1726,7 +1728,8 @@ def apply_fix(
                         f"({chars_n} char(s)) before commit",
                         colour=_DIM,
                     )
-                    diff, scan_truncated = _attempt_diff(cwd, ref, snap_untracked)  # recompute so tripwire/verify see the cleaned diff
+                    diff, scan_truncated = _attempt_diff(cwd, ref, snap_untracked,
+                                                         snap_ignored)  # recompute so tripwire/verify see the cleaned diff
             marker_spans = _tripwire_spans_for_diff(diff, cwd)
             trip = diff_tripwire(diff, commented_files=commented_files,
                                  commented_line=commented_line,
@@ -1895,12 +1898,19 @@ _VERIFY_DIFF_NOTE = ("# NOTE: this diff exceeded the inline budget; the "
 
 
 def _attempt_diff(cwd: str, tracked_ref: str,
-                  snap_untracked: Optional[Dict[str, tuple]] = None) -> Tuple[str, bool]:
+                  snap_untracked: Optional[Dict[str, tuple]] = None,
+                  snap_ignored: Optional[FrozenSet[str]] = None) -> Tuple[str, bool]:
     """The (near-)FULL diff of the attempt vs the snapshot's tracked ref, plus
     a chunk per untracked file the ATTEMPT touched. Files already untracked at
     snapshot time whose bytes are provably unchanged are filtered out
     (`_drop_unchanged_untracked`) so pre-existing worktree junk neither rides
-    the scan text nor trips the ceilings on every fix. Returns
+    the scan text nor trips the ceilings on every fix. A path the snapshot
+    recorded as IGNORED (`snap_ignored`) is dropped outright: the untracked
+    enumeration below reads whatever ignore rules the attempt left behind, so
+    an attempt that deleted `.gitignore` would otherwise append the CONTENTS of
+    the user's `.env` to this diff — and this diff is what the verify prompt
+    sends to a model. Filtering on the snapshot's record keeps the scan's scope
+    exactly what it is when the rules are intact. Returns
     (diff_text, scan_truncated): `scan_truncated` is True when a scan ceiling
     clipped or dropped content OR the untracked files could not be enumerated —
     the caller must then treat the diff as incompletely scannable and FORCE
@@ -1931,6 +1941,8 @@ def _attempt_diff(cwd: str, tracked_ref: str,
                 # dropped chunk, not silently open.
                 return "".join(parts), True
             names = [p for p in u.stdout.split("\0") if p]
+            if snap_ignored:
+                names = [n for n in names if n not in snap_ignored]
             names = _drop_unchanged_untracked(names, snap_untracked or {}, cwd)
             if len(names) > _SCAN_UNTRACKED_MAX_FILES:
                 names = names[:_SCAN_UNTRACKED_MAX_FILES]

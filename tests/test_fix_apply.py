@@ -472,6 +472,85 @@ def test_restore_still_restores_tracked_files_when_a_removal_fails(repo):
         os.chmod(locked, 0o700)
 
 
+# ---------------------------------------------------------------------------
+# The same root cause, the other consequence: the attempt DIFF must not carry
+# the CONTENTS of an ignored file. _attempt_diff enumerates untracked files at
+# the same broken moment the rollback did, and that diff is what the verify
+# prompt sends to a model — so an attempt that deleted .gitignore turned the
+# rollback bug into a secret-exposure bug. Every assertion below is on the
+# secret's BYTES: a check on the filename passes while the contents still ship.
+# ---------------------------------------------------------------------------
+
+_SECRET = "SECRET_KEY=hunter2-do-not-leak\n"
+_SECRET_BYTES = "hunter2-do-not-leak"
+
+
+def test_attempt_diff_excludes_ignored_file_contents(repo):
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".gitignore").unlink()               # what the failed attempt did
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert _SECRET_BYTES not in diff             # the bytes, not the path name
+    assert "+++ b/.env" not in diff              # and no chunk for the file at all
+    assert "the real fix" in diff                # the attempt's own change rides
+    # The bare string ".env" DOES still appear — as the deleted rule inside the
+    # .gitignore hunk. That is the attempt's own change and belongs in the diff;
+    # asserting on it would be asserting the wrong thing.
+
+
+def test_attempt_diff_leaks_the_secret_when_the_ignored_set_is_withheld(repo):
+    # The control, and the reason the assertion above means anything: withhold
+    # the snapshot's ignored set from the SAME fixture and the secret's bytes do
+    # reach the diff. Without this, a fixture that could never have leaked would
+    # let the test above pass with the filter deleted. This pins the reproduction,
+    # NOT a behaviour anyone should want — both production call sites pass the set.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    (repo / ".gitignore").unlink()
+
+    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1])
+    assert _SECRET_BYTES in diff
+
+
+def test_apply_fix_diff_never_carries_ignored_file_contents(repo):
+    # End-to-end on the real path: the fixer itself deletes .gitignore mid-attempt.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / ".gitignore").unlink()
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
+    assert out.status == "applied"
+    assert _SECRET_BYTES not in out.diff
+    assert "the real fix" in out.diff
+
+
+def test_apply_fix_unicode_recompute_does_not_reintroduce_the_leak(repo):
+    # The Unicode cleanup recomputes the attempt diff a second time. That second
+    # call is its own connection point: filtering only the first one leaves the
+    # secret riding the diff whenever a fix happens to trip the cleanup.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    nbsp = chr(0xA0)
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / ".gitignore").unlink()
+        # NBSP-as-indentation is a real SyntaxError, so the cleanup fires and
+        # forces the recompute.
+        (repo / "tracked.py").write_text("def f():\n" + nbsp + "   return 1\n",
+                                         encoding="utf-8")
+        return 0, "done"
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
+    assert out.status == "applied"
+    assert nbsp not in (repo / "tracked.py").read_text(encoding="utf-8")  # recompute ran
+    assert _SECRET_BYTES not in out.diff
+
+
 def test_snapshot_degrades_to_none_when_ignore_state_cannot_be_read(repo,
                                                                     monkeypatch):
     # Without the ignore state the restore cannot keep its promise, so the
@@ -818,7 +897,7 @@ def test_apply_fix_scan_truncation_forces_verify(repo, monkeypatch):
 
     monkeypatch.setattr(
         fix_apply, "_attempt_diff",
-        lambda cwd, ref, snap_untracked=None: (
+        lambda cwd, ref, snap_untracked=None, snap_ignored=None: (
             "diff --git a/f b/f\n--- a/f\n+++ b/f\n"
             "@@ -1 +1 @@\n-a\n+b\n", True))
     out = apply_fix("claim", cwd=str(repo), runner=fixer, label="COSMETIC",
