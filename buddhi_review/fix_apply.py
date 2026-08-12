@@ -810,6 +810,12 @@ def _removal_candidates(cwd: str) -> Optional[list]:
     leaves, is unrecorded and ignored and none of the rollback's business.
     Judging membership against the snapshot's RECORD would shred all three.
 
+    Which holds only while the rules being asked are the USER's. The pre-checkout
+    caller is asking the rules the failed attempt left, so an attempt that
+    DELETED ``.gitignore`` makes this call offer that same `.env.local` as an
+    ordinary "other" — and that is why the pre-checkout pass does no general
+    removal at all (:func:`restore_worktree`).
+
     What the snapshot's record IS good for is the mirror case, and that stays:
     a path git no longer ignores because the ATTEMPT broke the rule is spared by
     ``was_ignored`` in :func:`_remove_leftovers`.
@@ -838,9 +844,54 @@ def _removal_candidates(cwd: str) -> Optional[list]:
     return [p for p in u.stdout.split("\0") if p]
 
 
+def _ref_paths(cwd: str, tracked_ref: str) -> Optional[FrozenSet[str]]:
+    """Every path ``tracked_ref`` holds. None when git could not be asked.
+
+    What the pre-checkout removal pass needs in order to keep to the one job
+    that genuinely cannot wait for the checkout — see
+    :func:`_shadows_tracked_path`."""
+    t = _git(cwd, "ls-tree", "-r", "-z", "--name-only", tracked_ref,
+             errors="surrogateescape")
+    if t.returncode != 0:
+        return None
+    return frozenset(p for p in t.stdout.split("\0") if p)
+
+
+def _shadows_tracked_path(ref_paths: FrozenSet[str]) -> Callable[[str], bool]:
+    """Build ``shadows(rel) -> bool``: does an untracked `rel` sit where the
+    checkout has to put something of a DIFFERENT kind?
+
+    Two shapes, and only these two. The leftover is a FILE occupying a path the
+    ref needs as a DIRECTORY (`pkg` written over the `pkg/` holding
+    `pkg/mod.py`), or it lives UNDER a path the ref holds as a file (`topfile/`
+    made a directory, `topfile/leftover.txt` written inside). A leftover merely
+    sharing a name with a ref path is not shadowing anything: the checkout
+    overwrites it with the ref's content, which is the restore doing its job."""
+    dirs = set()
+    for p in ref_paths:
+        i = p.find("/")
+        while i != -1:
+            dirs.add(p[:i])
+            i = p.find("/", i + 1)
+
+    def shadows(rel: str) -> bool:
+        if rel in dirs:
+            return True
+        i = rel.find("/")
+        while i != -1:
+            if rel[:i] in ref_paths:
+                return True
+            i = rel.find("/", i + 1)
+        return False
+
+    return shadows
+
+
 def _remove_leftovers(cwd: str, pre_untracked: Dict[str, tuple],
                       was_ignored: Callable[[str], bool],
-                      ignored_moved: bool = False) -> Optional[bool]:
+                      ignored_moved: bool = False,
+                      only: Optional[Callable[[str], bool]] = None
+                      ) -> Optional[bool]:
     """Delete the untracked paths the snapshot did not record, pruning the
     directories that leaves empty. True when every removal landed, False when
     one was refused or the pass declined to judge (the rollback is then partial
@@ -851,6 +902,12 @@ def _remove_leftovers(cwd: str, pre_untracked: Dict[str, tuple],
     and is idempotent over the first — a path the first pass removed is not
     enumerated again.
 
+    ``only`` narrows the pass beyond that: the PRE-checkout call passes one,
+    because the ignore rules it is judging under are whatever the failed attempt
+    left, and "git calls it new" under a rule the attempt DELETED is not evidence
+    the attempt created it. General removal is left to the post-checkout call,
+    which asks the user's own restored rules. See :func:`restore_worktree`.
+
     ``ignored_moved`` (:func:`_ignored_paths_missing`) suspends the deletions
     entirely: a recorded ignored path has gone missing, so an un-ignored path
     here may be its renamed CONTENTS rather than the attempt's own leftover, and
@@ -859,7 +916,8 @@ def _remove_leftovers(cwd: str, pre_untracked: Dict[str, tuple],
     if candidates is None:
         return None
     doomed = [rel for rel in candidates
-              if rel not in pre_untracked and not was_ignored(rel)]
+              if rel not in pre_untracked and not was_ignored(rel)
+              and (only is None or only(rel))]
     if doomed and ignored_moved:
         # The source is ALREADY GONE, so each deletion below would destroy the
         # only copy of the file that exists rather than merely undoing a write.
@@ -898,18 +956,27 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     """Roll back to a snapshot: delete untracked files the failed attempt
     created, restore tracked files (``git checkout <ref> -- .`` — HEAD/branch
     untouched), and rewrite each snapshot untracked file to its exact content,
-    type and mode. New-untracked removal runs BEFORE the checkout so a failed
-    attempt's file cannot shadow a tracked path.
+    type and mode. Removal runs on BOTH sides of the checkout, and the two
+    passes are deliberately not the same pass.
 
-    That pre-checkout ordering means the first removal pass runs while the
-    ignore rules are still whatever the FAILED ATTEMPT left them, so the pass is
-    run TWICE — once on each side of the checkout — and each direction of the
-    ignore-rule question is answered by the side that can answer it honestly.
-    Rules NARROWED (the attempt deleted ``.gitignore``): a path the snapshot
-    recorded as ignored is left strictly alone in both passes, because it was
-    never captured (see :func:`snapshot_worktree`) and deleting it destroys the
-    only copy that exists — a rollback that deletes the user's ``.env`` is worse
-    than no rollback at all. Rules WIDENED (the attempt appended to
+    The pre-checkout one judges under whatever ignore rules the FAILED ATTEMPT
+    left behind, which is no basis for deleting anything: "git calls it new"
+    under a rule the attempt DELETED says nothing about who created the path.
+    So pass 1 is narrowed to the single job that genuinely cannot wait — a
+    leftover SHADOWING a tracked path, sitting where the checkout has to write
+    something of a different kind (:func:`_shadows_tracked_path`) — plus an
+    untracked ``.gitignore``, whose whole effect is to hide OTHER leftovers from
+    the pass that would remove them. GENERAL removal waits for pass 2, which
+    runs once the checkout has put the user's own rules back and every verdict
+    is therefore honest.
+
+    Rules NARROWED (the attempt deleted ``.gitignore``): every path the restored
+    rules ignore is left strictly alone — the ones the snapshot RECORDED and the
+    ones it never saw alike, because an ignored file is never captured (see
+    :func:`snapshot_worktree`) and deleting one destroys the only copy that
+    exists. A `.env.local` the developer's editor wrote mid-attempt is exactly
+    that case, and it is pass 1's narrowing that spares it: pass 2 never sees it
+    at all. Rules WIDENED (the attempt appended to
     ``.gitignore``): the leftover it hid is invisible to the first pass, and the
     SECOND pass is what removes it — the checkout has restored the tracked
     ignore files by then, so a path the attempt's rule hid is "other" again
@@ -952,13 +1019,25 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     # ref), so the answer holds for both passes.
     ignored_moved = _ignored_paths_missing(cwd, pre_ignored)
     try:
-        # PASS 1, pre-checkout: remove what git calls new under the rules the
-        # ATTEMPT left behind, sparing anything the snapshot recorded as ignored
-        # however it left them. Running before the checkout is what stops an
-        # attempt's file shadowing a tracked path; pass 2 below covers what the
-        # attempt's own rules hid from this one.
+        # PASS 1, pre-checkout: ONLY what cannot wait for the honest rules —
+        # a leftover shadowing a tracked path, and an untracked ``.gitignore``
+        # (left in place it would hide its neighbours from pass 2's enumeration,
+        # and unlike the files it hides it is a rule, not uncaptured content).
+        # Everything else waits: this pass is reading the ATTEMPT's ignore rules,
+        # under which the user's own uncaptured `.env.local` looks exactly like
+        # the attempt's leftover — and it is the one file no rollback can put
+        # back. A failure to enumerate the ref costs the shadow check only; the
+        # checkout's own return code below is the honest signal for that.
+        ref_paths = _ref_paths(cwd, tracked_ref)
+        shadows = (_shadows_tracked_path(ref_paths)
+                   if ref_paths is not None else None)
+
+        def must_go_first(rel: str) -> bool:
+            return (rel.rsplit("/", 1)[-1] == ".gitignore"
+                    or (shadows is not None and shadows(rel)))
+
         honoured = _remove_leftovers(cwd, pre_untracked, was_ignored,
-                                     ignored_moved)
+                                     ignored_moved, only=must_go_first)
         if honoured is None:
             return False
         # Neither pass above can see a path the attempt STAGED (``git add
@@ -973,20 +1052,32 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         # Either failure below scores the rollback as unclean and presses on: the
         # rest of it still runs (a maximally-restored worktree beats an abandoned
         # one) and the caller halts before the push on the False.
+        # ":(literal)" for the same reason :func:`_attempt_diff` uses it: these
+        # names come verbatim from ``git diff --name-only -z``, and ``reset``
+        # reads them as PATHSPECS. A name beginning with ":" is then parsed as
+        # pathspec MAGIC rather than as itself — ":weird.env" unstages nothing
+        # while ``reset`` still exits 0, so the force-staged secret survives with
+        # the rollback reporting clean. (A name carrying glob magic still matches
+        # itself exactly, but drags unrelated staged paths along with it.)
         staged_ignored = _tracked_diff_ignored(cwd, tracked_ref, was_ignored)
         if staged_ignored is None:
             honoured = False
         elif staged_ignored:
-            un = _git(cwd, "reset", "-q", tracked_ref, "--", *staged_ignored)
+            un = _git(cwd, "reset", "-q", tracked_ref, "--",
+                      *(f":(literal){p}" for p in staged_ignored))
             if un.returncode != 0:
                 honoured = False
         co = _git(cwd, "checkout", tracked_ref, "--", ".")
         if co.returncode != 0:
             return False
-        # PASS 2, post-checkout: the tracked ignore files are back, so a leftover
-        # the attempt hid by WIDENING a rule is plainly "other" again and goes
-        # out here — while a path the user's own unchanged rules cover was never
-        # offered to either pass and survives untouched. Fail closed on an
+        # PASS 2, post-checkout: the tracked ignore files are back, so this is
+        # where GENERAL removal happens — every leftover, including the ones the
+        # attempt hid by WIDENING a rule, judged against the USER's rules rather
+        # than the attempt's. A path those rules cover is not offered here at
+        # all, which is what makes the promise above true in both
+        # directions: an attempt that DELETED the rule cannot turn the user's
+        # uncaptured file into a candidate, because pass 1 no longer removes on
+        # that evidence and pass 2 no longer sees it. Fail closed on an
         # enumeration failure (residue cannot be ruled out) but press on: the
         # checkout has already landed, and finishing the restore beats
         # abandoning it half-done.

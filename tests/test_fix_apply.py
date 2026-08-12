@@ -461,6 +461,45 @@ def test_restore_spares_an_unrecorded_ignored_file_created_after_the_snapshot(re
     assert not (repo / "attempt-leftover.txt").exists()   # rollback still rolls back
 
 
+def test_restore_spares_an_unrecorded_ignored_file_when_the_attempt_broke_the_rule(repo):
+    # The same file as the test above under the ONE scenario this whole pass
+    # split exists for: the attempt DELETES .gitignore. `.env.local` was ignored
+    # for every moment it existed, so it is in neither half of the record and
+    # was never hashed — and with the rule gone the PRE-checkout pass is offered
+    # it as an ordinary "other". Deleting it there destroys the only copy in
+    # existence while the rollback reports itself clean, which is exactly why
+    # that pass does no general removal: the checkout puts .gitignore back and
+    # the post-checkout pass is never offered the file at all.
+    _ignored_repo(repo, ".env*\n", ".env", "SECRET_KEY=hunter2\n")
+    snap = snapshot_worktree(str(repo))
+    assert ".env.local" not in snap[2]                 # it does not exist yet
+
+    (repo / ".env.local").write_text("AWS_SECRET=live-prod-key\n")   # theirs
+    (repo / "attempt-leftover.txt").write_text("junk\n")             # ours
+    (repo / ".gitignore").unlink()                     # what the attempt did
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / ".env.local").read_text() == "AWS_SECRET=live-prod-key\n"
+    assert (repo / ".env").read_text() == "SECRET_KEY=hunter2\n"
+    assert (repo / ".gitignore").read_text() == ".env*\n"    # the rule is back
+    assert not (repo / "attempt-leftover.txt").exists()      # still a rollback
+
+
+def test_restore_removes_a_leftover_shadowing_a_tracked_path(repo):
+    # What the pre-checkout pass still does, and the only reason it runs before
+    # the checkout: the attempt turned a tracked FILE into a directory, so the
+    # path the checkout has to write is occupied by something of another kind.
+    snap = snapshot_worktree(str(repo))
+
+    (repo / "tracked.py").unlink()
+    (repo / "tracked.py").mkdir()
+    (repo / "tracked.py" / "leftover.txt").write_text("residue\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / "tracked.py").is_file()
+    assert (repo / "tracked.py").read_text() == "original\n"
+
+
 def test_restore_tells_the_attempts_rule_from_the_users_in_one_worktree(repo):
     # The discriminator itself, both halves side by side under one restore:
     # `build/` is the ATTEMPT's rule (it appended it), `.env*` is the USER's
@@ -1141,6 +1180,29 @@ def test_apply_fix_rejects_and_unstages_a_force_added_ignored_file(repo):
                             capture_output=True, text=True).stdout
     assert ".env" not in staged                        # …and no longer staged
     assert (repo / "tracked.py").read_text() == "original\n"
+
+
+def test_restore_unstages_a_force_added_ignored_file_named_like_pathspec_magic(repo):
+    # `git reset` takes PATHSPECS, not paths, and these names arrive verbatim
+    # from `git diff --name-only -z`. A name beginning with ":" is parsed as
+    # pathspec MAGIC rather than as itself: the raw name unstages NOTHING while
+    # reset still exits 0, so the rollback reports clean and the force-staged
+    # secret rides commit_push's `git add -A` into the customer's PR. Asserted
+    # end to end because the whole failure is that nothing looks wrong.
+    rel = ":weird.env"
+    _ignored_repo(repo, "*.env\n", rel, _SECRET)
+    snap = snapshot_worktree(str(repo))
+    assert rel in snap[2]
+
+    (repo / "tracked.py").write_text("the real fix\n")
+    subprocess.run(["git", "add", "-f", "--", f":(literal){rel}"], cwd=repo,
+                   check=True, capture_output=True)
+
+    assert restore_worktree(str(repo), snap)
+    staged = subprocess.run(["git", "diff", "--cached", "--name-only", "-z"],
+                            cwd=repo, capture_output=True, text=True).stdout
+    assert rel not in staged.split("\0")            # the index entry is gone
+    assert (repo / rel).read_text() == _SECRET      # the user's file is not
 
 
 # --- an UNKNOWN ignore state fails closed, not open ------------------------
