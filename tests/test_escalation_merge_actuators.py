@@ -183,6 +183,65 @@ def test_fix_disposition_reject_is_its_own_label_and_escalates():
     assert adapter.escalation.delivered and adapter.escalation.delivered[0].id == "fix-c1"
 
 
+def test_reject_escalation_states_the_refusals_own_reason():
+    # 'rejected' has more producers than the fix-verify REJECT: apply_fix also
+    # refuses an attempt that exposed / stripped / moved / copied one of the
+    # user's ignored files, and those roll back BEFORE any verify pass is run.
+    # The ask must carry the refusal's own reason instead of asserting a verify
+    # verdict that, for those, was never produced — a human sent hunting one
+    # finds nothing, and the triage is a different one entirely.
+    notifier = FakeNotifier({})
+    adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=notifier))
+    detail = "attempt exposed previously-ignored path(s): .env"
+    a = act_on_result(
+        Comment(id="c1", text="t"), _result("fix"), adapter=adapter,
+        fix_dispatch=lambda c, r: FixOutcome(status="rejected", detail=detail),
+    )
+    assert a.final == "rejected"
+    ask = notifier.sent[0]
+    assert detail in ask.question
+    assert "verify pass" not in ask.question        # the falsehood, gone
+    assert ask.detail == detail                     # …and still on the detail line
+
+
+def test_reject_escalation_does_not_claim_a_rollback_that_failed():
+    # The same honesty on the second axis: rollback_failed means edits are still
+    # sitting in the worktree, so "and rolled back" would be the next falsehood
+    # in the same sentence.
+    notifier = FakeNotifier({})
+    adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=notifier))
+    a = act_on_result(
+        Comment(id="c1", text="t"), _result("fix"), adapter=adapter,
+        fix_dispatch=lambda c, r: FixOutcome(
+            status="rejected", detail="fix-verify REJECT: bad patch",
+            rollback_failed=True),
+    )
+    assert a.rollback_failed is True
+    q = notifier.sent[0].question
+    assert "rollback did NOT complete" in q and "and rolled back" not in q
+
+
+def test_reject_escalation_survives_an_empty_or_oversized_detail():
+    # A refusal with no detail still asks a grammatical question, and an
+    # unbounded one (a guided-retry BLOCKED carries a raw fixer stdout line)
+    # is sliced for the console panel — the full text rides Ask.detail.
+    notifier = FakeNotifier({})
+    adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=notifier))
+    act_on_result(
+        Comment(id="c1", text="t"), _result("fix"), adapter=adapter,
+        fix_dispatch=lambda c, r: FixOutcome(status="rejected", detail=""),
+    )
+    assert "no reason recorded" in notifier.sent[0].question
+    long = "x" * 900
+    act_on_result(
+        Comment(id="c2", text="t"), _result("fix"), adapter=adapter,
+        fix_dispatch=lambda c, r: FixOutcome(status="rejected", detail=long),
+    )
+    ask = notifier.sent[1]
+    assert "x" * 300 in ask.question and "x" * 301 not in ask.question
+    assert ask.detail == long
+
+
 def test_fix_transient_failure_escalates_not_ladders():
     notifier = FakeNotifier({})
     adapter = ReviewAdapter(escalation=ConsoleEscalation(notifier=notifier))

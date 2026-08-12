@@ -315,16 +315,32 @@ def act_on_result(
                      else "skipped-invalid")
             return ActionResult(comment.id, d, final, outcome.detail, rollback_failed=rb)
         if outcome.status == "rejected":
-            # A fix-verify REJECT: the fixer produced a candidate patch and the
-            # verify pass refused it (rolled back). NOT a dismissal and NOT "no
-            # change needed" — the finding still stands. Surface it for a human
-            # like a failed fix so it is never silently counted as clean progress
-            # toward auto-merge, and keep its own honest ``rejected`` label rather
-            # than laundering it as ``skipped-invalid``.
+            # The fixer produced a candidate patch and something REFUSED it. NOT
+            # a dismissal and NOT "no change needed" — the finding still stands.
+            # Surface it for a human like a failed fix so it is never silently
+            # counted as clean progress toward auto-merge, and keep its own
+            # honest ``rejected`` label rather than laundering it as
+            # ``skipped-invalid``.
+            #
+            # The refusal's OWN reason rides the question. The fix-verify REJECT
+            # is only one of this status's producers: ``apply_fix`` also refuses
+            # an attempt that exposed / stripped / moved / copied one of the
+            # user's ignored files, and those roll back BEFORE any verify pass
+            # is run (no model call is spent on an attempt already disqualified)
+            # — so naming the verify pass as the source would send the on-call
+            # human hunting a verifier verdict that was never produced, for a
+            # very different triage than the one they actually have. Sliced for
+            # the one-line console panel only; the untruncated text still rides
+            # ``Ask.detail`` above.
+            # ``rb`` for the same reason: a refusal whose rollback did not
+            # complete leaves edits in the worktree, so "and rolled back" would
+            # be the second falsehood in the same sentence.
+            why = (outcome.detail or "").strip() or "no reason recorded"
+            what = ("was REFUSED, and the rollback did NOT complete" if rb
+                    else "was REFUSED and rolled back")
             _escalate(
-                f"The automated fix for comment {comment.id} was REJECTED by the "
-                f"pre-commit verify pass (the change was refused and rolled back) "
-                f"— how should it be handled?"
+                f"The automated fix for comment {comment.id} {what}: "
+                f"{why[:300]} — how should it be handled?"
             )
             return ActionResult(comment.id, d, "rejected", outcome.detail, rollback_failed=rb)
         # transient-failed → escalate rather than retrying on another model
