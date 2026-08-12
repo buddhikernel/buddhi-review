@@ -1,5 +1,6 @@
 """Snapshot/rollback fix-apply + the safety floor."""
 import os
+import shutil
 import subprocess
 
 import pytest
@@ -1294,6 +1295,302 @@ def test_leak_filter_survives_a_snapshot_that_died_hashing_blobs(repo,
     # no rollback, so the round driver is told to halt before the push.
     assert out.status == "rejected"
     assert out.rollback_failed
+
+
+# --- a MOVE is the one exposure the record cannot name by path -------------
+# Renaming the user's `.env` to an un-ignored `notes.txt` produces a destination
+# that matches NOTHING: not the snapshot's untracked map (the path did not exist
+# when it was taken), not its ignored record (that names the SOURCE), and not
+# git's own verdict (the new name is not ignored). Read as an ordinary
+# fixer-created file, it is DELETED by the rollback — and the source is already
+# gone, so that deletion destroys the only copy of the secret in existence —
+# while on the success path its contents ride the attempt diff into a model's
+# prompt. The missing SOURCE is the only trace the move leaves, and it is what
+# both paths key on (_ignored_paths_missing).
+
+def test_ignored_paths_missing_flags_a_moved_file(repo):
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    assert not fix_apply._ignored_paths_missing(str(repo), snap[2])
+
+    (repo / ".env").rename(repo / "notes.txt")       # what the attempt did
+    assert fix_apply._ignored_paths_missing(str(repo), snap[2])
+
+
+def test_ignored_paths_missing_flags_a_vanished_sealed_root(repo):
+    # The record is collapsed to roots, so a whole ignored TREE is one entry —
+    # and one lstat, which is what keeps this check affordable on a populated
+    # node_modules/.
+    _ignored_repo(repo, "node_modules/\n", "node_modules/left-pad/index.js",
+                  "module.exports = 1\n")
+    snap = snapshot_worktree(str(repo))
+    assert snap[2] == frozenset({"node_modules/"})
+    assert not fix_apply._ignored_paths_missing(str(repo), snap[2])
+
+    shutil.rmtree(repo / "node_modules")
+    assert fix_apply._ignored_paths_missing(str(repo), snap[2])
+
+
+def test_restore_spares_the_renamed_contents_of_an_ignored_file(repo):
+    # The destruction: `notes.txt` is the ONLY copy of the secret once the
+    # rename has happened, and ignored files are never hashed, so nothing can
+    # put it back. The rollback must therefore not remove it — and must not
+    # report itself clean either, since the leftovers it declined to judge are
+    # still sitting in the shared worktree.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".env").rename(repo / "notes.txt")
+    (repo / "leftover.py").write_text("attempt residue\n")
+
+    assert restore_worktree(str(repo), snap) is False   # ⇒ the round halts
+    assert (repo / "notes.txt").read_text() == _SECRET  # the only copy survives
+    assert (repo / "leftover.py").exists()              # spared with it, unjudged
+
+
+def test_restore_still_deletes_leftovers_when_no_ignored_path_moved(repo):
+    # The control the test above needs: while every recorded ignored path is
+    # where the snapshot left it, nothing changes — the leftover still goes and
+    # the rollback still reports clean. Without this, suspending the removals
+    # unconditionally would pass the test above.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    (repo / "leftover.py").write_text("attempt residue\n")
+
+    assert restore_worktree(str(repo), snap) is True
+    assert not (repo / "leftover.py").exists()
+    assert (repo / ".env").read_text() == _SECRET
+
+
+def test_attempt_diff_withholds_a_renamed_ignored_file(repo):
+    # The success-path half of the same defect: `notes.txt` is untracked and
+    # un-ignored, so the appendix would diff it against /dev/null and hand the
+    # whole secret to the verify prompt.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".env").rename(repo / "notes.txt")
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert _SECRET_BYTES not in diff
+    assert "+++ b/notes.txt" not in diff
+    assert "the real fix" in diff             # the attempt's own change still rides
+    assert truncated                          # withheld content ⇒ FORCED verify
+
+
+def test_attempt_diff_withholds_a_renamed_ignored_file_the_attempt_staged(repo):
+    # The same move through the INDEX: staging the destination takes it out of
+    # the untracked enumeration entirely and puts its contents in the TRACKED
+    # patch, where the appendix filter can never reach them.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".env").rename(repo / "notes.txt")
+    _force_add(repo, "notes.txt")
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert _SECRET_BYTES not in diff
+    assert "+++ b/notes.txt" not in diff
+    assert "the real fix" in diff
+    assert truncated
+
+
+def test_attempt_diff_keeps_the_appendix_while_no_ignored_path_moved(repo):
+    # The control for the diff half: an ordinary new file is still scanned, and
+    # the flag stays down. Withholding the appendix whenever an ignored file
+    # exists would blind the tripwire on every fix in every repo with a
+    # .gitignore.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    (repo / "new_module.py").write_text("NEW_FILE_FLAGS = ('--x',)\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert "NEW_FILE_FLAGS" in diff
+    assert not truncated
+
+
+def test_apply_fix_never_shows_a_verifier_a_renamed_ignored_file(repo):
+    # End-to-end on the real path, with the fixer doing the renaming.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    verify_calls = []
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / ".env").rename(repo / "notes.txt")
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=verify, verify_mode="off")
+    assert len(verify_calls) == 1                  # forced by the withheld content
+    assert _SECRET_BYTES not in verify_calls[0]
+    assert _SECRET_BYTES not in out.diff
+    assert (repo / "notes.txt").read_text() == _SECRET   # never destroyed
+
+
+# --- an unknown ignore state withholds the TRACKED adds too ----------------
+# Skipping the untracked appendix is only half the answer. `git diff <ref>`
+# reports every path the INDEX holds, so a fixer that ran `git add -f .env`
+# reaches the verify prompt through the tracked patch instead — with no recorded
+# ignored set, the path-matched filter that normally catches it is not even
+# consulted. What the exposure cannot escape is being NEW relative to the ref:
+# git ignores nothing it tracks, so the ref holds no ignored path.
+
+def test_attempt_diff_withholds_a_staged_secret_when_the_ignore_state_is_unknown(
+        repo):
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    _force_add(repo, ".env")                     # what the failed attempt did
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1], None)
+    assert _SECRET_BYTES not in diff
+    assert "+++ b/.env" not in diff
+    assert truncated
+    # …and the withholding stays scoped to the ADDED side: the modification
+    # hunks are the text the dangerous-change tripwire reads, and nothing the
+    # ref already holds can be an ignored file.
+    assert "the real fix" in diff
+
+
+def test_attempt_diff_unknown_state_still_carries_a_dangerous_modification(repo):
+    # The cost of the blanket alternative, pinned: withholding the whole tracked
+    # patch would disarm the tripwire in exactly the state where git is already
+    # misbehaving.
+    (repo / "tracked.py").write_text("BASE_FLAGS = ('--dangerously-skip',)\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD", None, None)
+    assert truncated
+    assert diff_tripwire(diff) is not None
+
+
+def test_apply_fix_unknown_ignore_state_never_verifies_a_staged_secret(repo,
+                                                                       monkeypatch):
+    # End-to-end on the degraded path both ignore-state reads die on, with the
+    # fixer force-staging the secret past its rule.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    real = fix_apply._git
+
+    def fail_ignored(cwd, *args, **kwargs):
+        if "--ignored" in args:
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_ignored)
+    assert snapshot_worktree(str(repo)) is None
+    assert fix_apply.ignored_roots(str(repo)) is None
+    verify_calls = []
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "tracked.py").write_text("the real fix\n")
+        _force_add(repo, ".env")
+        return 0, "done"
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=verify, verify_mode="off")
+    assert len(verify_calls) == 1                   # forced, not selected
+    assert _SECRET_BYTES not in verify_calls[0]
+    assert _SECRET_BYTES not in out.diff
+    assert "the real fix" in out.diff
+
+
+# --- an exposure check that could not RUN is not an all-clear --------------
+# `_unignored_exposures` is the gate that refuses an attempt outright. Both of
+# its commands can fail, and a failure there says nothing about what the attempt
+# did: the force-staged `.env` it would have found is invisible everywhere else
+# (the diff scan only marks itself incomplete, and the withheld path is the very
+# thing the verifier is not shown). Reading "I could not look" as "there was
+# nothing" is what lets the exposure ride commit_push's repo-wide `git add -A`.
+
+def test_unignored_exposures_reports_unknown_when_the_staged_check_fails(repo,
+                                                                         monkeypatch):
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    _force_add(repo, ".env")
+    assert fix_apply._unignored_exposures(str(repo), snap[0], snap[2]) == [".env"]
+
+    real = fix_apply._git
+
+    def fail_name_only(cwd, *args, **kwargs):
+        if "--name-only" in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_name_only)
+    assert fix_apply._unignored_exposures(str(repo), snap[0], snap[2]) is None
+
+
+def test_unignored_exposures_reports_unknown_when_the_untracked_check_fails(
+        repo, monkeypatch):
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    real = fix_apply._git
+
+    def fail_others(cwd, *args, **kwargs):
+        if "ls-files" in args and "--others" in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_others)
+    assert fix_apply._unignored_exposures(str(repo), snap[0], snap[2]) is None
+
+
+def test_unignored_exposures_unknown_ignore_state_is_still_an_empty_answer(repo):
+    # The boundary the None must not blur at the other end: with no recorded set
+    # there is nothing to measure against, which is not a failed measurement.
+    # That path is answered by the forced verify pass, not by a rollback.
+    snap = snapshot_worktree(str(repo))
+    assert fix_apply._unignored_exposures(str(repo), snap[0], None) == []
+
+
+def test_apply_fix_fails_closed_when_the_exposure_check_cannot_run(repo,
+                                                                   monkeypatch):
+    # End-to-end: the fixer force-stages the secret and the gate's own command
+    # then fails. The attempt must be rolled back and escalated — an evaluation
+    # that did not happen is not a verdict on the patch, so it escalates as
+    # transient-failed rather than reporting a rejection nothing reached.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    real = fix_apply._git
+    armed = []
+
+    def fail_after_the_fixer(cwd, *args, **kwargs):
+        if armed and "--name-only" in args and "--diff-filter=A" not in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: boom")
+        return real(cwd, *args, **kwargs)
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "tracked.py").write_text("the real fix\n")
+        _force_add(repo, ".env")
+        armed.append(True)
+        return 0, "done"
+
+    monkeypatch.setattr(fix_apply, "_git", fail_after_the_fixer)
+    verify_calls = []
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=verify, verify_mode="on", label="SUBSTANTIVE")
+    assert out.status == "transient-failed"
+    assert "exposed" in out.detail
+    assert verify_calls == []                    # no model call on a doomed attempt
+    assert _SECRET_BYTES not in (out.diff or "")
+    # Rolled back: the user's file is untouched on disk and no longer staged, so
+    # nothing rides the next `git add -A`.
+    assert (repo / ".env").read_text() == _SECRET
+    assert (repo / "tracked.py").read_text() == "original\n"
 
 
 # --- a pathname is bytes: decoding it must never be able to raise ----------

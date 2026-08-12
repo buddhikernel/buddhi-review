@@ -515,6 +515,32 @@ def _ignored_matcher(ignored: FrozenSet[str]) -> Callable[[str], bool]:
     return is_ignored
 
 
+def _ignored_paths_missing(cwd: str, ignored: FrozenSet[str]) -> bool:
+    """True when a path the snapshot recorded as IGNORED is no longer on disk.
+
+    A gone SOURCE is the only trace a MOVE leaves behind. Ignored files are
+    deliberately never hashed (:func:`snapshot_worktree`), so an attempt that
+    renamed the user's ``.env`` to an un-ignored `notes.txt` leaves nothing the
+    destination can be matched against: that path is absent from the untracked
+    map, absent from the ignored record, and — git having stopped ignoring it —
+    indistinguishable by inspection from a file the fixer wrote from scratch.
+    Read as a leftover it is DELETED (destroying the only copy in existence, the
+    source being already gone) and its CONTENTS ride the attempt diff into a
+    model's prompt.
+
+    So the missing source raises the flag, and its callers stop treating an
+    un-ignored path as PROVABLY the attempt's own for the rest of that pass. A
+    genuinely deleted ignored file raises it too — nothing distinguishes a delete
+    from a move once the source is gone — which costs a spared leftover and a
+    forced verify pass, against a destroyed ``.env`` and a leaked secret.
+
+    Cheap by construction: one ``lstat`` per RECORDED entry, and the record is
+    collapsed to roots, so a populated `node_modules/` costs one stat rather than
+    one per descendant."""
+    return any(not os.path.lexists(os.path.join(cwd, rel.rstrip("/")))
+               for rel in ignored)
+
+
 def _git(cwd: str, *args: str, text: bool = True,
          errors: Optional[str] = None,
          stdin_text: Optional[str] = None) -> "subprocess.CompletedProcess":
@@ -615,12 +641,34 @@ def _tracked_diff_ignored(cwd: str, tracked_ref: str,
     return [p for p in n.stdout.split("\0") if p and was_ignored(p)]
 
 
+def _tracked_diff_added(cwd: str, tracked_ref: str) -> Optional[list]:
+    """The paths ``git diff <tracked_ref>`` reports as ADDED. None when git could
+    not be asked.
+
+    The exact width of the leak the snapshot's record cannot close on its own. A
+    path the ref already holds was TRACKED when the snapshot was taken, and git
+    ignores nothing it tracks — so an ignored file's contents can only enter this
+    patch as a path that is NEW relative to the ref: force-staged past its rule
+    (``git add -f .env``), or staged under the name a rename gave it. Withholding
+    the added side therefore covers every way those contents can reach the verify
+    prompt through the TRACKED half, while the modification hunks that carry the
+    actual fix stay in the text the tripwire scans.
+
+    ``--no-renames`` so a staged rename is reported as an ADD of its destination
+    rather than an R pair whose destination never appears on this list."""
+    n = _git(cwd, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z",
+             "--diff-filter=A", tracked_ref, errors="surrogateescape")
+    if n.returncode != 0:
+        return None
+    return [p for p in n.stdout.split("\0") if p]
+
+
 def _unignored_exposures(cwd: str, tracked_ref: str,
-                         snap_ignored: Optional[FrozenSet[str]]) -> list:
+                         snap_ignored: Optional[FrozenSet[str]]) -> Optional[list]:
     """Every path the snapshot recorded as IGNORED that the attempt has made
     VISIBLE to git — staged into the index, or un-ignored by rules the attempt
     narrowed. Empty when the ignore state is unknown (there is nothing to
-    measure against) or git could not be asked.
+    measure against). None when a check could not be RUN.
 
     Visible is the operative word: ``commit_push`` stages the round's work with
     a repo-wide ``git add -A``, so every path on this list is one the customer's
@@ -628,18 +676,30 @@ def _unignored_exposures(cwd: str, tracked_ref: str,
     deleted. Forcing the verify pass cannot stand in for refusing the attempt:
     the prompt deliberately WITHHOLDS those paths' contents (see
     :func:`_attempt_diff`), so the model is asked to judge a change it cannot
-    see, and its CONFIRM — or an ordinary fail-open — ships the file."""
+    see, and its CONFIRM — or an ordinary fail-open — ships the file.
+
+    That is also why the None is kept separate from the empty list rather than
+    folded into it. "I could not look" and "I looked and there was nothing" are
+    the same answer only if the gate is decorative: a force-staged `.env` is
+    INVISIBLE until one of these two commands reports it, so reading a failed
+    command as an all-clear lets the attempt this gate exists to refuse ride the
+    later repo-wide ``git add -A`` — the diff scan having merely marked itself
+    incomplete, which is a forced verify pass, not a refusal. The caller fails
+    closed on the None (:func:`apply_fix`)."""
     if snap_ignored is None:
         return []
     was_ignored = _ignored_matcher(snap_ignored)
     try:
-        staged = _tracked_diff_ignored(cwd, tracked_ref, was_ignored) or []
+        staged = _tracked_diff_ignored(cwd, tracked_ref, was_ignored)
+        if staged is None:
+            return None
         u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard",
                  errors="surrogateescape")
-        unignored = ([p for p in u.stdout.split("\0") if p and was_ignored(p)]
-                     if u.returncode == 0 else [])
+        if u.returncode != 0:
+            return None
+        unignored = [p for p in u.stdout.split("\0") if p and was_ignored(p)]
     except (subprocess.TimeoutExpired, OSError, ValueError):
-        return []
+        return None
     return sorted(set(staged) | set(unignored))
 
 
@@ -779,23 +839,36 @@ def _removal_candidates(cwd: str) -> Optional[list]:
 
 
 def _remove_leftovers(cwd: str, pre_untracked: Dict[str, tuple],
-                      was_ignored: Callable[[str], bool]) -> Optional[bool]:
+                      was_ignored: Callable[[str], bool],
+                      ignored_moved: bool = False) -> Optional[bool]:
     """Delete the untracked paths the snapshot did not record, pruning the
     directories that leaves empty. True when every removal landed, False when
-    one was refused (the rollback is then partial and must not be reported
-    clean), None when the enumeration itself failed.
+    one was refused or the pass declined to judge (the rollback is then partial
+    and must not be reported clean), None when the enumeration itself failed.
 
     Run twice by :func:`restore_worktree`, once on each side of the checkout;
     the second call sees the ignore rules restored (:func:`_removal_candidates`)
     and is idempotent over the first — a path the first pass removed is not
-    enumerated again."""
+    enumerated again.
+
+    ``ignored_moved`` (:func:`_ignored_paths_missing`) suspends the deletions
+    entirely: a recorded ignored path has gone missing, so an un-ignored path
+    here may be its renamed CONTENTS rather than the attempt's own leftover, and
+    the discriminator that would tell them apart was never captured."""
     candidates = _removal_candidates(cwd)
     if candidates is None:
         return None
+    doomed = [rel for rel in candidates
+              if rel not in pre_untracked and not was_ignored(rel)]
+    if doomed and ignored_moved:
+        # The source is ALREADY GONE, so each deletion below would destroy the
+        # only copy of the file that exists rather than merely undoing a write.
+        # Nothing on this list is provably the attempt's, so nothing on it is
+        # removed; the False marks the rollback unclean and the caller halts
+        # before the push, which is where the surviving residue is answered.
+        return False
     honoured = True
-    for rel in candidates:
-        if rel in pre_untracked or was_ignored(rel):
-            continue
+    for rel in doomed:
         full_path = os.path.join(cwd, rel)
         try:
             if os.path.isdir(full_path) and not os.path.islink(full_path):
@@ -844,7 +917,12 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     (:func:`_removal_candidates`). Rules BYPASSED (the attempt ran ``git add -f
     .env``): the file is not "other" any more, so neither pass sees it — the
     INDEX entry is dropped instead, which leaves the user's file on disk and
-    stops the staged copy riding the next ``git add -A``.
+    stops the staged copy riding the next ``git add -A``. Rules ESCAPED (the
+    attempt MOVED the file to an un-ignored name): the destination matches
+    nothing in either record and would be deleted as a leftover while the source
+    is already gone, so a recorded ignored path that has gone MISSING suspends
+    the removals outright (:func:`_ignored_paths_missing`) and the rollback
+    reports itself unclean.
 
     What is emphatically NOT the rule is "unrecorded ⇒ the attempt's own". This
     is the shared worktree the round driver reuses, and an attempt takes minutes
@@ -866,13 +944,21 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         return False
     tracked_ref, pre_untracked, pre_ignored = snapshot
     was_ignored = _ignored_matcher(pre_ignored)
+    # A recorded ignored path that is GONE need not have been deleted: the
+    # attempt may have MOVED it to a name this record cannot speak for, in which
+    # case its contents are sitting under some un-ignored path the removal
+    # passes below would read as a leftover and shred. Asked once — the checkout
+    # cannot put such a path back (an ignored file is by definition not in the
+    # ref), so the answer holds for both passes.
+    ignored_moved = _ignored_paths_missing(cwd, pre_ignored)
     try:
         # PASS 1, pre-checkout: remove what git calls new under the rules the
         # ATTEMPT left behind, sparing anything the snapshot recorded as ignored
         # however it left them. Running before the checkout is what stops an
         # attempt's file shadowing a tracked path; pass 2 below covers what the
         # attempt's own rules hid from this one.
-        honoured = _remove_leftovers(cwd, pre_untracked, was_ignored)
+        honoured = _remove_leftovers(cwd, pre_untracked, was_ignored,
+                                     ignored_moved)
         if honoured is None:
             return False
         # Neither pass above can see a path the attempt STAGED (``git add
@@ -904,7 +990,8 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         # enumeration failure (residue cannot be ruled out) but press on: the
         # checkout has already landed, and finishing the restore beats
         # abandoning it half-done.
-        second = _remove_leftovers(cwd, pre_untracked, was_ignored)
+        second = _remove_leftovers(cwd, pre_untracked, was_ignored,
+                                   ignored_moved)
         if second is not True:
             honoured = False
         for rel, entry in pre_untracked.items():
@@ -1855,7 +1942,10 @@ def apply_fix(
     (:func:`_unignored_exposures`): the verify prompt withholds the very path in
     question, so a CONFIRM there would be a verdict on a change the model never
     saw, and an ``applied`` would hand the now-visible file to ``commit_push``'s
-    repo-wide ``git add -A``.
+    repo-wide ``git add -A``. When that check cannot be RUN at all the attempt is
+    rolled back too, as ``transient-failed`` (an evaluation that did not happen,
+    not a verdict on the patch) — treating an unanswerable question as an
+    all-clear is what would let the exposure ship.
 
     A fix-verify REJECT whose rollback is PROVABLY clean is not immediately
     terminal: ``BUDDHI_VERIFY_REJECT_RETRIES`` (default 1) re-dispatches the SAME
@@ -2090,14 +2180,23 @@ def apply_fix(
             # CONFIRM (or an ordinary fail-open) would return "applied" and hand
             # the now-visible secret to ``commit_push``'s ``git add -A``. Spend
             # no model call on an attempt that is already disqualified.
-            exposed = _unignored_exposures(cwd, ref, snap_ignored)
+            exposure = _unignored_exposures(cwd, ref, snap_ignored)
+            # None is "the check could not be RUN" — a git failure, not a verdict.
+            # It must not read as the empty list's all-clear: the exposure it
+            # would have found is invisible everywhere else, so the attempt is
+            # rolled back below rather than applied on an unanswered question.
+            exposed = exposure or []
+            exposure_unknown = exposure is None
             # A guided retry FORCES the verify pass: the retry exists BECAUSE the
             # verify pass rejected the previous attempt, so a corrected fix never
             # ships unverified even when the auto gate would not have selected its
             # diff. This is NOT a tripwire — the ⚠ alarm below stays scoped to ``trip``.
-            run_verify = verify_runner is not None and not exposed and (
-                guided_active
-                or should_verify(verify_mode, diff, tripwired=bool(trip), label=label))
+            run_verify = (
+                verify_runner is not None and not exposed
+                and not exposure_unknown   # about to roll back — spend no model call
+                and (guided_active
+                     or should_verify(verify_mode, diff, tripwired=bool(trip),
+                                      label=label)))
             if trip:  # tripwire alarm — the firing reason belongs on stdout, not a strip layer
                 _status_line(
                     "⚠",
@@ -2117,6 +2216,38 @@ def apply_fix(
                                "conservatively.\n"
                                + prompt_diff)
                 prompt_diff = _cap_utf8_diff(prompt_diff, _ATTEMPT_DIFF_MAX_BYTES)
+            if exposure_unknown:
+                # The exposure gate could not be RUN (git failed or timed out),
+                # and no answer is not the same as nothing to report: the very
+                # attempt this gate refuses — a force-staged `.env`, a deleted
+                # rule — shows up NOWHERE else, the diff scan having only marked
+                # itself incomplete (a forced verify pass over a text that
+                # deliberately withholds the path). Applying now would hand it to
+                # ``commit_push``'s repo-wide ``git add -A``. Escalate rather
+                # than reject: nothing judged the PATCH here, so there is no
+                # verdict to report — only an evaluation that did not happen,
+                # which is the disposition BLOCKED already gets above.
+                _status_line(
+                    "✗",
+                    "could not check the attempt for ignored-path exposure "
+                    "— rolling back",
+                    colour=_YELLOW,
+                )
+                trustworthy = _restore_or_degrade(
+                    cwd, snap, "after an unreadable ignored-path check")
+                return FixOutcome(
+                    status="transient-failed",
+                    detail="could not determine whether the attempt exposed "
+                           "previously-ignored path(s)"
+                    + (f" (tripwire: {trip})" if trip else "")
+                    + ("" if snap is not None and trustworthy
+                       else (" — no snapshot; the attempt's edits may remain"
+                             if snap is None
+                             else " — rollback FAILED, they may ride the next push")),
+                    diff=prompt_diff,
+                    attempts=total_attempts + attempt,
+                    rollback_failed=not trustworthy or snap is None,
+                )
             if exposed:
                 # TERMINAL, and never guided-retried: the objection is not a
                 # defect in the patch the fixer could correct — the attempt tore
@@ -2299,6 +2430,15 @@ def _attempt_diff(cwd: str, tracked_ref: str,
     to a model. Filtering on the snapshot's record keeps the scan's scope
     exactly what it is when the rules are intact.
 
+    A MOVE is the one exposure that record cannot name — `.env` renamed to
+    `notes.txt` is un-ignored, unrecorded and, to any inspection here,
+    indistinguishable from a file the fixer wrote. What gives it away is the
+    SOURCE going missing (:func:`_ignored_paths_missing`), and while one is
+    missing this text withholds every path that could be carrying those
+    contents: the whole untracked appendix, and the tracked patch's ADDED side
+    (:func:`_tracked_diff_added`) — the ref holds no ignored path, so a move can
+    only enter the tracked half as an add.
+
     Neither the filter nor its absence is ever SILENT. A dropped path is by
     construction one the ATTEMPT un-ignored (the enumeration lists only paths
     git does NOT ignore right now), and on the SUCCESS path nothing puts those
@@ -2309,25 +2449,44 @@ def _attempt_diff(cwd: str, tracked_ref: str,
     (both the snapshot and the cheap :func:`ignored_roots` retry failed), which
     is NOT the same answer as the empty set ("git says nothing is ignored"):
     the untracked appendix is then skipped ENTIRELY, because emitting one built
-    on rules the attempt may have rewritten is the very leak above.
+    on rules the attempt may have rewritten is the very leak above — and the
+    tracked patch's ADDED side goes with it, since skipping the appendix leaves
+    `git add -f .env` a clear run into the very same text through the index.
+    Withholding is scoped to the added side rather than the whole patch on
+    purpose: nothing already in the ref can be an ignored file, so the
+    modification hunks are provably safe, and they are the text the dangerous-
+    change tripwire reads — a blanket withholding would disarm it in exactly the
+    state where git is already misbehaving.
 
     Returns (diff_text, scan_truncated): `scan_truncated` is True when a scan
     ceiling clipped or dropped content, the untracked files (or the tracked
     patch's own path list) could not be enumerated, the ignore state was
-    unknown, OR a previously-ignored path was filtered out — the caller must
-    then treat the diff as incompletely scannable and FORCE the verify pass.
-    ("", False) when the tracked diff itself is wholly unavailable — that
-    fail-open contract is unchanged. Withholding is only ever half the answer:
-    a filtered path means the attempt EXPOSED one of the user's ignored files,
-    which :func:`apply_fix` rejects outright (:func:`_unignored_exposures`).
+    unknown, a recorded ignored path went MISSING, OR a previously-ignored path
+    was filtered out — the caller must then treat the diff as incompletely
+    scannable and FORCE the verify pass. ("", False) when the tracked diff
+    itself is wholly unavailable — that fail-open contract is unchanged.
+    Withholding is only ever half the answer: a path filtered by NAME means the
+    attempt EXPOSED one of the user's ignored files, which :func:`apply_fix`
+    rejects outright (:func:`_unignored_exposures`). A MOVE is the case that
+    gate cannot reach — it matches paths, and the destination is a name no
+    record holds — so what a missing source buys is the contents staying out of
+    the model's prompt and the forced verify pass, NOT a refusal; a moved file
+    that the attempt then leaves in place is still staged by ``commit_push``'s
+    ``git add -A``, the same as any other new file the fixer writes.
     `--no-ext-diff` keeps
     an external diff driver from replacing the hunk text the tripwire scans;
     errors="replace" keeps one non-UTF-8 file from blanking the whole scan."""
     try:
         was_ignored = (_ignored_matcher(snap_ignored)
                        if snap_ignored is not None else None)
+        # A recorded ignored path that has gone MISSING may have been moved
+        # rather than deleted, in which case its contents are sitting under some
+        # un-ignored pathname that neither filter below can name
+        # (:func:`_ignored_paths_missing`).
+        ignored_moved = (snap_ignored is not None
+                         and _ignored_paths_missing(cwd, snap_ignored))
         args = [*_DIFF_HEADER_FLAGS, "diff", "--no-ext-diff", tracked_ref]
-        staged_ignored: list = []
+        withheld: list = []
         if was_ignored is not None:
             # The untracked appendix below is not the only way in. `git diff
             # <ref>` reports every path the INDEX holds, so an attempt that ran
@@ -2344,23 +2503,39 @@ def _attempt_diff(cwd: str, tracked_ref: str,
                 # and force the verify pass, the same fail-CLOSED answer the
                 # unknown-ignore-state branch below gives, for the same reason.
                 return "", True
-            if staged_ignored:
-                # ":/" is the everything-from-the-repo-root positive half (git
-                # reads an exclude-only pathspec as "all but these" only from
-                # 2.13 on); ":(literal)" so a path carrying pathspec magic
-                # ("bui[1]ld/x") is excluded as the name it is, not as a glob.
-                args += ["--", ":/", *(f":(exclude,literal){p}"
-                                       for p in staged_ignored)]
+            withheld += staged_ignored
+        if was_ignored is None or ignored_moved:
+            # Two states in which the path-matched filter above cannot reach the
+            # exposure: the ignore record is UNKNOWN, so there is no verdict to
+            # filter by at all (`git add -f .env` then puts the secret in the
+            # tracked patch with nothing to stop it); or a recorded ignored path
+            # was MOVED, whose destination is not the name the record holds.
+            # What neither can escape is being NEW relative to the ref — git
+            # ignores nothing it tracks, so the ref holds no ignored path —
+            # which makes the added side (:func:`_tracked_diff_added`) exactly
+            # as wide as the exposure and no wider. The modification hunks that
+            # carry the fix itself stay, so the tripwire still has its text.
+            added = _tracked_diff_added(cwd, tracked_ref)
+            if added is None:
+                return "", True
+            withheld += added
+        if withheld:
+            # ":/" is the everything-from-the-repo-root positive half (git
+            # reads an exclude-only pathspec as "all but these" only from
+            # 2.13 on); ":(literal)" so a path carrying pathspec magic
+            # ("bui[1]ld/x") is excluded as the name it is, not as a glob.
+            args += ["--", ":/", *(f":(exclude,literal){p}"
+                                   for p in sorted(set(withheld)))]
         d = _git(cwd, *args, errors="replace")
         if d.returncode != 0:
             return "", False
         tracked = d.stdout
-        # A path dropped here is one the ATTEMPT force-added, and on the SUCCESS
-        # path nothing unstages it before ``commit_push``'s ``git add -A``
-        # commits it — so the drop fails closed exactly as the appendix's does,
-        # forcing the verify pass rather than reporting a diff that no longer
-        # matches what the round would commit.
-        truncated = bool(staged_ignored)
+        # A path dropped here is one the ATTEMPT force-added or moved past its
+        # rule, and on the SUCCESS path nothing unstages it before
+        # ``commit_push``'s ``git add -A`` commits it — so the drop fails closed
+        # exactly as the appendix's does, forcing the verify pass rather than
+        # reporting a diff that no longer matches what the round would commit.
+        truncated = bool(withheld)
         total = len(tracked.encode('utf-8'))
         if total > _SCAN_DIFF_MAX_BYTES:
             tracked = (tracked.encode('utf-8')[:_SCAN_DIFF_MAX_BYTES]
@@ -2389,6 +2564,15 @@ def _attempt_diff(cwd: str, tracked_ref: str,
                 return "".join(parts), True
             names = [p for p in u.stdout.split("\0") if p]
             kept = [n for n in names if not was_ignored(n)]
+            if kept and ignored_moved:
+                # A recorded ignored path is missing, so ANY of these may be its
+                # renamed contents — the destination of a move matches neither
+                # the snapshot's untracked map nor its ignored record, which is
+                # what makes it look like an ordinary fixer-created file. Nothing
+                # here can be proven not to be the user's ``.env`` under a new
+                # name, so the appendix is dropped whole and the verify pass is
+                # forced, exactly as the unknown-ignore-state branch above.
+                return "".join(parts), True
             if len(kept) != len(names):
                 # A drop here is never the routine case. `--others
                 # --exclude-standard` lists only what git does NOT ignore right
