@@ -446,16 +446,103 @@ def skip_kind(reason: str) -> str:
 # deletes or narrows a ``.gitignore`` cannot make the restore mistake the
 # user's ignored files for its own leftovers. Paths only — ignored files are
 # deliberately never hashed (a `node_modules/` would be ruinous to capture),
-# which is precisely why they must never be deleted either.
+# which is precisely why they must never be deleted either. It holds ROOTS,
+# not every descendant: a wholly-ignored tree collapses to one entry ending in
+# "/", so membership must be asked via :func:`_ignored_matcher`.
 Snapshot = Tuple[str, Dict[str, tuple], FrozenSet[str]]
 
 
+def _ignored_matcher(ignored: FrozenSet[str]) -> Callable[[str], bool]:
+    """Build ``is_ignored(rel) -> bool`` over a snapshot's recorded ignored set.
+
+    The set records what git called ignored at snapshot time, collapsed to its
+    ROOTS (``ls-files --directory``): a wholly-ignored `node_modules/` is one
+    entry rather than every file beneath it, so the enumeration cannot blow the
+    git timeout — and blow away the rollback with it — on a populated
+    dependency tree. Git marks exactly those collapsed entries with a trailing
+    "/", so they are the only ones matched by prefix; an individually-ignored
+    file (``.env``, ``src/local.conf``) is still recorded verbatim and still
+    matched exactly, which keeps ``build/`` from ever covering ``buildup.txt``.
+    An exact-only test against a collapsed set would read every file under an
+    ignored root as the attempt's own leftover — precisely the destruction this
+    set exists to prevent."""
+    roots = tuple(p for p in ignored if p.endswith("/"))
+
+    def is_ignored(rel: str) -> bool:
+        return rel in ignored or rel.startswith(roots)
+
+    return is_ignored
+
+
 def _git(cwd: str, *args: str, text: bool = True,
-         errors: Optional[str] = None) -> "subprocess.CompletedProcess":
+         errors: Optional[str] = None,
+         stdin_text: Optional[str] = None) -> "subprocess.CompletedProcess":
+    # stdin stays DEVNULL unless a caller has something to feed (git rejects
+    # `-z` on `check-ignore` without `--stdin`, and a pathname is only safe to
+    # hand over NUL-separated); subprocess forbids passing both.
     return subprocess.run(
         ["git", *args], cwd=cwd, capture_output=True, text=text,
-        errors=errors, timeout=_GIT_TIMEOUT, stdin=subprocess.DEVNULL,
+        errors=errors, timeout=_GIT_TIMEOUT, input=stdin_text,
+        stdin=subprocess.DEVNULL if stdin_text is None else None,
     )
+
+
+def _confirmed_ignored_roots(cwd: str,
+                             listed: FrozenSet[str]) -> Optional[FrozenSet[str]]:
+    """Keep only the directory entries git itself calls ignored, and return the
+    set the restore may match by prefix. None when the check could not be run.
+
+    ``ls-files --directory`` collapses any WHOLLY-UNTRACKED directory it can,
+    which is a wider class than "ignored": a `svc/` holding nothing but an
+    ignored `svc/local.conf` is emitted as `svc/` too. Treating that as a
+    prefix root would spare every file a failed attempt drops into `svc/` —
+    residue this rollback exists to remove, which `git add -A` would then carry
+    into the customer's PR. `git check-ignore` separates the two, and dropping
+    an unconfirmed root costs nothing: git lists the ignored paths under it
+    individually anyway (that is why `svc/local.conf` appears alongside), so
+    exact protection survives intact."""
+    roots = sorted(p for p in listed if p.endswith("/"))
+    if not roots:
+        return listed
+    try:
+        c = _git(cwd, "check-ignore", "-z", "--stdin",
+                 stdin_text="\0".join(roots), errors="surrogateescape")
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if c.returncode not in (0, 1):   # 1 = "none of them are ignored", not an error
+        return None
+    confirmed = {p for p in c.stdout.split("\0") if p}
+    return frozenset(p for p in listed
+                     if not p.endswith("/") or p in confirmed)
+
+
+def ignored_roots(cwd: str) -> Optional[FrozenSet[str]]:
+    """Ask git which paths it ignores RIGHT NOW, collapsed to roots and confirmed
+    (:func:`_confirmed_ignored_roots`). None when git could not be asked.
+
+    One cheap git call, deliberately callable on its own. The snapshot needs
+    this set, but so does the attempt-diff's leak filter — and those two must
+    not share a fate. :func:`snapshot_worktree` also returns None for reasons
+    that have nothing to do with the ignore state (a failed ``stash create``, an
+    ``lstat`` race on an untracked file, a ``hash-object`` batch that fell over),
+    and letting the ignored set die with the expensive untracked-content capture
+    would put the user's ``.env`` CONTENTS back into a model's prompt over a
+    hashing failure. See the fallback in :func:`apply_fix`.
+
+    ``--directory``: report a wholly-ignored tree as its root ("node_modules/")
+    instead of every file inside it. Without it this call enumerates — and this
+    process then holds — one entry per descendant, so a populated dependency
+    tree can run past ``_GIT_TIMEOUT`` and silently cost the run its rollback.
+    Roots are matched by prefix (see :func:`_ignored_matcher`)."""
+    try:
+        ig = _git(cwd, "ls-files", "-z", "--others", "--ignored",
+                  "--exclude-standard", "--directory", errors="surrogateescape")
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if ig.returncode != 0:
+        return None
+    return _confirmed_ignored_roots(
+        cwd, frozenset(p for p in ig.stdout.split("\0") if p))
 
 
 def snapshot_worktree(cwd: str) -> Optional[Snapshot]:
@@ -473,20 +560,31 @@ def snapshot_worktree(cwd: str) -> Optional[Snapshot]:
     when the attempt has destroyed the ignore rules. Asking git for the verdict
     — rather than parsing ignore files ourselves — is what makes every source
     git honours (a ``.gitignore`` at any depth, ``.git/info/exclude``,
-    ``core.excludesFile``) covered for free. Failing to enumerate them returns
+    ``core.excludesFile``) covered for free. That record is kept as ROOTS —
+    a wholly-ignored tree is one entry, not one per descendant — so a populated
+    `node_modules/` costs the snapshot a single path instead of an enumeration
+    that can outrun ``_GIT_TIMEOUT``; consumers ask :func:`_ignored_matcher`
+    rather than testing membership directly. Failing to enumerate them returns
     None: without that set the restore cannot promise to leave ignored files
     alone, and degrading to no rollback beats a rollback that may delete the
-    user's ``.env``."""
+    user's ``.env``. The enumeration itself lives in :func:`ignored_roots` so a
+    caller can hold that set even when this capture degrades."""
+    ignored = ignored_roots(cwd)
+    if ignored is None:
+        return None
     try:
         s = _git(cwd, "stash", "create")
-        u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard")
-        i = _git(cwd, "ls-files", "-z", "--others", "--ignored",
-                 "--exclude-standard")
+        # errors="surrogateescape": a pathname is bytes, not text. Strict UTF-8
+        # decoding raises UnicodeDecodeError (a ValueError — NOT caught below)
+        # on a filename git prints verbatim, aborting the whole fix instead of
+        # degrading to None. surrogateescape round-trips those bytes back
+        # through os.* and subprocess args, so the path stays usable.
+        u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard",
+                 errors="surrogateescape")
     except (subprocess.TimeoutExpired, OSError):
         return None
-    if s.returncode != 0 or u.returncode != 0 or i.returncode != 0:
+    if s.returncode != 0 or u.returncode != 0:
         return None
-    ignored: FrozenSet[str] = frozenset(p for p in i.stdout.split("\0") if p)
     tracked_ref = s.stdout.strip() or "HEAD"
     untracked: Dict[str, tuple] = {}
     blob_paths = []
@@ -522,6 +620,75 @@ def snapshot_worktree(cwd: str) -> Optional[Snapshot]:
     return (tracked_ref, untracked, ignored)
 
 
+def _prune_empty_parents(cwd: str, full_path: str) -> None:
+    """Walk up from a just-removed leftover, dropping directories the removal
+    emptied, and stop at the first one that is not empty (or at `cwd`).
+
+    A directory the failed attempt created is as much its leftover as the file
+    inside it, so a rollback that removes the file and keeps the directory has
+    not put the worktree back. ``os.rmdir`` is the whole guard: it refuses any
+    directory that still holds something, so a parent shared with content the
+    snapshot recorded survives untouched."""
+    parent = os.path.dirname(full_path)
+    while parent and parent != cwd:
+        try:
+            os.rmdir(parent)
+        except OSError:
+            break
+        parent = os.path.dirname(parent)
+
+
+def _removal_candidates(cwd: str,
+                        was_ignored: Callable[[str], bool]) -> Optional[list]:
+    """Every untracked path the removal pass must weigh — the ones git calls new
+    right now PLUS the ones a failed attempt hid behind ignore rules it widened
+    itself. None when git could not be asked.
+
+    ``--others --exclude-standard`` answers "what is new?" through whatever
+    ignore rules the ATTEMPT left behind, so an attempt that appended `build/`
+    to a tracked ``.gitignore`` has made that answer omit its own
+    `build/`\\ `evil.py`. The checkout that follows puts the original
+    ``.gitignore`` back, un-ignoring the leftover moments after the only pass
+    that would have removed it: residue in the shared worktree, reported as a
+    clean rollback, and swept into the customer's PR by ``commit_push``'s
+    repo-wide ``git add -A``. Enumerating the ignored side too is what closes
+    that evasion — and the SNAPSHOT's record, never git's current verdict, is
+    what decides which of those paths to spare.
+
+    That second enumeration is collapsed with ``--directory`` for the same
+    reason the snapshot's is: a populated `node_modules/` must not be listed
+    file-by-file. A collapsed root the snapshot also recorded is dropped whole;
+    one it did not is EXPANDED rather than removed wholesale, because a
+    directory that merely BECAME ignored can still hold paths the snapshot
+    recorded individually (a `svc/local.conf` under a newly-ignored `svc/`), and
+    rmtree-ing it on the strength of the attempt's own rules is exactly the
+    destruction this mechanism exists to prevent."""
+    u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard",
+             errors="surrogateescape")
+    if u.returncode != 0:
+        return None
+    candidates = [p for p in u.stdout.split("\0") if p]
+    ig = _git(cwd, "ls-files", "-z", "--others", "--ignored",
+              "--exclude-standard", "--directory", errors="surrogateescape")
+    if ig.returncode != 0:
+        return None
+    for rel in (p for p in ig.stdout.split("\0") if p):
+        if was_ignored(rel):
+            continue          # the snapshot's own record — never ours to touch
+        if not rel.endswith("/"):
+            candidates.append(rel)
+            continue
+        # ":(literal)" so a directory whose name carries pathspec magic
+        # ("bui[1]ld/") is matched as the name it is, not as a glob.
+        sub = _git(cwd, "ls-files", "-z", "--others", "--ignored",
+                   "--exclude-standard", "--", f":(literal){rel}",
+                   errors="surrogateescape")
+        if sub.returncode != 0:
+            return None
+        candidates.extend(p for p in sub.stdout.split("\0") if p)
+    return candidates
+
+
 def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     """Roll back to a snapshot: delete untracked files the failed attempt
     created, restore tracked files (``git checkout <ref> -- .`` — HEAD/branch
@@ -531,11 +698,15 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
 
     That pre-checkout ordering means the removal pass runs while the ignore
     rules are still whatever the FAILED ATTEMPT left them — so "is this path
-    new?" must never be asked of git's *current* exclusion verdict. A path the
-    snapshot recorded as ignored is left strictly alone: it was never captured
-    (see :func:`snapshot_worktree`), so deleting it destroys the only copy that
-    exists. A rollback that deletes the user's ``.env`` because a failed attempt
-    happened to delete ``.gitignore`` is worse than no rollback at all.
+    new?" must never be asked of git's *current* exclusion verdict, in EITHER
+    direction. Rules NARROWED (the attempt deleted ``.gitignore``): a path the
+    snapshot recorded as ignored is left strictly alone, because it was never
+    captured (see :func:`snapshot_worktree`) and deleting it destroys the only
+    copy that exists — a rollback that deletes the user's ``.env`` is worse than
+    no rollback at all. Rules WIDENED (the attempt appended to ``.gitignore``):
+    a path git now hides is still a candidate for removal, or an attempt could
+    evade its own rollback by writing one line into an ignore file
+    (:func:`_removal_candidates`).
 
     Returns False when the rollback could not be honoured in full — including a
     snapshot too old to carry the ignored set, and any deletion that failed for
@@ -549,13 +720,18 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         # than silently falling back to the ignore-blind removal this guards.
         return False
     tracked_ref, pre_untracked, pre_ignored = snapshot
+    was_ignored = _ignored_matcher(pre_ignored)
     honoured = True
     try:
-        u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard")
-        if u.returncode != 0:
+        # Both directions of the ignore-rule question are covered here: a path
+        # git NOW calls ignored but the snapshot did not is still the attempt's
+        # leftover (see :func:`_removal_candidates`), and a path the snapshot
+        # recorded as ignored stays untouched however the attempt left the rules.
+        candidates = _removal_candidates(cwd, was_ignored)
+        if candidates is None:
             return False
-        for rel in (p for p in u.stdout.split("\0") if p):
-            if rel not in pre_untracked and rel not in pre_ignored:
+        for rel in candidates:
+            if rel not in pre_untracked and not was_ignored(rel):
                 full_path = os.path.join(cwd, rel)
                 try:
                     if os.path.isdir(full_path) and not os.path.islink(full_path):
@@ -563,23 +739,22 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
                     else:
                         os.unlink(full_path)
                 except FileNotFoundError:
-                    pass  # already gone — the removal's goal, reached early
+                    # Already gone — the removal's goal, reached early. The
+                    # parents still need sweeping: whoever won the race removed
+                    # the file, not the directories the attempt created around
+                    # it, and this rollback must land in the same worktree state
+                    # either way rather than leaving stray empty dirs behind.
+                    _prune_empty_parents(cwd, full_path)
                 except OSError:
                     # A leftover we promised to remove is still there. Press on
                     # with the rest of the rollback (a maximally-restored
                     # worktree beats an abandoned one) but report the failure,
-                    # so the caller halts instead of pushing the residue.
+                    # so the caller halts instead of pushing the residue. No
+                    # pruning here: the leftover survives, so its parents are
+                    # not empty and are not ours to remove.
                     honoured = False
                 else:
-                    # Remove now-empty parent dirs so they cannot shadow a tracked
-                    # path and cause the subsequent git checkout to fail.
-                    parent = os.path.dirname(full_path)
-                    while parent and parent != cwd:
-                        try:
-                            os.rmdir(parent)
-                        except OSError:
-                            break
-                        parent = os.path.dirname(parent)
+                    _prune_empty_parents(cwd, full_path)
         co = _git(cwd, "checkout", tracked_ref, "--", ".")
         if co.returncode != 0:
             return False
@@ -1537,6 +1712,14 @@ def apply_fix(
     # No snapshot ⇒ no provable rollback. Degrade (proceed) instead of refusing;
     # ``ref`` falls back to HEAD so the attempt diff can still be computed.
     ref = snap[0] if snap is not None else "HEAD"
+    # The attempt diff's leak filter does NOT degrade with the snapshot: most of
+    # what makes snapshot_worktree return None (a failed `stash create`, an
+    # lstat race, a hash-object batch that fell over) says nothing about the
+    # ignore state, and "the user's ignored contents never reach a model" must
+    # not hinge on the expensive half succeeding. Captured HERE, before the
+    # fixer runs — the loop below reads the rules the ATTEMPT left behind, which
+    # is the very verdict this set exists to override.
+    snap_ignored = snap[2] if snap is not None else ignored_roots(cwd)
     timeout = EFFORT_TIMEOUTS.get(effort, EFFORT_TIMEOUTS["high"])
     max_attempts = (FIX_RETRIES if retries is None else max(0, retries)) + 1
     # No snapshot ⇒ no rollback between retries; each attempt compounds the
@@ -1715,7 +1898,6 @@ def apply_fix(
             # verify over this attempt's diff (the FULL scan text — the 60KB cap is
             # applied only to the verify-prompt artifact by _compose_verify_diff).
             snap_untracked = snap[1] if snap is not None else None
-            snap_ignored = snap[2] if snap is not None else None
             diff, scan_truncated = _attempt_diff(cwd, ref, snap_untracked,
                                                  snap_ignored)
             if _unicode_cleanup_enabled():
@@ -1905,12 +2087,13 @@ def _attempt_diff(cwd: str, tracked_ref: str,
     snapshot time whose bytes are provably unchanged are filtered out
     (`_drop_unchanged_untracked`) so pre-existing worktree junk neither rides
     the scan text nor trips the ceilings on every fix. A path the snapshot
-    recorded as IGNORED (`snap_ignored`) is dropped outright: the untracked
-    enumeration below reads whatever ignore rules the attempt left behind, so
-    an attempt that deleted `.gitignore` would otherwise append the CONTENTS of
-    the user's `.env` to this diff — and this diff is what the verify prompt
-    sends to a model. Filtering on the snapshot's record keeps the scan's scope
-    exactly what it is when the rules are intact. Returns
+    recorded as IGNORED (`snap_ignored` — a path of its own, or one under a
+    recorded root; see :func:`_ignored_matcher`) is dropped outright: the
+    untracked enumeration below reads whatever ignore rules the attempt left
+    behind, so an attempt that deleted `.gitignore` would otherwise append the
+    CONTENTS of the user's `.env` to this diff — and this diff is what the
+    verify prompt sends to a model. Filtering on the snapshot's record keeps
+    the scan's scope exactly what it is when the rules are intact. Returns
     (diff_text, scan_truncated): `scan_truncated` is True when a scan ceiling
     clipped or dropped content OR the untracked files could not be enumerated —
     the caller must then treat the diff as incompletely scannable and FORCE
@@ -1942,7 +2125,8 @@ def _attempt_diff(cwd: str, tracked_ref: str,
                 return "".join(parts), True
             names = [p for p in u.stdout.split("\0") if p]
             if snap_ignored:
-                names = [n for n in names if n not in snap_ignored]
+                was_ignored = _ignored_matcher(snap_ignored)
+                names = [n for n in names if not was_ignored(n)]
             names = _drop_unchanged_untracked(names, snap_untracked or {}, cwd)
             if len(names) > _SCAN_UNTRACKED_MAX_FILES:
                 names = names[:_SCAN_UNTRACKED_MAX_FILES]

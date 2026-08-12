@@ -347,6 +347,213 @@ def test_restore_leaves_an_ignored_artifact_the_attempt_created(repo):
     assert (repo / "build" / "old.o").read_text() == "stale\n"
 
 
+# --- the OTHER direction: rules WIDENED by the attempt ---------------------
+# Everything above is the attempt NARROWING the ignore rules (deleting
+# .gitignore) and the restore having to spare files git no longer excludes.
+# Widening is the mirror image and the dangerous one: `ls-files --others
+# --exclude-standard` asks the rules the ATTEMPT left behind, so one appended
+# line hides the attempt's own leftover from the only pass that removes it —
+# and the checkout right afterwards puts the original rules back, un-ignoring
+# the residue while restore_worktree reports a clean rollback and commit_push's
+# `git add -A` sweeps it into the customer's PR.
+
+def test_restore_deletes_a_leftover_the_attempt_hid_by_widening_gitignore(repo):
+    _ignored_repo(repo, ".env\n", ".env", "SECRET_KEY=hunter2\n")
+    snap = snapshot_worktree(str(repo))
+    assert "build/" not in snap[2]                  # not ignored when captured
+
+    # What the failed attempt did: append a rule, then write under it.
+    (repo / ".gitignore").write_text(".env\nbuild/\n")
+    (repo / "build").mkdir()
+    (repo / "build" / "evil.py").write_text("residue\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "build" / "evil.py").exists()
+    assert not (repo / "build").exists()            # and the dir it created
+    assert (repo / ".gitignore").read_text() == ".env\n"   # rule rolled back too
+    assert (repo / ".env").read_text() == "SECRET_KEY=hunter2\n"
+
+
+def test_restore_spares_a_recorded_ignored_file_under_a_newly_ignored_dir(repo):
+    # The reason a newly-ignored DIRECTORY cannot simply be rmtree'd: `svc/` was
+    # never a recorded root (only `svc/local.conf` was — see
+    # test_snapshot_drops_a_directory_that_is_not_itself_ignored), so removing it
+    # wholesale on the strength of the attempt's own rule would destroy the
+    # user's uncaptured file. Expand the root, then judge each path.
+    _ignored_repo(repo, "svc/local.conf\n", "svc/local.conf", "token = abc123\n")
+    snap = snapshot_worktree(str(repo))
+    assert "svc/" not in snap[2] and "svc/local.conf" in snap[2]
+
+    (repo / ".gitignore").write_text("svc/local.conf\nsvc/\n")   # the attempt
+    (repo / "svc" / "evil.py").write_text("residue\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "svc" / "evil.py").exists()               # leftover gone
+    assert (repo / "svc" / "local.conf").read_text() == "token = abc123\n"
+
+
+def test_restore_still_spares_a_recorded_root_the_attempt_kept_ignored(repo):
+    # The widened-rules sweep must not reopen the narrowed-rules promise: a root
+    # the snapshot recorded is dropped whole, artifacts and all, even though the
+    # ignored enumeration now offers it as a removal candidate.
+    _ignored_repo(repo, "build/\n", "build/old.o", "stale\n")
+    snap = snapshot_worktree(str(repo))
+    assert "build/" in snap[2]
+
+    (repo / "build" / "fresh.o").write_text("from the failed attempt\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / "build" / "old.o").read_text() == "stale\n"
+    assert (repo / "build" / "fresh.o").read_text() == "from the failed attempt\n"
+
+
+def test_restore_removes_an_ignored_tree_the_attempt_created_from_nothing(repo):
+    # The boundary this sweep moves, stated on purpose. The snapshot's RECORD is
+    # the arbiter, not git's live verdict, so an ignored directory that did not
+    # exist when the snapshot was taken is the attempt's own and goes back out —
+    # which is what "restore the worktree" means. Nothing of the user's is at
+    # risk: anything they had was either recorded ignored (spared above) or
+    # enumerated as untracked and hashed (restored below). Contrast
+    # test_restore_still_spares_a_recorded_root_the_attempt_kept_ignored, where
+    # the root pre-existed and its artifacts survive untouched.
+    _ignored_repo(repo, "build/\n", "keep.txt", "mine\n")     # no build/ yet
+    snap = snapshot_worktree(str(repo))
+    assert "build/" not in snap[2]
+
+    (repo / "build").mkdir()                                  # the attempt's
+    (repo / "build" / "out.o").write_text("from the failed attempt\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "build").exists()
+    assert (repo / "keep.txt").read_text() == "mine\n"
+
+
+def test_restore_deletes_a_leftover_hidden_by_a_new_nested_gitignore(repo):
+    # The rule need not be the top-level one: a .gitignore the attempt DROPS in
+    # a subdirectory hides its neighbours just as well, and git's verdict is the
+    # only thing that sees it.
+    _ignored_repo(repo, ".env\n", ".env", "SECRET_KEY=hunter2\n")
+    snap = snapshot_worktree(str(repo))
+
+    (repo / "sub").mkdir()
+    (repo / "sub" / ".gitignore").write_text("*.log\n")
+    (repo / "sub" / "residue.log").write_text("hidden\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "sub").exists()
+    assert (repo / ".env").read_text() == "SECRET_KEY=hunter2\n"
+
+
+def test_restore_reports_failure_when_a_hidden_leftover_cannot_be_removed(repo,
+                                                                          monkeypatch):
+    # A leftover found only via the ignored enumeration is under the same
+    # contract as any other: if it survives, the rollback was not honoured and
+    # the caller must halt rather than push the residue.
+    _ignored_repo(repo, ".env\n", ".env", "SECRET_KEY=hunter2\n")
+    snap = snapshot_worktree(str(repo))
+    (repo / ".gitignore").write_text(".env\nbuild/\n")
+    (repo / "build").mkdir()
+    (repo / "build" / "evil.py").write_text("residue\n")
+
+    real_unlink = os.unlink
+
+    def refuse(path, *a, **kw):
+        if str(path).endswith("evil.py"):
+            raise PermissionError(13, "denied")
+        return real_unlink(path, *a, **kw)
+
+    monkeypatch.setattr(os, "unlink", refuse)
+    assert restore_worktree(str(repo), snap) is False
+
+
+# --- the ignored set is ROOTS, and roots are matched by prefix -------------
+# Enumerating every descendant of an ignored tree is what a populated
+# node_modules/ makes ruinous: the snapshot would carry one entry per file and
+# could run past _GIT_TIMEOUT, whose only outcome is a run with no rollback at
+# all. Recording the ROOT instead is only safe if every consumer asks by
+# prefix — an exact-match test against a collapsed set reads each file under
+# the root as the attempt's leftover, which is the deletion this all prevents.
+
+def test_snapshot_collapses_an_ignored_tree_to_its_root(repo):
+    _ignored_repo(repo, "node_modules/\n", "node_modules/left-pad/index.js",
+                  "module.exports = 1\n")
+    (repo / "node_modules" / "left-pad" / "dist").mkdir()
+    (repo / "node_modules" / "left-pad" / "dist" / "b.js").write_text("bundle\n")
+
+    snap = snapshot_worktree(str(repo))
+    assert snap is not None
+    assert "node_modules/" in snap[2]                     # the root, once
+    assert not [p for p in snap[2] if p.startswith("node_modules/")
+                and p != "node_modules/"]                 # and no descendant
+
+
+def test_snapshot_still_records_an_individually_ignored_file_verbatim(repo):
+    # --directory collapses whole ignored TREES; a single ignored file has no
+    # root to collapse into and must survive as its own entry, or nothing
+    # protects it.
+    _ignored_repo(repo, "svc/local.conf\n", "svc/local.conf", "token = abc123\n")
+    snap = snapshot_worktree(str(repo))
+    assert "svc/local.conf" in snap[2]
+
+
+def test_snapshot_drops_a_directory_that_is_not_itself_ignored(repo):
+    # `svc/` here holds nothing but an ignored file, so --directory offers the
+    # DIRECTORY as well — but the directory is not ignored, and keeping it as a
+    # prefix root would spare every leftover a failed attempt drops into svc/.
+    _ignored_repo(repo, "svc/local.conf\n", "svc/local.conf", "token = abc123\n")
+    snap = snapshot_worktree(str(repo))
+    assert "svc/" not in snap[2]
+
+    (repo / "svc" / "attempt-leftover.txt").write_text("junk\n")
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "svc" / "attempt-leftover.txt").exists()
+    assert (repo / "svc" / "local.conf").read_text() == "token = abc123\n"
+
+
+def test_snapshot_degrades_when_the_root_check_cannot_run(repo, monkeypatch):
+    # Unable to tell a genuinely-ignored root from a merely-untracked one, the
+    # snapshot cannot promise either half of the contract — degrade to no
+    # rollback rather than guess.
+    _ignored_repo(repo, "node_modules/\n", "node_modules/left-pad/index.js", "1\n")
+    real = fix_apply._git
+
+    def fail_check_ignore(cwd, *args, **kwargs):
+        if "check-ignore" in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_check_ignore)
+    assert snapshot_worktree(str(repo)) is None
+
+
+def test_restore_keeps_a_deeply_nested_file_under_an_ignored_root(repo):
+    # The prefix match doing the work: the snapshot recorded "node_modules/",
+    # never this path, and with the rule destroyed git offers it as a leftover.
+    _ignored_repo(repo, "node_modules/\n", "node_modules/left-pad/index.js",
+                  "module.exports = 1\n")
+    deep = repo / "node_modules" / "left-pad" / "dist" / "bundle.js"
+    deep.parent.mkdir(parents=True)
+    deep.write_text("the built bundle\n")
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".gitignore").unlink()          # what the failed attempt did
+
+    assert restore_worktree(str(repo), snap)
+    assert deep.read_text() == "the built bundle\n"
+
+
+def test_restore_deletes_a_leftover_that_merely_shares_a_root_prefix(repo):
+    # A prefix test without git's trailing "/" would read "buildup.txt" as
+    # living under the ignored "build/" root and spare a genuine leftover.
+    _ignored_repo(repo, "build/\n", "build/old.o", "stale\n")
+    snap = snapshot_worktree(str(repo))
+    (repo / "buildup.txt").write_text("attempt leftover\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "buildup.txt").exists()
+    assert (repo / "build" / "old.o").read_text() == "stale\n"
+
+
 # --- the ignore SOURCES covered: whatever git itself honours ---------------
 # The snapshot asks git which paths are ignored rather than parsing rules, so
 # each source below is covered by the same mechanism. One test per source, each
@@ -453,6 +660,39 @@ def test_restore_tolerates_a_leftover_that_vanished_before_removal(repo,
     assert not (repo / "leftover.txt").exists()
 
 
+def test_restore_prunes_empty_parents_of_a_leftover_that_vanished(repo,
+                                                                  monkeypatch):
+    # Losing the unlink race must not change WHERE the rollback lands. Whoever
+    # removed the file did not remove the directory the attempt created around
+    # it, so without the sweep on this path the worktree keeps a stray "sub/"
+    # that the same rollback removes whenever it wins the race.
+    snap = snapshot_worktree(str(repo))
+    (repo / "sub").mkdir()
+    (repo / "sub" / "nested-leftover.txt").write_text("junk\n")
+    real_unlink = os.unlink
+
+    def racing_unlink(path, *a, **kw):
+        real_unlink(path, *a, **kw)
+        raise FileNotFoundError(path)     # as if another process got there first
+
+    monkeypatch.setattr(os, "unlink", racing_unlink)
+    assert restore_worktree(str(repo), snap) is True
+    assert not (repo / "sub").exists()
+
+
+def test_restore_prune_stops_at_a_parent_that_still_holds_something(repo):
+    # The sweep walks up only through directories the removal emptied. A parent
+    # that still holds a file the snapshot recorded is not the attempt's to take.
+    (repo / "sub").mkdir()
+    (repo / "sub" / "keep.txt").write_text("mine\n")
+    snap = snapshot_worktree(str(repo))
+    (repo / "sub" / "leftover.txt").write_text("junk\n")
+
+    assert restore_worktree(str(repo), snap) is True
+    assert not (repo / "sub" / "leftover.txt").exists()
+    assert (repo / "sub" / "keep.txt").read_text() == "mine\n"
+
+
 def test_restore_still_restores_tracked_files_when_a_removal_fails(repo):
     # False means "do not trust this worktree", not "I gave up": the rest of the
     # rollback still runs, so the worktree is left as close to the snapshot as
@@ -515,6 +755,40 @@ def test_attempt_diff_leaks_the_secret_when_the_ignored_set_is_withheld(repo):
     assert _SECRET_BYTES in diff
 
 
+def test_attempt_diff_excludes_contents_under_an_ignored_root(repo):
+    # The snapshot records "secrets/", not "secrets/prod.env" — so the filter
+    # here has to match by prefix. An exact-match test would find no entry for
+    # this path and append the secret's bytes to the diff the verify prompt
+    # sends to a model, which is the exposure the ignored set exists to stop.
+    _ignored_repo(repo, "secrets/\n", "secrets/prod.env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    assert "secrets/" in snap[2]
+
+    (repo / ".gitignore").unlink()               # what the failed attempt did
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert _SECRET_BYTES not in diff
+    assert "+++ b/secrets/prod.env" not in diff
+    assert "the real fix" in diff
+
+
+def test_attempt_diff_leaks_from_under_a_root_when_matching_is_exact_only(
+        repo, monkeypatch):
+    # The control, and the reason the assertion above means anything: put back
+    # the exact-match test that a collapsed set makes wrong and the secret's
+    # bytes do reach the diff. This pins the reproduction, NOT a behaviour
+    # anyone should want.
+    _ignored_repo(repo, "secrets/\n", "secrets/prod.env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    (repo / ".gitignore").unlink()
+    monkeypatch.setattr(fix_apply, "_ignored_matcher",
+                        lambda ignored: lambda rel: rel in ignored)
+
+    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert _SECRET_BYTES in diff
+
+
 def test_apply_fix_diff_never_carries_ignored_file_contents(repo):
     # End-to-end on the real path: the fixer itself deletes .gitignore mid-attempt.
     _ignored_repo(repo, ".env\n", ".env", _SECRET)
@@ -565,6 +839,107 @@ def test_snapshot_degrades_to_none_when_ignore_state_cannot_be_read(repo,
 
     monkeypatch.setattr(fix_apply, "_git", fail_ignored)
     assert snapshot_worktree(str(repo)) is None
+
+
+def test_leak_filter_survives_a_snapshot_that_died_hashing_blobs(repo,
+                                                                 monkeypatch):
+    # The converse, and the point of splitting ignored_roots out: the snapshot
+    # also degrades for reasons that say NOTHING about the ignore state — a
+    # failed `stash create`, an lstat race, a hash-object batch that fell over.
+    # "The user's ignored contents never reach a model" must not hinge on the
+    # expensive half (hashing every untracked file) succeeding.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    (repo / "scratch.txt").write_text("some untracked junk\n")   # forces hashing
+    real = fix_apply._git
+
+    def fail_hash(cwd, *args, **kwargs):
+        if "hash-object" in args:
+            return subprocess.CompletedProcess(args, 128, "", "fatal: boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_hash)
+    assert snapshot_worktree(str(repo)) is None      # the snapshot did degrade
+    assert fix_apply.ignored_roots(str(repo)) == frozenset({".env"})
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / ".gitignore").unlink()
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
+    assert out.status == "applied"
+    assert _SECRET_BYTES not in out.diff             # …the filter did not
+    assert "the real fix" in out.diff
+
+
+# --- a pathname is bytes: decoding it must never be able to raise ----------
+# git prints pathnames verbatim, so on a filesystem that allows them (ext4 and
+# friends) one non-UTF-8 name reaches this process as undecodable bytes. Strict
+# decoding raises UnicodeDecodeError — a ValueError, which the snapshot's
+# TimeoutExpired/OSError handler does not catch — killing the whole fix instead
+# of degrading to "no rollback net".
+
+def test_snapshot_survives_a_non_utf8_pathname(repo, monkeypatch):
+    # macOS refuses to create such a filename at all, so git's byte stream is
+    # modelled here and decoded exactly as subprocess.run(text=True) would:
+    # raising unless the call asked for a lenient errors=.
+    real = fix_apply._git
+    raw = b"logs/bad-\xff.txt\x00"
+
+    def fake(cwd, *args, **kwargs):
+        if "ls-files" in args and "--ignored" in args:
+            errors = kwargs.get("errors") or "strict"
+            return subprocess.CompletedProcess(
+                args, 0, raw.decode("utf-8", errors=errors), "")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fake)
+    snap = snapshot_worktree(str(repo))
+    assert snap is not None
+    # The exact surrogate: a lossy decoder ("replace") yields U+FFFD instead and
+    # can no longer name the file it is meant to protect.
+    assert "logs/bad-\udcff.txt" in snap[2]
+
+
+def test_restore_matches_a_non_utf8_pathname_against_the_ignored_set(repo,
+                                                                     monkeypatch):
+    # The restore's own enumeration has to decode the same way the snapshot's
+    # did, twice over: a strict decode raises here too (the handler catches only
+    # TimeoutExpired/OSError), and a lossy one yields a name that no longer
+    # equals the recorded entry — so the file the snapshot promised to protect
+    # is read as a leftover and unlinked.
+    snap = snapshot_worktree(str(repo))
+    snap = (snap[0], snap[1], frozenset({"bad-\udcff.txt"}))
+    real = fix_apply._git
+    raw = b"bad-\xff.txt\x00"
+
+    def fake(cwd, *args, **kwargs):
+        if "ls-files" in args:
+            errors = kwargs.get("errors") or "strict"
+            return subprocess.CompletedProcess(
+                args, 0, raw.decode("utf-8", errors=errors), "")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fake)
+    assert restore_worktree(str(repo), snap) is True   # matched ⇒ left alone
+
+
+def test_snapshot_and_restore_survive_a_real_non_utf8_pathname(repo):
+    # The same case end to end where the filesystem permits it (Linux CI).
+    bad = os.path.join(str(repo), "bad-\udcff.txt")
+    try:
+        with open(bad, "wb") as f:
+            f.write(b"junk\n")
+    except (OSError, UnicodeEncodeError):
+        pytest.skip("filesystem rejects non-UTF-8 pathnames (e.g. APFS)")
+    snap = snapshot_worktree(str(repo))
+    assert snap is not None
+    assert "bad-\udcff.txt" in snap[1]        # captured, so restorable
+    os.unlink(bad)
+
+    assert restore_worktree(str(repo), snap) is True
+    with open(bad, "rb") as f:
+        assert f.read() == b"junk\n"
 
 
 # ---------------------------------------------------------------------------
