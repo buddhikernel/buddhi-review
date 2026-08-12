@@ -554,6 +554,110 @@ def test_restore_deletes_a_leftover_that_merely_shares_a_root_prefix(repo):
     assert (repo / "build" / "old.o").read_text() == "stale\n"
 
 
+# --- …but only the roots git SEALED speak for paths it never listed --------
+# `--directory` collapses a directory whose whole CURRENT content is ignored,
+# which is weaker than "nothing under it can ever be un-ignored": with `foo/**`
+# plus `!foo/keep.txt` git emits `foo/` while a future foo/keep.txt is
+# explicitly re-included. Git separates the two cases in the same listing — it
+# descends into an ignored directory only when a re-inclusion pattern could
+# apply inside, and descending is what makes the contents appear alongside the
+# collapsed entry — so a root with a recorded descendant must not be a prefix.
+
+_REINCLUDE = "foo/**\n!foo/keep.txt\n"
+
+
+def test_sealed_roots_keeps_a_root_git_listed_nothing_beneath(repo):
+    assert fix_apply._sealed_roots(frozenset({"node_modules/"})) == ("node_modules/",)
+
+
+def test_sealed_roots_drops_a_root_git_descended_into(repo):
+    # `foo/junk.txt` alongside `foo/` is git's own signal that it walked into
+    # foo/ — which it does only when something under it could be re-included.
+    assert fix_apply._sealed_roots(frozenset({"foo/", "foo/junk.txt"})) == ()
+
+
+def test_sealed_roots_keeps_a_sealed_directory_nested_in_a_descended_one(repo):
+    # A descended root loses only its own prefix standing. The subdirectories
+    # git collapsed while walking it are sealed in their own right and stay.
+    assert fix_apply._sealed_roots(
+        frozenset({"foo/", "foo/junk.txt", "foo/sub/"})) == ("foo/sub/",)
+
+
+def test_sealed_roots_is_not_fooled_by_a_lexical_neighbour(repo):
+    # "buildup.txt" sorts immediately after "build/" without living under it;
+    # reading adjacency as containment would strip a genuinely sealed root.
+    assert fix_apply._sealed_roots(
+        frozenset({"build/", "buildup.txt"})) == ("build/",)
+
+
+def test_snapshot_records_the_files_under_a_reincludable_root(repo):
+    # Git's descent is what makes the narrowing free: it had already listed
+    # every ignored file under foo/ before the snapshot's set was built, so
+    # dropping the prefix costs no extra enumeration and loses no protection.
+    _ignored_repo(repo, _REINCLUDE, "foo/junk.txt", "build residue\n")
+    snap = snapshot_worktree(str(repo))
+    assert snap is not None
+    assert "foo/" in snap[2] and "foo/junk.txt" in snap[2]
+
+    was_ignored = fix_apply._ignored_matcher(snap[2])
+    assert was_ignored("foo/junk.txt")          # recorded exactly → still spared
+    assert not was_ignored("foo/keep.txt")      # re-included → never was ignored
+
+
+def test_restore_removes_a_reincluded_file_the_attempt_created(repo):
+    # The defect: foo/keep.txt is NOT ignored, so leaving it behind hands
+    # commit_push's repo-wide `git add -A` a file no reviewer ever saw.
+    _ignored_repo(repo, _REINCLUDE, "foo/junk.txt", "build residue\n")
+    snap = snapshot_worktree(str(repo))
+    (repo / "foo" / "keep.txt").write_text("attempt leftover\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert not (repo / "foo" / "keep.txt").exists()
+    assert (repo / "foo" / "junk.txt").read_text() == "build residue\n"
+
+
+def test_restore_spares_the_ignored_files_under_a_reincludable_root(repo):
+    # The other half: narrowing the prefix must not reopen the deletion. Every
+    # path that WAS ignored under foo/ is in the set verbatim, so it survives
+    # even with the rule destroyed — the exact case the prefix used to carry.
+    _ignored_repo(repo, _REINCLUDE, "foo/junk.txt", "build residue\n")
+    (repo / "foo" / "sub").mkdir()
+    (repo / "foo" / "sub" / "deep.o").write_text("compiled\n")
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".gitignore").unlink()          # what the failed attempt did
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / "foo" / "junk.txt").read_text() == "build residue\n"
+    assert (repo / "foo" / "sub" / "deep.o").read_text() == "compiled\n"
+
+
+def test_restore_spares_a_new_file_under_a_sealed_root_nested_in_foo(repo):
+    # foo/sub/ was collapsed WITHOUT git listing its contents — git refused to
+    # descend, because a file cannot be re-included once a parent directory is
+    # excluded. So it keeps its prefix standing and covers paths never listed.
+    _ignored_repo(repo, _REINCLUDE, "foo/sub/deep.o", "compiled\n")
+    snap = snapshot_worktree(str(repo))
+    assert "foo/sub/" in snap[2]
+    (repo / "foo" / "sub" / "later.o").write_text("also ignored\n")
+
+    assert restore_worktree(str(repo), snap)
+    assert (repo / "foo" / "sub" / "later.o").read_text() == "also ignored\n"
+
+
+def test_attempt_diff_shows_a_reincluded_file_the_attempt_created(repo):
+    # The suppression side of the same root cause: a prefix-matched foo/keep.txt
+    # is dropped from the diff the tripwire scans, so the file rides into the PR
+    # unread. It is not ignored — its bytes belong in the scan.
+    _ignored_repo(repo, _REINCLUDE, "foo/junk.txt", "build residue\n")
+    snap = snapshot_worktree(str(repo))
+    (repo / "foo" / "keep.txt").write_text("the attempt wrote this\n")
+
+    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert "the attempt wrote this" in diff
+    assert "build residue" not in diff      # genuinely ignored, still filtered
+
+
 # --- the ignore SOURCES covered: whatever git itself honours ---------------
 # The snapshot asks git which paths are ignored rather than parsing rules, so
 # each source below is covered by the same mechanism. One test per source, each
@@ -741,17 +845,20 @@ def test_attempt_diff_excludes_ignored_file_contents(repo):
     # asserting on it would be asserting the wrong thing.
 
 
-def test_attempt_diff_leaks_the_secret_when_the_ignored_set_is_withheld(repo):
-    # The control, and the reason the assertion above means anything: withhold
-    # the snapshot's ignored set from the SAME fixture and the secret's bytes do
-    # reach the diff. Without this, a fixture that could never have leaked would
-    # let the test above pass with the filter deleted. This pins the reproduction,
-    # NOT a behaviour anyone should want — both production call sites pass the set.
+def test_attempt_diff_leaks_the_secret_when_the_ignored_set_is_empty(repo):
+    # The control, and the reason the assertion above means anything: hand the
+    # SAME fixture an ignored set that matches nothing — git's answer for a repo
+    # with no ignore rules at all — and the secret's bytes do reach the diff.
+    # Without this, a fixture that could never have leaked would let the test
+    # above pass with the filter deleted. This pins the reproduction, NOT a
+    # behaviour anyone should want — both production call sites pass the real
+    # set, and an ignored set that is UNKNOWN (None) is the fail-CLOSED case
+    # below, never this one.
     _ignored_repo(repo, ".env\n", ".env", _SECRET)
     snap = snapshot_worktree(str(repo))
     (repo / ".gitignore").unlink()
 
-    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1])
+    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1], frozenset())
     assert _SECRET_BYTES in diff
 
 
@@ -789,6 +896,65 @@ def test_attempt_diff_leaks_from_under_a_root_when_matching_is_exact_only(
     assert _SECRET_BYTES in diff
 
 
+# --- the drop is never SILENT ---------------------------------------------
+# The filter withholds CONTENTS; it must not also withhold the fact that a file
+# was withheld. Every path it drops is one git listed as NOT ignored right now
+# yet the snapshot recorded as ignored — i.e. the attempt NARROWED the rules —
+# and the success path has no rollback to put them back before commit_push's
+# `git add -A` stages the now-visible file into the customer's PR. So the drop
+# fails CLOSED: scan_truncated=True, which the caller turns into a forced verify.
+
+def test_attempt_diff_reports_truncated_when_an_unignored_path_is_filtered(repo):
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".gitignore").unlink()               # the attempt narrowed the rules
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert truncated                             # the round cannot ship unverified
+    assert _SECRET_BYTES not in diff             # …and the contents still never ride
+    assert "the real fix" in diff
+
+
+def test_attempt_diff_stays_untruncated_while_the_rules_are_intact(repo):
+    # The control: with the ignore rules left alone the filter drops nothing (git
+    # never lists the ignored file in the first place), so the flag stays False
+    # and a normal fix is not pushed into a forced verify on every round.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2])
+    assert not truncated
+    assert _SECRET_BYTES not in diff
+    assert "the real fix" in diff
+
+
+def test_apply_fix_forces_verify_when_the_attempt_unignores_a_file(repo):
+    # End-to-end: verify_mode="off" would normally skip the pass entirely, and a
+    # benign one-line fix trips no wire — the un-ignored .env is the ONLY reason
+    # the verify pass runs, which is what stops the round shipping it unseen.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    verify_calls = []
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / ".gitignore").unlink()
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=verify, verify_mode="off")
+    assert out.status == "applied"
+    assert len(verify_calls) == 1                # forced, not selected
+    assert _SECRET_BYTES not in verify_calls[0]  # …and still no contents
+    assert "attempt diff exceeded the scan budget" in out.detail
+
+
 def test_apply_fix_diff_never_carries_ignored_file_contents(repo):
     # End-to-end on the real path: the fixer itself deletes .gitignore mid-attempt.
     _ignored_repo(repo, ".env\n", ".env", _SECRET)
@@ -802,6 +968,87 @@ def test_apply_fix_diff_never_carries_ignored_file_contents(repo):
     assert out.status == "applied"
     assert _SECRET_BYTES not in out.diff
     assert "the real fix" in out.diff
+
+
+# --- an UNKNOWN ignore state fails closed, not open ------------------------
+# `ignored_roots` returns None on any git failure (a timeout/OSError, a non-zero
+# `ls-files`, a `check-ignore` that exited >= 2). That None is "I could not find
+# out", NOT the empty set's "git says nothing is ignored" — and the untracked
+# appendix is built by re-asking git through whatever rules the ATTEMPT left
+# behind. Emitting it unfiltered on an unknown ignore state is exactly the leak
+# the filter exists to stop, so the appendix is skipped outright instead.
+
+def test_attempt_diff_skips_the_appendix_when_the_ignore_state_is_unknown(repo):
+    (repo / "untracked_marker.py").write_text("NEW_FILE_FLAGS = ('--x',)\n")
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD", None, None)
+    assert truncated                             # forced verify, not a silent pass
+    assert "NEW_FILE_FLAGS" not in diff          # no appendix built on unknown rules
+    assert "the real fix" in diff                # the tracked diff is preserved
+
+
+def test_attempt_diff_unknown_ignore_state_never_leaks_the_secret(repo):
+    # The leak this closes, on the fixture that reproduces it: with the rules
+    # narrowed and no ignored set to override them, the appendix would otherwise
+    # carry the user's .env CONTENTS into the verify prompt.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    (repo / ".gitignore").unlink()               # what the failed attempt did
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD", None, None)
+    assert truncated
+    assert _SECRET_BYTES not in diff
+    assert "the real fix" in diff
+
+
+def test_attempt_diff_empty_ignored_set_is_not_read_as_unknown(repo):
+    # The boundary the None check must not blur: a repo git says ignores NOTHING
+    # returns frozenset(), which is a real answer — the appendix still rides and
+    # the flag stays False. Reading it as "unknown" would force a verify pass on
+    # every fix in every repo without a .gitignore.
+    (repo / "untracked_marker.py").write_text("NEW_FILE_FLAGS = ('--x',)\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD", None, frozenset())
+    assert not truncated
+    assert "NEW_FILE_FLAGS" in diff
+
+
+def test_apply_fix_fails_closed_when_the_ignore_state_cannot_be_read(repo,
+                                                                     monkeypatch):
+    # End-to-end on the degraded path both halves die on: `ls-files --ignored`
+    # fails, so snapshot_worktree AND the cheap ignored_roots retry both return
+    # None. The fix still proceeds (a degrade, not a refusal) but the verify pass
+    # is FORCED and the secret never reaches the model's prompt.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    real = fix_apply._git
+
+    def fail_ignored(cwd, *args, **kwargs):
+        if "--ignored" in args:
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_ignored)
+    assert snapshot_worktree(str(repo)) is None
+    assert fix_apply.ignored_roots(str(repo)) is None    # the retry fails too
+    verify_calls = []
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / ".gitignore").unlink()
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=verify, verify_mode="off")
+    assert out.status == "applied"
+    assert len(verify_calls) == 1                        # forced, not selected
+    assert _SECRET_BYTES not in verify_calls[0]
+    assert _SECRET_BYTES not in out.diff
+    assert "the real fix" in out.diff                    # the tracked diff survives
 
 
 def test_apply_fix_unicode_recompute_does_not_reintroduce_the_leak(repo):
@@ -1207,7 +1454,7 @@ def test_attempt_diff_scans_full_and_composer_caps(repo):
     # everything) and `_compose_verify_diff` is where the cap + sentinel live.
     big = "y = 1\n" + "\n".join(f"line{i} = {i}" for i in range(20000)) + "\n"
     (repo / "tracked.py").write_text(big)
-    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD")
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD", None, frozenset())
     assert not truncated
     assert len(diff.encode()) > fix_apply._ATTEMPT_DIFF_MAX_BYTES
     assert "line19999" in diff              # the tail is scannable
@@ -1225,7 +1472,7 @@ def test_attempt_diff_scans_untracked_past_the_prompt_budget(repo):
     # composed verify artifact stays capped.
     (repo / "tracked.py").write_text("z = 1\n" + "q" * 70000 + "\n")
     (repo / "untracked_marker.py").write_text("NOW_SCANNED_FLAGS = ('--x',)\n")
-    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD")
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD", None, frozenset())
     assert not truncated
     assert "NOW_SCANNED_FLAGS" in diff
     assert diff_tripwire(diff) is not None
@@ -1240,7 +1487,7 @@ def test_attempt_diff_scan_ceiling_reports_truncated(repo, monkeypatch):
     # that into a forced verify) — never a silent shorter scan.
     (repo / "tracked.py").write_text("z = 1\n" + "q" * 5000 + "\n")
     monkeypatch.setattr(fix_apply, "_SCAN_DIFF_MAX_BYTES", 1000)
-    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD")
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD", None, frozenset())
     assert truncated
     assert len(diff.encode()) <= 1000
 

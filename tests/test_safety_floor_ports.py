@@ -381,7 +381,7 @@ def test_attempt_diff_preexisting_unchanged_untracked_filtered(repo_sf):
     import unittest.mock as um
     with um.patch.object(fix_apply, "_SCAN_CHUNK_MAX_BYTES", 500):
         diff, truncated = fix_apply._attempt_diff(str(repo), snap[0] or "HEAD",
-                                                  snap[1])
+                                                  snap[1], snap[2])
     assert not truncated
     assert "junk.log" not in diff
     assert "X2 = 1" in diff
@@ -393,7 +393,7 @@ def test_attempt_diff_preexisting_untracked_modified_still_rides(repo_sf):
     snap = fix_apply.snapshot_worktree(str(repo))
     (repo / "notes.py").write_text("EVIL_FLAGS = ('--x',)\n")
     diff, truncated = fix_apply._attempt_diff(str(repo), snap[0] or "HEAD",
-                                              snap[1])
+                                              snap[1], snap[2])
     assert not truncated
     assert "EVIL_FLAGS" in diff
 
@@ -412,7 +412,9 @@ def test_attempt_diff_ls_files_failure_fails_closed(repo_sf, monkeypatch):
         return real_git(cwd, *args, **kw)
 
     monkeypatch.setattr(fix_apply, "_git", fake_git)
-    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD")
+    # A KNOWN-empty ignored set, so the enumeration failure below is what the
+    # fail-closed verdict rests on rather than an unknown ignore state.
+    diff, truncated = fix_apply._attempt_diff(str(repo), "HEAD", None, frozenset())
     assert truncated
     assert "X2 = 1" in diff   # the tracked diff is preserved
 

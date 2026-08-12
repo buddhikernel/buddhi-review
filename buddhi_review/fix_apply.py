@@ -448,8 +448,50 @@ def skip_kind(reason: str) -> str:
 # deliberately never hashed (a `node_modules/` would be ruinous to capture),
 # which is precisely why they must never be deleted either. It holds ROOTS,
 # not every descendant: a wholly-ignored tree collapses to one entry ending in
-# "/", so membership must be asked via :func:`_ignored_matcher`.
+# "/", so membership must be asked via :func:`_ignored_matcher` — and only the
+# roots git sealed (:func:`_sealed_roots`) speak for paths it never listed.
 Snapshot = Tuple[str, Dict[str, tuple], FrozenSet[str]]
+
+
+def _sealed_roots(ignored: FrozenSet[str]) -> Tuple[str, ...]:
+    """The recorded directory entries that may stand in for every path beneath
+    them — the ones git collapsed and declined to DESCEND into.
+
+    A trailing "/" alone does not earn that standing. ``ls-files --directory``
+    collapses a directory whose whole CURRENT content is ignored, which is a
+    weaker fact than "nothing under it could ever be un-ignored": with
+    ``foo/**`` plus ``!foo/keep.txt`` and only ignored files present, git emits
+    `foo/` and ``check-ignore`` confirms it, yet `foo/keep.txt` is explicitly
+    re-included. Taking that root as an unconditional prefix would read a
+    fixer-CREATED `foo/keep.txt` as previously-ignored — the rollback would
+    spare it and :func:`_attempt_diff` would hide it, leaving an unreviewed file
+    to ride ``commit_push``'s repo-wide ``git add -A`` into the customer's PR.
+
+    Git draws the distinction itself, in the same listing. It descends into an
+    ignored directory exactly when a re-inclusion pattern could still apply
+    inside it, and descending is what makes that directory's contents appear
+    ALONGSIDE the collapsed entry (`foo/` *and* `foo/junk.txt`). A root git
+    collapsed while listing nothing beneath it is one it refused to descend —
+    git's own rule that a file cannot be re-included once a parent directory is
+    excluded — so every descendant it holds now or grows later is ignored and
+    the prefix is sound. A root with a recorded descendant loses only its
+    prefix standing: the descendants git enumerated remain in the set as exact
+    entries (nested collapsed directories among them, each a sealed prefix in
+    its own right), so every path that was ignored AT SNAPSHOT TIME is still
+    matched — the deletion this set prevents is not reopened.
+
+    Free on the tree the collapse exists for: a sealed `node_modules/` is still
+    one entry, and a root git descended into had already been enumerated
+    file-by-file by git before this function saw it."""
+    entries = sorted(ignored)
+    # Sorted order gathers a root's descendants immediately after it — any
+    # string between "foo/" and "foo/z" must itself begin "foo/" — so the single
+    # next entry settles whether git listed anything under this root.
+    return tuple(
+        p for i, p in enumerate(entries)
+        if p.endswith("/")
+        and not (i + 1 < len(entries) and entries[i + 1].startswith(p))
+    )
 
 
 def _ignored_matcher(ignored: FrozenSet[str]) -> Callable[[str], bool]:
@@ -459,14 +501,13 @@ def _ignored_matcher(ignored: FrozenSet[str]) -> Callable[[str], bool]:
     ROOTS (``ls-files --directory``): a wholly-ignored `node_modules/` is one
     entry rather than every file beneath it, so the enumeration cannot blow the
     git timeout — and blow away the rollback with it — on a populated
-    dependency tree. Git marks exactly those collapsed entries with a trailing
-    "/", so they are the only ones matched by prefix; an individually-ignored
-    file (``.env``, ``src/local.conf``) is still recorded verbatim and still
-    matched exactly, which keeps ``build/`` from ever covering ``buildup.txt``.
-    An exact-only test against a collapsed set would read every file under an
-    ignored root as the attempt's own leftover — precisely the destruction this
-    set exists to prevent."""
-    roots = tuple(p for p in ignored if p.endswith("/"))
+    dependency tree. Only the SEALED roots (:func:`_sealed_roots`) are matched
+    by prefix; an individually-ignored file (``.env``, ``src/local.conf``) is
+    recorded verbatim and matched exactly, which keeps ``build/`` from ever
+    covering ``buildup.txt``. An exact-only test against a collapsed set would
+    read every file under an ignored root as the attempt's own leftover —
+    precisely the destruction this set exists to prevent."""
+    roots = _sealed_roots(ignored)
 
     def is_ignored(rel: str) -> bool:
         return rel in ignored or rel.startswith(roots)
@@ -533,7 +574,10 @@ def ignored_roots(cwd: str) -> Optional[FrozenSet[str]]:
     instead of every file inside it. Without it this call enumerates — and this
     process then holds — one entry per descendant, so a populated dependency
     tree can run past ``_GIT_TIMEOUT`` and silently cost the run its rollback.
-    Roots are matched by prefix (see :func:`_ignored_matcher`)."""
+    A root git SEALED — collapsed without listing anything beneath it — is
+    matched by prefix; one it descended into speaks only for itself, because a
+    re-inclusion exception can un-ignore a path created under it later (see
+    :func:`_sealed_roots`)."""
     try:
         ig = _git(cwd, "ls-files", "-z", "--others", "--ignored",
                   "--exclude-standard", "--directory", errors="surrogateescape")
@@ -1718,7 +1762,11 @@ def apply_fix(
     # ignore state, and "the user's ignored contents never reach a model" must
     # not hinge on the expensive half succeeding. Captured HERE, before the
     # fixer runs — the loop below reads the rules the ATTEMPT left behind, which
-    # is the very verdict this set exists to override.
+    # is the very verdict this set exists to override. When even this cheap
+    # retry fails the answer is None, and None is passed through as UNKNOWN
+    # rather than read as "nothing was ignored": `_attempt_diff` then drops the
+    # untracked appendix and forces the verify pass instead of emitting one
+    # built on rules the attempt may have rewritten.
     snap_ignored = snap[2] if snap is not None else ignored_roots(cwd)
     timeout = EFFORT_TIMEOUTS.get(effort, EFFORT_TIMEOUTS["high"])
     max_attempts = (FIX_RETRIES if retries is None else max(0, retries)) + 1
@@ -1940,8 +1988,11 @@ def apply_fix(
             # always sees the exact hunks that tripped the wire.
             prompt_diff = _compose_verify_diff(diff, bool(trip), marker_spans)
             if scan_truncated:
-                prompt_diff = ("⚠ NOTE: diff is incomplete — scan ceiling or untracked "
-                               "enumeration failure; treat any CONFIRM conservatively.\n"
+                prompt_diff = ("⚠ NOTE: diff is incomplete — a scan ceiling, an "
+                               "untracked-enumeration failure, an unknown ignore state, "
+                               "or a previously-ignored file the attempt un-ignored (its "
+                               "contents are deliberately withheld); treat any CONFIRM "
+                               "conservatively.\n"
                                + prompt_diff)
                 prompt_diff = _cap_utf8_diff(prompt_diff, _ATTEMPT_DIFF_MAX_BYTES)
             if run_verify:
@@ -2088,17 +2139,32 @@ def _attempt_diff(cwd: str, tracked_ref: str,
     (`_drop_unchanged_untracked`) so pre-existing worktree junk neither rides
     the scan text nor trips the ceilings on every fix. A path the snapshot
     recorded as IGNORED (`snap_ignored` — a path of its own, or one under a
-    recorded root; see :func:`_ignored_matcher`) is dropped outright: the
+    SEALED root; see :func:`_ignored_matcher`) is dropped outright: the
     untracked enumeration below reads whatever ignore rules the attempt left
     behind, so an attempt that deleted `.gitignore` would otherwise append the
     CONTENTS of the user's `.env` to this diff — and this diff is what the
     verify prompt sends to a model. Filtering on the snapshot's record keeps
-    the scan's scope exactly what it is when the rules are intact. Returns
-    (diff_text, scan_truncated): `scan_truncated` is True when a scan ceiling
-    clipped or dropped content OR the untracked files could not be enumerated —
-    the caller must then treat the diff as incompletely scannable and FORCE
-    the verify pass. ("", False) when the tracked diff itself is wholly
-    unavailable — that fail-open contract is unchanged. `--no-ext-diff` keeps
+    the scan's scope exactly what it is when the rules are intact.
+
+    Neither the filter nor its absence is ever SILENT. A dropped path is by
+    construction one the ATTEMPT un-ignored (the enumeration lists only paths
+    git does NOT ignore right now), and on the SUCCESS path nothing puts those
+    rules back before ``commit_push``'s ``git add -A`` stages the now-visible
+    file into the customer's PR — so a drop sets `scan_truncated`, forcing the
+    verify pass rather than leaving a reported diff that no longer matches what
+    the round commits. `snap_ignored=None` means the ignore state is UNKNOWN
+    (both the snapshot and the cheap :func:`ignored_roots` retry failed), which
+    is NOT the same answer as the empty set ("git says nothing is ignored"):
+    the untracked appendix is then skipped ENTIRELY, because emitting one built
+    on rules the attempt may have rewritten is the very leak above.
+
+    Returns (diff_text, scan_truncated): `scan_truncated` is True when a scan
+    ceiling clipped or dropped content, the untracked files could not be
+    enumerated, the ignore state was unknown, OR a previously-ignored path was
+    filtered out — the caller must then treat the diff as incompletely
+    scannable and FORCE the verify pass. ("", False) when the tracked diff
+    itself is wholly unavailable — that fail-open contract is unchanged.
+    `--no-ext-diff` keeps
     an external diff driver from replacing the hunk text the tripwire scans;
     errors="replace" keeps one non-UTF-8 file from blanking the whole scan."""
     try:
@@ -2116,18 +2182,40 @@ def _attempt_diff(cwd: str, tracked_ref: str,
             truncated = True
         parts = [tracked]
         try:
+            if snap_ignored is None:
+                # Ignore state UNKNOWN — NOT "nothing is ignored", which is the
+                # empty set and still filters (it just matches nothing). The
+                # enumeration below reads whatever rules the ATTEMPT left behind,
+                # so without the snapshot's verdict to override them an attempt
+                # that deleted `.gitignore` puts the CONTENTS of the user's
+                # `.env` straight into the text the verify prompt sends to a
+                # model. Fail CLOSED — no appendix at all, and truncated=True so
+                # the caller FORCES the verify pass instead of reading the short
+                # diff as a clean one.
+                return "".join(parts), True
             u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard",
-                     errors="replace")
+                     errors="surrogateescape")
             if u.returncode != 0:
                 # Can't enumerate untracked files: a fixer-created dangerous
                 # new file could be sitting unscanned — fail closed like a
                 # dropped chunk, not silently open.
                 return "".join(parts), True
             names = [p for p in u.stdout.split("\0") if p]
-            if snap_ignored:
-                was_ignored = _ignored_matcher(snap_ignored)
-                names = [n for n in names if not was_ignored(n)]
-            names = _drop_unchanged_untracked(names, snap_untracked or {}, cwd)
+            was_ignored = _ignored_matcher(snap_ignored)
+            kept = [n for n in names if not was_ignored(n)]
+            if len(kept) != len(names):
+                # A drop here is never the routine case. `--others
+                # --exclude-standard` lists only what git does NOT ignore right
+                # now, so every path the snapshot's record removes is one the
+                # ATTEMPT un-ignored — and on the SUCCESS path there is no
+                # rollback to put the rules back before ``commit_push``'s
+                # ``git add -A`` stages, commits and pushes it. The contents
+                # still stay out of the model's prompt; what must not happen is
+                # the path vanishing without a trace, leaving a reported diff
+                # that no longer matches what the round commits. Fail closed —
+                # the caller turns this into a FORCED verify pass.
+                truncated = True
+            names = _drop_unchanged_untracked(kept, snap_untracked or {}, cwd)
             if len(names) > _SCAN_UNTRACKED_MAX_FILES:
                 names = names[:_SCAN_UNTRACKED_MAX_FILES]
                 truncated = True
