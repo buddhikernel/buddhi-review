@@ -528,9 +528,11 @@ _SEALED_DESCENDANT_CAP = 512
 # …and how many directory entries the whole capture may VISIT, across every
 # root, before it stops walking. Separate from the cap on purpose: the cap is
 # about what a root is worth recording, this is about what the snapshot is
-# willing to spend looking. Charging an abandoned giant against a single shared
-# budget would let `node_modules/` starve the `secrets/` sorted after it — the
-# one root whose descendants are the point of the exercise.
+# willing to spend looking. Spent as a per-root SHARE rather than a single
+# counter drained in sorted order (:func:`sealed_descendants`) — charging an
+# abandoned giant against one shared pool would let `node_modules/` starve the
+# `secrets/` sorted after it, which is the one root whose descendants are the
+# point of the exercise.
 _SEALED_WALK_BUDGET = 4096
 
 
@@ -562,17 +564,34 @@ def sealed_descendants(cwd: str, ignored: FrozenSet[str]) -> FrozenSet[str]:
     a credential actually sits in. A partial list is never kept: half a tree
     would flag as "missing" every file the walk simply never reached.
 
-    Directories are deliberately not recorded: an empty one that vanishes took
-    no content with it, and a non-empty one cannot vanish without taking a
-    recorded FILE with it. Symlinks are recorded but never followed — the walk
-    must not leave the tree it was asked about, still less loop. Roots are
-    walked in sorted order (:func:`_sealed_roots`), so which of them a spent
-    budget covers is deterministic rather than a function of set iteration."""
+    Real directories are deliberately not recorded: an empty one that vanishes
+    took no content with it, and a non-empty one cannot vanish without taking a
+    recorded FILE with it. A SYMLINK to a directory is not that — ``os.walk``
+    files it under `dirnames` and never follows it (`followlinks` stays off), so
+    nothing beneath it is ever recorded and the link is the only path there is to
+    record. It moves out of the root exactly as a file does, and its destination
+    is the same un-ignored name nothing else can name, so it is recorded
+    alongside the files rather than passed over with the directories it is
+    grouped with.
+
+    The budget is spent as a per-root SHARE of what remains, never as one pool
+    drained in order. Roots are walked sorted (:func:`_sealed_roots`), so a
+    single counter would let a `node_modules/` walked first exhaust it and leave
+    the `secrets/` after it with no descendants at all — the starvation the two
+    bounds exist to prevent, arriving through the bound meant to prevent it.
+    Each root instead gets ``remaining // roots left``, so a giant is abandoned
+    within its own share and every later root keeps one; a root that spends less
+    than its share hands the rest forward, which leaves the ordinary single-root
+    case the whole budget. Sorted order still makes the outcome deterministic
+    rather than a function of set iteration."""
     found_all: set = set()
-    budget = _SEALED_WALK_BUDGET
-    for root in _sealed_roots(ignored):
-        if budget <= 0:
+    roots = _sealed_roots(ignored)
+    remaining = _SEALED_WALK_BUDGET
+    for i, root in enumerate(roots):
+        if remaining <= 0:
             break
+        share = max(1, remaining // (len(roots) - i))
+        budget = share
         base = os.path.join(cwd, root.rstrip("/"))
         found: list = []
         overrun = False
@@ -581,7 +600,13 @@ def sealed_descendants(cwd: str, ignored: FrozenSet[str]) -> FrozenSet[str]:
                 # Charged per directory read, dirs included: what this bound is
                 # protecting is the walking, not the keeping.
                 budget -= len(dirnames) + len(filenames)
-                for name in filenames:
+                # A symlink TO a directory sits in `dirnames`, and the walk does
+                # not descend it — so unlike a real directory it stands for
+                # nothing that will be recorded beneath it. Recorded here, and
+                # never resolved: `islink` reads the entry itself.
+                links = [n for n in dirnames
+                         if os.path.islink(os.path.join(dirpath, n))]
+                for name in (*filenames, *links):
                     if len(found) >= _SEALED_DESCENDANT_CAP:
                         overrun = True
                         break
@@ -594,6 +619,9 @@ def sealed_descendants(cwd: str, ignored: FrozenSet[str]) -> FrozenSet[str]:
             # An unreadable tree records nothing rather than a partial list; the
             # root's own entry still stands, which is where this started.
             overrun = True
+        # Only what this root actually SPENT leaves the pool — an early return
+        # hands its unused share to the roots behind it.
+        remaining -= share - max(budget, 0)
         if not overrun:
             found_all.update(found)
     return frozenset(found_all)
@@ -816,6 +844,150 @@ def _unignored_exposures(cwd: str, tracked_ref: str,
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return None
     return sorted(set(staged) | set(unignored))
+
+
+# The most paths one copy-check will HASH. A size collision against one of the
+# user's ignored files is what earns a read at all, so the number is generous by
+# design; a batch past it is answered with None — the caller fails closed — rather
+# than with a partial comparison, which is the one answer worse than none.
+_IGNORED_COPY_HASH_CAP = 512
+
+
+def _hash_worktree_files(cwd: str, rels: list) -> Optional[Dict[str, str]]:
+    """``git hash-object`` over a batch of worktree paths → ``{rel: sha}``. None
+    when the batch could not be RUN or came back the wrong length — a short
+    answer cannot be zipped back onto its inputs, and guessing which sha belongs
+    to which path is exactly the wrong way to be wrong here.
+
+    ``--stdin-paths`` is NEWLINE-separated, so a pathname holding one cannot be
+    asked about at all; that is a None too, not a silent omission."""
+    if not rels:
+        return {}
+    if any("\n" in r for r in rels):
+        return None
+    try:
+        h = _git(cwd, "hash-object", "--stdin-paths",
+                 stdin_text="\n".join(rels) + "\n", errors="surrogateescape")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    if h.returncode != 0:
+        return None
+    shas = h.stdout.splitlines()
+    if len(shas) != len(rels):
+        return None
+    return {rel: sha.strip() for rel, sha in zip(rels, shas)}
+
+
+def _ignored_copies(cwd: str, tracked_ref: str,
+                    snap_ignored: Optional[FrozenSet[str]],
+                    snap_descendants: FrozenSet[str] = frozenset(),
+                    snap_untracked: Optional[Dict[str, tuple]] = None
+                    ) -> Optional[list]:
+    """Every path the attempt has left carrying the CONTENT of a file the
+    snapshot recorded as IGNORED — a ``cp .env notes.txt``, or an ``ln`` of the
+    same. Empty when the ignore state is unknown (there is nothing to compare
+    against). None when the comparison could not be RUN.
+
+    The exposure every other gate here is blind to, and blind to for a reason
+    each states about itself. :func:`_unignored_exposures` matches RECORDED
+    paths and the destination of a copy is a name no record holds;
+    :func:`_ignore_coverage_stripped` reads rule files and a copy touches none;
+    :func:`_ignored_paths_missing` keys on a SOURCE going away, and a copy is
+    precisely the move that leaves its source where it was. So ``.env`` is still
+    ignored, still present and still unreported — while a byte-identical
+    `notes.txt` sits un-ignored beside it, its contents in the text the verify
+    prompt sends to a model and its path in the sweep of ``commit_push``'s
+    repo-wide ``git add -A``.
+
+    Content is therefore the only thing left to match on, and it is matched
+    cheaply. A hardlink shares an inode and is settled with no read at all;
+    everything else is hashed ONLY where a candidate's SIZE already equals a
+    recorded ignored file's. An empty file is skipped on both sides — it has no
+    contents to leak, and its size would otherwise collide with every other empty
+    file the attempt wrote. The recorded set bounds the rest: it is collapsed to
+    roots, so a populated `node_modules/` contributes one DIRECTORY entry
+    (skipped — a directory carries no bytes of its own) instead of a tree, and
+    the files beneath a SEALED root arrive only within
+    :func:`sealed_descendants`'s own cap.
+
+    Candidates are the paths that are NEW to git — untracked, or ADDED relative
+    to the ref (:func:`_tracked_diff_added`) — and, among those, the ones the
+    attempt plausibly TOUCHED (:func:`_drop_unchanged_untracked`). That last
+    filter is what keeps this from firing on the user's own worktree: an
+    untracked `notes.txt` they copied from their `.env` themselves, before the
+    run, is byte-identical to it on every attempt, and rejecting a fix over a
+    file nobody touched would make the gate a permanent refusal.
+
+    Deliberately an ADDITION to the missing-source flag rather than a
+    replacement for it, on the grounds :func:`_ignored_paths_missing` gives: an
+    exact-content test is defeated by a single appended byte, so it can only
+    reach the case that flag cannot see — the source that never went away."""
+    if snap_ignored is None:
+        return []
+    was_ignored = _ignored_matcher(snap_ignored)
+    try:
+        u = _git(cwd, "ls-files", "-z", "--others", "--exclude-standard",
+                 errors="surrogateescape")
+        if u.returncode != 0:
+            return None
+        added = _tracked_diff_added(cwd, tracked_ref)
+        if added is None:
+            return None
+        candidates = sorted({p for p in (*u.stdout.split("\0"), *added)
+                             if p and not was_ignored(p)})
+        if not candidates:
+            return []
+        # Sources: the recorded ignored FILES. A trailing "/" is a directory —
+        # it holds no bytes of its own, and what a `cp -r` of one would copy are
+        # the files beneath it, which is exactly what `snap_descendants` records.
+        ids: set = set()
+        by_size: Dict[int, list] = {}
+        for rel in (*snap_ignored, *snap_descendants):
+            if rel.endswith("/"):
+                continue
+            try:
+                st = os.lstat(os.path.join(cwd, rel))
+            except OSError:
+                continue          # gone or unreadable — the MISSING flag's business
+            if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+                continue
+            ids.add((st.st_dev, st.st_ino))
+            by_size.setdefault(st.st_size, []).append(rel)
+        if not by_size:
+            return []
+        hits: set = set()
+        pairs: list = []
+        to_hash: set = set()
+        for rel in _drop_unchanged_untracked(candidates, snap_untracked or {},
+                                             cwd):
+            try:
+                st = os.lstat(os.path.join(cwd, rel))
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_size == 0:
+                continue
+            if (st.st_dev, st.st_ino) in ids:
+                hits.add(rel)     # the same inode IS the file — nothing to read
+                continue
+            same_size = by_size.get(st.st_size)
+            if same_size:
+                pairs.append((rel, same_size))
+                to_hash.add(rel)
+                to_hash.update(same_size)
+        if pairs:
+            if len(to_hash) > _IGNORED_COPY_HASH_CAP:
+                return None
+            shas = _hash_worktree_files(cwd, sorted(to_hash))
+            if shas is None:
+                return None
+            for rel, same_size in pairs:
+                sha = shas.get(rel)
+                if sha is not None and any(shas.get(s) == sha
+                                           for s in same_size):
+                    hits.add(rel)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    return sorted(hits)
 
 
 def _coverage_removed(patch: str) -> bool:
@@ -2337,11 +2509,22 @@ def apply_fix(
     no record names out of a source nothing enumerates, with no rule touched to
     give it away. This is the same signal the FAILURE path already halts the
     round on (:func:`restore_worktree`), and the success path is where the file
-    would actually ship, so the two are held to one standard.
-    When either check cannot be RUN at all the attempt is
+    would actually ship, so the two are held to one standard. An attempt that
+    COPIED one is refused a fourth time and on the same terms
+    (:func:`_ignored_copies`): a ``cp`` leaves its source in place, so the check
+    above finds nothing missing, and the destination's only tie to the file is
+    its BYTES — which is what makes it the one shape here with a path list of
+    its own to name.
+    When any of these checks cannot be RUN at all the attempt is
     rolled back too, as ``transient-failed`` (an evaluation that did not happen,
     not a verdict on the patch) — treating an unanswerable question as an
-    all-clear is what would let the exposure ship.
+    all-clear is what would let the exposure ship. An ignore state that was
+    never captured (both the snapshot and the cheap :func:`ignored_roots` retry
+    failed) is the widest form of that same unanswered question, and gets the
+    same disposition: every gate above is keyed on the snapshot's record, so
+    without one they all answer blank, while :func:`_attempt_diff` has meanwhile
+    withheld BOTH halves of the attempt's new content — leaving nothing for the
+    tripwire or the verifier to judge a fixer-created file by.
 
     A fix-verify REJECT whose rollback is PROVABLY clean is not immediately
     terminal: ``BUDDHI_VERIFY_REJECT_RETRIES`` (default 1) re-dispatches the SAME
@@ -2364,8 +2547,11 @@ def apply_fix(
     # is the very verdict this set exists to override. When even this cheap
     # retry fails the answer is None, and None is passed through as UNKNOWN
     # rather than read as "nothing was ignored": `_attempt_diff` then drops the
-    # untracked appendix and forces the verify pass instead of emitting one
-    # built on rules the attempt may have rewritten.
+    # untracked appendix (and the tracked patch's added side) instead of
+    # emitting one built on rules the attempt may have rewritten, and the
+    # attempt is rolled back rather than applied on the strength of a text those
+    # two withholdings have emptied of every file the fixer created
+    # (`exposure_unknown` below).
     snap_ignored = snap[2] if snap is not None else ignored_roots(cwd)
     # The files the collapsed roots stand in for, captured at the same moment
     # and for the same reason: a root that survives losing one child is no
@@ -2593,10 +2779,11 @@ def apply_fix(
             # that rule leaves a file created under it mid-attempt — by the
             # developer's editor, a dev server, a hook — belonging to no record
             # at all and riding ``git add -A`` into the customer's PR. Asked only
-            # where there is a recorded ignore state to have been taken under:
-            # an UNKNOWN one already withholds the whole diff and degrades by
-            # design (a git failure must not turn every fix into a refusal), and
-            # a rule change measured against no baseline is not a verdict.
+            # where there is a recorded ignore state to have been taken under —
+            # a rule change measured against no baseline is not a verdict. That
+            # is a statement about THIS check, not a pass for the unknown state:
+            # it has its own refusal below (`exposure_unknown`), on the ground
+            # that the same missing baseline blanks every gate here at once.
             stripped = (_ignore_coverage_stripped(cwd, ref, snap_untracked)
                         if snap_ignored is not None else False)
             # …and the same refusal again for the third shape, which is the one
@@ -2624,19 +2811,48 @@ def apply_fix(
             moved = (snap_ignored is not None
                      and _ignored_paths_missing(cwd, snap_ignored,
                                                 snap_descendants or frozenset()))
+            # …and the fourth shape: the move's twin that leaves its source in
+            # place. `cp .env notes.txt` removes nothing, so `moved` stays down;
+            # it touches no rule, so `stripped` does; and its destination is a
+            # name no record holds, so `exposure` cannot name it either. What it
+            # DOES share with the file is the bytes, which is what
+            # :func:`_ignored_copies` matches — and what ``commit_push``'s
+            # repo-wide ``git add -A`` would otherwise put in the customer's PR.
+            # Refused rather than verified for the reason the whole gate gives:
+            # the prompt withholds exactly those paths, so the verifier would be
+            # judging a diff scrubbed of the only change that mattered.
+            copies = _ignored_copies(cwd, ref, snap_ignored,
+                                     snap_descendants or frozenset(),
+                                     snap_untracked)
             # None is "the check could not be RUN" — a git failure, not a verdict.
             # It must not read as the empty list's all-clear: the exposure it
             # would have found is invisible everywhere else, so the attempt is
             # rolled back below rather than applied on an unanswered question.
             exposed = exposure or []
-            exposure_unknown = exposure is None or stripped is None
+            copied = copies or []
+            # …and an UNKNOWN ignore state is the widest unanswered question of
+            # the four, not an exemption from them. Every gate above measures
+            # the attempt against the snapshot's record, so with no record they
+            # all answer with a blank ([] / False) indistinguishable from an
+            # all-clear — while :func:`_attempt_diff` has meanwhile withheld
+            # BOTH halves of the attempt's new content (the untracked appendix
+            # AND the tracked patch's added side, which is every way a new file
+            # can reach this text). A file the fixer created is then invisible
+            # to the tripwire, never offered to `deterministic_unicode_cleanup`,
+            # and withheld from the verify prompt that the forced pass would ask
+            # to CONFIRM it — after which ``commit_push``'s repo-wide
+            # ``git add -A`` commits and pushes it. Withholding content that can
+            # still ship is paired with a refusal in every other state here; a
+            # missing ignore record is no reason to make this the exception.
+            exposure_unknown = (snap_ignored is None or exposure is None
+                                or stripped is None or copies is None)
             # A guided retry FORCES the verify pass: the retry exists BECAUSE the
             # verify pass rejected the previous attempt, so a corrected fix never
             # ships unverified even when the auto gate would not have selected its
             # diff. This is NOT a tripwire — the ⚠ alarm below stays scoped to ``trip``.
             run_verify = (
                 verify_runner is not None and not exposed and not stripped
-                and not moved
+                and not moved and not copied
                 and not exposure_unknown   # about to roll back — spend no model call
                 and (guided_active
                      or should_verify(verify_mode, diff, tripwired=bool(trip),
@@ -2661,7 +2877,8 @@ def apply_fix(
                                + prompt_diff)
                 prompt_diff = _cap_utf8_diff(prompt_diff, _ATTEMPT_DIFF_MAX_BYTES)
             if exposure_unknown:
-                # The exposure gate could not be RUN (git failed or timed out),
+                # The exposure gate could not be RUN (git failed or timed out,
+                # or the ignore state it measures against was never captured),
                 # and no answer is not the same as nothing to report: the very
                 # attempt this gate refuses — a force-staged `.env`, a deleted
                 # rule — shows up NOWHERE else, the diff scan having only marked
@@ -2671,10 +2888,21 @@ def apply_fix(
                 # than reject: nothing judged the PATCH here, so there is no
                 # verdict to report — only an evaluation that did not happen,
                 # which is the disposition BLOCKED already gets above.
+                #
+                # Which of the two produced the None is carried into the detail:
+                # "the check fell over" and "there was nothing to check against"
+                # are different things to hand a human, and the second one also
+                # means the diff they are looking at is missing every file the
+                # attempt created.
+                unknown_why = (
+                    "the ignore state itself was never captured, so the "
+                    "attempt's new files are withheld from the diff too"
+                    if snap_ignored is None
+                    else "the check could not be run")
                 _status_line(
                     "✗",
                     "could not check the attempt for ignored-path exposure "
-                    "— rolling back",
+                    f"({unknown_why}) — rolling back",
                     colour=_YELLOW,
                 )
                 trustworthy = _restore_or_degrade(
@@ -2682,7 +2910,7 @@ def apply_fix(
                 return FixOutcome(
                     status="transient-failed",
                     detail="could not determine whether the attempt exposed "
-                           "previously-ignored path(s)"
+                           f"previously-ignored path(s) — {unknown_why}"
                     + (f" (tripwire: {trip})" if trip else "")
                     + ("" if snap is not None and trustworthy
                        else (" — no snapshot; the attempt's edits may remain"
@@ -2692,7 +2920,7 @@ def apply_fix(
                     attempts=total_attempts + attempt,
                     rollback_failed=not trustworthy or snap is None,
                 )
-            if exposed or stripped or moved:
+            if exposed or stripped or moved or copied:
                 # TERMINAL, and never guided-retried: the objection is not a
                 # defect in the patch the fixer could correct — the attempt tore
                 # a hole in the user's ignore rules, and re-dispatching the same
@@ -2708,11 +2936,19 @@ def apply_fix(
                 # definition no record names. A MISSING recorded ignored path
                 # (:func:`_ignored_paths_missing`) is the same again, and without
                 # even a rule change to point at: the destination of a move is a
-                # name nothing on either list can hold.
+                # name nothing on either list can hold. A COPY
+                # (:func:`_ignored_copies`) is that same destination with the
+                # source still in place, so it is the one shape with a path list
+                # of its own to report.
                 if exposed:
                     shown = (", ".join(exposed[:3])
                              + ("…" if len(exposed) > 3 else ""))
                     what = f"exposed previously-ignored path(s): {shown}"
+                elif copied:
+                    shown = (", ".join(copied[:3])
+                             + ("…" if len(copied) > 3 else ""))
+                    what = ("copied a previously-ignored file's contents to "
+                            f"un-ignored path(s): {shown}")
                 elif stripped:
                     what = "removed ignore-rule coverage it was snapshotted under"
                 else:
@@ -2901,6 +3137,13 @@ def _attempt_diff(cwd: str, tracked_ref: str,
     a child (:func:`sealed_descendants`); without it the source of such a move
     goes missing from nothing the record names.
 
+    A COPY is the same exposure with the source left standing — `cp .env
+    notes.txt` moves nothing, so the missing-source flag never rises — and it is
+    caught by CONTENT instead (:func:`_ignored_copies`): a shared inode, or a
+    hash equal to a recorded ignored file's. Those destinations are named, so
+    they are withheld by NAME rather than by dropping the appendix whole, and
+    the rest of the attempt's work still reaches the tripwire.
+
     Neither the filter nor its absence is ever SILENT. A dropped path is by
     construction one the ATTEMPT un-ignored (the enumeration lists only paths
     git does NOT ignore right now), and on the SUCCESS path nothing puts those
@@ -2918,7 +3161,12 @@ def _attempt_diff(cwd: str, tracked_ref: str,
     purpose: nothing already in the ref can be an ignored file, so the
     modification hunks are provably safe, and they are the text the dangerous-
     change tripwire reads — a blanket withholding would disarm it in exactly the
-    state where git is already misbehaving.
+    state where git is already misbehaving. Those two withholdings together are
+    also why that state is not merely a forced verify pass at the call site: no
+    file the attempt CREATED survives into this text, so there is nothing for
+    the tripwire or the verifier to judge one by, and :func:`apply_fix` rolls
+    the attempt back on the unknown state instead of applying it (the same
+    ``transient-failed`` its other unanswerable checks get).
 
     Returns (diff_text, scan_truncated): `scan_truncated` is True when a scan
     ceiling clipped or dropped content, the untracked files (or the tracked
@@ -2954,6 +3202,8 @@ def _attempt_diff(cwd: str, tracked_ref: str,
                              snap_descendants or frozenset()))
         args = [*_DIFF_HEADER_FLAGS, "diff", "--no-ext-diff", tracked_ref]
         withheld: list = []
+        copied: set = set()
+        copy_unknown = False
         if was_ignored is not None:
             # The untracked appendix below is not the only way in. `git diff
             # <ref>` reports every path the INDEX holds, so an attempt that ran
@@ -2971,6 +3221,34 @@ def _attempt_diff(cwd: str, tracked_ref: str,
                 # unknown-ignore-state branch below gives, for the same reason.
                 return "", True
             withheld += staged_ignored
+            if not ignored_moved:
+                # …and the paths that carry a recorded ignored file's CONTENT
+                # under a name no record holds. A `cp .env notes.txt` leaves
+                # every source in place, so the flag above stays down while the
+                # copy's bytes sit in BOTH halves of this text
+                # (:func:`_ignored_copies`). Named exactly rather than withheld
+                # wholesale, the way a MOVE has to be: a copy's destination is a
+                # path this check can point at, so the rest of the attempt's
+                # work still reaches the tripwire and the verify prompt. Skipped
+                # entirely once `ignored_moved` is up — that branch already
+                # withholds the whole appendix and the whole added side, which
+                # is every place a copy could show.
+                copies = _ignored_copies(cwd, tracked_ref, snap_ignored,
+                                         snap_descendants or frozenset(),
+                                         snap_untracked)
+                if copies is None:
+                    # The comparison could not be RUN, which is not the empty
+                    # list's all-clear: no untracked path can be shown NOT to be
+                    # a copy, so the appendix is dropped whole below and the
+                    # verify pass forced. Scoped to the appendix on purpose — the
+                    # modification hunks stay, for the reason the docstring gives
+                    # about the branch below, and the refusal this state actually
+                    # needs is :func:`apply_fix`'s, which rolls the attempt back
+                    # on the same None rather than shipping it.
+                    copy_unknown = True
+                else:
+                    withheld += copies
+                    copied = set(copies)
         if was_ignored is None or ignored_moved:
             # Two states in which the path-matched filter above cannot reach the
             # exposure: the ignore record is UNKNOWN, so there is no verdict to
@@ -3002,7 +3280,10 @@ def _attempt_diff(cwd: str, tracked_ref: str,
         # ``commit_push``'s ``git add -A`` commits it — so the drop fails closed
         # exactly as the appendix's does, forcing the verify pass rather than
         # reporting a diff that no longer matches what the round would commit.
-        truncated = bool(withheld)
+        # …and `copy_unknown` for the same reason with nothing to point at: an
+        # unanswered copy check leaves the appendix below unprovable, so the
+        # short diff must not read as a clean one even when it withheld nothing.
+        truncated = bool(withheld) or copy_unknown
         total = len(tracked.encode('utf-8'))
         if total > _SCAN_DIFF_MAX_BYTES:
             tracked = (tracked.encode('utf-8')[:_SCAN_DIFF_MAX_BYTES]
@@ -3030,8 +3311,11 @@ def _attempt_diff(cwd: str, tracked_ref: str,
                 # dropped chunk, not silently open.
                 return "".join(parts), True
             names = [p for p in u.stdout.split("\0") if p]
-            kept = [n for n in names if not was_ignored(n)]
-            if kept and ignored_moved:
+            # `copied` is un-ignored by NAME — that is what makes it reachable
+            # here at all — so the matcher above cannot drop it; its bytes are
+            # one of the user's ignored files' (:func:`_ignored_copies`).
+            kept = [n for n in names if not was_ignored(n) and n not in copied]
+            if kept and (ignored_moved or copy_unknown):
                 # A recorded ignored path is missing, so ANY of these may be its
                 # renamed contents — the destination of a move matches neither
                 # the snapshot's untracked map nor its ignored record, which is

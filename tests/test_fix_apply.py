@@ -1294,8 +1294,11 @@ def test_apply_fix_fails_closed_when_the_ignore_state_cannot_be_read(repo,
                                                                      monkeypatch):
     # End-to-end on the degraded path both halves die on: `ls-files --ignored`
     # fails, so snapshot_worktree AND the cheap ignored_roots retry both return
-    # None. The fix still proceeds (a degrade, not a refusal) but the verify pass
-    # is FORCED and the secret never reaches the model's prompt.
+    # None. The attempt is ROLLED BACK rather than applied — with no record to
+    # measure against, every ignored-path gate answers blank while the leak
+    # filter withholds both halves of the attempt's new content, so there is
+    # nothing left for a verify pass to judge. The secret never reaches a model
+    # because no model call is spent at all.
     _ignored_repo(repo, ".env\n", ".env", _SECRET)
     real = fix_apply._git
 
@@ -1320,9 +1323,11 @@ def test_apply_fix_fails_closed_when_the_ignore_state_cannot_be_read(repo,
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
                     verify_runner=verify, verify_mode="off")
-    assert out.status == "applied"
-    assert len(verify_calls) == 1                        # forced, not selected
-    assert _SECRET_BYTES not in verify_calls[0]
+    assert out.status == "transient-failed"
+    assert verify_calls == []                  # nothing judged it — none was spent
+    assert "ignore state itself was never captured" in out.detail
+    # No snapshot ⇒ no rollback happened ⇒ the round driver halts before the push.
+    assert out.rollback_failed
     assert _SECRET_BYTES not in out.diff
     assert "the real fix" in out.diff                    # the tracked diff survives
 
@@ -1514,6 +1519,75 @@ def test_sealed_descendants_abandons_a_root_too_large_to_walk(repo):
     assert fix_apply._ignored_paths_missing(str(repo), snap[2], snap[3])
 
 
+def test_sealed_descendants_walk_budget_is_shared_out_per_root(repo, monkeypatch):
+    # The starvation the test above does NOT reach: it stays under the CAP's
+    # budget cost, so a single shared pool would still have covered `secrets/`.
+    # Squeeze the walk budget instead and the roots compete for it directly —
+    # `node_modules/` sorts first and, drained from one counter, would leave
+    # `secrets/` unwalked and its files unrecorded, which is a move out of the
+    # one root the whole record exists for going unnoticed.
+    monkeypatch.setattr(fix_apply, "_SEALED_WALK_BUDGET", 8)
+    _ignored_repo(repo, "node_modules/\nsecrets/\n", "secrets/prod.env", _SECRET)
+    (repo / "secrets" / "other.env").write_text("B=2\n")
+    for i in range(12):                       # comfortably past the whole budget
+        p = repo / "node_modules" / f"pkg{i}"
+        p.mkdir(parents=True, exist_ok=True)
+        (p / "index.js").write_text("1\n")
+
+    snap = snapshot_worktree(str(repo))
+    assert "node_modules/" in snap[2] and "secrets/" in snap[2]
+    assert not any(p.startswith("node_modules/") for p in snap[3])   # abandoned
+    assert snap[3] == frozenset({"secrets/prod.env", "secrets/other.env"})
+    # …and the share bought a real detection, not just an entry in a set.
+    (repo / "secrets" / "prod.env").rename(repo / "notes.txt")
+    assert fix_apply._ignored_paths_missing(str(repo), snap[2], snap[3])
+
+
+def test_sealed_descendants_gives_a_lone_root_the_whole_budget(repo, monkeypatch):
+    # The control on the share: dividing per root must not shrink what the
+    # ordinary single-root case may walk, and an unspent share carries forward.
+    monkeypatch.setattr(fix_apply, "_SEALED_WALK_BUDGET", 8)
+    _ignored_repo(repo, "secrets/\n", "secrets/prod.env", _SECRET)
+    for i in range(6):
+        (repo / "secrets" / f"k{i}.env").write_text(f"K{i}=1\n")
+
+    snap = snapshot_worktree(str(repo))
+    assert len(snap[3]) == 7                  # 7 entries out of a budget of 8
+
+
+def test_sealed_descendants_records_a_directory_symlink(repo):
+    # `os.walk` files a symlink to a directory under `dirnames` and never
+    # follows it, so nothing beneath it is ever recorded — which leaves the link
+    # itself the only path there is to record, and a filenames-only loop
+    # recording nothing at all.
+    _sealed_repo(repo)
+    (repo / "secrets" / "data").mkdir()
+    (repo / "secrets" / "data" / "deep.env").write_text("C=3\n")
+    os.symlink("data", repo / "secrets" / "link")
+
+    snap = snapshot_worktree(str(repo))
+    assert snap[2] == frozenset({"secrets/"})           # still one sealed root
+    assert "secrets/link" in snap[3]
+    assert "secrets/data/deep.env" in snap[3]           # …and the walk still descends
+    assert "secrets/data" not in snap[3]                # a REAL directory is not recorded
+
+
+def test_ignored_paths_missing_flags_a_directory_symlink_moved_out(repo):
+    # What recording the link is for: renaming it to an un-ignored name leaves
+    # the root standing (its other children are untouched), so without the link
+    # in the record nothing is missing — and the rollback deletes the
+    # destination as a leftover while reporting itself clean.
+    _sealed_repo(repo)
+    (repo / "secrets" / "data").mkdir()
+    (repo / "secrets" / "data" / "deep.env").write_text("C=3\n")
+    os.symlink("data", repo / "secrets" / "link")
+    snap = snapshot_worktree(str(repo))
+    assert not fix_apply._ignored_paths_missing(str(repo), snap[2], snap[3])
+
+    (repo / "secrets" / "link").rename(repo / "notes")
+    assert fix_apply._ignored_paths_missing(str(repo), snap[2], snap[3])
+
+
 def test_attempt_diff_withholds_a_file_moved_out_of_a_sealed_root(repo):
     # The success-path half: `notes.txt` is untracked and un-ignored, so the
     # appendix would diff it against /dev/null and hand the whole secret to the
@@ -1600,6 +1674,171 @@ def test_apply_fix_never_shows_a_verifier_a_file_moved_out_of_a_sealed_root(repo
     # The destination is the only copy left, so the rollback declines to remove
     # it and says so — the round driver halts before the push on that False.
     assert out.rollback_failed
+
+
+# ---------------------------------------------------------------------------
+# The COPY: a move that leaves its source in place
+# ---------------------------------------------------------------------------
+
+def test_ignored_copies_names_a_copy_of_an_ignored_file(repo):
+    # `cp .env notes.txt` removes nothing, so the missing-SOURCE flag stays
+    # down; `notes.txt` is on no record, so the path-matched gates stay down
+    # too. The bytes are the only tie left.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    shutil.copy(repo / ".env", repo / "notes.txt")
+
+    assert not fix_apply._ignored_paths_missing(str(repo), snap[2], snap[3])
+    assert fix_apply._unignored_exposures(str(repo), snap[0], snap[2]) == []
+    assert fix_apply._ignored_copies(str(repo), snap[0], snap[2], snap[3],
+                                     snap[1]) == ["notes.txt"]
+
+
+def test_ignored_copies_names_a_hardlink_to_an_ignored_file(repo):
+    # The same exposure without a read: a hardlink IS the file, one inode under
+    # two names, one of which git no longer ignores.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    os.link(repo / ".env", repo / "notes.txt")
+
+    assert fix_apply._ignored_copies(str(repo), snap[0], snap[2], snap[3],
+                                     snap[1]) == ["notes.txt"]
+
+
+def test_ignored_copies_names_a_copy_out_of_a_sealed_root(repo):
+    # The collapsed-root case, which needs the recorded descendants: `secrets/`
+    # is one entry and holds no bytes of its own, so the files beneath it are
+    # the only sources there are to compare against.
+    secret = _sealed_repo(repo)
+    snap = snapshot_worktree(str(repo))
+    shutil.copy(secret, repo / "notes.txt")
+
+    assert fix_apply._ignored_copies(str(repo), snap[0], snap[2], snap[3],
+                                     snap[1]) == ["notes.txt"]
+    assert fix_apply._ignored_copies(str(repo), snap[0], snap[2]) == []  # w/o them
+
+
+def test_ignored_copies_ignores_the_attempts_own_new_files(repo):
+    # The control that keeps this from firing on every fix: an ordinary new file
+    # is not a copy of anything, and an EMPTY one is not a leak however many
+    # empty files it matches the size of.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    (repo / "empty.ignored").write_text("")
+    snap = snapshot_worktree(str(repo))
+    (repo / "new.py").write_text("the real fix\n")
+    (repo / "also-empty.txt").write_text("")
+
+    assert fix_apply._ignored_copies(str(repo), snap[0], snap[2], snap[3],
+                                     snap[1]) == []
+
+
+def test_ignored_copies_ignores_a_copy_the_user_made_themselves(repo):
+    # The usability floor: a duplicate the user left in their own worktree
+    # BEFORE the run is byte-identical on every attempt. Reading it as the
+    # attempt's doing would reject every fix in the repo, forever.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    (repo / "notes.txt").write_text(_SECRET)       # theirs, and already there
+    snap = snapshot_worktree(str(repo))
+
+    assert fix_apply._ignored_copies(str(repo), snap[0], snap[2], snap[3],
+                                     snap[1]) == []
+
+
+def test_attempt_diff_withholds_a_copy_of_an_ignored_file(repo):
+    # The leak: `notes.txt` is untracked and un-ignored, so the appendix would
+    # diff it against /dev/null and hand the whole secret to the verify prompt.
+    # Withheld by NAME — the attempt's own work still rides the diff, unlike the
+    # MOVE case, where the destination cannot be named at all.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    shutil.copy(repo / ".env", repo / "notes.txt")
+    (repo / "tracked.py").write_text("the real fix\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1],
+                                              snap[2], snap[3])
+    assert _SECRET_BYTES not in diff
+    assert "+++ b/notes.txt" not in diff
+    assert "the real fix" in diff              # the attempt's own change rides
+    assert truncated                           # withheld content ⇒ FORCED verify
+
+
+def test_attempt_diff_leaks_a_copy_without_the_content_check(repo, monkeypatch):
+    # The control, and the reason the assertion above means anything: judged on
+    # PATHS alone — every gate this file had before the content check — the same
+    # fixture puts the secret's bytes straight into the text the verify prompt
+    # sends to a model. This pins the reproduction, NOT a behaviour anyone wants.
+    monkeypatch.setattr(fix_apply, "_ignored_copies",
+                        lambda *a, **k: [])
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    shutil.copy(repo / ".env", repo / "notes.txt")
+
+    diff, _ = fix_apply._attempt_diff(str(repo), snap[0], snap[1], snap[2],
+                                      snap[3])
+    assert _SECRET_BYTES in diff
+
+
+def test_attempt_diff_fails_closed_when_the_copy_check_cannot_run(repo,
+                                                                  monkeypatch):
+    # None is "the comparison could not be RUN", and it must not read as the
+    # empty list's all-clear: nothing untracked can be shown NOT to be a copy,
+    # so the appendix goes whole and the verify pass is forced. Scoped to the
+    # appendix — the modification hunks are the tripwire's text, and blanking
+    # them would disarm it in exactly the state where git is misbehaving.
+    monkeypatch.setattr(fix_apply, "_ignored_copies", lambda *a, **k: None)
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+    (repo / ".gitignore").write_text(".env\n# edited\n")   # a modification hunk
+    (repo / "leftover.txt").write_text("would have been appended\n")
+
+    diff, truncated = fix_apply._attempt_diff(str(repo), snap[0], snap[1],
+                                              snap[2], snap[3])
+    assert truncated
+    assert "# edited" in diff                     # the tripwire keeps its text
+    assert "would have been appended" not in diff  # …and the appendix is gone
+
+
+def test_apply_fix_rejects_an_attempt_that_copied_an_ignored_file(repo):
+    # End-to-end, with the fixer doing the copying. REFUSED rather than
+    # verified: the prompt withholds the destination's bytes, so a CONFIRM would
+    # be a verdict taken without seeing the one change that mattered — and an
+    # "applied" hands `notes.txt` to commit_push's repo-wide `git add -A`.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    verify_calls = []
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        shutil.copy(repo / ".env", repo / "notes.txt")
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=verify, verify_mode="off")
+    assert out.status == "rejected"
+    assert "copied a previously-ignored file" in out.detail
+    assert verify_calls == []                   # no model call on a doomed attempt
+    assert _SECRET_BYTES not in out.diff
+    assert not (repo / "notes.txt").exists()    # rolled back off the worktree
+    assert (repo / ".env").read_text() == _SECRET
+
+
+def test_apply_fix_applies_an_ordinary_fix_beside_an_ignored_file(repo):
+    # The control the rejection needs: with an ignored `.env` sitting there
+    # untouched, an ordinary fix still applies. Without this, refusing every
+    # attempt would pass the test above.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=None, verify_mode="off")
+    assert out.status == "applied"
+    assert (repo / "tracked.py").read_text() == "the real fix\n"
 
 
 def test_restore_reads_a_snapshot_with_no_descendant_member(repo):
@@ -1762,7 +2001,10 @@ def test_attempt_diff_unknown_state_still_carries_a_dangerous_modification(repo)
 def test_apply_fix_unknown_ignore_state_never_verifies_a_staged_secret(repo,
                                                                        monkeypatch):
     # End-to-end on the degraded path both ignore-state reads die on, with the
-    # fixer force-staging the secret past its rule.
+    # fixer force-staging the secret past its rule. Nothing here can NAME the
+    # exposure — with no record, `_unignored_exposures` has nothing to match
+    # against — so the refusal rests on the unknown state itself, and the
+    # staged secret is never verified because no verify pass runs.
     _ignored_repo(repo, ".env\n", ".env", _SECRET)
     real = fix_apply._git
 
@@ -1787,10 +2029,60 @@ def test_apply_fix_unknown_ignore_state_never_verifies_a_staged_secret(repo,
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
                     verify_runner=verify, verify_mode="off")
-    assert len(verify_calls) == 1                   # forced, not selected
-    assert _SECRET_BYTES not in verify_calls[0]
+    assert out.status == "transient-failed"
+    assert verify_calls == []                       # never asked, never confirmed
     assert _SECRET_BYTES not in out.diff
     assert "the real fix" in out.diff
+
+
+def test_apply_fix_unknown_ignore_state_refuses_a_file_it_cannot_show(repo,
+                                                                      monkeypatch):
+    # The other half of the same hole, and the one with no secret in it at all:
+    # a file the FIXER created. Both withholdings apply (no appendix, no added
+    # side), so `helper.py` reaches neither the tripwire nor the verify prompt —
+    # and applying would hand it straight to ``commit_push``'s repo-wide
+    # ``git add -A``. The attempt is refused instead of CONFIRMed blind.
+    real = fix_apply._git
+
+    def fail_ignored(cwd, *args, **kwargs):
+        if "--ignored" in args:
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_ignored)
+    verify_calls = []
+
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "helper.py").write_text(
+            "CLAUDE_MCP_ISOLATION_FLAGS = ('--dangerously-skip-permissions',)\n")
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    def verify(prompt):
+        verify_calls.append(prompt)
+        return '{"verdict": "CONFIRM", "reason": "ok"}'
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
+                    verify_runner=verify, verify_mode="off")
+    assert out.status == "transient-failed"
+    assert verify_calls == []
+    # The file really was invisible to both — that is WHY this refuses.
+    assert "CLAUDE_MCP_ISOLATION_FLAGS" not in out.diff
+    assert "new files are withheld from the diff too" in out.detail
+
+
+def test_apply_fix_empty_ignored_set_is_not_read_as_an_unknown_state(repo):
+    # The boundary the refusal must not cross, at the apply_fix level: a repo
+    # git says ignores NOTHING yields frozenset(), a real answer. Reading that
+    # as "unknown" would refuse every fix in every repo without a .gitignore.
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "helper.py").write_text("HELPER = 1\n")
+        (repo / "tracked.py").write_text("the real fix\n")
+        return 0, "done"
+
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
+    assert out.status == "applied"
+    assert "HELPER = 1" in out.diff          # the appendix rides, unfiltered
 
 
 # --- an exposure check that could not RUN is not an all-clear --------------
@@ -2081,12 +2373,14 @@ def test_apply_fix_still_applies_a_fix_that_only_ADDS_an_ignore_rule(repo):
     assert (repo / ".gitignore").read_text() == ".env*\nbuild/\n"
 
 
-def test_apply_fix_unknown_ignore_state_still_degrades_on_a_stripped_rule(repo,
-                                                                          monkeypatch):
-    # The boundary the refusal must not cross. With the ignore state UNKNOWN
-    # there is no baseline the rules can be said to have been narrowed FROM, and
-    # that path degrades by design (a git failure must not turn every fix into a
-    # refusal) — it withholds the whole appendix and FORCES the verify pass.
+def test_apply_fix_unknown_ignore_state_does_not_refuse_as_a_stripped_rule(
+        repo, monkeypatch):
+    # Which gate owns the refusal, when the attempt deletes a rule and the
+    # ignore state is UNKNOWN. Not the coverage gate: with no baseline the
+    # rules cannot be said to have been narrowed FROM anything, so it is never
+    # asked and never names a stripped rule. The unknown state refuses on its
+    # own terms instead, and the detail says so — the two must not be conflated,
+    # because they are different things for a human to go looking at.
     _rule_repo(repo)
     real = fix_apply._git
 
@@ -2109,8 +2403,10 @@ def test_apply_fix_unknown_ignore_state_still_degrades_on_a_stripped_rule(repo,
 
     out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0,
                     verify_runner=verify, verify_mode="off")
-    assert out.status == "applied"
-    assert len(verify_calls) == 1                # forced, not selected
+    assert out.status == "transient-failed"      # not the 'rejected' a rule gets
+    assert verify_calls == []
+    assert "ignore state itself was never captured" in out.detail
+    assert "removed ignore-rule coverage" not in out.detail
 
 
 def test_apply_fix_escalates_when_the_rule_check_cannot_run(repo, monkeypatch):
@@ -2426,12 +2722,29 @@ def test_apply_fix_real_snapshot_failed_restore_halts(repo, monkeypatch, capsys)
     assert "could not roll back" in capsys.readouterr().out
 
 
-def test_apply_fix_no_snapshot_clean_success_applies(tmp_path):
-    # A no-snapshot run whose fixer SUCCEEDS still applies (degrade is not refuse).
+def test_apply_fix_no_snapshot_clean_success_applies(repo, monkeypatch):
+    # A no-snapshot run whose fixer SUCCEEDS still applies (degrade is not
+    # refuse). The snapshot dies HERE on `stash create`, which says nothing
+    # about the ignore state — `ignored_roots` still answers, so every gate that
+    # refuses an unanswerable question has its baseline. That split is the whole
+    # point of factoring `ignored_roots` out; the case where even it fails is
+    # `test_apply_fix_fails_closed_when_the_ignore_state_cannot_be_read`, and
+    # that one refuses.
+    real = fix_apply._git
+
+    def fail_stash(cwd, *args, **kwargs):
+        if "stash" in args:
+            return subprocess.CompletedProcess(args, 1, "", "boom")
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(fix_apply, "_git", fail_stash)
+    assert snapshot_worktree(str(repo)) is None
+    assert fix_apply.ignored_roots(str(repo)) is not None
+
     def fixer(prompt, *, model, effort, timeout, cwd):
-        (tmp_path / "note.txt").write_text("done\n")
+        (repo / "note.txt").write_text("done\n")
         return 0, "ok"
-    out = apply_fix("claim", cwd=str(tmp_path), runner=fixer, retries=0)
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
     assert out.status == "applied" and out.rollback_failed is False
 
 
