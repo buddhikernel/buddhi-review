@@ -641,14 +641,17 @@ def _ignored_paths_missing(cwd: str, ignored: FrozenSet[str],
     source being already gone) and its CONTENTS ride the attempt diff into a
     model's prompt.
 
-    So the missing source raises the flag, and its callers stop treating an
-    un-ignored path as PROVABLY the attempt's own for the rest of that pass. A
-    genuinely DELETED ignored file raises it too — nothing distinguishes a delete
-    from a move once the source is gone — and that conflation is not cheap. On
-    the FAILURE path the removal pass declines to judge, so
-    :func:`restore_worktree` reports itself unclean, the round driver HALTS
-    before the push, and the attempt's genuine leftovers stay in the shared
-    worktree for the next comment's attempt to inherit. On the SUCCESS path
+    So the missing source raises the flag, and its callers stop treating any
+    un-ignored path as PROVABLY the attempt's own. A genuinely DELETED ignored
+    file raises it too — nothing distinguishes a delete from a move once the
+    source is gone — and that conflation is not cheap. On the FAILURE path
+    :func:`restore_worktree` ABANDONS the rollback where it stands, before its
+    first write: the destination of a move can be a tracked path the checkout
+    overwrites or a recorded path the closing rewrite overwrites, neither of
+    which any deletion pass weighs, so declining only the deletions would leave
+    both overwrites live. It reports itself unclean, the round driver HALTS
+    before the push, and the attempt's leftovers stay in the shared worktree for
+    the next comment's attempt to inherit. On the SUCCESS path
     :func:`apply_fix` REJECTS the attempt outright. A fixer that runs the
     project's build or test suite pays that whenever a recorded artifact is
     removed and not recreated — a ``make clean``, a `.pytest_cache/` entry a
@@ -658,16 +661,18 @@ def _ignored_paths_missing(cwd: str, ignored: FrozenSet[str],
     Deliberately NOT narrowed all the same, there being no sound way to. "Count
     only a vanished FILE entry" changes nothing: a root small enough to have
     recorded descendants loses those FILES too when it is cleaned, and one too
-    large recorded none to lose. "Count it only where an un-ignored candidate
-    exists" is already how the removal pass reads the flag — a pass with nothing
-    doomed never consults it — and carrying that test to the success path would
-    have to treat every path the attempt touched as a possible destination, since
-    a move can overwrite a TRACKED file as readily as create an untracked one,
-    which is every successful fix there is. Content-matching the destination
-    (hashing the recorded ignored files at snapshot time) is the one test that
-    would genuinely separate the two, and a single appended byte defeats it. So
-    the flag stays blunt, and its cost is paid where the alternative is a
-    destroyed ``.env`` or a leaked secret.
+    large recorded none to lose. "Count it only where an un-ignored candidate to
+    be deleted exists" is the narrowing the rollback used to apply, and it is
+    exactly what let the destruction through: a move onto a TRACKED path or onto
+    a path the snapshot RECORDED produces no removal candidate at all, so the
+    check that read the flag was never consulted while the checkout and the
+    rewrite went on to overwrite the only copy. Widening it to every path the
+    attempt could have moved ONTO is every path a fix touches, which is every
+    successful fix there is. Content-matching the destination (hashing the
+    recorded ignored files at snapshot time) is the one test that would genuinely
+    separate a move from a delete, and a single appended byte defeats it. So the
+    flag stays blunt, and its cost is paid where the alternative is a destroyed
+    ``.env`` or a leaked secret.
 
     `descendants` (:func:`sealed_descendants`) is what the collapsed roots would
     otherwise cost this check. A root stands for every path beneath it, but it
@@ -1306,7 +1311,6 @@ def _shadows_tracked_path(ref_paths: FrozenSet[str]) -> Callable[[str], bool]:
 
 def _remove_leftovers(cwd: str, pre_untracked: Dict[str, tuple],
                       was_ignored: Callable[[str], bool],
-                      ignored_moved: bool = False,
                       only: Optional[Callable[[str], bool]] = None
                       ) -> Optional[bool]:
     """Delete the untracked paths the snapshot did not record, pruning the
@@ -1325,23 +1329,19 @@ def _remove_leftovers(cwd: str, pre_untracked: Dict[str, tuple],
     the attempt created it. General removal is left to the post-checkout call,
     which asks the user's own restored rules. See :func:`restore_worktree`.
 
-    ``ignored_moved`` (:func:`_ignored_paths_missing`) suspends the deletions
-    entirely: a recorded ignored path has gone missing, so an un-ignored path
-    here may be its renamed CONTENTS rather than the attempt's own leftover, and
-    the discriminator that would tell them apart was never captured."""
+    Deliberately carries no "a recorded ignored path went missing" flag. That
+    condition means an un-ignored path here may be the renamed CONTENTS of the
+    user's ``.env`` rather than the attempt's leftover — but it equally means the
+    CHECKOUT and the closing rewrite may be about to overwrite those contents at
+    a path no removal pass ever weighs, so it can only be answered by abandoning
+    the rollback outright, before any of the three runs. :func:`restore_worktree`
+    does exactly that and this pass is never reached with it true."""
     candidates = _removal_candidates(cwd)
     if candidates is None:
         return None
     doomed = [rel for rel in candidates
               if rel not in pre_untracked and not was_ignored(rel)
               and (only is None or only(rel))]
-    if doomed and ignored_moved:
-        # The source is ALREADY GONE, so each deletion below would destroy the
-        # only copy of the file that exists rather than merely undoing a write.
-        # Nothing on this list is provably the attempt's, so nothing on it is
-        # removed; the False marks the rollback unclean and the caller halts
-        # before the push, which is where the surviving residue is answered.
-        return False
     honoured = True
     for rel in doomed:
         full_path = os.path.join(cwd, rel)
@@ -1449,10 +1449,13 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     INDEX entry is dropped instead, which leaves the user's file on disk and
     stops the staged copy riding the next ``git add -A``. Rules ESCAPED (the
     attempt MOVED the file to an un-ignored name): the destination matches
-    nothing in either record and would be deleted as a leftover while the source
-    is already gone, so a recorded ignored path that has gone MISSING suspends
-    the removals outright (:func:`_ignored_paths_missing`) and the rollback
-    reports itself unclean.
+    nothing in either record, so a recorded ignored path that has gone MISSING
+    (:func:`_ignored_paths_missing`) ABANDONS the rollback before its first
+    write and reports it unclean. Nothing narrower reaches it — the destination
+    is deleted as a leftover only when it is a fresh un-ignored name, while a
+    rename ONTO a tracked path is overwritten by the checkout and one onto a
+    recorded untracked path by the closing rewrite, and neither of those is a
+    removal candidate any deletion-side guard can see.
 
     What is emphatically NOT the rule is "unrecorded ⇒ the attempt's own". This
     is the shared worktree the round driver reuses, and an attempt takes minutes
@@ -1462,10 +1465,12 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     exactly the class of file no rollback can put back.
 
     Returns False when the rollback could not be honoured in full — including a
-    snapshot too old to carry the ignored set, and any deletion that failed for
-    a reason other than the path already being gone. The caller turns False into
-    ``rollback_failed`` and halts before the push, so a partial rollback must
-    never be reported as a clean one."""
+    snapshot too old to carry the ignored set, a recorded ignored path gone
+    missing, and any deletion that failed for a reason other than the path
+    already being gone. The caller turns False into ``rollback_failed`` and
+    halts before the push, so a partial rollback must never be reported as a
+    clean one. A False that arrives from the ignored-path abort is stronger than
+    partial: nothing was written at all, which is what makes it safe."""
     if not snapshot:
         return False
     if len(snapshot) < 3:
@@ -1482,13 +1487,33 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
     was_ignored = _ignored_matcher(pre_ignored)
     # A recorded ignored path that is GONE need not have been deleted: the
     # attempt may have MOVED it to a name this record cannot speak for, in which
-    # case its contents are sitting under some un-ignored path the removal
-    # passes below would read as a leftover and shred. Asked once — the checkout
-    # cannot put such a path back (an ignored file is by definition not in the
-    # ref), so the answer holds for both passes. A file moved out of a SEALED
-    # root leaves the root itself standing, so the question is put to the
-    # recorded descendants too (:func:`sealed_descendants`).
-    ignored_moved = _ignored_paths_missing(cwd, pre_ignored, pre_descendants)
+    # case its contents are sitting under some un-ignored path that every step
+    # below would overwrite or shred. A file moved out of a SEALED root leaves
+    # the root itself standing, so the question is put to the recorded
+    # descendants too (:func:`sealed_descendants`).
+    if _ignored_paths_missing(cwd, pre_ignored, pre_descendants):
+        # ABORT THE WHOLE ROLLBACK — and it has to be an abort, taken HERE,
+        # rather than a flag handed to the removal passes. The destination of
+        # such a move is not reachable through the deletions alone: renamed onto
+        # a TRACKED path it is overwritten by the ``checkout`` below, and renamed
+        # onto a path the snapshot RECORDED it is overwritten by the closing
+        # :func:`_restore_untracked`. Neither destination is a removal candidate,
+        # so neither is anything a deletion-suspending flag can reach — and
+        # declining to delete while still restoring destroys the file and then
+        # returns False about it, which is the worst of both. A plain deletion
+        # with no leftover beside it slips through the same gap from the other
+        # side: nothing is doomed, so the flag is never consulted at all and a
+        # rollback taken over a broken ignore record reports itself CLEAN.
+        #
+        # Nothing has been touched yet, which is the point of the position: the
+        # worktree is left exactly as the failed attempt left it, and the False
+        # halts the round before the push (:func:`_restore_or_degrade`). The
+        # residue — the attempt's leftovers, and an ignored path it may have
+        # force-STAGED — is what that costs, and it is the cheap side of the
+        # trade: the alternative is the only copy of the user's ``.env`` gone
+        # for good. Nothing of the residue reaches the customer's PR either, the
+        # halt being before the push and the worktree being handed to a human.
+        return False
     try:
         # PASS 1, pre-checkout: ONLY what cannot wait for the honest rules —
         # a leftover shadowing a tracked path, and an untracked ``.gitignore``
@@ -1508,7 +1533,7 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
                     or (shadows is not None and shadows(rel)))
 
         honoured = _remove_leftovers(cwd, pre_untracked, was_ignored,
-                                     ignored_moved, only=must_go_first)
+                                     only=must_go_first)
         if honoured is None:
             return False
         # Neither pass above can see a path the attempt STAGED (``git add
@@ -1568,8 +1593,7 @@ def restore_worktree(cwd: str, snapshot: Optional[Snapshot]) -> bool:
         rule_files = _untracked_rule_files(pre_untracked)
         if rule_files and not _restore_untracked(cwd, rule_files):
             return False
-        second = _remove_leftovers(cwd, pre_untracked, was_ignored,
-                                   ignored_moved)
+        second = _remove_leftovers(cwd, pre_untracked, was_ignored)
         if second is not True:
             honoured = False
         if not _restore_untracked(cwd, pre_untracked):
