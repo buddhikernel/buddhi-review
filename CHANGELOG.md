@@ -21,6 +21,24 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.9.0](https://github.com/buddhikernel/buddhi-review/compare/v0.8.0...v0.9.0) (2026-08-15)
+
+
+### Features
+
+* **commit-push:** F7 — keep runner build artifacts out of the customer's PR ([#106](https://github.com/buddhikernel/buddhi-review/issues/106)) ([a175a46](https://github.com/buddhikernel/buddhi-review/commit/a175a460cfa2954ffdd97fd19b74a149b8fb4f5e))
+
+
+### Bug Fixes
+
+* **fix-apply:** P18a — rollback must never delete the user's ignored files, and their contents must never reach a model ([#107](https://github.com/buddhikernel/buddhi-review/issues/107)) ([95fbdaf](https://github.com/buddhikernel/buddhi-review/commit/95fbdaf5943ab5e323d086a4262232c5bee9b6c9))
+* **fix-apply:** P18b — a lost ignored path aborts the rollback before it writes ([#108](https://github.com/buddhikernel/buddhi-review/issues/108)) ([bf3d49c](https://github.com/buddhikernel/buddhi-review/commit/bf3d49c5f500e9fb43d7ed73b6ac12a8d1ff9bf7))
+
+
+### Documentation
+
+* clarify author-model review framing ([#104](https://github.com/buddhikernel/buddhi-review/issues/104)) ([24aaf7b](https://github.com/buddhikernel/buddhi-review/commit/24aaf7b4423290f27b28fd53077921f5ca2f5728))
+
 ## [0.8.0](https://github.com/buddhikernel/buddhi-review/compare/v0.7.0...v0.8.0) (2026-07-26)
 
 
