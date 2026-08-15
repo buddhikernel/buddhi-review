@@ -1886,6 +1886,116 @@ def test_restore_still_deletes_leftovers_when_no_ignored_path_moved(repo):
     assert (repo / ".env").read_text() == _SECRET
 
 
+# --- …and the destination is not always something a DELETION can reach ------
+# Every move above renames the secret to a FRESH un-ignored name, which is the
+# one destination the removal passes weigh at all. The rollback has two other
+# writers, and each owns a class of destination no deletion-side guard can see:
+# ``git checkout <ref> -- .`` overwrites a rename onto a TRACKED path, and the
+# closing :func:`_restore_untracked` overwrites a rename onto a path the
+# snapshot RECORDED. Suspending the deletions leaves both live — so the missing
+# source abandons the rollback before its first write instead.
+
+def test_restore_spares_an_ignored_file_renamed_onto_a_tracked_path(repo):
+    # `tracked.py` is in the ref, so it is not "other" and never a removal
+    # candidate: nothing is doomed, the deletion-side guard is never consulted,
+    # and the checkout writes the ref's bytes straight over the only copy of the
+    # secret that exists — with the rollback reporting itself CLEAN.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".env").rename(repo / "tracked.py")        # what the attempt did
+
+    assert restore_worktree(str(repo), snap) is False   # ⇒ the round halts
+    assert (repo / "tracked.py").read_text() == _SECRET  # the only copy survives
+
+
+def test_restore_spares_an_ignored_file_renamed_onto_a_recorded_untracked_path(
+        repo):
+    # The second writer, and the same blind spot: `keep.txt` IS in the snapshot's
+    # untracked map, so it is spared by the removal passes and then rewritten
+    # from the object store at the very end of the rollback — over the secret.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    (repo / "keep.txt").write_text("the user's untracked note\n")
+    snap = snapshot_worktree(str(repo))
+    assert "keep.txt" in snap[1]                        # recorded, hence rewritten
+
+    (repo / ".env").rename(repo / "keep.txt")
+
+    assert restore_worktree(str(repo), snap) is False
+    assert (repo / "keep.txt").read_text() == _SECRET   # the only copy survives
+
+
+def test_restore_reports_unclean_when_an_ignored_file_simply_vanished(repo):
+    # The same gap from the other side, and the one that hides it: with NO
+    # leftover beside it there is nothing doomed, so a deletion-side guard is
+    # never reached and a rollback taken over a broken ignore record reports
+    # itself clean. Nothing distinguishes this from a move whose destination the
+    # passes cannot see, so it is the same answer.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".env").unlink()
+
+    assert restore_worktree(str(repo), snap) is False
+
+
+def test_restore_writes_nothing_at_all_once_an_ignored_path_is_missing(repo):
+    # The abort is an EARLY RETURN, not a flag: the previous shape returned False
+    # and destroyed the secret anyway, because declining the deletions still let
+    # the checkout run. So the assertion is that the worktree is untouched — the
+    # tracked file the attempt corrupted is still corrupt, the leftover is still
+    # there, and the recorded untracked file is still as the attempt left it.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    (repo / "keep.txt").write_text("recorded\n")
+    snap = snapshot_worktree(str(repo))
+
+    (repo / ".env").rename(repo / "moved-secret.txt")
+    (repo / "tracked.py").write_text("half-applied edit\n")
+    (repo / "keep.txt").write_text("clobbered by the attempt\n")
+    (repo / "leftover.py").write_text("attempt residue\n")
+
+    assert restore_worktree(str(repo), snap) is False
+    assert (repo / "moved-secret.txt").read_text() == _SECRET
+    assert (repo / "tracked.py").read_text() == "half-applied edit\n"
+    assert (repo / "keep.txt").read_text() == "clobbered by the attempt\n"
+    assert (repo / "leftover.py").exists()
+
+
+def test_restore_spares_a_sealed_child_renamed_onto_a_tracked_path(repo):
+    # The sealed-root half of the tracked-destination case: `secrets/` survives
+    # the move (its other file is still there), so the flag is only up because
+    # the recorded DESCENDANTS notice — and the destination is a tracked path,
+    # which no deletion pass would have weighed even if one had run.
+    secret = _sealed_repo(repo)
+    snap = snapshot_worktree(str(repo))
+
+    secret.rename(repo / "tracked.py")
+
+    assert restore_worktree(str(repo), snap) is False
+    assert (repo / "tracked.py").read_text() == _SECRET
+
+
+def test_restore_still_rolls_back_a_tracked_file_while_the_ignored_set_is_intact(
+        repo):
+    # The control for all five: aborting on a MISSING ignored path must not stop
+    # the rollback from rolling back. Every recorded ignored path is where the
+    # snapshot left it, so the tracked corruption is reverted, the recorded
+    # untracked file is rewritten, the leftover goes, and the report is clean.
+    _ignored_repo(repo, ".env\n", ".env", _SECRET)
+    (repo / "keep.txt").write_text("recorded\n")
+    snap = snapshot_worktree(str(repo))
+
+    (repo / "tracked.py").write_text("half-applied edit\n")
+    (repo / "keep.txt").write_text("clobbered by the attempt\n")
+    (repo / "leftover.py").write_text("attempt residue\n")
+
+    assert restore_worktree(str(repo), snap) is True
+    assert (repo / "tracked.py").read_text() == "original\n"
+    assert (repo / "keep.txt").read_text() == "recorded\n"
+    assert not (repo / "leftover.py").exists()
+    assert (repo / ".env").read_text() == _SECRET
+
+
 def test_attempt_diff_withholds_a_renamed_ignored_file(repo):
     # The success-path half of the same defect: `notes.txt` is untracked and
     # un-ignored, so the appendix would diff it against /dev/null and hand the
@@ -2346,12 +2456,14 @@ def test_apply_fix_rejects_an_attempt_that_MOVED_an_ignored_file(repo):
     assert out.status == "rejected"
     assert "previously-ignored path" in out.detail
     assert verify_calls == []                    # no model call on a doomed attempt
-    # The tracked half rolls back, and `notes.txt` deliberately does NOT: the
-    # source is already gone, so it is the only copy of the user's bytes in
-    # existence and removing it would destroy what the refusal exists to protect.
-    # The rollback says so rather than reporting clean, and the round driver
-    # halts on that — which is what keeps `git add -A` from ever running.
-    assert (repo / "tracked.py").read_text() == "original\n"
+    # `notes.txt` survives: the source is already gone, so it is the only copy of
+    # the user's bytes in existence. Nothing else is restored EITHER — not even
+    # the tracked half — because the destination of such a move can be any path
+    # at all, including a tracked one the checkout would write straight over, and
+    # nothing in the worktree says which. So the rollback stops before its first
+    # write and reports itself unclean; the round driver halts on that, which is
+    # what keeps `git add -A` from ever running over the residue it leaves.
+    assert (repo / "tracked.py").read_text() == "the real fix\n"
     assert (repo / "notes.txt").read_text() == _SECRET
     assert out.rollback_failed
 
@@ -2490,6 +2602,17 @@ def test_restore_matches_a_non_utf8_pathname_against_the_ignored_set(repo,
         return real(cwd, *args, **kwargs)
 
     monkeypatch.setattr(fix_apply, "_git", fake)
+    # APFS refuses the byte sequence outright, so the file's EXISTENCE is
+    # modelled here alongside git's output — on a filesystem that can hold the
+    # name it is simply there (the sibling test drives that case for real).
+    # Without it the rollback would abort on a recorded ignored path that is
+    # "missing" only because this fixture could not create it, and the decode
+    # this test exists for would never be reached.
+    real_lexists = os.path.lexists
+    monkeypatch.setattr(
+        os.path, "lexists",
+        lambda p: True if p == os.path.join(str(repo), "bad-\udcff.txt")
+        else real_lexists(p))
     assert restore_worktree(str(repo), snap) is True   # matched ⇒ left alone
 
 
