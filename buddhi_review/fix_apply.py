@@ -663,10 +663,11 @@ def _ignored_paths_missing(cwd: str, ignored: FrozenSet[str],
     recorded descendants loses those FILES too when it is cleaned, and one too
     large recorded none to lose. "Count it only where an un-ignored candidate to
     be deleted exists" is the narrowing the rollback used to apply, and it is
-    exactly what let the destruction through: a move onto a TRACKED path or onto
-    a path the snapshot RECORDED produces no removal candidate at all, so the
-    check that read the flag was never consulted while the checkout and the
-    rewrite went on to overwrite the only copy. Widening it to every path the
+    exactly what let the destruction through: the flag gated the DELETIONS
+    only, so a move onto a TRACKED path was overwritten by the checkout —
+    which runs before pass 2's general verdict, pass 1 being narrowed by
+    ``only=`` — and one onto a RECORDED path by the closing rewrite, both of
+    which ran whether or not the flag had been read. Widening it to every path the
     attempt could have moved ONTO is every path a fix touches, which is every
     successful fix there is. Content-matching the destination (hashing the
     recorded ignored files at snapshot time) is the one test that would genuinely
