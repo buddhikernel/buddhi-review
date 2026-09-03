@@ -4,15 +4,19 @@ One round = summon/re-request the expected reviewers → wait a short beat for t
 triggers to register → hold the round open until **every expected bot has
 quiesced** → classify + kernel-decide + act on the round's new comments →
 commit/push the applied fixes → decide whether to run another round. The run
-ends **clean** the moment a round produces no substantive progress; a round that
-did land a substantive fix earns another review round, up to ``max_rounds``.
+ends **clean** the moment a round pushes nothing new; a round that did push a
+commit earns another review round, up to ``max_rounds``.
 
 **Termination.** Another review round is requested ONLY when the round produced
-real substantive progress — at least one ``SUBSTANTIVE`` comment whose fix
-actually landed AND changed files. A cosmetic / PR-description / outdated /
-invalid-only round — or a substantive comment the fixer skipped, or a
-substantive fix that changed nothing — is a clean finish: any applied fixes are
-committed/pushed, then the run exits clean without re-summoning anyone. When the
+a NEW COMMIT on the PR branch — ``commit_and_push`` reported ``pushed`` — or,
+with pushing off, when a ``SUBSTANTIVE`` comment's fix landed AND changed files
+in the worktree. The reviewers are then asked to look at exactly that head, and
+the head-aware merge boundary moves onto it: the code cannot tell polish from
+substance, so every commit the loop authors is reviewed before it merges, a
+COSMETIC-labelled fix included. A round whose fixes committed nothing — a
+PR-description / outdated / invalid-only round, a comment the fixer skipped, a
+fix that changed nothing on disk — is a clean finish: the run exits clean
+without re-summoning anyone. When the
 round budget is spent and the final round completed cleanly (no unanswered
 escalation, no poisoned worktree, no failed push, no operator stop), the exit
 routes through the same clean-exit gates as a naturally-clean finish rather than
@@ -1186,10 +1190,11 @@ class RoundDriver:
         #   Everything already on the PR when this run began — a prior crashed run's
         #   fixes included — is unknown-provenance ⇒ treated as SUBSTANTIVE.
         self._process_start_head: Optional[str] = None
-        # _last_substantive_head: the PR head after this run's most recent
-        #   SUBSTANTIVE push; init to _process_start_head, advanced only on a
-        #   substantive round. Every commit after it is a loop-authored cosmetic-only
-        #   fix. None (unresolvable local head) → the gate BLOCKS (fail-closed).
+        # _last_substantive_head: the PR head after this run's most recent push;
+        #   init to _process_start_head, advanced on EVERY round that pushed a new
+        #   commit — whatever label the round carried (the code cannot tell polish
+        #   from substance, so every loop-authored commit is reviewed before it
+        #   merges). None (unresolvable local head) → the gate BLOCKS (fail-closed).
         self._last_substantive_head: Optional[str] = None
         # _round_review_head: the local HEAD captured at the START of the current
         #   round == the remote head reviewers check out this round (the loop pushes
@@ -3417,19 +3422,27 @@ class RoundDriver:
             # stickiness across a restart; a PRE-fix stamp would never match.
             self._persist_polish_state()
 
-            # ── Substantive-progress gate ─────────────────────────────────────
-            # Request another review round ONLY when this round produced real
-            # substantive progress: at least one SUBSTANTIVE-labeled comment whose
-            # fix actually LANDED (final == "fixed") AND changed files. A cosmetic
-            # / PR-description / outdated / invalid-only round — or a substantive
-            # comment the fixer skipped, or a substantive fix that changed nothing
-            # — is a clean finish: the applied fixes were committed above, so exit
-            # clean without re-summoning anyone. (A verify-REJECT does NOT reach
-            # here as a clean finish: it escalated at the round-level gate above,
-            # so an unanswered/stop REJECT already handed back or stopped the run.)
-            # The file-change check reads the commit result when pushing
-            # (``pushed`` = real changes committed); with pushing off it probes
-            # the worktree directly.
+            # ── Review-progress gate ──────────────────────────────────────────
+            # Request another review round when this round put a NEW COMMIT on the
+            # PR branch (``pushed`` — a real, non-empty commit reached the remote),
+            # or — with pushing off — when a SUBSTANTIVE-labeled comment's fix
+            # LANDED (final == "fixed") AND changed files in the worktree. A round
+            # whose fixes committed nothing — PR-description / outdated /
+            # invalid-only, a comment the fixer skipped, a fix that changed nothing
+            # on disk — is a clean finish: exit clean without re-summoning anyone.
+            # (A verify-REJECT does NOT reach here as a clean finish: it escalated
+            # at the round-level gate above, so an unanswered/stop REJECT already
+            # handed back or stopped the run.)
+            #
+            # WHY THE COMMIT AND NOT THE LABEL (parity with the reference loop's
+            # 2026-09-03 re-ruling): a COSMETIC-labelled comment's fixer can write
+            # a real production edit, and the commit carries it exactly like a
+            # substantive one. Nothing on this path looks inside the commit, and
+            # the two content oracles that tried to tell polish from substance were
+            # both refuted by measurement — so the one fact read here is whether a
+            # commit happened. The cost is a verification round for some genuinely
+            # cosmetic fixes; the alternative was merging production code no
+            # reviewer had seen behind a cosmetic label.
             round_substantive = any(
                 r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
                 for r, a in zip(results, round_actions)
@@ -3448,14 +3461,24 @@ class RoundDriver:
                 and r.classification.label in _REAL_FINDING_LABELS
                 for r, a in zip(results, round_actions)
             )
-            take_substantive_round = round_substantive and (
-                committed_changes or self._worktree_has_changes())
-            if take_substantive_round:
-                # F2: this round pushed a SUBSTANTIVE fix — the head now carries
-                # commits no reviewer has seen. Advance the head-aware boundary so
-                # the gate requires a review at/after this head; only a cosmetic-only
-                # tail after it may ride an earlier reviewed head. Read from LOCAL git
-                # (None on failure → the gate blocks, fail-closed).
+            # ⚠️ KNOWN GAP (reported, not built here): a reviewer this round parked as
+            # polish-only is dropped from expected_bots(), so a COSMETIC-labelled
+            # commit from a single-reviewer fleet earns a verification round that
+            # asks nobody, and the clean exit then fails CLOSED with
+            # `[unreviewed-head]`. The reference loop offers such a head to the
+            # parked reviewer through its gate-time summon ladder, which this tree
+            # does not have.
+            take_substantive_round = committed_changes or (
+                round_substantive and self._worktree_has_changes())
+            if committed_changes:
+                # F2: this round PUSHED a commit — the head now carries a commit no
+                # reviewer has seen. Advance the head-aware boundary onto it so the
+                # gate requires a review at/after this head. The head is read from
+                # LOCAL git right here: commit_and_push pushes the local HEAD and
+                # returns 'pushed' only after that push succeeded, synchronously, so
+                # this read IS the head it pushed (None on a git failure → the gate
+                # blocks, fail-closed). Advanced on the commit alone — never on the
+                # worktree probe above, which proves no push happened.
                 self._last_substantive_head = self._local_head_sha()
             if round_no >= self.max_rounds and restart_reverify:
                 # Final round, but the restart's re-fixed pre-existing finding was never
