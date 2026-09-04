@@ -3362,7 +3362,13 @@ class RoundDriver:
             # whose whole round was non-substantive has nothing left to fix, and
             # one whose real findings were ALL dismissed on reassessment must
             # not be re-asked (it would loop against the same verdict).
+            _parked_before = (set(self.polishing), set(self.reviewed_no_change))
             self._update_polishing(actionable, results, round_actions)
+            # The reviewers THIS round parked — polish-only, or every finding
+            # dismissed. If the round goes on to push a commit they are exactly the
+            # reviewers who must be offered it (see the un-park below the push).
+            _newly_parked = (self.polishing - _parked_before[0],
+                             self.reviewed_no_change - _parked_before[1])
             self._render_round(round_no, actionable, results, expected)  # per-reviewer round summary
 
             if self.adapter.escalation.delivered:
@@ -3413,6 +3419,21 @@ class RoundDriver:
                     # Bucket C: local/remote diverged — never rebase/force-push it.
                     return self._handback("needs-human", round_no, rebase_skip=True)
                 committed_changes = (pushed == "pushed")
+                if committed_changes:
+                    # The round put a NEW COMMIT on the branch, and a reviewer whose
+                    # verdict was reached against the head this commit REPLACED has
+                    # not seen the new one. Un-park the reviewers THIS round parked
+                    # — polish-only, or every finding dismissed — so expected_bots()
+                    # re-requests them for the verification round below: that is
+                    # the offer the reference loop's gate-time ladder makes, and this
+                    # tree has no ladder. A reviewer parked by an EARLIER round that
+                    # did not push stays parked (the park's purpose — not burning
+                    # rounds re-asking about dismissed findings — is untouched), and
+                    # a round that pushed nothing parks as before. Done BEFORE the
+                    # polish stamp below, so a restart never inherits a polish verdict
+                    # for a head nobody reviewed.
+                    self.polishing -= _newly_parked[0]
+                    self.reviewed_no_change -= _newly_parked[1]
 
             # Persist this round's polish-only verdicts against the tip the loop
             # now carries — AFTER the fixes are pushed, so the stamp names the head
@@ -3461,13 +3482,11 @@ class RoundDriver:
                 and r.classification.label in _REAL_FINDING_LABELS
                 for r, a in zip(results, round_actions)
             )
-            # ⚠️ KNOWN GAP (reported, not built here): a reviewer this round parked as
-            # polish-only is dropped from expected_bots(), so a COSMETIC-labelled
-            # commit from a single-reviewer fleet earns a verification round that
-            # asks nobody, and the clean exit then fails CLOSED with
-            # `[unreviewed-head]`. The reference loop offers such a head to the
-            # parked reviewer through its gate-time summon ladder, which this tree
-            # does not have.
+            # The verification round can reach the reviewer the round parked: a
+            # pushing round un-parks its own newly-parked reviewers above, so a
+            # COSMETIC-labelled commit from a single-reviewer fleet is offered to
+            # that reviewer next round instead of the round asking nobody and the
+            # clean exit failing closed with `[unreviewed-head]`.
             take_substantive_round = committed_changes or (
                 round_substantive and self._worktree_has_changes())
             if committed_changes:
