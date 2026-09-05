@@ -279,11 +279,13 @@ def _killed_mixed_round():
 
 def test_a_polish_verdict_reached_before_the_round_pushed_does_not_survive_the_restart():
     # Round 1's polish-only verdict was reached against H0; the SAME round then pushed
-    # H0 → H1. copilot has not seen H1, so the pushing round un-parks it, no polish
-    # stamp is written for H1, and the restart at H1 re-offers copilot the head it
-    # never judged instead of skipping it on a verdict about its parent.
+    # H0 → H1. claude is still expected to verify H1, so copilot stays parked for
+    # the run — but its verdict is about H0, so NO polish stamp names it at H1: a
+    # verdict about the parent is never stamped against the child, and the restart
+    # at H1 re-derives copilot's verdict from the PR itself instead of restoring
+    # one about a head it never judged.
     driver1, gh1 = _killed_mixed_round()
-    assert "copilot" not in driver1.polishing        # un-parked: the round it judged was replaced
+    assert "copilot" in driver1.polishing            # parked: claude covers the pushed head
     assert gh1.head == "H1"                          # the fix push advanced the tip
 
     state = polish_state.read_polish_state(PR, REPO)
@@ -296,8 +298,11 @@ def test_a_polish_verdict_reached_before_the_round_pushed_does_not_survive_the_r
                                   rr_active=True, preflight=True, auto_merge=True,
                                   max_rounds=3)
     outcome = driver2.run()
-    assert "copilot" not in driver2.polishing              # nothing restored for it …
-    assert gh2.matching("requested_reviewers") != []       # … so it IS re-asked about the new head
+    assert driver2._polish_restored is False               # nothing restored from the stamp …
+    assert "copilot" in driver2.polishing                  # … its park is re-derived from its LIVE
+    #                                                        cosmetic comment at the preflight, and
+    assert gh2.matching("requested_reviewers") == []       # claude covers the new head, so copilot
+    #                                                        is not re-asked (the park rule, C1)
     assert "copilot" in driver2.reviewed_ever              # and it still counts as reviewed
     # The merge outcome: copilot's verdict was reached against H0, and the
     # killed run's fix (H1) plus the restart's re-applied fix (H2) are commits NO

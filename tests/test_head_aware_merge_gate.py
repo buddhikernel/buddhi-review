@@ -974,3 +974,134 @@ def test_the_boundary_advances_at_the_cap_too_and_the_cap_fails_closed():
     assert driver._last_substantive_head == "H1"
     assert outcome.merged is False
     assert gh.matching("gh", "merge", "--squash") == []
+
+
+# ---------------------------------------------------------------------------
+# A pushing round's park is lifted the way the reference loop's gate-time
+# ladder offers a head: only when nobody else covers it, and at most once per
+# reviewer per run. The two rows that pin it: a lone nitter (F) and a covered
+# head (G).
+# ---------------------------------------------------------------------------
+TWO_REVIEWERS = {"active_reviewers": ["claude", "copilot"],
+                 "auto_on_open": {"claude": False, "copilot": False}}
+
+_TIMES = round_driver.RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
+                                 idle_timeout=900, max_wait_total=1800, register_delay=0)
+
+
+def _fed_driver(*, gh, clock, cfg, timeline, anchors, classify, max_rounds):
+    """A RoundDriver whose fetches read a growing timeline and anchor each comment
+    at the tip current when it was first seen (the post-poll anchoring the
+    content-round harness above uses)."""
+    def fix(c, r):
+        gh.dirty = True
+        return FixOutcome(status="applied")
+
+    def fetch(pr, repo=None, cwd=None):
+        out = [c for t, c in timeline if t <= clock.t]
+        for c in out:
+            anchors.setdefault(c.id, gh.head)
+        return out
+
+    def inline_fetch(pr, repo=None, cwd=None):
+        return [_inline("copilot" if c.source.startswith("copilot") else "claude",
+                        anchors.get(c.id, gh.head))
+                for t, c in timeline if t <= clock.t and c.path]
+
+    def reviews_fetch(pr, repo=None, cwd=None):
+        return [{"user": {"login": c.source}, "commit_id": anchors.get(c.id, gh.head),
+                 "body": c.text, "state": "COMMENTED"}
+                for t, c in timeline if t <= clock.t and not c.path]
+
+    return round_driver.RoundDriver(
+        "7", repo="o/r", cwd="/nonexistent", cfg=cfg,
+        adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),
+        classify_runner=classify, fix_dispatch=fix, fetch=fetch,
+        reactions_fetch=lambda pr, repo=None, cwd=None: [],
+        reviews_fetch=reviews_fetch, inline_fetch=inline_fetch,
+        threads_fetch=lambda pr, repo=None, cwd=None: [],
+        resolve_thread=lambda thread_id, cwd=None: True,
+        gh_run=gh, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
+        wall_clock=lambda: datetime(2026, 1, 1, 1, 30, tzinfo=timezone.utc),
+        times=_TIMES, answer_waiter=lambda esc, **k: {}, auto_merge=True,
+        preflight=False, push=True, test_gate=False, max_rounds=max_rounds)
+
+
+def _nit_on_every(needle, source, clock, timeline):
+    """A SteppingGh that answers every `needle` summon with a FRESH cosmetic nit."""
+    n = {"k": 0}
+
+    class Nitting(SteppingGh):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            argv = list(argv)
+            if any(needle in a for a in argv):
+                n["k"] += 1
+                timeline.append((clock.t, Comment(
+                    id=f"nit{n['k']}", text=f"nit: rename tmp{n['k']}", source=source,
+                    path="x.py", diff_hunk="@@",
+                    created_at=f"2026-01-01T{n['k']:02d}:30:00+00:00")))
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+    return Nitting()
+
+
+def _classify_nits(p):
+    return json.dumps({"label": "COSMETIC" if "nit:" in p else "SUBSTANTIVE",
+                       "reason": "t"})
+
+
+@pytest.mark.parametrize("max_rounds", [3, 5, 8])
+def test_a_lone_reviewer_nitting_every_pushed_head_is_re_offered_once_then_the_gate_fails_closed(max_rounds):
+    # Row F: the only reviewer answers a FRESH cosmetic nit every time it is
+    # asked, and the fixer always pushes. Round 1 parks it (polish-only) and
+    # pushes H0→H1; nobody else is expected, so it is un-parked and offered H1.
+    # Its second nit is applied and pushed (H2) — and that is its ONE wake this
+    # run: it stays parked, the gate finds H2 covered by nobody, and the run
+    # hands back after 2 rounds at EVERY cap instead of spinning to the cap
+    # (the reference loop's ladder wakes each reviewer at most once per run).
+    clock, timeline, anchors = FakeClock(), [], {}
+    gh = _nit_on_every("@claude review", "claude[bot]", clock, timeline)
+    d = _fed_driver(gh=gh, clock=clock, cfg=CLAUDE_ONLY, timeline=timeline,
+                    anchors=anchors, classify=_classify_nits, max_rounds=max_rounds)
+    outcome = d.run()
+    assert outcome.rounds == 2, "bounded by the once-per-run wake, not by the cap"
+    assert len(gh.matching("@claude review")) == 2
+    assert len(gh.matching("git", "push")) == 2
+    assert "claude" in d.polishing                       # parked for good after its one wake
+    assert outcome.merged is False
+    assert gh.matching("gh", "merge", "--squash") == []  # H2 is covered by nobody: fail-closed
+
+
+@pytest.mark.parametrize("max_rounds", [3, 5])
+def test_a_polish_only_reviewer_is_not_re_offered_while_another_reviewer_covers_the_pushed_head(max_rounds):
+    # Row G: two reviewers. claude posts a real finding on H0; copilot answers
+    # every re-request with a fresh nit. Round 1 fixes both and pushes H1; claude
+    # is still expected (its finding earns the re-review), so copilot — parked
+    # polish-only — stays parked: one anchored review of H1 is what the gate
+    # needs. Round 2 asks claude alone, claude signs off on H1, the PR merges at
+    # H1 in 2 rounds. (Un-parking copilot here re-asks a nitter forever: the run
+    # would spend every round to the cap and hand back unmerged.)
+    clock, timeline, anchors = FakeClock(), [], {}
+    gh = _nit_on_every("requested_reviewers", "copilot[bot]", clock, timeline)
+    timeline.append((0, Comment(id="f1", text="this null check is missing",
+                                source="claude[bot]", path="x.py", diff_hunk="@@",
+                                created_at="2026-01-01T00:30:00+00:00")))
+    signoff = Comment(id="s1", text="No issues found.", source="claude[bot]",
+                      from_issue_channel=True, created_at="2026-01-01T02:00:00+00:00")
+    d = _fed_driver(gh=gh, clock=clock, cfg=TWO_REVIEWERS, timeline=timeline,
+                    anchors=anchors, classify=_classify_nits, max_rounds=max_rounds)
+    orig = gh.__call__
+
+    def hook(argv, *, cwd=None, timeout=None):   # claude signs off on its SECOND summon
+        argv = list(argv)
+        if any("@claude review" in a for a in argv) and len(gh.matching("@claude review")) == 1:
+            timeline.append((clock.t + 1, signoff))
+        return orig(argv, cwd=cwd, timeout=timeout)
+    d.gh_run = hook
+    outcome = d.run()
+    assert outcome.rounds == 2 and outcome.merged is True
+    assert len(gh.matching("requested_reviewers")) == 1  # copilot: round 1 only
+    assert len(gh.matching("@claude review")) == 2
+    assert "copilot" in d.polishing
+    pinned = [c[c.index("--match-head-commit") + 1] for c in gh.calls
+              if "--match-head-commit" in c]
+    assert pinned == ["H1"], "merged at the head claude anchored its sign-off on"

@@ -1055,11 +1055,17 @@ class RoundDriver:
         # hard buckets), so they never touch the SAFETY / hard-cause reporting.
         # Cleared by --rr (re-requests everyone):
         #   polishing     — a reviewer whose round posted only non-substantive
-        #                   comments (nothing left to fix); dropped from re-request.
+        #                   comments (nothing left to fix); parked out of re-request
+        #                   (un-parked at most once, only when nobody else is left
+        #                   to verify a head the same round pushed — see run()).
         self.polishing: Set[str] = set()
+        # The reviewers a pushing round has already un-parked once this run: the
+        # second cosmetic-only answer parks them for good (each reviewer is offered
+        # a head it has not judged at most once per run).
+        self._unparked_after_push: Set[str] = set()
         #   reviewed_no_change — a reviewer whose substantive comment(s) this
         #                   round were ALL dismissed on reassessment (fixer
-        #                   skip — no change applied); dropped from re-request
+        #                   skip — no change applied); parked out of re-request
         #                   so the run never loops re-asking a reviewer whose
         #                   findings it has already judged not worth changing.
         self.reviewed_no_change: Set[str] = set()
@@ -2259,16 +2265,16 @@ class RoundDriver:
 
         * **polish** — a reviewer whose comments this round were ALL
           non-substantive (none SUBSTANTIVE / BUSINESS_QUESTION /
-          CLASSIFICATION_FAILED) has nothing left to fix; dropped from
-          re-request for the rest of the run.
+          CLASSIFICATION_FAILED) has nothing left to fix; parked out of
+          re-request (a park a PUSHING round may lift once — see run()).
         * **reviewed — no change** — a reviewer whose real findings this round
           all ended dismissed with NO change applied (``final`` in
           ``{"skipped-invalid", "skipped-already-fixed"}``): the fixer judged
           the comment invalid / already-fixed / not applicable via a genuine
           validity judgment. A substantive comment the loop decided not to act
           on is not cosmetic — it gets its own label — and re-asking that
-          reviewer would loop it against the same verdict, so it too is dropped
-          from re-request. A fix-verify REJECT is NOT a dismissal (``final ==
+          reviewer would loop it against the same verdict, so it too is parked
+          out of re-request. A fix-verify REJECT is NOT a dismissal (``final ==
           "rejected"``): the finding still stands, so its reviewer keeps its
           re-request slot and the REJECT is escalated at the round-level gate.
 
@@ -2281,7 +2287,8 @@ class RoundDriver:
 
         On an ``--rr-active`` restart a deferred responder's pre-existing comments ARE
         its round-1 verdict, so they demote it exactly like any round: cosmetic-only →
-        polish (left alone next round), dismissed real findings → reviewed-no-change,
+        polish (parked, unless the round pushes a head nobody else is left to verify),
+        dismissed real findings → reviewed-no-change,
         a surviving finding → keeps its slot and is re-requested by ``expected_bots()``.
         That is how the restart needs no separate summon debt. The ONE exception is a
         pre-existing finding the fixer reports ``skipped-already-fixed`` (its id is in
@@ -2556,7 +2563,9 @@ class RoundDriver:
           processed as its round-1 verdict instead. After that NOTHING is special: the
           existing ``expected_bots()`` + end-of-round rules decide round 2 — a
           substantive finding re-requests its bot to verify the fix, a cosmetic one
-          lands in ``self.polishing`` and is left alone, an approval is done. There is
+          lands in ``self.polishing`` and is parked (a pushing round un-parks it only
+          when no other reviewer is left to verify the pushed head, and at most once
+          per run), an approval is done. There is
           no summon debt; the correct behaviour falls out of the rules the loop already
           runs.
 
@@ -2575,8 +2584,9 @@ class RoundDriver:
         # unconditionally on the restart path. After the snapshot NOTHING is
         # special: expected_bots() and the round-end rules decide any further round — a
         # substantive comment re-requests its bot (it is in none of the exclusion sets),
-        # a cosmetic one lands in self.polishing and is left alone, an approval is done.
-        # No summon debt.
+        # a cosmetic one lands in self.polishing and is parked (un-parked only by a
+        # pushing round that leaves nobody else to verify its head, once per run), an
+        # approval is done. No summon debt.
         if self.preflight:
             self._preflight_snapshot(restart=True)
             deferred = set(self._preflight_responders)
@@ -2849,13 +2859,17 @@ class RoundDriver:
             print(f"[rr-active] {bot}: polish-only at this HEAD — not re-requesting")
         return restored
 
-    def _persist_polish_state(self) -> None:
+    def _persist_polish_state(self, exclude: Set[str] = frozenset()) -> None:
         """Stamp the run's CURRENT polish-only set against the tip this round
         leaves behind — called at every round end, AFTER the round's fixes are
         pushed, so the tip is the one the loop carries into the next round (and the
-        one a restart would meet as live HEAD). Fail-closed: an unreadable tip
-        writes nothing, so a later restore can never match a stamp taken on an
-        unknown head. Best-effort — a failed write only costs a re-summon."""
+        one a restart would meet as live HEAD). ``exclude`` names the reviewers
+        whose verdict was reached on a tip this round has since replaced (the ones
+        it parked and then pushed past): a verdict about the parent is never
+        stamped against the child, so a restart at the new tip re-asks them.
+        Fail-closed: an unreadable tip writes nothing, so a later restore can never
+        match a stamp taken on an unknown head. Best-effort — a failed write only
+        costs a re-summon."""
         tip = self._head_sha()
         if not tip:
             return
@@ -2863,7 +2877,8 @@ class RoundDriver:
         # a verdict overwrite it with the empty set at the same unadvanced tip; a run
         # that restored nothing keeps write_polish_state's empty no-clobber guard.
         polish_state.write_polish_state(
-            self.pr, self._polish_repo_key(), tip, sorted(self.polishing),
+            self.pr, self._polish_repo_key(), tip,
+            sorted(self.polishing - set(exclude)),
             restored_prior=self._polish_restored)
 
     # ------------------------------------------------------------------- run
@@ -3351,10 +3366,11 @@ class RoundDriver:
             # decided AFTER classification, BEFORE the table renders its status.
             # A deferred responder's pre-existing comments ARE its round-1 verdict on
             # the restart path, so they drive these demotions like any round's: a
-            # cosmetic-only responder lands in self.polishing and is left alone next
-            # round (the whole point — the loop already knows not to re-ask a polish
-            # bot), and a substantive one is re-requested by expected_bots() to verify
-            # the fix. That is why the deferral needs no summon debt.
+            # cosmetic-only responder lands in self.polishing and is parked (the
+            # whole point — the loop already knows not to re-ask a polish bot while
+            # someone else covers the head; the un-park below the push is the one
+            # exception), and a substantive one is re-requested by expected_bots()
+            # to verify the fix. That is why the deferral needs no summon debt.
             self._promote_reviewed_no_findings(actionable, results)
             # Round-end demotions BEFORE the table renders, so a reviewer about
             # to be dropped shows its actual next-round disposition (Polish-only
@@ -3365,8 +3381,9 @@ class RoundDriver:
             _parked_before = (set(self.polishing), set(self.reviewed_no_change))
             self._update_polishing(actionable, results, round_actions)
             # The reviewers THIS round parked — polish-only, or every finding
-            # dismissed. If the round goes on to push a commit they are exactly the
-            # reviewers who must be offered it (see the un-park below the push).
+            # dismissed. If the round goes on to push a commit, their verdicts were
+            # reached on a head that no longer exists (see the un-park and the
+            # stamp exclusion below the push).
             _newly_parked = (self.polishing - _parked_before[0],
                              self.reviewed_no_change - _parked_before[1])
             self._render_round(round_no, actionable, results, expected)  # per-reviewer round summary
@@ -3422,26 +3439,41 @@ class RoundDriver:
                 if committed_changes:
                     # The round put a NEW COMMIT on the branch, and a reviewer whose
                     # verdict was reached against the head this commit REPLACED has
-                    # not seen the new one. Un-park the reviewers THIS round parked
-                    # — polish-only, or every finding dismissed — so expected_bots()
-                    # re-requests them for the verification round below: that is
-                    # the offer the reference loop's gate-time ladder makes, and this
-                    # tree has no ladder. A reviewer parked by an EARLIER round that
-                    # did not push stays parked (the park's purpose — not burning
-                    # rounds re-asking about dismissed findings — is untouched), and
-                    # a round that pushed nothing parks as before. Done BEFORE the
-                    # polish stamp below, so a restart never inherits a polish verdict
-                    # for a head nobody reviewed.
-                    self.polishing -= _newly_parked[0]
-                    self.reviewed_no_change -= _newly_parked[1]
+                    # not seen the new one. Offer it the way the reference loop's
+                    # gate-time ladder does — a head is offered only when nobody
+                    # covers it, and each reviewer is woken at most once:
+                    #   1. the reviewers THIS round parked — polish-only, or every
+                    #      finding dismissed — are un-parked ONLY if, after the park,
+                    #      no other expected reviewer remains to verify the pushed
+                    #      head; while someone else is still expected, one anchored
+                    #      review of the new head is what the head-aware gate needs,
+                    #      and the parked reviewer stays parked;
+                    #   2. a reviewer is un-parked at most ONCE per run — its second
+                    #      cosmetic-only answer is applied and pushed as today, then
+                    #      it is parked for good and the gate decides (a head nobody
+                    #      covers is `[unreviewed-head]`, fail-closed);
+                    #   3. a reviewer parked by an EARLIER round that did not push
+                    #      stays parked (the park's purpose — not burning rounds
+                    #      re-asking about dismissed findings — is untouched), and
+                    #      a round that pushed nothing parks as before.
+                    _unpark = ((_newly_parked[0] | _newly_parked[1])
+                               - self._unparked_after_push)
+                    if _unpark and not self.expected_bots():
+                        self.polishing -= _unpark
+                        self.reviewed_no_change -= _unpark
+                        self._unparked_after_push |= _unpark
 
             # Persist this round's polish-only verdicts against the tip the loop
             # now carries — AFTER the fixes are pushed, so the stamp names the head
-            # a restart would meet. A polish-only reviewer is sticky within a run
-            # (never re-summoned even as later fixes advance HEAD), so stamping the
-            # POST-fix tip and restoring only at that tip reproduces exactly that
-            # stickiness across a restart; a PRE-fix stamp would never match.
-            self._persist_polish_state()
+            # a restart would meet. A polish verdict is a verdict on the tip it was
+            # reached on: when this round PUSHED, the reviewers it parked judged
+            # the PREVIOUS tip, so they are excluded from the stamp at the pushed
+            # one — whether or not the un-park above lifted their park — and a
+            # restart at the new tip re-asks them. A round that pushed nothing
+            # stamps its parks at the very tip they were reached on.
+            self._persist_polish_state(
+                exclude=((_newly_parked[0] | _newly_parked[1])
+                         if committed_changes else set()))
 
             # ── Review-progress gate ──────────────────────────────────────────
             # Request another review round when this round put a NEW COMMIT on the

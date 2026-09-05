@@ -1172,12 +1172,14 @@ def test_substantive_fix_earns_another_round():
 # Sticky polish-exclusion + soft-reset on --rr
 # ---------------------------------------------------------------------------
 
-def test_polish_only_reviewer_is_re_offered_the_head_the_round_pushed():
+def test_polish_only_reviewer_stays_parked_while_another_reviewer_covers_the_pushed_head():
     # copilot posts only a cosmetic nit (no real finding) → parked as polish-only
-    # by round 1. But round 1 PUSHED (claude's fix and copilot's nit), so the head
-    # copilot judged is gone: the pushing round un-parks copilot and round 2
-    # re-requests BOTH reviewers for the new head. copilot stays silent in round 2
-    # and is not asked a third time; the run still terminates.
+    # by round 1. Round 1 PUSHED (claude's fix and copilot's nit), so the head
+    # copilot judged is gone — but claude is still expected for the verification
+    # round (its finding earns a re-review), and ONE anchored review of the new
+    # head is what the head-aware gate needs. So copilot stays parked and is not
+    # re-asked: a head is offered only when nobody covers it (the reference
+    # loop's ladder rule). Round 2 re-requests claude alone, which signs off.
     cfg = {"active_reviewers": ["claude", "copilot"],
            "auto_on_open": {"claude": False, "copilot": False}}
 
@@ -1196,8 +1198,8 @@ def test_polish_only_reviewer_is_re_offered_the_head_the_round_pushed():
         max_rounds=3, answer_waiter=lambda esc, **k: {},
     )
     outcome = driver.run()
-    assert "copilot" not in driver.polishing             # un-parked: the round it judged was replaced
-    assert len(gh.matching("requested_reviewers")) == 2  # copilot: round 1 + the verification round
+    assert "copilot" in driver.polishing                 # stays parked: claude covers the pushed head
+    assert len(gh.matching("requested_reviewers")) == 1  # copilot: round 1 only
     assert len(gh.matching("@claude review")) == 2       # claude re-requested in round 2
     assert outcome.rounds == 2 and outcome.status == "clean"
 
@@ -1228,9 +1230,10 @@ def test_dismissed_substantive_reviewer_is_reviewed_no_change(capsys):
     # copilot's substantive finding is dismissed by the fixer (a genuine SKIP
     # citing "already handled upstream" → final "skipped-already-fixed", NO change
     # applied): it renders "Reviewed — no change" in round 1's table. Round 1
-    # then PUSHES claude's fix, so the dismissed-findings verdict was reached
-    # against a head that no longer exists: copilot is un-parked and re-offered
-    # the pushed head in round 2 alongside claude.
+    # then PUSHES claude's fix — but claude is still expected to verify that
+    # head, so copilot stays parked: a head is offered only when nobody covers
+    # it, and re-asking a reviewer whose findings were all dismissed would loop
+    # it against the same verdict.
     cfg = {"active_reviewers": ["claude", "copilot"],
            "auto_on_open": {"claude": False, "copilot": False}}
 
@@ -1254,26 +1257,26 @@ def test_dismissed_substantive_reviewer_is_reviewed_no_change(capsys):
     )
     outcome = driver.run()
     out = capsys.readouterr().out
-    # The demotion: its own log line, never the polish bucket — and the un-park
-    # afterwards, because the round pushed a head copilot has not seen.
-    assert "copilot" not in driver.reviewed_no_change
+    # The demotion: its own log line, never the polish bucket — and the park
+    # holds through the push, because claude covers the pushed head.
+    assert "copilot" in driver.reviewed_no_change
     assert "copilot" not in driver.polishing
     assert ("[round] → excluding copilot from subsequent rounds this run "
             "(reviewed — no change: every finding dismissed on "
             "reassessment)") in out
-    # copilot is re-offered the pushed head exactly once (round 2), then silent →
-    # not asked a third time; claude re-asked as before.
-    assert len(gh.matching("requested_reviewers")) == 2
+    # copilot is asked once (round 1) and never re-offered the pushed head;
+    # claude is re-asked to verify it.
+    assert len(gh.matching("requested_reviewers")) == 1
     assert len(gh.matching("@claude review")) == 2
     assert outcome.rounds == 2
     # Round 1's table already shows the terminal label, not "Active", and never
-    # the polish mislabel; round 2's shows the re-offered reviewer's silence.
+    # the polish mislabel; round 2's carries the same park.
     copilot_rows = [ln for ln in out.splitlines()
                     if ln.startswith("│") and " Copilot" in ln]
     assert len(copilot_rows) == 2
-    assert "Reviewed — no change" in copilot_rows[0]
-    assert "No review posted" in copilot_rows[1]
-    assert all("Polish-only" not in ln for ln in copilot_rows)
+    assert all("Reviewed — no change" in ln for ln in copilot_rows)
+    assert all("Polish-only" not in ln and "No review posted" not in ln
+               for ln in copilot_rows)
 
 
 def test_mixed_dismissed_substantive_and_cosmetic_is_reviewed_no_change(capsys):
