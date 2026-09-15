@@ -237,6 +237,30 @@ def _state_dir(tmp_path, monkeypatch):
     return tmp_path
 
 
+class GhHeadCleanTree(GhHead):
+    """A GhHead whose worktree is CLEAN after the fixes: `commit_and_push` finds
+    nothing to commit, so the round pushes nothing and the tip never moves. The
+    shape a polish verdict SURVIVES a restart in — nothing new for the parked
+    reviewer to see."""
+
+    def __call__(self, argv, *, cwd=None, timeout=None):
+        argv = list(argv)
+        if argv[:3] == ["git", "status", "--porcelain"]:
+            self.calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+        return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+
+def _polish_round_without_push(**kw):
+    """Run 1: a mixed round (polish bot + substantive bot) whose fixes leave the
+    tree CLEAN — nothing is pushed, the tip stays at H0, and copilot's polish
+    verdict is stamped against it. Returns the driver + its gh recorder."""
+    gh = GhHeadCleanTree(head="H0", advance_to="H1", **kw)
+    driver, clock = make_driver([(0, SUBSTANTIVE), (0, COSMETIC)], gh=gh, max_rounds=3)
+    driver.run()
+    return driver, gh
+
+
 def _killed_mixed_round():
     """Run 1: a mixed round (polish bot + substantive bot), whose fix pushes
     H0 → H1, killed at the round-2 summon. Returns the driver + its gh recorder."""
@@ -253,17 +277,20 @@ def _killed_mixed_round():
 # The anchor: a mixed round, killed, restarted
 # ---------------------------------------------------------------------------
 
-def test_mixed_round_polish_verdict_survives_a_kill_and_restart():
+def test_a_polish_verdict_reached_before_the_round_pushed_does_not_survive_the_restart():
+    # Round 1's polish-only verdict was reached against H0; the SAME round then pushed
+    # H0 → H1. claude is still expected to verify H1, so copilot stays parked for
+    # the run — but its verdict is about H0, so NO polish stamp names it at H1: a
+    # verdict about the parent is never stamped against the child, and the restart
+    # at H1 re-derives copilot's verdict from the PR itself instead of restoring
+    # one about a head it never judged.
     driver1, gh1 = _killed_mixed_round()
-    assert driver1.polishing == {"copilot"}          # round 1's polish-only verdict
+    assert "copilot" in driver1.polishing            # parked: claude covers the pushed head
     assert gh1.head == "H1"                          # the fix push advanced the tip
 
     state = polish_state.read_polish_state(PR, REPO)
-    assert state is not None
-    assert state["bots"] == ["copilot"]
-    # The POST-fix tip — the head a restart actually meets. A pre-fix stamp (H0)
-    # would never match it, and every reviewer this feature skips would be re-asked.
-    assert state["tip_sha"] == "H1" and state["tip_sha"] != "H0"
+    assert state is None or "copilot" not in state["bots"], (
+        "a verdict about H0 must never be stamped against H1")
 
     # ── the restart, at the live head the killed run left behind ──────────────
     gh2 = GhHead(head="H1", advance_to="H2")
@@ -271,11 +298,13 @@ def test_mixed_round_polish_verdict_survives_a_kill_and_restart():
                                   rr_active=True, preflight=True, auto_merge=True,
                                   max_rounds=3)
     outcome = driver2.run()
-    assert "copilot" in driver2.polishing                  # verdict restored …
-    assert gh2.matching("requested_reviewers") == []       # … so it is never re-asked
+    assert driver2._polish_restored is False               # nothing restored from the stamp …
+    assert "copilot" in driver2.polishing                  # … its park is re-derived from its LIVE
+    #                                                        cosmetic comment at the preflight, and
+    assert gh2.matching("requested_reviewers") == []       # claude covers the new head, so copilot
+    #                                                        is not re-asked (the park rule, C1)
     assert "copilot" in driver2.reviewed_ever              # and it still counts as reviewed
-    # This test's SUBJECT — the polish verdict surviving the kill — is unchanged above.
-    # The merge outcome is not: copilot's verdict was reached against H0, and the
+    # The merge outcome: copilot's verdict was reached against H0, and the
     # killed run's fix (H1) plus the restart's re-applied fix (H2) are commits NO
     # reviewer has ever seen. That is the D4 crash-restart case the head-aware gate
     # exists to refuse, so the run hands back for a re-review instead of merging.
@@ -393,13 +422,12 @@ def test_default_launch_still_dismisses_an_already_fixed_finding():
 
 def test_repo_less_run_keys_polish_state_on_the_cwd_inferred_repo():
     # repo=None: RoundDriver must infer "o/r" from the cwd's gh remote rather
-    # than falling back to the shared "local" key.
-    gh = GhHead(head="H0", advance_to="H1", kill_on="@claude review", kill_after=1,
-                name_with_owner=REPO)
+    # than falling back to the shared "local" key. (A round that pushes nothing
+    # keeps its polish verdict — the stamp is what this test is about.)
+    gh = GhHeadCleanTree(head="H0", advance_to="H1", name_with_owner=REPO)
     driver, clock = make_driver([(0, SUBSTANTIVE), (0, COSMETIC)], gh=gh,
                                  repo=None, max_rounds=3)
-    with pytest.raises(KeyboardInterrupt):
-        driver.run()
+    driver.run()
     assert driver.polishing == {"copilot"}
     # Stamped under the INFERRED repo, not the "local" fallback.
     assert polish_state.read_polish_state(PR, REPO)["bots"] == ["copilot"]
@@ -409,10 +437,11 @@ def test_repo_less_run_keys_polish_state_on_the_cwd_inferred_repo():
 def test_restart_omitting_repo_still_restores_a_run_that_passed_it():
     # Run 1 passes --repo explicitly; the restart omits it but shares the same
     # cwd/remote, so it must resolve to the SAME key and restore the verdict.
-    _killed_mixed_round()
-    assert polish_state.read_polish_state(PR, REPO)["tip_sha"] == "H1"
+    # Run 1 pushes nothing, so the verdict is stamped at the tip the restart meets.
+    _polish_round_without_push()
+    assert polish_state.read_polish_state(PR, REPO)["tip_sha"] == "H0"
 
-    gh2 = GhHead(head="H1", advance_to="H2", name_with_owner=REPO)
+    gh2 = GhHead(head="H0", advance_to="H1", name_with_owner=REPO)
     driver2, clock2 = make_driver([(0, SUBSTANTIVE), (0, COSMETIC)], gh=gh2,
                                   repo=None, rr_active=True, preflight=True, max_rounds=3)
     driver2.run()
@@ -439,12 +468,11 @@ def test_polish_is_not_restored_when_head_has_moved():
 
 def test_unknown_tip_on_write_stamps_nothing():
     # The tip could not be read at the round's end → no stamp is written, so a later
-    # restore can never match a state whose head the loop never knew.
-    gh = GhHead(head="H0", advance_to="H1", head_fails=True,
-                kill_on="@claude review", kill_after=1)
+    # restore can never match a state whose head the loop never knew. (Nothing is
+    # pushed, so the verdict itself stands — only the stamp is under test.)
+    gh = GhHeadCleanTree(head="H0", advance_to="H1", head_fails=True)
     driver, clock = make_driver([(0, SUBSTANTIVE), (0, COSMETIC)], gh=gh, max_rounds=3)
-    with pytest.raises(KeyboardInterrupt):
-        driver.run()
+    driver.run()
     assert driver.polishing == {"copilot"}                    # the verdict was reached …
     assert polish_state.read_polish_state(PR, REPO) is None   # … but never stamped
     assert not os.path.exists(polish_state.state_path(PR, REPO))
