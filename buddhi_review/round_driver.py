@@ -2866,7 +2866,9 @@ class RoundDriver:
         one a restart would meet as live HEAD). ``exclude`` names the reviewers
         whose verdict was reached on a tip this round has since replaced (the ones
         it parked and then pushed past): a verdict about the parent is never
-        stamped against the child, so a restart at the new tip re-asks them.
+        stamped against the child, so a restart at the new tip restores nothing
+        for them and re-derives their park from their live comments — re-asking
+        only when no reviewer remains expected for the head.
         Fail-closed: an unreadable tip writes nothing, so a later restore can never
         match a stamp taken on an unknown head. Best-effort — a failed write only
         costs a re-summon."""
@@ -3469,7 +3471,9 @@ class RoundDriver:
             # reached on: when this round PUSHED, the reviewers it parked judged
             # the PREVIOUS tip, so they are excluded from the stamp at the pushed
             # one — whether or not the un-park above lifted their park — and a
-            # restart at the new tip re-asks them. A round that pushed nothing
+            # restart at the new tip restores nothing for them: it re-derives
+            # their park from their live comments and re-asks only when no
+            # reviewer remains expected for the head. A round that pushed nothing
             # stamps its parks at the very tip they were reached on.
             self._persist_polish_state(
                 exclude=((_newly_parked[0] | _newly_parked[1])
