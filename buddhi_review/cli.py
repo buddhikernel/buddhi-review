@@ -366,7 +366,7 @@ def _install_skills(args: argparse.Namespace) -> int:
 # installed files, reporting success. ``-c`` prepends the cwd the same way, so the
 # payload drops ``sys.path[0]`` before importing anything: the re-sync then resolves the
 # package exactly as the console script would. (``-P`` / ``PYTHONSAFEPATH`` do this
-# natively but only from 3.11; this package supports 3.9.)
+# natively but only from 3.11; this package supports 3.10.)
 _RESYNC_PATH_PREAMBLE = "import sys; sys.path.pop(0); "
 _RESYNC_CODE = (_RESYNC_PATH_PREAMBLE
                 + "from buddhi_review.cli import main; sys.exit(main(sys.argv[1:]))")

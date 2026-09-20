@@ -20,7 +20,7 @@ You need these four things in place:
 - **The GitHub CLI (`gh`)** installed and authenticated, so that `gh auth status`
   confirms that you are signed in. Triggering Copilot reviews requires `gh` 2.87 or
   later.
-- **Python 3.9+**.
+- **Python 3.10+** (the floor is set by the `buddhikernel` dependency).
 - **A GitHub repository in which you can open pull requests** and configure at least
   one supported reviewer (see [Choose and set up your reviewers](#3-choose-and-set-up-your-reviewers)).
 
