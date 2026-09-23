@@ -728,7 +728,7 @@ def build_parser() -> argparse.ArgumentParser:
 _UNCLAIMED_COMMAND_NOTICE = (
     "The '{command}' command is not included in this free installation.\n"
     "If you have a Buddhi licence, renew or reactivate it and run the command again.\n"
-    "To get a licence: https://buddhikernel.com"
+    "To get a licence: https://buddhireview.com/buy"
 )
 
 

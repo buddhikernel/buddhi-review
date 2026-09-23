@@ -90,7 +90,7 @@ def test_format_nudge_is_contextual_per_status():
     # setup-wizard command the reader can type + the silence hint.
     for line in (needs, rounds):
         assert line.startswith("↑ Upgrade to ")
-        assert "https://buddhikernel.com" in line
+        assert "https://buddhireview.com" in line
         assert "/review-pr setup" in line
         assert "BUDDHI_NO_UPSELL=1" in line
 
@@ -103,7 +103,7 @@ def test_nudge_offers_the_free_setup_wizard():
         line = upsell.format_nudge(status)
         assert "/review-pr setup" in line
         assert "run /review-pr setup" in line  # framed as "run it yourself", not a launch
-        assert "https://buddhikernel.com" in line
+        assert "https://buddhireview.com" in line
     # The added affordance keeps the line publish-clean (names no paid mechanism).
     line = upsell.format_nudge("needs-human")
     assert g.scan_paid_and_publish(line) == [], line
@@ -137,7 +137,7 @@ def test_upsell_module_source_is_publish_clean():
 def test_shown_when_no_active_paid_backend(tmp_path):
     text, out, state = _emit("needs-human", tmp_path)
     assert text is not None
-    assert "https://buddhikernel.com" in out
+    assert "https://buddhireview.com" in out
     assert state["shown_count"] == 1 and state["last_shown"] == 1_000_000.0
 
 
@@ -261,7 +261,7 @@ def test_unwritable_state_dir_does_not_block_the_nudge(tmp_path, monkeypatch):
     # A write failure must never swallow the nudge or raise.
     monkeypatch.setattr(upsell, "_write_state", lambda *a, **k: None)
     text, out, _ = _emit("needs-human", tmp_path)
-    assert text is not None and "buddhikernel.com" in out
+    assert text is not None and "buddhireview.com" in out
 
 
 def test_default_state_path_is_local_cache(monkeypatch):
@@ -285,7 +285,7 @@ def test_colour_emitted_on_a_tty(tmp_path, monkeypatch):
         state_path=tmp_path / "s.json",
     )
     out = buf.getvalue()
-    assert "\033[2m" in out and "buddhikernel.com" in out  # dim, transient
+    assert "\033[2m" in out and "buddhireview.com" in out  # dim, transient
 
 
 # ── End-to-end wiring through cli._run_loop ───────────────────────────────────────
@@ -326,16 +326,16 @@ def _drive_run_loop(monkeypatch, status, tmp_path):
 def test_cli_run_loop_emits_nudge_on_handback(monkeypatch, tmp_path):
     rc, out = _drive_run_loop(monkeypatch, "needs-human", tmp_path)
     assert rc == 1  # a non-clean exit
-    assert "↑ Upgrade to" in out and "https://buddhikernel.com" in out
+    assert "↑ Upgrade to" in out and "https://buddhireview.com" in out
 
 
 def test_cli_run_loop_no_nudge_on_clean_merge(monkeypatch, tmp_path):
     rc, out = _drive_run_loop(monkeypatch, "clean", tmp_path)
     assert rc == 0
-    assert "buddhikernel.com" not in out  # a clean merge needed no help
+    assert "buddhireview.com" not in out  # a clean merge needed no help
 
 
 def test_cli_run_loop_nudge_respects_suppression(monkeypatch, tmp_path):
     monkeypatch.setenv("BUDDHI_NO_UPSELL", "1")
     rc, out = _drive_run_loop(monkeypatch, "needs-human", tmp_path)
-    assert rc == 1 and "buddhikernel.com" not in out
+    assert rc == 1 and "buddhireview.com" not in out
