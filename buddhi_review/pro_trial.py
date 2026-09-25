@@ -66,10 +66,13 @@ _INDEX_HOST = "pypi.pkg.keygen.sh"
 _INDEX_LOGIN = "license"
 _PACKAGE = "buddhi-review-pro"
 
-# The subscribe / re-subscribe destination. TODO(MP-2): swap for the live Paddle
-# hosted-checkout URL once the buddhikernel.com #buy-link carries it (today it still
-# points at the site's contact section, so the bare site is the correct target).
-CHECKOUT_URL = "https://buddhikernel.com"
+# The subscribe / re-subscribe destination: the commercial site's checkout page, and
+# the support mailbox. The commercial domain is buddhireview.com; the open-source
+# kernel's site is never a place to buy. tests/test_commercial_links.py fails the
+# build if a shipped file names the kernel's site, if the checkout, upgrade and
+# notice links disagree on the host, or if a shipped email address is off that domain.
+CHECKOUT_URL = "https://buddhireview.com/buy"
+SUPPORT_EMAIL = "support@buddhireview.com"
 
 _VND = "application/vnd.api+json"
 _HTTP_TIMEOUT_S = 20
@@ -395,8 +398,8 @@ class TrialOutcome:
 
 
 def _convert_pointer() -> str:
-    return (f"Already subscribed? Subscribe or paste your Pro key from {CHECKOUT_URL} "
-            "and re-run setup.")
+    return (f"Subscribe at {CHECKOUT_URL}, then re-run setup. "
+            f"If you already subscribed, email {SUPPORT_EMAIL}.")
 
 
 def convert_checkout_prompt() -> str:
@@ -404,7 +407,7 @@ def convert_checkout_prompt() -> str:
     user at checkout. Exposed so the caller can render it through its own formatting
     (e.g. the wizard's ``_row``) instead of ``convert`` writing straight to the
     stream out-of-band with the rest of the wizard's output."""
-    return f"Subscribe or re-subscribe at {CHECKOUT_URL} — Keygen emails your Pro key."
+    return f"Subscribe or re-subscribe at {CHECKOUT_URL}."
 
 
 def _expiry_phrase(attrs: Optional[dict]) -> str:
@@ -466,7 +469,7 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
                             f"already been used for a trial. {_convert_pointer()}")
     return TrialOutcome(False, "not_activated",
                         "Pro installed, but it did not activate on this machine — your key may "
-                        f"already be active elsewhere. Contact support via {CHECKOUT_URL}.")
+                        f"already be active elsewhere. Contact {SUPPORT_EMAIL}.")
 
 
 def start_trial(email: str, *, transport=None, backends=None, runner=None,

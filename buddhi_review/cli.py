@@ -717,7 +717,8 @@ def build_parser() -> argparse.ArgumentParser:
 # separately-installed, active backend (which runs it), or answered with the notice
 # below — the normal free-only outcome, and equally what a plain typo gets.
 
-# The upgrade notice (approved verbatim 2026-07-12, gate H1) printed when no installed
+# The upgrade notice (approved verbatim 2026-07-12, gate H1; its link moved to
+# buddhireview.com/buy on 2026-09-25, WS11) printed when no installed
 # backend claims the command. The free tree ships NO list of non-free command names,
 # so a command whose paid access has lapsed and one that never existed are
 # indistinguishable here; the wording is deliberately true for BOTH and asserts
@@ -728,7 +729,7 @@ def build_parser() -> argparse.ArgumentParser:
 _UNCLAIMED_COMMAND_NOTICE = (
     "The '{command}' command is not included in this free installation.\n"
     "If you have a Buddhi licence, renew or reactivate it and run the command again.\n"
-    "To get a licence: https://buddhikernel.com"
+    "To get a licence: https://buddhireview.com/buy"
 )
 
 

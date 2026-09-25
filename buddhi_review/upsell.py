@@ -43,9 +43,9 @@ from typing import Dict, List, Optional, TextIO
 
 from buddhi_review.transparency import _colour_enabled
 
-# The project's marketing domain — the Cmd-clickable upgrade destination. A full
-# ``https://`` URL is what terminals reliably auto-linkify for Cmd-click.
-DOMAIN = "buddhikernel.com"
+# The commercial site — the Cmd-clickable upgrade destination. A full ``https://``
+# URL is what terminals reliably auto-linkify for Cmd-click.
+DOMAIN = "buddhireview.com"
 _URL = f"https://{DOMAIN}"
 
 # The free OSS onboarding wizard's slash command — the second, equally non-committal

@@ -205,7 +205,7 @@ def test_no_claimant_prints_notice_and_exits_2():
     out = buf.getvalue()
     assert out.rstrip("\n") == cli._UNCLAIMED_COMMAND_NOTICE.format(command="review-batch")
     assert "review-batch" in out
-    assert "https://buddhikernel.com" in out
+    assert "https://buddhireview.com/buy" in out
 
 
 def test_inactive_backend_falls_through_to_the_notice():
