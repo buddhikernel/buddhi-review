@@ -1171,3 +1171,94 @@ def test_a_polish_only_reviewer_is_dropped_while_the_substantive_reviewer_verifi
     pinned = [c[c.index("--match-head-commit") + 1] for c in gh.calls
               if "--match-head-commit" in c]
     assert pinned == ["H1"], "merged at the head claude anchored its sign-off on"
+
+
+# ---------------------------------------------------------------------------
+# The round-end boundary lines, pinned with a moving tip: the substantive test
+# pairs THIS round's results with THIS round's actions, only an APPLIED
+# substantive fix counts, and an unreadable head after the push leaves the
+# boundary unknown (the gate blocks) rather than falling back to an older head.
+# ---------------------------------------------------------------------------
+
+def test_a_dismissed_round_one_finding_does_not_hide_a_round_two_substantive_fix():
+    # round_substantive must pair THIS round's results with THIS round's actions.
+    # Round 1: A (SUBSTANTIVE) is dismissed as invalid, B (SUBSTANTIVE) is fixed →
+    # H1. Round 2: C (SUBSTANTIVE, posted on H1) is fixed → H2. Round 3: silent.
+    # H2 was never reviewed, so the run must block.
+    gh, clock = SteppingGh(), FakeClock()
+    a = Comment(id="A", text="this lock is never released", source="claude[bot]",
+                path="x.py", diff_hunk="@@ -1 +1 @@", created_at="2026-01-01T00:30:00+00:00")
+    b = Comment(id="B", text="this null check is missing", source="claude[bot]",
+                path="x.py", diff_hunk="@@ -2 +2 @@", created_at="2026-01-01T00:30:00+00:00")
+    c = Comment(id="C", text="this bound is off by one", source="claude[bot]",
+                path="x.py", diff_hunk="@@ -3 +3 @@", created_at="2026-01-01T02:00:00+00:00")
+    timeline = [(0, a), (0, b), (200, c)]
+    anchors = {"A": "H0", "B": "H0", "C": "H1"}
+
+    def inline_fetch(pr, repo=None, cwd=None):
+        return [_inline("claude", anchors[x.id]) for t, x in timeline if t <= clock.t]
+
+    def fix(cm, r):
+        if cm.id == "A":
+            return FixOutcome(status="skipped", detail="SKIP: the cited path is unreachable")
+        gh.dirty = True
+        return FixOutcome(status="applied")
+    driver = _content_round_driver(label="SUBSTANTIVE", timeline=timeline, gh=gh,
+                                   clock=clock, max_rounds=3, fix=fix,
+                                   inline_fetch=inline_fetch)
+    outcome = driver.run()
+    assert gh.head == "H2"
+    assert driver._last_substantive_head == "H2"
+    assert outcome.rounds == 3
+    assert len(gh.matching("@claude review")) == 3
+    assert outcome.merged is False
+    assert gh.matching("gh", "merge", "--squash") == []
+
+
+def test_a_dismissed_substantive_finding_beside_a_cosmetic_fix_merges_on_the_existing_review():
+    # Only an APPLIED substantive fix moves the boundary. A SUBSTANTIVE finding the
+    # fixer dismissed, plus a pushed COSMETIC nit, is a cosmetic-only round.
+    gh, clock = MainlineGh(), FakeClock()
+    f1 = Comment(id="f1", text="this null check is missing", source="claude[bot]",
+                 path="x.py", diff_hunk="@@ -1 +1 @@", created_at="2026-01-01T00:30:00+00:00")
+    n1 = Comment(id="n1", text="nit: rename tmp", source="claude[bot]",
+                 path="x.py", diff_hunk="@@ -2 +2 @@", created_at="2026-01-01T00:30:00+00:00")
+
+    def fix(cm, r):
+        if cm.id == "f1":
+            return FixOutcome(status="skipped", detail="SKIP: the cited path is unreachable")
+        return FixOutcome(status="applied")
+    driver = _content_round_driver(label="SUBSTANTIVE", timeline=[(0, f1), (0, n1)],
+                                   gh=gh, clock=clock, fix=fix)
+    outcome = driver.run()
+    assert gh.head == "H1"
+    assert driver._last_substantive_head == "H0"
+    assert "claude" in driver.reviewed_no_change
+    assert outcome.rounds == 1
+    assert outcome.merged is True
+    assert _pinned(gh) == ["H1"]
+
+
+def test_an_unreadable_head_after_a_substantive_push_blocks_the_merge(capsys):
+    # The round-end boundary read fails (git rev-parse errors right after the push):
+    # the boundary is None and the gate must block [gate-unverified] — never fall
+    # back to an older head whose review would then cover the pushed commit.
+    class BlipGh(MainlineGh):
+        blipped = False
+
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            argv = list(argv)
+            if (self.pushed and not self.blipped and argv[:2] == ["git", "rev-parse"]
+                    and argv[-1] == "HEAD"):
+                self.blipped = True
+                self.calls.append(argv)
+                return _CP(128, "")
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+    gh, clock = BlipGh(), FakeClock()
+    driver = _content_round_driver(label="SUBSTANTIVE", timeline=[(0, _FINDING)],
+                                   gh=gh, clock=clock, max_rounds=3)
+    outcome = driver.run()
+    assert driver._last_substantive_head is None
+    assert outcome.merged is False
+    assert gh.matching("gh", "merge", "--squash") == []
+    assert "[gate-unverified]" in capsys.readouterr().out
