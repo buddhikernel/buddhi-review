@@ -206,6 +206,9 @@ class ActionResult:
     # poisons the shared worktree. The round driver halts before pushing on this,
     # regardless of ``final`` — so it is plumbed for EVERY fix disposition.
     rollback_failed: bool = False
+    # Whether this action itself changed files. ``None`` means the injected
+    # dispatcher did not provide per-action evidence.
+    files_changed: Optional[bool] = None
 
 
 def default_fix_dispatch(
@@ -305,7 +308,10 @@ def act_on_result(
             adapter.escalation.notifier.send(ask)
 
         if outcome.status == "applied":
-            return ActionResult(comment.id, d, "fixed", outcome.detail, rollback_failed=rb)
+            return ActionResult(
+                comment.id, d, "fixed", outcome.detail,
+                rollback_failed=rb, files_changed=outcome.files_changed,
+            )
         if outcome.status == "skipped":
             # A genuine validity judgment — the fixer decided nothing should be
             # applied. Render the honest sub-label it stated in its reason

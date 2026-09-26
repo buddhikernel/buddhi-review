@@ -2460,6 +2460,12 @@ class FixOutcome:
     # residue. ``status`` still means "what to do about the comment"; this means
     # "is the worktree trustworthy".
     rollback_failed: bool = False
+    # Per-dispatch evidence for the round driver's substantive-progress gate.
+    # ``None`` preserves compatibility with custom/test dispatchers that cannot
+    # report it; the built-in fixer records whether its own attempt produced a
+    # file delta, so a sibling cosmetic edit cannot be credited to a no-op
+    # substantive fix.
+    files_changed: Optional[bool] = None
 
 
 # runner(prompt, *, model, effort, timeout, cwd) -> (returncode, stdout). The
@@ -3065,7 +3071,8 @@ def apply_fix(
                 else:
                     _status_line("✓", "fix verified (CONFIRM)", colour=_DIM)
             return FixOutcome(status="applied", detail=trip or "",
-                              diff=prompt_diff, attempts=total_attempts + attempt)
+                              diff=prompt_diff, attempts=total_attempts + attempt,
+                              files_changed=bool(diff))
 
         if guided_retry_reason is not None:
             # A trustworthy REJECT with budget left broke out of the attempt loop:

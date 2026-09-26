@@ -1239,6 +1239,37 @@ def test_a_dismissed_substantive_finding_beside_a_cosmetic_fix_merges_on_the_exi
     assert _pinned(gh) == ["H1"]
 
 
+def test_a_noop_substantive_fix_cannot_claim_a_sibling_cosmetic_commit():
+    # Both fixers report applied, but only the COSMETIC action changed files. The
+    # round-wide push must not be credited to the no-op SUBSTANTIVE action: the
+    # boundary stays at H0, no verification round is requested, and the cosmetic
+    # commit merges under the documented exemption.
+    gh, clock = MainlineGh(), FakeClock()
+    f1 = Comment(id="f1", text="this null check is missing", source="claude[bot]",
+                 path="x.py", diff_hunk="@@ -1 +1 @@",
+                 created_at="2026-01-01T00:30:00+00:00")
+    n1 = Comment(id="n1", text="nit: rename tmp", source="claude[bot]",
+                 path="x.py", diff_hunk="@@ -2 +2 @@",
+                 created_at="2026-01-01T00:30:00+00:00")
+
+    def fix(cm, r):
+        return FixOutcome(status="applied", files_changed=(cm.id == "n1"))
+
+    driver = _content_round_driver(
+        label="SUBSTANTIVE", timeline=[(0, f1), (0, n1)], gh=gh,
+        clock=clock, fix=fix,
+    )
+    outcome = driver.run()
+    assert [a.final for a in outcome.actions] == ["fixed", "fixed"]
+    assert [a.files_changed for a in outcome.actions] == [False, True]
+    assert gh.head == "H1", "the cosmetic action's edit was pushed"
+    assert driver._last_substantive_head == "H0"
+    assert len(gh.matching("@claude review")) == 1, "no verification round"
+    assert outcome.rounds == 1
+    assert outcome.merged is True
+    assert _pinned(gh) == ["H1"]
+
+
 def test_an_unreadable_head_after_a_substantive_push_blocks_the_merge(capsys):
     # The round-end boundary read fails (git rev-parse errors right after the push):
     # the boundary is None and the gate must block [gate-unverified] — never fall

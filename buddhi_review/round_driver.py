@@ -3436,9 +3436,17 @@ class RoundDriver:
             # hand. Nothing here looks inside the commit, so a production edit
             # applied under a COSMETIC label merges unseen — an accepted hole,
             # pinned by a documented-decision test, not a defect to re-wire.
-            round_substantive = any(
-                r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
-                for r, a in zip(results, round_actions)
+            substantive_fixed_actions = [
+                a for r, a in zip(results, round_actions)
+                if r.classification.label == "SUBSTANTIVE"
+                and a.final == "fixed"
+            ]
+            round_substantive = bool(substantive_fixed_actions)
+            substantive_change_evidence_complete = all(
+                a.files_changed is not None for a in substantive_fixed_actions
+            )
+            substantive_action_changed_files = any(
+                a.files_changed is True for a in substantive_fixed_actions
             )
             # An --rr-active restart re-fixed a pre-existing finding whose fix the
             # killed run already pushed and the reviewer never re-reviewed: the fixer
@@ -3454,7 +3462,12 @@ class RoundDriver:
                 and r.classification.label in _REAL_FINDING_LABELS
                 for r, a in zip(results, round_actions)
             )
-            take_substantive_round = round_substantive and (
+            substantive_progress = (
+                substantive_action_changed_files
+                if substantive_change_evidence_complete
+                else round_substantive
+            )
+            take_substantive_round = substantive_progress and (
                 committed_changes or self._worktree_has_changes())
             if take_substantive_round:
                 # F2: this round pushed a SUBSTANTIVE fix — the head now carries
