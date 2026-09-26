@@ -2659,6 +2659,30 @@ def test_apply_fix_reports_a_successful_noop_as_no_file_change(repo):
     assert out.files_changed is False
 
 
+def test_apply_fix_keeps_files_changed_unknown_when_the_diff_is_unreadable(repo, monkeypatch):
+    # `_attempt_diff` answers ("", False) for an UNAVAILABLE tracked diff, the
+    # same as for a genuine no-op; the fixer's edit still gets pushed, so it
+    # must not be reported as "no files changed".
+    def fixer(prompt, *, model, effort, timeout, cwd):
+        (repo / "tracked.py").write_text("fixed\n")
+        return 0, "done"
+
+    monkeypatch.setattr(fix_apply, "_attempt_diff", lambda *a, **k: ("", False))
+    out = apply_fix("claim", cwd=str(repo), runner=fixer, retries=0)
+    assert out.status == "applied"
+    assert out.files_changed is None
+
+
+def test_files_changed_evidence_distinguishes_unknown_from_noop(repo):
+    cwd = str(repo)
+    assert fix_apply._files_changed_evidence(cwd, "HEAD", "diff --git x", False) is True
+    assert fix_apply._files_changed_evidence(cwd, "HEAD", "", True) is None
+    assert fix_apply._files_changed_evidence(cwd, "HEAD", "", False) is False
+    (repo / "tracked.py").write_text("edited\n")
+    # empty text but the worktree really differs from the ref -> unknown, not False
+    assert fix_apply._files_changed_evidence(cwd, "HEAD", "", False) is None
+
+
 def test_apply_fix_transient_restores_then_retries_same(repo):
     seen = []
     def fixer(prompt, *, model, effort, timeout, cwd):

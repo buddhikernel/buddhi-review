@@ -3072,7 +3072,8 @@ def apply_fix(
                     _status_line("✓", "fix verified (CONFIRM)", colour=_DIM)
             return FixOutcome(status="applied", detail=trip or "",
                               diff=prompt_diff, attempts=total_attempts + attempt,
-                              files_changed=bool(diff))
+                              files_changed=_files_changed_evidence(
+                                  cwd, ref, diff, scan_truncated))
 
         if guided_retry_reason is not None:
             # A trustworthy REJECT with budget left broke out of the attempt loop:
@@ -3398,6 +3399,29 @@ def _attempt_diff(cwd: str, tracked_ref: str,
         return "".join(parts), truncated
     except (subprocess.TimeoutExpired, OSError, ValueError):
         return "", False
+
+
+def _files_changed_evidence(cwd: str, ref: str, diff: str,
+                            scan_truncated: bool) -> Optional[bool]:
+    """Did the attempt change files? ``True``/``False`` when that is KNOWN,
+    ``None`` when it is not — never ``False`` for a diff that merely could not
+    be read. :func:`_attempt_diff` answers ``("", False)`` for BOTH a genuine
+    no-op and a wholly unavailable tracked diff, and ``("", True)`` when the
+    scan withheld everything, so an empty text alone proves nothing: reading it
+    as "no change" would let the round driver treat a pushed substantive fix as
+    no-progress and merge it unreviewed. A non-empty diff is proof of a change;
+    an empty one counts as a no-op only once an independent ``git diff --quiet``
+    against the same ref answers "clean". Anything else stays ``None``, which
+    the round driver's fallback treats fail-closed."""
+    if diff:
+        return True
+    if scan_truncated:
+        return None
+    try:
+        probe = _git(cwd, "diff", "--quiet", "--no-ext-diff", ref)
+    except (subprocess.TimeoutExpired, OSError, ValueError):
+        return None
+    return False if probe.returncode == 0 else None
 
 
 def _drop_unchanged_untracked(names: list, snap_untracked: Dict[str, tuple],
