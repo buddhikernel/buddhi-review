@@ -21,6 +21,14 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.9.1](https://github.com/buddhikernel/buddhi-review/compare/v0.9.0...v0.9.1) (2026-09-26)
+
+
+### Bug Fixes
+
+* **round-driver:** a cosmetic-only round merges on the review already in hand, and only a substantive fix earns a re-review ([#112](https://github.com/buddhikernel/buddhi-review/issues/112)) ([cc06aa0](https://github.com/buddhikernel/buddhi-review/commit/cc06aa086527c2c3f0bb6c45f52b4c4c07fc4fd1))
+* **wizard:** WS11 — correct Pro links and activation guidance ([#111](https://github.com/buddhikernel/buddhi-review/issues/111)) ([f8fe27a](https://github.com/buddhikernel/buddhi-review/commit/f8fe27ab58309eb670c464908c633aadf9a5c700))
+
 ## [0.9.0](https://github.com/buddhikernel/buddhi-review/compare/v0.8.0...v0.9.0) (2026-09-15)
 
 
