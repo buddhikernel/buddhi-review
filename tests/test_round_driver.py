@@ -1078,34 +1078,30 @@ def test_no_auth_banner_on_normal_review_round(capsys):
 # earns another round; everything else is a clean finish.
 # ---------------------------------------------------------------------------
 
-def test_cosmetic_only_round_that_pushed_earns_a_verification_round():
-    # A round whose only fix is COSMETIC still PUSHES a commit the reviewer has not
-    # seen. The boundary follows that commit, so the round earns a verification
-    # round: claude — parked as polish-only by this round — is un-parked because
-    # the round pushed, and is re-requested ONCE for the new head. It stays silent
-    # in round 2, and the run ends clean (merging in this constant-head harness,
-    # where the review anchors at the one head there is).
+def test_cosmetic_only_round_ends_the_run_clean():
+    # A round whose only fix is COSMETIC produces no substantive progress: the
+    # cosmetic fix is committed/pushed, then the run ends clean (merges under
+    # auto-merge) with NO re-request round.
     timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]"))]
     fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
     driver, clock, gh = make_driver(
         timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
-        auto_merge=True, max_rounds=3, answer_waiter=lambda esc, **k: {},
+        auto_merge=True, answer_waiter=lambda esc, **k: {},
     )
     outcome = driver.run()
+    assert outcome.status == "clean" and outcome.rounds == 1
+    assert outcome.merged is True
     assert [a.final for a in outcome.actions] == ["fixed"]  # cosmetic fix applied
     assert gh.matching("git", "push")                       # …committed + pushed
-    assert "claude" not in driver.polishing, "a pushing round un-parks the reviewer it parked"
-    assert len(gh.matching("@claude review")) == 2          # round 1 + the verification round
-    assert outcome.status == "clean" and outcome.rounds == 2
-    assert outcome.merged is True
+    assert len(gh.matching("@claude review")) == 1          # but NO round-2 re-request
     assert gh.matching("gh", "merge", "--squash")
 
 
 def test_cosmetic_only_round_that_pushed_nothing_stays_parked_and_ends_the_run():
-    # THE CONTROL for the un-park: the fixer reports applied but the tree is clean,
-    # so nothing is pushed. Nothing new exists for the reviewer to see — it stays
-    # parked as polish-only, no verification round is requested, the run ends in
-    # round 1 and merges on the review it already has.
+    # THE CONTROL for the pushed case above: the fixer reports applied but the
+    # tree is clean, so nothing is pushed. Nothing new exists for the reviewer to
+    # see — it stays parked as polish-only, no verification round is requested,
+    # the run ends in round 1 and merges on the review it already has.
     class CleanTreeGh(GhRecorder):
         def __call__(self, argv, *, cwd=None, timeout=None):
             self.calls.append(list(argv))
@@ -1172,14 +1168,9 @@ def test_substantive_fix_earns_another_round():
 # Sticky polish-exclusion + soft-reset on --rr
 # ---------------------------------------------------------------------------
 
-def test_polish_only_reviewer_stays_parked_while_another_reviewer_covers_the_pushed_head():
-    # copilot posts only a cosmetic nit (no real finding) → parked as polish-only
-    # by round 1. Round 1 PUSHED (claude's fix and copilot's nit), so the head
-    # copilot judged is gone — but claude is still expected for the verification
-    # round (its finding earns a re-review), and ONE anchored review of the new
-    # head is what the head-aware gate needs. So copilot stays parked and is not
-    # re-asked: a head is offered only when nobody covers it (the reference
-    # loop's ladder rule). Round 2 re-requests claude alone, which signs off.
+def test_polish_only_reviewer_dropped_from_rerequest():
+    # copilot posts only a cosmetic nit (no real finding) → dropped as polish-only;
+    # claude's substantive fix drives round 2, where copilot is no longer summoned.
     cfg = {"active_reviewers": ["claude", "copilot"],
            "auto_on_open": {"claude": False, "copilot": False}}
 
@@ -1198,8 +1189,8 @@ def test_polish_only_reviewer_stays_parked_while_another_reviewer_covers_the_pus
         max_rounds=3, answer_waiter=lambda esc, **k: {},
     )
     outcome = driver.run()
-    assert "copilot" in driver.polishing                 # stays parked: claude covers the pushed head
-    assert len(gh.matching("requested_reviewers")) == 1  # copilot: round 1 only
+    assert "copilot" in driver.polishing                 # cosmetic-only → polish-dropped
+    assert len(gh.matching("requested_reviewers")) == 1  # copilot summoned round 1 only
     assert len(gh.matching("@claude review")) == 2       # claude re-requested in round 2
     assert outcome.rounds == 2 and outcome.status == "clean"
 
@@ -1229,11 +1220,8 @@ def test_reviewer_with_a_real_finding_is_not_polished():
 def test_dismissed_substantive_reviewer_is_reviewed_no_change(capsys):
     # copilot's substantive finding is dismissed by the fixer (a genuine SKIP
     # citing "already handled upstream" → final "skipped-already-fixed", NO change
-    # applied): it renders "Reviewed — no change" in round 1's table. Round 1
-    # then PUSHES claude's fix — but claude is still expected to verify that
-    # head, so copilot stays parked: a head is offered only when nobody covers
-    # it, and re-asking a reviewer whose findings were all dismissed would loop
-    # it against the same verdict.
+    # applied): it renders "Reviewed — no change" and is dropped from re-request,
+    # while claude's FIXED finding drives round 2 exactly as today.
     cfg = {"active_reviewers": ["claude", "copilot"],
            "auto_on_open": {"claude": False, "copilot": False}}
 
@@ -1257,20 +1245,18 @@ def test_dismissed_substantive_reviewer_is_reviewed_no_change(capsys):
     )
     outcome = driver.run()
     out = capsys.readouterr().out
-    # The demotion: its own log line, never the polish bucket — and the park
-    # holds through the push, because claude covers the pushed head.
+    # The demotion: its own set + its own log line, never the polish bucket.
     assert "copilot" in driver.reviewed_no_change
     assert "copilot" not in driver.polishing
     assert ("[round] → excluding copilot from subsequent rounds this run "
             "(reviewed — no change: every finding dismissed on "
             "reassessment)") in out
-    # copilot is asked once (round 1) and never re-offered the pushed head;
-    # claude is re-asked to verify it.
+    # Anti-loop: copilot is summoned round 1 only, never re-asked.
     assert len(gh.matching("requested_reviewers")) == 1
-    assert len(gh.matching("@claude review")) == 2
+    assert len(gh.matching("@claude review")) == 2       # claude re-asked as today
     assert outcome.rounds == 2
-    # Round 1's table already shows the terminal label, not "Active", and never
-    # the polish mislabel; round 2's carries the same park.
+    # The SAME round's table already shows the terminal label, not "Active",
+    # and never the polish mislabel; round 2's carries the same drop.
     copilot_rows = [ln for ln in out.splitlines()
                     if ln.startswith("│") and " Copilot" in ln]
     assert len(copilot_rows) == 2
@@ -1305,19 +1291,13 @@ def test_mixed_dismissed_substantive_and_cosmetic_is_reviewed_no_change(capsys):
         timeline, cfg=cfg, classify=classify, fix=fix,
         max_rounds=3, answer_waiter=lambda esc, **k: {},
     )
-    outcome = driver.run()
+    driver.run()
     out = capsys.readouterr().out
-    # Round 1's table renders the terminal label (before the push un-parks it) …
+    assert "copilot" in driver.reviewed_no_change
+    assert "copilot" not in driver.polishing
     row1 = next(ln for ln in out.splitlines()
                 if ln.startswith("│") and " Copilot" in ln)
     assert "Reviewed — no change" in row1 and "Polish-only" not in row1
-    # … and because the applied nit PUSHED a new head, copilot is un-parked and
-    # re-offered it in round 2 (once), rather than the run merging that head on a
-    # verdict reached against its parent.
-    assert "copilot" not in driver.reviewed_no_change
-    assert "copilot" not in driver.polishing
-    assert len(gh.matching("requested_reviewers")) == 2
-    assert outcome.rounds == 2
 
 
 def test_failed_fix_escalation_keeps_reviewer_engaged():
@@ -1570,23 +1550,15 @@ def test_preflight_processes_pre_existing_comment_in_round1_without_waiting():
         fixed.append(c.id)
         return FixOutcome(status="applied")
 
-    fixed_at = []
-
-    def fix_timed(c, r):
-        fixed_at.append(clock.t)
-        return fix(c, r)
-
     timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]"))]
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix_timed,
-        auto_merge=True, answer_waiter=lambda esc, **k: {}, preflight=True, max_rounds=3)
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        auto_merge=True, answer_waiter=lambda esc, **k: {}, preflight=True)
     outcome = driver.run()
+    assert outcome.status == "clean" and outcome.rounds == 1
     assert fixed == ["a"]                          # the pre-existing comment was fixed
-    assert fixed_at == [0]                          # … in round 1 with NO poll wait
-    # Round 1 neither re-summons nor waits on the finding-poster. The fix PUSHED,
-    # so round 2 — the verification round — is where claude is asked, once.
-    assert len(gh.matching("@claude review")) == 1
-    assert outcome.status == "clean" and outcome.rounds == 2
+    assert clock.t < driver.times.min_bot_wait      # NO min-bot wait was burned
+    assert gh.matching("@claude review") == []      # finding-poster not re-summoned round 1
     assert outcome.merged is True                   # a genuine review happened → merge
 
 
@@ -1958,11 +1930,13 @@ def test_rr_active_summons_only_bots_with_no_verdict_in_hand():
     assert gh.matching("requested_reviewers")         # copilot (no verdict) IS summoned
 
 
-def test_rr_active_cosmetic_only_responder_is_asked_once_for_the_head_it_pushed():
-    # THE bug the deleted summon-debt caused was a re-summon for NO reason. There
-    # is now exactly one reason to re-ask a polish-only responder: the round PUSHED
-    # a commit it has not seen. Deferred out of round 1, comment processed with no
-    # wait, parked as polish, then un-parked by the push and asked ONCE in round 2.
+def test_rr_active_cosmetic_only_responder_is_not_force_re_reviewed():
+    # THE bug the deleted summon-debt caused. A bot whose round-1 (pre-existing) comment
+    # is COSMETIC has nothing to fix, so the existing polish rule puts it in
+    # self.polishing and LEAVES IT ALONE. The debt used to override that rule and
+    # re-summon it — confusing the operator. With no debt the normal rules govern:
+    # deferred out of round 1, comment processed with no wait, demoted to polish, and
+    # NEVER re-requested — the run finishes in round 1.
     fixed_at = []
 
     def fix(c, r):
@@ -1980,15 +1954,15 @@ def test_rr_active_cosmetic_only_responder_is_asked_once_for_the_head_it_pushed(
     outcome = driver.run()
     assert "claude" in driver._preflight_responders   # deferred out of round 1 …
     assert fixed_at == [0]                            # … its comment processed with NO wait
-    assert "claude" not in driver.polishing           # the push un-parked it
-    assert len(gh.matching("@claude review")) == 1    # asked ONCE, for the pushed head
-    assert outcome.rounds == 2                         # the verification round, then done
+    assert "claude" in driver.polishing               # cosmetic → the polish rule owns it
+    assert gh.matching("@claude review") == []        # NEVER re-requested (no debt override)
+    assert outcome.rounds == 1                         # so the run finishes in round 1
 
 
 def test_rr_active_cosmetic_only_responder_stays_parked_when_nothing_was_pushed():
-    # The control for the un-park on the restart path: the same shape on a clean
-    # tree (nothing to push) keeps the polish rule exactly as before — parked,
-    # NEVER re-requested, the run finishes in round 1.
+    # The control for the pushed case above, on the restart path: the same shape
+    # on a clean tree (nothing to push) keeps the polish rule exactly as before —
+    # parked, NEVER re-requested, the run finishes in round 1.
     class CleanTreeGh(GhRecorder):
         def __call__(self, argv, *, cwd=None, timeout=None):
             self.calls.append(list(argv))
