@@ -769,18 +769,29 @@ def test_placeholder_review_at_merged_head_still_blocks():
 
 
 # ===========================================================================
-# The boundary follows the COMMIT, not the label (parity with the reference
-# loop's 2026-09-03 re-ruling), and a pushing round un-parks the reviewer it parked.
+# DOCUMENTED DECISION (operator, 2026-09-26): cosmetic code fixes are NOT
+# re-reviewed. The boundary follows the LABEL, not the commit.
 #
-# A COSMETIC-labelled comment's fixer can write real production code, and the
-# round's commit carries it exactly like a substantive one. Nothing on the round
-# path looks inside the commit, and the two content oracles that tried to tell
-# polish from substance were refuted — so the ONE fact the boundary reads is that
-# `commit_and_push` reported `pushed`. A round that pushed earns a verification
-# round, and the reviewer it parked as polish-only (whose verdict was about the
-# head the push REPLACED) is un-parked so that round can offer it the new head —
-# this tree has no gate-time ladder, so the round loop IS the offer. A round that
-# committed nothing keeps its park and is a clean finish.
+# The head-aware boundary advances only when a round applied a SUBSTANTIVE-
+# labelled fix that changed files. A round whose only fixes were COSMETIC is a
+# clean finish: its commit does not move the boundary, no verification round is
+# requested, and the PR merges on the review already in hand (the gate's
+# cosmetic-tail rule). A polish-only reviewer stays dropped for the run; a push
+# never lifts that.
+#
+# THE ACCEPTED HOLE, stated plainly: nothing on the round path looks inside the
+# commit. A comment the classifier labels COSMETIC whose fixer nevertheless
+# writes a real production edit produces a commit the loop calls polish, and it
+# merges without any reviewer having seen that commit. That is the decision, not
+# a defect — do not "fix" it by moving the boundary onto every pushed commit.
+#
+# Substantive fixes keep their re-review: a SUBSTANTIVE fix pushed below the
+# round cap re-requests its reviewer and a silent reviewer blocks the merge; on
+# the final round it fails closed (this tree has no gate-time summon ladder).
+#
+# These tests use a tip that really advances on each push. The constant-head
+# fake in test_round_driver.py cannot see the boundary move, so the exemption is
+# pinned HERE.
 # ===========================================================================
 
 class SteppingGh(MainlineGh):
@@ -849,31 +860,68 @@ _SIGNOFF = Comment(id="s1", text="No issues found.", source="claude[bot]",
                    created_at="2026-01-01T02:00:00+00:00")
 
 
-def test_a_cosmetic_labelled_commit_moves_the_boundary_and_is_re_offered_before_any_merge():
-    # THE FLIP + THE OFFER. Claude reviewed H0 (an inline finding anchored there);
-    # the fixer applies a fix under a COSMETIC label; the push advances the tip to
-    # H1. Before: the boundary stayed at H0, the gate's cosmetic-tail rule merged
-    # H1 on a review of H0 — production code no reviewer had seen. Now: the
-    # boundary is H1, claude — parked as polish-only by the round — is un-parked
-    # because the round pushed, is re-requested for H1, stays silent, and the
-    # clean exit BLOCKS: nothing merges before the reviewer answers.
-    gh, clock = MainlineGh(), FakeClock()
+class ProductionEditGh(MainlineGh):
+    """MainlineGh whose worktree carries a 56-line PRODUCTION edit to engine.py —
+    the shape of a COSMETIC-labelled comment whose fixer wrote real code. Anything
+    that read the commit's content would see it (``git diff --numstat`` answers
+    it); the round path reads none of it."""
+
+    def __call__(self, argv, *, cwd=None, timeout=None):
+        argv = list(argv)
+        if argv[:3] == ["git", "status", "--porcelain"]:
+            self.calls.append(argv)
+            return _CP(0, "" if self.pushed else " M engine.py\n")
+        if argv[:2] == ["git", "diff"] and "--numstat" in argv:
+            self.calls.append(argv)
+            return _CP(0, "56\t0\tengine.py\n")
+        return super().__call__(argv, cwd=cwd, timeout=timeout)
+
+
+def _content_reads(gh):
+    """Every recorded argv that would have read the commit's CONTENT: a numstat,
+    a ``git diff`` of anything but the index-vs-HEAD dirty probe, or a ``git show``
+    of more than the committer date."""
+    return [c for c in gh.calls
+            if "--numstat" in c
+            or (c[:2] == ["git", "diff"] and "--cached" not in c)
+            or (c[:2] == ["git", "show"] and "-s" not in c)]
+
+
+def _pinned(gh):
+    return [c[c.index("--match-head-commit") + 1] for c in gh.calls
+            if "--match-head-commit" in c]
+
+
+def test_a_cosmetic_labelled_commit_merges_on_the_existing_review_by_decision():
+    """Documented decision (operator, 2026-09-26): cosmetic code fixes are not
+    re-reviewed. A production edit under a COSMETIC label merges without a
+    reviewer having seen this commit. Accepted hole, not a defect — do not fix by
+    moving the boundary onto the commit.
+
+    Claude reviewed H0 (an inline finding anchored there); the classifier labels
+    it COSMETIC; the fixer writes a 56-line production edit to engine.py and the
+    push advances the tip to H1. The boundary stays at H0, claude stays dropped
+    as polish-only, nobody is re-asked, and the PR merges pinned to H1 on the
+    review of H0 — without anything having read the commit's content."""
+    gh, clock = ProductionEditGh(), FakeClock()
     driver = _content_round_driver(label="COSMETIC", timeline=[(0, _FINDING)],
                                    gh=gh, clock=clock)
     outcome = driver.run()
     assert gh.head == "H1", "the fix push advanced the tip"
-    assert driver._last_substantive_head == "H1", "the boundary followed the COMMIT"
-    assert "claude" not in driver.polishing, "the pushing round un-parked its reviewer"
-    assert len(gh.matching("@claude review")) == 2, "re-offered the pushed head, once"
-    assert outcome.rounds == 2
-    assert outcome.merged is False, "H1 was never reviewed — the gate must block"
-    assert gh.matching("gh", "merge", "--squash") == []
+    assert driver._last_substantive_head == "H0", "a COSMETIC-only round leaves the boundary"
+    assert "claude" in driver.polishing, "polish-only: dropped for the run"
+    assert len(gh.matching("@claude review")) == 1, "no verification round"
+    assert outcome.rounds == 1
+    assert outcome.merged is True, "merged on the review already in hand"
+    assert _pinned(gh) == ["H1"]
+    assert _content_reads(gh) == [], "nothing on the round path read the commit"
 
 
 def test_the_same_shape_on_the_stale_boundary_would_have_merged():
-    # The counterfactual through the SAME pure gate: with the boundary left at H0
-    # — what the label rule did — a review of H0 satisfies the cosmetic-tail rule
-    # for merged head H1. The flip is the boundary's doing.
+    # The pure half of the decision, through the SAME pure gate: with the boundary
+    # left at H0 — what the label rule does for a COSMETIC-only round — a review
+    # of H0 satisfies the cosmetic-tail rule for merged head H1. With the boundary
+    # at H1 — what a SUBSTANTIVE round does — the same review blocks.
     anc = lambda a, b: int(a[1:]) <= int(b[1:])
     assert _head_reviewed_blocks_merge(
         True, {"claude"}, {"claude": {"H0"}}, "H1", "H0", anc) is False
@@ -881,27 +929,30 @@ def test_the_same_shape_on_the_stale_boundary_would_have_merged():
         True, {"claude"}, {"claude": {"H0"}}, "H1", "H1", anc) is True
 
 
-def test_a_cosmetic_commit_merges_once_the_reviewer_signs_off_on_its_head():
-    # THE CONTROL — the polish tail still lands. The single reviewer is re-offered
-    # the pushed head in the verification round and signs off SHA-LESSLY after
-    # H1's commit time, inside round 2's poll window; the sign-off anchors to H1
-    # and the PR merges, pinned to H1.
+def test_a_cosmetic_commit_merges_in_one_round_without_a_sign_off():
+    # The same timeline in which a verification round would have met a sign-off
+    # at t=200: a COSMETIC-only round is a clean finish, so the run ends in round
+    # 1 — the sign-off is never polled (no sha-less anchor is recorded) and the PR
+    # merges on the review of H0, pinned to H1.
     gh, clock = MainlineGh(), FakeClock()
     driver = _content_round_driver(label="COSMETIC",
                                    timeline=[(0, _FINDING), (200, _SIGNOFF)],
                                    gh=gh, clock=clock)
     outcome = driver.run()
-    assert driver._last_substantive_head == "H1"
-    assert outcome.rounds == 2, "the commit earned a verification round"
+    assert outcome.rounds == 1, "no verification round for a cosmetic-only round"
+    assert driver._clean_signal_head == {}, "the run ended before the sign-off was polled"
+    assert driver._last_substantive_head == "H0"
     assert outcome.merged is True
-    pinned = gh.matching("gh", "merge", "--match-head-commit")
-    assert pinned and "H1" in pinned[0]
+    assert _pinned(gh) == ["H1"]
 
 
-def test_findings_on_the_re_offered_head_are_fixed_and_the_final_head_still_needs_a_review():
-    # The re-offered reviewer comes back with a FINDING on H1: it is fixed and
-    # pushed (H2), the boundary follows to H2, and with no review of H2 by the cap
-    # the clean exit blocks — findings never let an unreviewed head merge.
+def test_a_substantive_finding_on_the_verified_head_is_fixed_and_the_final_head_still_needs_a_review():
+    # Substantive fixes keep their re-review. Claude's SUBSTANTIVE finding on H0
+    # is fixed and pushed (H1): the boundary follows and claude is re-asked. It
+    # comes back with a SUBSTANTIVE finding on H1: fixed and pushed (H2), the
+    # boundary follows to H2, claude is asked a third time and stays silent — and
+    # with no review of H2 by the cap the clean exit blocks. Findings never let an
+    # unreviewed head merge.
     gh, clock = SteppingGh(), FakeClock()
     finding2 = Comment(id="f2", text="this null check is missing", source="claude[bot]",
                        path="x.py", diff_hunk="@@ -3 +3 @@",
@@ -915,13 +966,16 @@ def test_findings_on_the_re_offered_head_are_fixed_and_the_final_head_still_need
     def fix(c, r):
         gh.dirty = True
         return FixOutcome(status="applied")
-    driver = _content_round_driver(label="COSMETIC",
+    driver = _content_round_driver(label="SUBSTANTIVE",
                                    timeline=[(0, _FINDING), (200, finding2)],
                                    gh=gh, clock=clock, max_rounds=3, fix=fix,
                                    inline_fetch=inline_fetch)
     outcome = driver.run()
     assert gh.head == "H2", "the round-2 finding was fixed and pushed"
     assert driver._last_substantive_head == "H2"
+    assert outcome.rounds == 3
+    assert len(gh.matching("@claude review")) == 3
+    assert len(gh.matching("git", "push")) == 2
     assert outcome.merged is False
     assert gh.matching("gh", "merge", "--squash") == []
 
@@ -948,10 +1002,10 @@ def test_a_round_that_committed_nothing_neither_moves_the_boundary_nor_asks_agai
     assert outcome.merged is True
 
 
-def test_the_label_is_not_consulted_by_the_boundary():
-    # The identical run under a SUBSTANTIVE label ends with the identical boundary,
-    # the identical re-request and the identical merge verdict — the label changes
-    # nothing the gate or the round loop reads.
+def test_the_label_decides_whether_the_boundary_moves():
+    # The identical run under the two labels: COSMETIC leaves the boundary at H0,
+    # asks nobody again, and merges on the review of H0; SUBSTANTIVE moves the
+    # boundary to H1, re-asks claude, and — claude silent — blocks.
     results = {}
     for label in ("COSMETIC", "SUBSTANTIVE"):
         gh, clock = MainlineGh(), FakeClock()
@@ -960,27 +1014,42 @@ def test_the_label_is_not_consulted_by_the_boundary():
         outcome = driver.run()
         results[label] = (driver._last_substantive_head,
                           len(gh.matching("@claude review")), outcome.merged)
-    assert results["COSMETIC"] == results["SUBSTANTIVE"] == ("H1", 2, False)
+    assert results["COSMETIC"] == ("H0", 1, True)
+    assert results["SUBSTANTIVE"] == ("H1", 2, False)
 
 
-def test_the_boundary_advances_at_the_cap_too_and_the_cap_fails_closed():
-    # max_rounds=1: the cosmetic commit lands on the final round, the boundary
-    # follows it, and — with no ladder in this tree — the clean exit blocks and
-    # hands back rather than merging an unreviewed head.
+def test_a_cosmetic_commit_on_the_final_round_merges_on_the_existing_review():
+    # max_rounds=1: the cosmetic commit is the final commit. The boundary stays
+    # at H0 and the PR merges on the review of H0, pinned to H1.
     gh, clock = MainlineGh(), FakeClock()
     driver = _content_round_driver(label="COSMETIC", timeline=[(0, _FINDING)],
                                    gh=gh, clock=clock, max_rounds=1)
     outcome = driver.run()
+    assert driver._last_substantive_head == "H0"
+    assert outcome.rounds == 1
+    assert outcome.merged is True
+    assert _pinned(gh) == ["H1"]
+
+
+def test_a_substantive_commit_on_the_final_round_fails_closed():
+    # max_rounds=1: the SUBSTANTIVE commit lands on the final round, the boundary
+    # follows it, and — with no gate-time summon ladder in this tree — the clean
+    # exit blocks and hands back rather than merging an unreviewed head.
+    gh, clock = MainlineGh(), FakeClock()
+    driver = _content_round_driver(label="SUBSTANTIVE", timeline=[(0, _FINDING)],
+                                   gh=gh, clock=clock, max_rounds=1)
+    outcome = driver.run()
     assert driver._last_substantive_head == "H1"
+    assert outcome.rounds == 1
     assert outcome.merged is False
     assert gh.matching("gh", "merge", "--squash") == []
 
 
 # ---------------------------------------------------------------------------
-# A pushing round's park is lifted the way the reference loop's gate-time
-# ladder offers a head: only when nobody else covers it, and at most once per
-# reviewer per run. The two rows that pin it: a lone nitter (F) and a covered
-# head (G).
+# The polish-only drop is sticky for the run — a push never lifts it. The two
+# rows that pin it with a moving tip: a lone nitter (terminates in one round
+# and merges) and a polish-only reviewer beside a substantive one (the
+# substantive reviewer verifies the pushed head; the nitter is never re-asked).
 # ---------------------------------------------------------------------------
 TWO_REVIEWERS = {"active_reviewers": ["claude", "copilot"],
                  "auto_on_open": {"claude": False, "copilot": False}}
@@ -1050,36 +1119,33 @@ def _classify_nits(p):
 
 
 @pytest.mark.parametrize("max_rounds", [3, 5, 8])
-def test_a_lone_reviewer_nitting_every_pushed_head_is_re_offered_once_then_the_gate_fails_closed(max_rounds):
-    # Row F: the only reviewer answers a FRESH cosmetic nit every time it is
-    # asked, and the fixer always pushes. Round 1 parks it (polish-only) and
-    # pushes H0→H1; nobody else is expected, so it is un-parked and offered H1.
-    # Its second nit is applied and pushed (H2) — and that is its ONE wake this
-    # run: it stays parked, the gate finds H2 covered by nobody, and the run
-    # hands back after 2 rounds at EVERY cap instead of spinning to the cap
-    # (the reference loop's ladder wakes each reviewer at most once per run).
+def test_a_lone_reviewer_nitting_is_dropped_after_one_round_and_the_run_merges(max_rounds):
+    # The only reviewer answers a FRESH cosmetic nit every time it is asked, and
+    # the fixer always pushes. Round 1 drops it (polish-only) and pushes H0→H1;
+    # the round is cosmetic-only, so it is a clean finish: nobody is re-asked and
+    # the PR merges on the review of H0, pinned to H1 — in ONE round at every cap,
+    # never spinning to the cap, because the polish drop is sticky.
     clock, timeline, anchors = FakeClock(), [], {}
     gh = _nit_on_every("@claude review", "claude[bot]", clock, timeline)
     d = _fed_driver(gh=gh, clock=clock, cfg=CLAUDE_ONLY, timeline=timeline,
                     anchors=anchors, classify=_classify_nits, max_rounds=max_rounds)
     outcome = d.run()
-    assert outcome.rounds == 2, "bounded by the once-per-run wake, not by the cap"
-    assert len(gh.matching("@claude review")) == 2
-    assert len(gh.matching("git", "push")) == 2
-    assert "claude" in d.polishing                       # parked for good after its one wake
-    assert outcome.merged is False
-    assert gh.matching("gh", "merge", "--squash") == []  # H2 is covered by nobody: fail-closed
+    assert outcome.rounds == 1, "a cosmetic-only round is a clean finish"
+    assert len(gh.matching("@claude review")) == 1
+    assert len(gh.matching("git", "push")) == 1
+    assert "claude" in d.polishing                       # dropped for the run
+    assert outcome.merged is True
+    assert _pinned(gh) == ["H1"]
 
 
 @pytest.mark.parametrize("max_rounds", [3, 5])
-def test_a_polish_only_reviewer_is_not_re_offered_while_another_reviewer_covers_the_pushed_head(max_rounds):
-    # Row G: two reviewers. claude posts a real finding on H0; copilot answers
-    # every re-request with a fresh nit. Round 1 fixes both and pushes H1; claude
-    # is still expected (its finding earns the re-review), so copilot — parked
-    # polish-only — stays parked: one anchored review of H1 is what the gate
-    # needs. Round 2 asks claude alone, claude signs off on H1, the PR merges at
-    # H1 in 2 rounds. (Un-parking copilot here re-asks a nitter forever: the run
-    # would spend every round to the cap and hand back unmerged.)
+def test_a_polish_only_reviewer_is_dropped_while_the_substantive_reviewer_verifies_the_pushed_head(max_rounds):
+    # Two reviewers. claude posts a real finding on H0; copilot answers every
+    # re-request with a fresh nit. Round 1 fixes both and pushes H1; claude's
+    # SUBSTANTIVE fix earns the verification round, and copilot — dropped
+    # polish-only — is not summoned again. Round 2 asks claude alone, claude signs
+    # off on H1, the PR merges at H1 in 2 rounds. (Re-asking copilot here would
+    # re-ask a nitter forever: the run would spend every round to the cap.)
     clock, timeline, anchors = FakeClock(), [], {}
     gh = _nit_on_every("requested_reviewers", "copilot[bot]", clock, timeline)
     timeline.append((0, Comment(id="f1", text="this null check is missing",

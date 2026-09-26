@@ -4,19 +4,15 @@ One round = summon/re-request the expected reviewers → wait a short beat for t
 triggers to register → hold the round open until **every expected bot has
 quiesced** → classify + kernel-decide + act on the round's new comments →
 commit/push the applied fixes → decide whether to run another round. The run
-ends **clean** the moment a round pushes nothing new; a round that did push a
-commit earns another review round, up to ``max_rounds``.
+ends **clean** the moment a round produces no substantive progress; a round that
+did land a substantive fix earns another review round, up to ``max_rounds``.
 
 **Termination.** Another review round is requested ONLY when the round produced
-a NEW COMMIT on the PR branch — ``commit_and_push`` reported ``pushed`` — or,
-with pushing off, when a ``SUBSTANTIVE`` comment's fix landed AND changed files
-in the worktree. The reviewers are then asked to look at exactly that head, and
-the head-aware merge boundary moves onto it: the code cannot tell polish from
-substance, so every commit the loop authors is reviewed before it merges, a
-COSMETIC-labelled fix included. A round whose fixes committed nothing — a
-PR-description / outdated / invalid-only round, a comment the fixer skipped, a
-fix that changed nothing on disk — is a clean finish: the run exits clean
-without re-summoning anyone. When the
+real substantive progress — at least one ``SUBSTANTIVE`` comment whose fix
+actually landed AND changed files. A cosmetic / PR-description / outdated /
+invalid-only round — or a substantive comment the fixer skipped, or a
+substantive fix that changed nothing — is a clean finish: any applied fixes are
+committed/pushed, then the run exits clean without re-summoning anyone. When the
 round budget is spent and the final round completed cleanly (no unanswered
 escalation, no poisoned worktree, no failed push, no operator stop), the exit
 routes through the same clean-exit gates as a naturally-clean finish rather than
@@ -1055,17 +1051,11 @@ class RoundDriver:
         # hard buckets), so they never touch the SAFETY / hard-cause reporting.
         # Cleared by --rr (re-requests everyone):
         #   polishing     — a reviewer whose round posted only non-substantive
-        #                   comments (nothing left to fix); parked out of re-request
-        #                   (un-parked at most once, only when nobody else is left
-        #                   to verify a head the same round pushed — see run()).
+        #                   comments (nothing left to fix); dropped from re-request.
         self.polishing: Set[str] = set()
-        # The reviewers a pushing round has already un-parked once this run: the
-        # second cosmetic-only answer parks them for good (each reviewer is offered
-        # a head it has not judged at most once per run).
-        self._unparked_after_push: Set[str] = set()
         #   reviewed_no_change — a reviewer whose substantive comment(s) this
         #                   round were ALL dismissed on reassessment (fixer
-        #                   skip — no change applied); parked out of re-request
+        #                   skip — no change applied); dropped from re-request
         #                   so the run never loops re-asking a reviewer whose
         #                   findings it has already judged not worth changing.
         self.reviewed_no_change: Set[str] = set()
@@ -1196,11 +1186,10 @@ class RoundDriver:
         #   Everything already on the PR when this run began — a prior crashed run's
         #   fixes included — is unknown-provenance ⇒ treated as SUBSTANTIVE.
         self._process_start_head: Optional[str] = None
-        # _last_substantive_head: the PR head after this run's most recent push;
-        #   init to _process_start_head, advanced on EVERY round that pushed a new
-        #   commit — whatever label the round carried (the code cannot tell polish
-        #   from substance, so every loop-authored commit is reviewed before it
-        #   merges). None (unresolvable local head) → the gate BLOCKS (fail-closed).
+        # _last_substantive_head: the PR head after this run's most recent
+        #   SUBSTANTIVE push; init to _process_start_head, advanced only on a
+        #   substantive round. Every commit after it is a loop-authored cosmetic-only
+        #   fix. None (unresolvable local head) → the gate BLOCKS (fail-closed).
         self._last_substantive_head: Optional[str] = None
         # _round_review_head: the local HEAD captured at the START of the current
         #   round == the remote head reviewers check out this round (the loop pushes
@@ -2265,16 +2254,16 @@ class RoundDriver:
 
         * **polish** — a reviewer whose comments this round were ALL
           non-substantive (none SUBSTANTIVE / BUSINESS_QUESTION /
-          CLASSIFICATION_FAILED) has nothing left to fix; parked out of
-          re-request (a park a PUSHING round may lift once — see run()).
+          CLASSIFICATION_FAILED) has nothing left to fix; dropped from
+          re-request for the rest of the run.
         * **reviewed — no change** — a reviewer whose real findings this round
           all ended dismissed with NO change applied (``final`` in
           ``{"skipped-invalid", "skipped-already-fixed"}``): the fixer judged
           the comment invalid / already-fixed / not applicable via a genuine
           validity judgment. A substantive comment the loop decided not to act
           on is not cosmetic — it gets its own label — and re-asking that
-          reviewer would loop it against the same verdict, so it too is parked
-          out of re-request. A fix-verify REJECT is NOT a dismissal (``final ==
+          reviewer would loop it against the same verdict, so it too is dropped
+          from re-request. A fix-verify REJECT is NOT a dismissal (``final ==
           "rejected"``): the finding still stands, so its reviewer keeps its
           re-request slot and the REJECT is escalated at the round-level gate.
 
@@ -2287,8 +2276,7 @@ class RoundDriver:
 
         On an ``--rr-active`` restart a deferred responder's pre-existing comments ARE
         its round-1 verdict, so they demote it exactly like any round: cosmetic-only →
-        polish (parked, unless the round pushes a head nobody else is left to verify),
-        dismissed real findings → reviewed-no-change,
+        polish (left alone next round), dismissed real findings → reviewed-no-change,
         a surviving finding → keeps its slot and is re-requested by ``expected_bots()``.
         That is how the restart needs no separate summon debt. The ONE exception is a
         pre-existing finding the fixer reports ``skipped-already-fixed`` (its id is in
@@ -2563,9 +2551,7 @@ class RoundDriver:
           processed as its round-1 verdict instead. After that NOTHING is special: the
           existing ``expected_bots()`` + end-of-round rules decide round 2 — a
           substantive finding re-requests its bot to verify the fix, a cosmetic one
-          lands in ``self.polishing`` and is parked (a pushing round un-parks it only
-          when no other reviewer is left to verify the pushed head, and at most once
-          per run), an approval is done. There is
+          lands in ``self.polishing`` and is left alone, an approval is done. There is
           no summon debt; the correct behaviour falls out of the rules the loop already
           runs.
 
@@ -2584,9 +2570,8 @@ class RoundDriver:
         # unconditionally on the restart path. After the snapshot NOTHING is
         # special: expected_bots() and the round-end rules decide any further round — a
         # substantive comment re-requests its bot (it is in none of the exclusion sets),
-        # a cosmetic one lands in self.polishing and is parked (un-parked only by a
-        # pushing round that leaves nobody else to verify its head, once per run), an
-        # approval is done. No summon debt.
+        # a cosmetic one lands in self.polishing and is left alone, an approval is done.
+        # No summon debt.
         if self.preflight:
             self._preflight_snapshot(restart=True)
             deferred = set(self._preflight_responders)
@@ -2859,19 +2844,13 @@ class RoundDriver:
             print(f"[rr-active] {bot}: polish-only at this HEAD — not re-requesting")
         return restored
 
-    def _persist_polish_state(self, exclude: Set[str] = frozenset()) -> None:
+    def _persist_polish_state(self) -> None:
         """Stamp the run's CURRENT polish-only set against the tip this round
         leaves behind — called at every round end, AFTER the round's fixes are
         pushed, so the tip is the one the loop carries into the next round (and the
-        one a restart would meet as live HEAD). ``exclude`` names the reviewers
-        whose verdict was reached on a tip this round has since replaced (the ones
-        it parked and then pushed past): a verdict about the parent is never
-        stamped against the child, so a restart at the new tip restores nothing
-        for them and re-derives their park from their live comments — re-asking
-        only when no reviewer remains expected for the head.
-        Fail-closed: an unreadable tip writes nothing, so a later restore can never
-        match a stamp taken on an unknown head. Best-effort — a failed write only
-        costs a re-summon."""
+        one a restart would meet as live HEAD). Fail-closed: an unreadable tip
+        writes nothing, so a later restore can never match a stamp taken on an
+        unknown head. Best-effort — a failed write only costs a re-summon."""
         tip = self._head_sha()
         if not tip:
             return
@@ -2879,8 +2858,7 @@ class RoundDriver:
         # a verdict overwrite it with the empty set at the same unadvanced tip; a run
         # that restored nothing keeps write_polish_state's empty no-clobber guard.
         polish_state.write_polish_state(
-            self.pr, self._polish_repo_key(), tip,
-            sorted(self.polishing - set(exclude)),
+            self.pr, self._polish_repo_key(), tip, sorted(self.polishing),
             restored_prior=self._polish_restored)
 
     # ------------------------------------------------------------------- run
@@ -3368,11 +3346,10 @@ class RoundDriver:
             # decided AFTER classification, BEFORE the table renders its status.
             # A deferred responder's pre-existing comments ARE its round-1 verdict on
             # the restart path, so they drive these demotions like any round's: a
-            # cosmetic-only responder lands in self.polishing and is parked (the
-            # whole point — the loop already knows not to re-ask a polish bot while
-            # someone else covers the head; the un-park below the push is the one
-            # exception), and a substantive one is re-requested by expected_bots()
-            # to verify the fix. That is why the deferral needs no summon debt.
+            # cosmetic-only responder lands in self.polishing and is left alone next
+            # round (the whole point — the loop already knows not to re-ask a polish
+            # bot), and a substantive one is re-requested by expected_bots() to verify
+            # the fix. That is why the deferral needs no summon debt.
             self._promote_reviewed_no_findings(actionable, results)
             # Round-end demotions BEFORE the table renders, so a reviewer about
             # to be dropped shows its actual next-round disposition (Polish-only
@@ -3380,14 +3357,7 @@ class RoundDriver:
             # whose whole round was non-substantive has nothing left to fix, and
             # one whose real findings were ALL dismissed on reassessment must
             # not be re-asked (it would loop against the same verdict).
-            _parked_before = (set(self.polishing), set(self.reviewed_no_change))
             self._update_polishing(actionable, results, round_actions)
-            # The reviewers THIS round parked — polish-only, or every finding
-            # dismissed. If the round goes on to push a commit, their verdicts were
-            # reached on a head that no longer exists (see the un-park and the
-            # stamp exclusion below the push).
-            _newly_parked = (self.polishing - _parked_before[0],
-                             self.reviewed_no_change - _parked_before[1])
             self._render_round(round_no, actionable, results, expected)  # per-reviewer round summary
 
             if self.adapter.escalation.delivered:
@@ -3438,68 +3408,34 @@ class RoundDriver:
                     # Bucket C: local/remote diverged — never rebase/force-push it.
                     return self._handback("needs-human", round_no, rebase_skip=True)
                 committed_changes = (pushed == "pushed")
-                if committed_changes:
-                    # The round put a NEW COMMIT on the branch, and a reviewer whose
-                    # verdict was reached against the head this commit REPLACED has
-                    # not seen the new one. Offer it the way the reference loop's
-                    # gate-time ladder does — a head is offered only when nobody
-                    # covers it, and each reviewer is woken at most once:
-                    #   1. the reviewers THIS round parked — polish-only, or every
-                    #      finding dismissed — are un-parked ONLY if, after the park,
-                    #      no other expected reviewer remains to verify the pushed
-                    #      head; while someone else is still expected, one anchored
-                    #      review of the new head is what the head-aware gate needs,
-                    #      and the parked reviewer stays parked;
-                    #   2. a reviewer is un-parked at most ONCE per run — its second
-                    #      cosmetic-only answer is applied and pushed as today, then
-                    #      it is parked for good and the gate decides (a head nobody
-                    #      covers is `[unreviewed-head]`, fail-closed);
-                    #   3. a reviewer parked by an EARLIER round that did not push
-                    #      stays parked (the park's purpose — not burning rounds
-                    #      re-asking about dismissed findings — is untouched), and
-                    #      a round that pushed nothing parks as before.
-                    _unpark = ((_newly_parked[0] | _newly_parked[1])
-                               - self._unparked_after_push)
-                    if _unpark and not self.expected_bots():
-                        self.polishing -= _unpark
-                        self.reviewed_no_change -= _unpark
-                        self._unparked_after_push |= _unpark
 
             # Persist this round's polish-only verdicts against the tip the loop
             # now carries — AFTER the fixes are pushed, so the stamp names the head
-            # a restart would meet. A polish verdict is a verdict on the tip it was
-            # reached on: when this round PUSHED, the reviewers it parked judged
-            # the PREVIOUS tip, so they are excluded from the stamp at the pushed
-            # one — whether or not the un-park above lifted their park — and a
-            # restart at the new tip restores nothing for them: it re-derives
-            # their park from their live comments and re-asks only when no
-            # reviewer remains expected for the head. A round that pushed nothing
-            # stamps its parks at the very tip they were reached on.
-            self._persist_polish_state(
-                exclude=((_newly_parked[0] | _newly_parked[1])
-                         if committed_changes else set()))
+            # a restart would meet. A polish-only reviewer is sticky within a run
+            # (never re-summoned even as later fixes advance HEAD), so stamping the
+            # POST-fix tip and restoring only at that tip reproduces exactly that
+            # stickiness across a restart; a PRE-fix stamp would never match.
+            self._persist_polish_state()
 
-            # ── Review-progress gate ──────────────────────────────────────────
-            # Request another review round when this round put a NEW COMMIT on the
-            # PR branch (``pushed`` — a real, non-empty commit reached the remote),
-            # or — with pushing off — when a SUBSTANTIVE-labeled comment's fix
-            # LANDED (final == "fixed") AND changed files in the worktree. A round
-            # whose fixes committed nothing — PR-description / outdated /
-            # invalid-only, a comment the fixer skipped, a fix that changed nothing
-            # on disk — is a clean finish: exit clean without re-summoning anyone.
-            # (A verify-REJECT does NOT reach here as a clean finish: it escalated
-            # at the round-level gate above, so an unanswered/stop REJECT already
-            # handed back or stopped the run.)
-            #
-            # WHY THE COMMIT AND NOT THE LABEL (parity with the reference loop's
-            # 2026-09-03 re-ruling): a COSMETIC-labelled comment's fixer can write
-            # a real production edit, and the commit carries it exactly like a
-            # substantive one. Nothing on this path looks inside the commit, and
-            # the two content oracles that tried to tell polish from substance were
-            # both refuted by measurement — so the one fact read here is whether a
-            # commit happened. The cost is a verification round for some genuinely
-            # cosmetic fixes; the alternative was merging production code no
-            # reviewer had seen behind a cosmetic label.
+            # ── Substantive-progress gate ─────────────────────────────────────
+            # Request another review round ONLY when this round produced real
+            # substantive progress: at least one SUBSTANTIVE-labeled comment whose
+            # fix actually LANDED (final == "fixed") AND changed files. A cosmetic
+            # / PR-description / outdated / invalid-only round — or a substantive
+            # comment the fixer skipped, or a substantive fix that changed nothing
+            # — is a clean finish: the applied fixes were committed above, so exit
+            # clean without re-summoning anyone. (A verify-REJECT does NOT reach
+            # here as a clean finish: it escalated at the round-level gate above,
+            # so an unanswered/stop REJECT already handed back or stopped the run.)
+            # The file-change check reads the commit result when pushing
+            # (``pushed`` = real changes committed); with pushing off it probes
+            # the worktree directly.
+            # DELIBERATE (operator decision, 2026-09-26): cosmetic code fixes are
+            # NOT re-reviewed. A COSMETIC-only round's commit does not move the
+            # head-aware merge boundary and the PR merges on the review already in
+            # hand. Nothing here looks inside the commit, so a production edit
+            # applied under a COSMETIC label merges unseen — an accepted hole,
+            # pinned by a documented-decision test, not a defect to re-wire.
             round_substantive = any(
                 r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
                 for r, a in zip(results, round_actions)
@@ -3518,22 +3454,14 @@ class RoundDriver:
                 and r.classification.label in _REAL_FINDING_LABELS
                 for r, a in zip(results, round_actions)
             )
-            # The verification round can reach the reviewer the round parked: a
-            # pushing round un-parks its own newly-parked reviewers above, so a
-            # COSMETIC-labelled commit from a single-reviewer fleet is offered to
-            # that reviewer next round instead of the round asking nobody and the
-            # clean exit failing closed with `[unreviewed-head]`.
-            take_substantive_round = committed_changes or (
-                round_substantive and self._worktree_has_changes())
-            if committed_changes:
-                # F2: this round PUSHED a commit — the head now carries a commit no
-                # reviewer has seen. Advance the head-aware boundary onto it so the
-                # gate requires a review at/after this head. The head is read from
-                # LOCAL git right here: commit_and_push pushes the local HEAD and
-                # returns 'pushed' only after that push succeeded, synchronously, so
-                # this read IS the head it pushed (None on a git failure → the gate
-                # blocks, fail-closed). Advanced on the commit alone — never on the
-                # worktree probe above, which proves no push happened.
+            take_substantive_round = round_substantive and (
+                committed_changes or self._worktree_has_changes())
+            if take_substantive_round:
+                # F2: this round pushed a SUBSTANTIVE fix — the head now carries
+                # commits no reviewer has seen. Advance the head-aware boundary so
+                # the gate requires a review at/after this head; only a cosmetic-only
+                # tail after it may ride an earlier reviewed head. Read from LOCAL git
+                # (None on failure → the gate blocks, fail-closed).
                 self._last_substantive_head = self._local_head_sha()
             if round_no >= self.max_rounds and restart_reverify:
                 # Final round, but the restart's re-fixed pre-existing finding was never

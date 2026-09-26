@@ -8,14 +8,12 @@ in-process state: kill the loop between rounds and it is gone, so an
 burning a summon, a register delay, and a full poll window on a bot whose
 comments the poll then re-ingests anyway.
 
-The verdict is tied to a specific tip: a polish-only reviewer stays parked
-*within* a run while another expected reviewer covers each head the run pushes
-(once per run, when nobody is left to cover a pushed head, it is re-offered
-that head), so the stamp is written with the tip the loop carries into its next
-round — minus any reviewer whose verdict the round's own push has outdated — and
-restored ONLY when the PR's live HEAD still equals it. A HEAD that moved (a
-human's commit, a rebase) invalidates the verdict — the reviewer may have real
-findings on the new code — and nothing is restored.
+The verdict is tied to a specific tip: a polish-only reviewer is sticky *within*
+a run (it is not re-summoned even as later fixes advance HEAD), so the stamp is
+written with the tip the loop carries into its next round and restored ONLY when
+the PR's live HEAD still equals it. A HEAD that moved (a human's commit, a
+rebase) invalidates the verdict — the reviewer may have real findings on the new
+code — and nothing is restored.
 
 STORAGE. One JSON object per PR under ``$BUDDHI_POLISH_STATE_DIR`` (default
 ``~/.cache/buddhi/polish-state``), named ``<owner__repo>-PR<pr>.json`` — the FULL
