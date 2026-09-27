@@ -36,7 +36,7 @@ Understanding the trust boundary helps you scope a report:
   cherry-pick / force-push) while a review is in flight. It activates only when the
   skill runs and leaves your everyday git untouched.
 - **It reads and writes local files.** Config lives at
-  `~/.config/review-loop/config.yaml`; escalation answer files are written under your
+  `~/.config/buddhi/config.yaml`; escalation answer files are written under your
   temp directory and created with `O_EXCL` (plus `O_NOFOLLOW` where the platform has
   it) so the loop owns the path it writes.
 - **It makes no outbound network connections of its own.** The reviewers it triggers

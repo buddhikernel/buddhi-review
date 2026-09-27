@@ -19,7 +19,7 @@ Enable only the reviewers you have — the rest are subtracted everywhere (no
 trigger comments fired into a void, no dead waits). `/review-pr setup` (Step 5)
 validates each one's reachability and persists the working set as
 `active_reviewers` (+ the per-bot `auto_on_open` map) in
-`~/.config/review-loop/config.yaml`.
+`~/.config/buddhi/config.yaml`.
 
 | Reviewer | Trigger | Requires | How the wizard validates |
 |---|---|---|---|

@@ -162,7 +162,7 @@ window**; complete it there. It walks you through:
 It then confirms the **local answer-file channel** for questions that require your
 input.
 
-The wizard stores your global settings in `~/.config/review-loop/config.yaml`. When you
+The wizard stores your global settings in `~/.config/buddhi/config.yaml`. When you
 run the loop from inside a repository without `--repo`, it uses the current repository
 automatically. When you pass `--repo OWNER/REPO`, that repository must be confirmed
 unless a global default fleet is configured or `BUDDHI_ALLOW_UNCONFIRMED_REPO=1` is set.

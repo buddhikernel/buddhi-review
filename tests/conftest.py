@@ -10,7 +10,7 @@ deletes the seam and injects its own runner.
 
 The test gate resolves its command through the CONFIG (``test_command``, global +
 per-repo) as well as the environment, so an unpinned suite would read the
-developer's real ``~/.config/review-loop/config.yaml`` and a machine with a global
+developer's real ``~/.config/buddhi/config.yaml`` and a machine with a global
 ``test_command`` set would flip gate assertions. Point ``BUDDHI_CONFIG`` at a
 per-test tmp path (a file that does not exist → the empty-config default) and
 clear ``BUDDHI_TEST_COMMAND``; a test that wants a config writes to

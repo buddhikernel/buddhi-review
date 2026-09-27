@@ -17,7 +17,10 @@ _PAID_KEYS = (
     "claude_credit_reserve", "github_review_minutes",
 )
 _FREE_KEYS = {"plan", "active_reviewers", "auto_on_open", "notifications", "repo", "cwd",
-              "repos"}
+              "repos",
+              # The bound repo's answers, promoted to the top level so a global default
+              # exists for the per-repo choice gates (tests/test_canonical_config.py).
+              "auto_merge", "label_gated_ci", "promoted_global_defaults"}
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────────
