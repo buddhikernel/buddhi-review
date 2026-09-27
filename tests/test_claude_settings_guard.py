@@ -1,0 +1,2012 @@
+"""The ``.claude`` settings guard, window by window.
+
+Every repository here is a real git repository; every git call is real. A
+``claude`` spawn is simulated by reading, inside a guard window, what a ``claude``
+started there would load (``settings_guard_support.seen_settings``), or by the
+recording ``ClaudeStub`` when a real spawn path is driven. No hook ever runs: a
+test hook only ``touch``es a marker under the test's tmp dir, and every test that
+could run one asserts the marker is absent.
+"""
+import io
+import json
+import os
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import threading
+import time
+from contextlib import redirect_stdout
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from buddhi_review import claude_settings_guard as guard
+from buddhi_review import cli, fix_apply, model_call
+from buddhi_review.actuators import act_on_result
+from buddhi_review.classify import Classification
+from buddhi_review.loop import Comment, CommentResult
+from settings_guard_support import (
+    LOCAL_SETTINGS,
+    PACKAGE_ROOT,
+    SETTINGS,
+    ClaudeStub,
+    command_hook,
+    git,
+    hostile,
+    make_pr_repo,
+    markers_present,
+    seen_settings,
+    touch,
+    write,
+)
+
+
+def _spawn(cwd):
+    """One guarded "spawn": what a claude started in ``cwd`` would load."""
+    with guard.window(cwd):
+        return seen_settings(os.path.realpath(cwd or os.getcwd()))
+
+
+def _hooks(view):
+    events = set()
+    for obj in view.values():
+        events.update((obj or {}).get("hooks", {}) or {})
+    return sorted(events)
+
+
+def _state_files():
+    d = os.environ[guard.STATE_DIR_ENV]
+    return sorted(os.listdir(d)) if os.path.isdir(d) else []
+
+
+def _mode(path) -> int:
+    return stat.S_IMODE(os.lstat(path).st_mode)
+
+
+def _saved_copies():
+    """Originals the guard saved beside the journal (their only copy)."""
+    return sorted(f for f in _state_files() if ".settings" in f)
+
+
+def _saved_bytes():
+    return [(Path(os.environ[guard.STATE_DIR_ENV]) / f).read_bytes() for f in _saved_copies()]
+
+
+def _snapshot(root: Path):
+    """Bytes, inode and mtime of every file under ``root`` — to prove nothing
+    outside the checkout is ever written."""
+    out = {}
+    for p in sorted(root.rglob("*")):
+        st = os.lstat(p)
+        out[str(p)] = (p.read_bytes() if p.is_file() and not p.is_symlink() else None,
+                       st.st_ino, st.st_mtime_ns)
+    return out
+
+
+# ── what a settings value names (C3) ──────────────────────────────────────────────
+
+@pytest.mark.parametrize("command", [
+    'python3 "$CLAUDE_PROJECT_DIR"/tools/check.py',
+    'python3 "${CLAUDE_PROJECT_DIR}"/tools/check.py',
+    "python3 ${CLAUDE_PROJECT_DIR}/tools/check.py",
+    "python3 $CLAUDE_PROJECT_DIR/tools/check.py",
+    'python3 "$CLAUDE_PROJECT_DIR/tools/check.py"',
+    "python3 ./tools/check.py",
+    "python3 tools/check.py",
+    "python3 $PWD/tools/check.py",
+    'python3 "$(pwd)"/tools/check.py',
+    "python3 ~+/tools/check.py",
+    "bash -c 'python3 $CLAUDE_PROJECT_DIR/tools/check.py'",
+    "sh -c \"python3 './tools/check.py' --flag\"",
+])
+def test_every_spelling_of_a_checkout_path_names_that_file(command):
+    named = guard.named_paths(command)
+    assert named.unsafe is None
+    assert (named.paths | named.bare) >= {"tools/check.py"}
+    # an interpreter imports from its script's directory, so that is named too
+    assert named.trees | named.bare_trees == {"tools"}
+
+
+@pytest.mark.parametrize("command,path", [
+    ('sh $"./x.sh"', "x.sh"),                                   # bash's locale-quoted string
+    ("sh '.''/x.sh'", "x.sh"),                                  # adjacent quoted parts join
+    ('sh .""/x.sh', "x.sh"),
+    ("sh ./x\\\n.sh", "x.sh"),                                  # backslash-newline
+    ("sh \\./x.sh", "x.sh"),
+    ("eval \"sh ./x.sh\"", "x.sh"),
+    ("echo ./x.sh | xargs sh", "x.sh"),
+    ("sh <<EOF\n./x.sh\nEOF", "x.sh"),                         # a here-document
+    ("sh <<< ./x.sh", "x.sh"),                                  # a here-string
+    ("source <(cat ./x.sh)", "x.sh"),                           # process substitution
+    ("A=./x.sh; sh $A", "x.sh"),                                # indirection through a variable
+    ("export BASH_ENV=./x.sh", "x.sh"),
+    ("NODE_OPTIONS='--require ./x.js' node y", "x.js"),
+    ("node -r./x.js y", "x.js"),                                # a value glued to a short option
+    ("perl -I./lib tools/lint.pl", "lib"),
+    ("pytest -c./tools/pytest.ini", "tools/pytest.ini"),
+    ("node --require=./x.js y", "x.js"),
+    ("node -e \"require('./tools/x.js')\"", "tools/x.js"),
+    ("sh -c 'sh \"$0\"' ./x.sh", "x.sh"),
+    ("sh '`pwd`/x.sh'", "x.sh"),                                # quoted, re-read by a shell
+    ('[ -f "$CLAUDE_PROJECT_DIR/x.sh" ] && sh "$CLAUDE_PROJECT_DIR/x.sh"', "x.sh"),
+    ("{ sh ./x.sh; }", "x.sh"),
+    ("sh ./tools/../x.sh", "tools/../x.sh"),                     # ``..`` is resolved on disk
+])
+def test_shell_forms_that_reach_a_file_name_it(command, path):
+    named = guard.named_paths(command)
+    assert named.unsafe is None
+    assert path in (named.paths | named.bare)
+
+
+@pytest.mark.parametrize("command,path", [
+    ('sh "lint hook.sh"', "lint hook.sh"),                      # a quoted name with a space
+    ("sh lint\\ hook.sh", "lint hook.sh"),
+    ("python3 'Dev Tools/check.py'", "Dev Tools/check.py"),
+    ('sh "run(1).sh"', "run(1).sh"),
+    ('sh "R&D.sh"', "R&D.sh"),
+    ('sh "$CLAUDE_PROJECT_DIR/tools hook.sh"', "tools hook.sh"),
+    ("sh ~+0/x.sh", "x.sh"),                                    # ~+0 and ~0 are $PWD too
+    ("sh ~0/x.sh", "x.sh"),
+    ("python3 -c \"exec(open(r'tools/x.py').read())\"", "tools/x.py"),  # a Python r'' string
+    ("python3 -c \"runpy.run_path(f'tools/x.py')\"", "tools/x.py"),
+    ("env -S 'sh\\_./x.sh'", "x.sh"),                            # env -S's \\_ separator
+    ("java @jvm.opts -jar tools/fmt.jar", "jvm.opts"),          # an argument file
+    (". ./scripts/env.sh && true", "scripts/env.sh"),           # the . builtin
+])
+def test_round_two_shell_forms_name_their_file(command, path):
+    named = guard.named_paths(command)
+    assert named.unsafe is None
+    assert path in (named.paths | named.bare)
+
+
+@pytest.mark.parametrize("command,why", [
+    ("export PYTHONPATH=$PYTHONPATH:$CLAUDE_PROJECT_DIR/src; python3 x.py", "checkout root"),
+    ('export PYTHONPATH="${PYTHONPATH}:src"', "checkout root"),
+    ("export PYTHONPATH+=:", "checkout root"),
+    ("PATH+=: make", "checkout root"),
+    ("sh ~-/x.sh", "directory stack"),                          # where the last cd came from
+    ("sh ~1/x.sh", "directory stack"),
+    ("cd tools && sh $OLDPWD/x.sh", "cannot be parsed"),
+    ("sh ./tools/*/../../x.sh", "climbs back out"),              # .. after a glob
+    ("sh ./tools/{..,x}/x.sh", "cannot follow"),                # .. inside a brace expansion
+    ("python3 ./check.py", "imports from the checkout root"),   # sys.path[0] is the root
+])
+def test_round_two_forms_that_reach_unknowable_places_are_unsafe(command, why):
+    assert why in (guard.named_paths(command).unsafe or "")
+
+
+def test_a_search_path_through_path_itself_is_not_the_root():
+    assert guard.named_paths("export PATH=$PATH:$CLAUDE_PROJECT_DIR/bin").unsafe is None
+    assert guard.named_paths("PATH+=:/opt/bin make").unsafe is None
+
+
+@pytest.mark.parametrize("command", [
+    "git diff --name-only | awk '{print $1}'",   # a {…} that is not a brace expansion
+    "find tools -name '*.py' -exec true {} +",
+])
+def test_ordinary_shell_programs_are_not_mistaken_for_the_root(command):
+    assert guard.named_paths(command).unsafe is None
+
+
+def test_env_values_are_also_read_literally():
+    """No shell reads an ``env`` value: ``~/lib`` is a directory named ``~`` inside
+    the checkout, and ``shell env.sh`` is one file name."""
+    named = guard.named_paths({"PYTHONPATH": "~/lib", "BASH_ENV": "shell env.sh"}, key="env")
+    assert {"~/lib", "shell env.sh"} <= named.bare
+
+
+def test_home_relative_paths_that_reach_the_checkout_are_named(tmp_path, monkeypatch):
+    checkout = tmp_path / "home" / "work" / "wt"
+    (checkout / "tools").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for command in ("sh ~/work/wt/x.sh", 'sh "$HOME"/work/wt/x.sh', "sh ${HOME}/work/wt/x.sh"):
+        assert guard.named_paths(command, str(checkout)).paths == {"x.sh"}, command
+    alias = tmp_path / "alias-to-tools"
+    os.symlink(checkout / "tools", alias)
+    assert guard.named_paths(f"python3 {alias}/check.py", str(checkout)).paths == {"tools/check.py"}
+
+
+def test_a_module_added_next_to_a_python_hook_is_caught(tmp_path):
+    """The documented hook shape ``python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/x.py``
+    imports from its own directory first: a PR that adds ``.claude/hooks/json.py``
+    there would replace the standard library's ``json``. The hook is held back."""
+    markers = tmp_path / "markers"
+    hook = 'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/check.py'
+    base = {SETTINGS: {"hooks": command_hook("PostToolUse", hook, "Edit")},
+            ".claude/hooks/check.py": "import json\n"}
+    repo = make_pr_repo(tmp_path, base, {"src/app.py": "x = 1\n"})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    assert _hooks(_spawn(str(repo.wt))) == ["PostToolUse"]     # nothing near it changed: live
+    write(repo.wt, ".claude/hooks/json.py", touch(markers, "json") + "\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+    assert markers_present(markers) == []
+
+
+def test_a_literal_tilde_directory_in_an_env_search_path_is_caught(tmp_path):
+    markers = tmp_path / "markers"
+    base = {SETTINGS: {"env": {"PYTHONPATH": "~/lib"}}}
+    repo = make_pr_repo(tmp_path, base, {"~/lib/sitecustomize.py": touch(markers, "site") + "\n"})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    assert "env" not in _spawn(str(repo.wt))[SETTINGS]
+
+
+def test_a_value_nested_too_deeply_is_unsafe_not_a_crash():
+    value = "sh ./x.sh"
+    for _ in range(5000):
+        value = [value]
+    assert guard.named_paths(value).unsafe == "it is nested too deeply to check"
+    assert guard._parse(("{\"a\": " + "[" * 5000 + "]" * 5000 + "}").encode()) is None
+
+
+@pytest.mark.parametrize("command,tree", [
+    ('for f in "$CLAUDE_PROJECT_DIR"/hooks.d/*.sh; do sh "$f"; done', "hooks.d"),
+    ("sh ./hooks.d/*.sh", "hooks.d"),
+    ("sh hooks.d/*.sh", "hooks.d"),
+    ('sh "$CLAUDE_PROJECT_DIR"/hooks.d/$NAME.sh', "hooks.d"),
+])
+def test_a_glob_or_variable_names_the_directory_before_it(command, tree):
+    named = guard.named_paths(command)
+    assert named.unsafe is None
+    assert tree in (named.trees | named.bare_trees)
+
+
+@pytest.mark.parametrize("command", [
+    "cd $CLAUDE_PROJECT_DIR && npm test",
+    'cd "${CLAUDE_PROJECT_DIR}" && npm test',
+    "cd . && make",
+    "cd ./ && make",
+    'for f in "$CLAUDE_PROJECT_DIR"/*.sh; do sh "$f"; done',
+    "for f in *.sh; do sh $f; done",
+    "$CLAUDE_PROJECT_DIR/",
+    "find . -name x",
+    "sh ./hooks.{d,e}/run.sh",   # a brace expansion at the first component could be anything
+])
+def test_a_value_naming_the_checkout_root_is_unsafe(command):
+    assert guard.named_paths(command).unsafe == "it names the checkout root"
+
+
+@pytest.mark.parametrize("command,why", [
+    ('echo "unbalanced', "cannot be parsed"),
+    ("python3 $(whoami)/x.py", "cannot be parsed"),
+    ("python3 ${CLAUDE_PROJECT_DIR:-.}/x.py", "cannot be parsed"),
+    ("python3 $'\\x2e/x.py'", "cannot be parsed"),
+    ("python3 foo$CLAUDE_PROJECT_DIR/x.py", "cannot be parsed"),
+    ("python3 ../sibling/x.py", "outside the checkout"),
+    ("python3 $CLAUDE_PROJECT_DIR/../sibling/x.py", "outside the checkout"),
+])
+def test_what_cannot_be_followed_is_unsafe(command, why):
+    assert why in (guard.named_paths(command).unsafe or "")
+
+
+def test_permission_rules_and_hook_matchers_are_not_commands():
+    perms = {"allow": ["Bash(npm run test:*)", "Read(./src/**)"], "deny": ["Bash(rm *)"],
+             "defaultMode": "acceptEdits"}
+    assert guard.named_paths(perms, key="permissions") == guard.named_paths({}, key="permissions")
+    hooks = command_hook("PreToolUse", "echo hi", "*")
+    named = guard.named_paths(hooks, key="hooks")
+    assert named.unsafe is None and named.bare == {"echo", "hi"}
+    # the same strings anywhere else ARE scanned
+    assert guard.named_paths({"x": "Bash(rm *)"}, key="statusLine").unsafe
+
+
+def test_opaque_variables_and_outside_paths_name_nothing():
+    named = guard.named_paths('npx prettier --write "$CLAUDE_FILE_PATHS" $HOME/bin/x /usr/bin/env')
+    assert named.unsafe is None and not named.paths and not named.trees
+
+
+# ── round three: the value scanner ───────────────────────────────────────────────
+
+S = '"$CLAUDE_PROJECT_DIR"/.claude/hooks/check.py'
+
+
+@pytest.mark.parametrize("command", [
+    f"if [ -f {S} ]; then python3 {S}; fi",               # after a reserved word
+    f"timeout 30 python3 {S}",                             # behind wrappers
+    f"env -i python3 {S}",
+    f"nice -n 10 python3 {S}",
+    f"uv run {S}",
+    f"python3 -W ignore {S}",                              # past an option's argument
+    f'"$PYTHON" {S}',                                      # an interpreter named by a variable
+])
+def test_an_interpreter_anywhere_names_its_scripts_directory(command):
+    named = guard.named_paths(command)
+    assert named.unsafe is None
+    assert ".claude/hooks" in named.trees
+
+
+@pytest.mark.parametrize("command", [
+    'HOOKS="$CLAUDE_PROJECT_DIR/.claude/hooks"; . "$HOOKS/../lib/common.sh"',
+    "D=tools; sh \"$D/../x.sh\"",
+    'sh "$CLAUDE_PROJECT_DIR"/sub/.?/x.sh',                 # .? and .* can match ..
+    'for f in "$CLAUDE_PROJECT_DIR"/sub/.*/x.sh; do sh "$f"; done',
+    'sh "$CLAUDE_PROJECT_DIR"/sub/.{.,}/x.sh',
+])
+def test_climbing_out_through_a_variable_or_a_dot_glob_is_unsafe(command):
+    assert guard.named_paths(command).unsafe
+
+
+@pytest.mark.parametrize("command", [
+    "python3 -c \"import json,sys; p=json.load(sys.stdin)['tool_input']['file_path']; "
+    "sys.exit(2 if any(x in p for x in ['.env', '.git/']) else 0)\"",
+    "node -e \"const [a] = process.argv; console.log(a)\"",
+    'case "$f" in *.py) black "$f";; *.js) prettier "$f";; esac',
+    'case "$f" in\n  *.py) ruff format "$f" ;;\n  *.js) prettier -w "$f" ;;\nesac',
+    'case "$f" in *.py|*.pyi) black "$f";; esac',
+    '[[ "$f" == *.py ]] && black "$f"',
+    "if [ -f .venv/bin/activate ]; then . .venv/bin/activate; fi",
+    "echo done # it's formatted",
+])
+def test_ordinary_hooks_are_not_misread_as_naming_the_root(command):
+    assert guard.named_paths(command).unsafe is None, guard.named_paths(command).unsafe
+
+
+def test_a_prompt_hook_and_additional_directories_are_not_commands():
+    hooks = {"Stop": [{"hooks": [{"type": "prompt", "prompt": "Don't stop yet; check it's done."}]}]}
+    assert guard.named_paths(hooks, key="hooks").unsafe is None
+    perms = {"deny": ["Read(./.env)"], "additionalDirectories": ["../shared-docs"]}
+    assert guard.named_paths(perms, key="permissions").unsafe is None
+
+
+def test_a_path_holding_a_nul_is_unsafe_not_a_crash():
+    assert guard.named_paths("cat ~\x00/notes").unsafe
+    assert guard.named_paths("cat ~\ud800/notes").unsafe
+
+
+def _hook_repo(tmp_path, command, files, head=None):
+    base = {SETTINGS: {"hooks": command_hook("SessionStart", command)}, **files}
+    repo = make_pr_repo(tmp_path, base, head or {"docs/guide.md": "x\n"})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    return repo
+
+
+def test_a_script_run_by_its_shebang_names_its_directory(tmp_path):
+    """The documented hook ``"$CLAUDE_PROJECT_DIR"/.claude/hooks/check.py``, run by
+    its ``#!/usr/bin/env python3`` line: a module the PR adds beside it would
+    replace the standard library's, so the hook is held back."""
+    repo = _hook_repo(tmp_path, S, {".claude/hooks/check.py": "#!/usr/bin/env python3\nimport json\n"})
+    os.chmod(repo.wt / ".claude/hooks/check.py", 0o755)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, ".claude/hooks/json.py", "x = 1\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_cd_into_a_checked_directory_resolves_what_follows_there(tmp_path):
+    command = 'cd "$CLAUDE_PROJECT_DIR"/.claude/hooks && ./format.sh'
+    repo = _hook_repo(tmp_path, command, {".claude/hooks/format.sh": "true\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, ".claude/hooks/format.sh", "echo changed\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_protective_hook_that_mentions_git_stays_live(tmp_path):
+    repo = _hook_repo(tmp_path, "grep -q ORIG_HEAD .git/HEAD && exit 2", {})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+
+
+def test_an_untracked_bytecode_cache_does_not_strip_a_python_hook(tmp_path):
+    """A hook's own run writes ``__pycache__/*.pyc`` beside its helper module: that
+    untracked cache is not a change. A cache the PR commits still is."""
+    command = f"python3 {S}"
+    repo = _hook_repo(tmp_path, command, {".claude/hooks/check.py": "import helper\n",
+                                         ".claude/hooks/helper.py": "x = 1\n"})
+    write(repo.wt, ".claude/hooks/__pycache__/helper.cpython-311.pyc", b"\x00cache")
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    git(repo.wt, "add", "-f", ".claude/hooks/__pycache__/helper.cpython-311.pyc")
+    git(repo.wt, "commit", "-qm", "commit a cache")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_named_file_the_base_branch_lacks_is_never_trusted(tmp_path):
+    """C3(c): an optional script base does not have, which the PR adds."""
+    repo = _hook_repo(tmp_path, "[ -f ./local-hook.sh ] && sh ./local-hook.sh", {})
+    assert _hooks(_spawn(str(repo.wt))) == []              # absent at base: never trusted
+    write(repo.wt, "local-hook.sh", touch(tmp_path / "markers", "local") + "\n")
+    assert _hooks(_spawn(str(repo.wt))) == []              # ... not even once it exists
+
+
+# ── A5: a directory hook (C3a) ───────────────────────────────────────────────────
+
+DIR_HOOK = 'for f in "$CLAUDE_PROJECT_DIR"/hooks.d/*.sh; do sh "$f"; done'
+
+
+def _dir_hook_repo(tmp_path, head=None, removed=()):
+    markers = tmp_path / "markers"
+    base = {
+        SETTINGS: {"model": "sonnet", "hooks": command_hook("SessionStart", DIR_HOOK)},
+        "hooks.d/a.sh": touch(markers, "a") + "\n",
+        "hooks.d/b.sh": touch(markers, "b") + "\n",
+        ".gitignore": "*.local.sh\n",
+    }
+    repo = make_pr_repo(tmp_path, base, head or {"src/app.py": "x = 2\n"}, removed=removed)
+    guard.install_base_resolver(lambda checkout: repo.base)
+    return repo
+
+
+@pytest.mark.parametrize("case", ["adds", "modifies", "removes", "untracked", "ignored", "symlink"])
+def test_a_directory_hook_is_stripped_when_the_directory_changes(tmp_path, case):
+    """A5: base-identical ``for f in "$CLAUDE_PROJECT_DIR"/hooks.d/*.sh`` hook. The
+    PR adds, modifies or removes a file there — or a file appears untracked,
+    ignored, or as a symlink base lacks — and the hook is held back."""
+    markers = tmp_path / "markers"
+    head, removed = None, ()
+    if case == "adds":
+        head = {"hooks.d/evil.sh": touch(markers, "evil") + "\n"}
+    elif case == "modifies":
+        head = {"hooks.d/a.sh": touch(markers, "a2") + "\n"}
+    elif case == "removes":
+        removed = ("hooks.d/a.sh",)
+    repo = _dir_hook_repo(tmp_path, head, removed)
+    if case == "untracked":
+        write(repo.wt, "hooks.d/c.sh", touch(markers, "c") + "\n")
+    elif case == "ignored":
+        write(repo.wt, "hooks.d/c.local.sh", touch(markers, "c") + "\n")
+        assert "c.local.sh" not in repo.status()
+    elif case == "symlink":
+        os.symlink(str(tmp_path / "elsewhere.sh"), repo.wt / "hooks.d" / "c.sh")
+    before = repo.settings_bytes()
+    view = _spawn(str(repo.wt))
+    assert _hooks(view) == [] and view[SETTINGS]["model"] == "sonnet"
+    assert repo.settings_bytes() == before
+    assert markers_present(repo.markers) == []
+
+
+def test_a_directory_hook_stays_live_when_the_directory_is_untouched(tmp_path):
+    """A5 control: the PR leaves ``hooks.d/`` alone, so the hook stays live and the
+    settings file is never rewritten."""
+    repo = _dir_hook_repo(tmp_path)
+    path = repo.wt / SETTINGS
+    st = os.stat(path)
+    view = _spawn(str(repo.wt))
+    assert _hooks(view) == ["SessionStart"]
+    assert (os.stat(path).st_ino, os.stat(path).st_mtime_ns) == (st.st_ino, st.st_mtime_ns)
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+def test_a_base_identical_symlink_is_followed_to_what_it_points_at(tmp_path):
+    """A symlink base also has is trusted only as far as its target: a PR that
+    changes the file a ``hooks.d`` symlink points at still loses the hook."""
+    markers = tmp_path / "markers"
+    base = {
+        SETTINGS: {"hooks": command_hook("SessionStart", DIR_HOOK)},
+        "scripts/real.sh": touch(markers, "real") + "\n",
+    }
+    repo = make_pr_repo(tmp_path, base, {})
+    (repo.wt / "hooks.d").mkdir()
+    os.symlink("../scripts/real.sh", repo.wt / "hooks.d" / "a.sh")
+    git(repo.wt, "add", "-A")
+    git(repo.wt, "commit", "-qm", "link")
+    new_base = git(repo.wt, "rev-parse", "HEAD").strip()
+    guard.install_base_resolver(lambda checkout: new_base)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]  # link and target both base
+    write(repo.wt, "scripts/real.sh", touch(markers, "changed") + "\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+# ── A6: kill → restore ───────────────────────────────────────────────────────────
+
+_CHILD = """
+import sys, time
+from buddhi_review import claude_settings_guard as guard
+with guard.window(sys.argv[1]):
+    open(sys.argv[2], "w").write("ready")
+    time.sleep(120)
+"""
+
+
+def _child_env():
+    env = dict(os.environ)
+    env["PYTHONPATH"] = PACKAGE_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    return env
+
+
+def _kill_mid_window(repo, tmp_path):
+    ready = tmp_path / "ready"
+    proc = subprocess.Popen([sys.executable, "-c", _CHILD, str(repo.wt), str(ready)],
+                            env=_child_env(), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 30
+    while not ready.exists():
+        assert proc.poll() is None, proc.stderr.read().decode()
+        assert time.monotonic() < deadline, "the child never entered its window"
+        time.sleep(0.02)
+    journal = guard._journal_path(str(repo.wt))
+    assert _mode(journal) == 0o600
+    assert _mode(os.path.dirname(journal)) == 0o700
+    proc.send_signal(signal.SIGKILL)
+    proc.wait()
+    proc.stderr.close()
+    return journal
+
+
+def _hostile_tracked(tmp_path):
+    return make_pr_repo(tmp_path, {}, {SETTINGS: hostile(tmp_path / "markers")}), SETTINGS
+
+
+def _hostile_untracked_local(tmp_path):
+    repo = make_pr_repo(tmp_path, {".gitignore": ".claude/settings.local.json\n"}, {})
+    path = write(repo.wt, LOCAL_SETTINGS, {
+        "env": {"ANTHROPIC_API_KEY": "sk-local-secret"},
+        **hostile(tmp_path / "markers"),
+    })
+    os.chmod(path, 0o600)
+    return repo, LOCAL_SETTINGS
+
+
+def _heal_by_next_spawn(repo):
+    view = _spawn(str(repo.wt))
+    assert _hooks(view) == []
+
+
+def _heal_at_loop_entry(repo):
+    class _Driver:
+        def __init__(self, *a, **k):
+            pass
+
+        def run(self):
+            return SimpleNamespace(status="clean", rounds=1, merged=False)
+
+    mp = pytest.MonkeyPatch()
+    try:
+        mp.setattr(cli.round_driver, "RoundDriver", _Driver)
+        mp.setattr(cli.round_driver, "refuse_primary_checkout", lambda *a, **k: None)
+        mp.setattr(cli.round_driver, "enforce_repo_confirmation_gate", lambda *a, **k: None)
+        mp.setattr(cli, "ConsoleNotifier",
+                   lambda *a, **k: SimpleNamespace(startup_log=lambda: None))
+        mp.setattr(cli.upsell, "maybe_emit_run_end_nudge", lambda *a, **k: None)
+        args = cli.build_parser().parse_args(
+            ["run-loop", "7", "--repo", "o/r", "--max-rounds", "3", "--cwd", str(repo.wt)])
+        with redirect_stdout(io.StringIO()):
+            assert cli._run_loop(args) == 0
+    finally:
+        mp.undo()
+
+
+@pytest.mark.parametrize("heal", [_heal_by_next_spawn, _heal_at_loop_entry],
+                         ids=["next-spawn", "loop-entry"])
+@pytest.mark.parametrize("make", [_hostile_tracked, _hostile_untracked_local],
+                         ids=["tracked-settings", "untracked-0600-local"])
+def test_a_killed_window_is_restored_exactly(tmp_path, capfd, make, heal):
+    """A6: a child enters the guard, signals ready, and is SIGKILLed. Before
+    recovery the file is still scrubbed; the next guarded spawn and the loop-entry
+    heal each restore bytes, mode and index flags on their own; git status is
+    clean; the journal is gone, and was 0o600 while it existed."""
+    repo, rel = make(tmp_path)
+    path = repo.wt / rel
+    before, mode, flags = path.read_bytes(), _mode(path), repo.flags()
+    journal = _kill_mid_window(repo, tmp_path)
+    assert os.path.exists(journal)
+    assert _hooks(seen_settings(str(repo.wt))) == []          # still scrubbed
+    assert path.read_bytes() != before
+    heal(repo)
+    assert path.read_bytes() == before
+    assert _mode(path) == mode
+    assert repo.flags() == flags
+    assert repo.status() == ""
+    assert not os.path.exists(journal)
+    assert [f for f in _state_files() if not f.endswith(".lock")] == []
+    assert "after an interrupted claude run" in capfd.readouterr().err
+    assert markers_present(repo.markers) == []
+
+
+# ── C4: an exception raised inside the spawn still restores ──────────────────────
+
+@pytest.mark.parametrize("raised,surfaces", [
+    (subprocess.TimeoutExpired("claude", 1), subprocess.TimeoutExpired),
+    (KeyboardInterrupt(), KeyboardInterrupt),
+    (FileNotFoundError("claude"), RuntimeError),   # a model call's launch failure
+], ids=["timeout", "interrupt", "launch-failure"])
+def test_an_exception_inside_the_spawn_restores_at_once(tmp_path, monkeypatch, raised, surfaces):
+    """The restore runs as the exception leaves the window, not at the next spawn:
+    bytes, mode and flags are back and no journal remains, whether the spawn timed
+    out, was interrupted, or failed to start."""
+    repo, rel = _hostile_tracked(tmp_path)
+    before, flags = repo.settings_bytes(), repo.flags()
+
+    def boom(spawn):
+        raise raised
+
+    monkeypatch.setattr(subprocess, "run", ClaudeStub(real_run=subprocess.run, during=boom))
+    with pytest.raises(surfaces):
+        model_call.run_model_text("p", role="classifier", cwd=str(repo.wt))
+    assert repo.settings_bytes() == before and repo.flags() == flags and repo.status() == ""
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+def test_a_fixer_timeout_restores_before_its_retry(tmp_path, monkeypatch):
+    repo, rel = _hostile_tracked(tmp_path)
+    before, flags = repo.settings_bytes(), repo.flags()
+    views = []
+
+    def timeout(spawn):
+        views.append((spawn.hooks, repo.flags()))
+        raise subprocess.TimeoutExpired("claude", 1)
+
+    monkeypatch.setattr(fix_apply, "maybe_sandbox", lambda argv, cwd: list(argv))
+    monkeypatch.setattr(subprocess, "run", ClaudeStub(real_run=subprocess.run, during=timeout))
+    outcome = fix_apply.apply_fix("fix it", cwd=str(repo.wt), model="sonnet", effort="low",
+                                  retries=1)
+    assert outcome.status == "transient-failed" and len(views) == 2
+    assert all(hooks == [] for hooks, _ in views)
+    assert repo.settings_bytes() == before and repo.flags() == flags and repo.status() == ""
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+def test_two_spellings_of_one_checkout_share_one_lock_and_journal(tmp_path):
+    """On a case-insensitive filesystem another letter case names the same
+    checkout: it must find the same journal (and take the same lock)."""
+    repo, rel = _hostile_tracked(tmp_path)
+    other = str(repo.wt)[:-2] + str(repo.wt)[-2:].upper()
+    if not os.path.isdir(other) or os.path.samefile(other, repo.wt) is False:
+        pytest.skip("the filesystem is case-sensitive")
+    assert guard._journal_path(other) == guard._journal_path(str(repo.wt))
+    before = repo.settings_bytes()
+    _kill_mid_window(repo, tmp_path)
+    assert guard.recover(other) is True
+    assert repo.settings_bytes() == before and repo.status() == ""
+
+
+# ── A7: a user's own skip-worktree override survives (C6) ────────────────────────
+
+@pytest.mark.parametrize("edit", ["allowlisted", "adds-a-hook"])
+def test_a_user_skip_worktree_override_survives_repeated_spawns(tmp_path, edit):
+    """A7: a tracked settings file the user marked ``--skip-worktree`` and edited
+    locally keeps its bytes and its bit through three guarded spawns; when the
+    edit adds a hook base lacks, a scrub and restore happen and no spawn sees it."""
+    repo = make_pr_repo(tmp_path, {SETTINGS: {"model": "sonnet"}}, {})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    git(repo.wt, "update-index", "--skip-worktree", SETTINGS)
+    local = {"model": "opus", "theme": "dark"}
+    if edit == "adds-a-hook":
+        local.update(hostile(tmp_path / "markers"))
+    path = write(repo.wt, SETTINGS, local)
+    before = path.read_bytes()
+    for _ in range(3):
+        view = _spawn(str(repo.wt))
+        assert _hooks(view) == [] and view[SETTINGS]["model"] == "opus"
+        assert path.read_bytes() == before
+        assert git(repo.wt, "ls-files", "-v", SETTINGS).startswith("S ")
+    assert repo.status() == ""
+    assert markers_present(repo.markers) == []
+
+
+# ── A8: two processes on one checkout ────────────────────────────────────────────
+
+_SLOW_CHILD = """
+import json, os, sys, time
+from buddhi_review import claude_settings_guard as guard
+_write = os.write
+def _one_byte_at_a_time(fd, data):
+    # any write in place would be caught half-done by the poller
+    n = _write(fd, bytes(memoryview(data)[:1]))
+    time.sleep(0.0005)
+    return n
+os.write = _one_byte_at_a_time
+with guard.window(sys.argv[1]):
+    start = time.time()
+    time.sleep(0.5)          # the "spawn"
+    end = time.time()
+open(sys.argv[2], "w").write(json.dumps([start, end]))
+"""
+
+
+def test_two_processes_never_interleave_and_the_path_is_never_torn(tmp_path):
+    """A8: two processes each hold a window with a slow spawn while a poller reads
+    the settings path in a tight loop. The windows never overlap, the poller never
+    sees the path absent or unparseable, and the final state is byte-identical."""
+    repo, rel = _hostile_tracked(tmp_path)
+    path = repo.wt / rel
+    before, flags = path.read_bytes(), repo.flags()
+    seen = {"reads": 0, "absent": 0, "torn": 0}
+    stop = threading.Event()
+
+    def poll():
+        while not stop.is_set():
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError:
+                seen["absent"] += 1
+                continue
+            try:
+                ok = isinstance(json.loads(data), dict)
+            except ValueError:
+                ok = False
+            seen["reads"] += 1
+            seen["torn"] += not ok
+
+    poller = threading.Thread(target=poll, daemon=True)
+    poller.start()
+    logs = [tmp_path / "a.json", tmp_path / "b.json"]
+    procs = [subprocess.Popen([sys.executable, "-c", _SLOW_CHILD, str(repo.wt), str(log)],
+                              env=_child_env(), stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL) for log in logs]
+    try:
+        for p in procs:
+            assert p.wait(timeout=45) == 0
+    finally:
+        stop.set()
+        poller.join()
+    (s1, e1), (s2, e2) = sorted(json.loads(log.read_text()) for log in logs)
+    assert e1 <= s2, "the two windows overlapped"
+    assert seen["reads"] > 100
+    assert seen["absent"] == 0 and seen["torn"] == 0, seen
+    assert path.read_bytes() == before and repo.flags() == flags and repo.status() == ""
+    assert markers_present(repo.markers) == []
+
+
+# ── A10: no base commit known ────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("resolver,why", [
+    (None, "no base resolver is installed"),
+    (lambda checkout: None, "the base resolver found none"),
+    (lambda checkout: 1 / 0, "the base resolver failed: division by zero"),
+])
+def test_with_no_base_only_allowlisted_keys_survive(tmp_path, capfd, resolver, why):
+    """A10: with no resolver, or one that cannot answer, a base-identical hook and
+    base-identical permissions are held back too — only the audited display keys
+    survive — with ONE log line, and no crash."""
+    settings = {"model": "sonnet", "theme": "dark", "permissions": {"allow": ["Bash(ls)"]},
+                "hooks": command_hook("SessionStart", touch(tmp_path / "markers", "base"))}
+    repo = make_pr_repo(tmp_path, {SETTINGS: settings}, {})
+    guard.install_base_resolver(resolver)
+    capfd.readouterr()
+    for _ in range(2):
+        view = _spawn(str(repo.wt))
+        assert view[SETTINGS] == {"model": "sonnet", "theme": "dark"}
+    err = capfd.readouterr().err
+    lines = [ln for ln in err.splitlines() if "base commit is unknown" in ln]
+    assert len(lines) == 1 and why in lines[0], err
+    assert repo.status() == ""
+
+
+# ── A11 / C10: the hot path is free ──────────────────────────────────────────────
+
+class _Counter:
+    def __init__(self, real):
+        self.real, self.calls = real, []
+
+    def __call__(self, argv, *a, **kw):
+        self.calls.append([str(x) for x in argv])
+        if os.path.basename(str(argv[0])) == "claude":
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        return self.real(argv, *a, **kw)
+
+
+def test_a_checkout_with_no_claude_entry_costs_no_subprocess_and_no_write(tmp_path, monkeypatch):
+    """A11: no ``.claude`` entry → the guard runs zero subprocesses and writes
+    nothing (its state dir is never even created); a model spawn and a fixer spawn
+    each run exactly their one ``claude``."""
+    counter = _Counter(subprocess.run)
+    monkeypatch.setattr(subprocess, "run", counter)
+    with guard.window(str(tmp_path)):
+        pass
+    assert counter.calls == []
+    model_call._make_default_spawn(str(tmp_path))(["claude", "-p", "x"], None, 5)
+    monkeypatch.setattr(fix_apply, "maybe_sandbox", lambda argv, cwd: list(argv))
+    fix_apply.default_fixer_runner("p", model="sonnet", effort="low", timeout=5, cwd=str(tmp_path))
+    assert [c[0] for c in counter.calls] == ["claude", "claude"]
+    assert not os.path.exists(os.environ[guard.STATE_DIR_ENV])
+
+
+def test_an_allowlisted_only_file_is_never_touched(tmp_path, monkeypatch):
+    """C10: a file holding only allowlisted keys costs no subprocess, no rewrite,
+    no index change and no journal."""
+    repo = make_pr_repo(tmp_path, {}, {SETTINGS: {"model": "opus", "theme": "dark",
+                                                  "verbose": True}})
+    path = repo.wt / SETTINGS
+    st, flags = os.stat(path), repo.flags()
+    counter = _Counter(subprocess.run)
+    monkeypatch.setattr(subprocess, "run", counter)
+    view = _spawn(str(repo.wt))
+    assert counter.calls == []
+    assert view[SETTINGS] == {"model": "opus", "theme": "dark", "verbose": True}
+    assert (os.stat(path).st_ino, os.stat(path).st_mtime_ns) == (st.st_ino, st.st_mtime_ns)
+    assert repo.flags() == flags
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+def test_a_base_trusted_file_is_read_but_never_written(tmp_path, monkeypatch):
+    """C10: base-trusted keys cost git reads only — no rewrite, no index change,
+    no journal."""
+    settings = {"hooks": command_hook("SessionStart", touch(tmp_path / "markers", "x"))}
+    repo = make_pr_repo(tmp_path, {SETTINGS: settings}, {})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    path = repo.wt / SETTINGS
+    st, flags = os.stat(path), repo.flags()
+    counter = _Counter(subprocess.run)
+    monkeypatch.setattr(subprocess, "run", counter)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    assert all(c[:2] != ["git", "update-index"] for c in counter.calls)
+    assert (os.stat(path).st_ino, os.stat(path).st_mtime_ns) == (st.st_ino, st.st_mtime_ns)
+    assert repo.flags() == flags
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+# ── A12: a falsy cwd is the process's own directory, never skipped (C8) ──────────
+
+@pytest.mark.parametrize("falsy", [None, ""])
+def test_a_falsy_cwd_guards_the_directory_the_child_inherits(tmp_path, monkeypatch, falsy):
+    """A12: called with no cwd from inside a hostile checkout, the guard scrubs
+    and restores that checkout — it is never skipped."""
+    monkeypatch.delenv(guard.FALLBACK_CWD_ENV)  # this test pins the real fallback
+    repo, rel = _hostile_tracked(tmp_path)
+    before = repo.settings_bytes()
+    monkeypatch.chdir(repo.wt)
+    assert _hooks(_spawn(falsy)) == []
+    assert repo.settings_bytes() == before and repo.status() == ""
+    stub = ClaudeStub(real_run=subprocess.run)
+    monkeypatch.setattr(subprocess, "run", stub)
+    model_call.run_model_text("p", role="classifier")        # the cwd-less default spawn
+    assert stub.spawns[-1].cwd_kwarg is None
+    assert stub.spawns[-1].effective == os.path.realpath(repo.wt)
+    assert stub.spawns[-1].hooks == []
+    assert markers_present(repo.markers) == []
+
+
+# ── A13: nothing outside the checkout is ever written ────────────────────────────
+
+def test_a_committed_claude_symlink_is_removed_for_the_spawn_never_written_through(tmp_path):
+    outside = tmp_path / "outside"
+    write(outside, "settings.json", hostile(tmp_path / "markers"))
+    repo = make_pr_repo(tmp_path, {}, {})
+    os.symlink(str(outside), repo.wt / ".claude")
+    git(repo.wt, "add", ".claude")
+    git(repo.wt, "commit", "-qm", "link .claude outside")
+    flags, snap = repo.flags(), _snapshot(outside)
+    with guard.window(str(repo.wt)):
+        assert not os.path.lexists(repo.wt / ".claude")
+        assert repo.status() == ""                         # skip-worktree hides the gap
+    assert os.readlink(repo.wt / ".claude") == str(outside)
+    assert _snapshot(outside) == snap
+    assert repo.flags() == flags and repo.status() == ""
+
+
+def test_a_hardlinked_settings_file_never_writes_the_outside_file(tmp_path):
+    repo, rel = _hostile_tracked(tmp_path)
+    before = repo.settings_bytes()
+    outside = tmp_path / "outside" / "settings.json"
+    outside.parent.mkdir()
+    outside.write_bytes(before)
+    (repo.wt / rel).unlink()
+    os.link(outside, repo.wt / rel)
+    snap = _snapshot(outside.parent)
+    assert _hooks(_spawn(str(repo.wt))) == []
+    assert _snapshot(outside.parent) == snap
+    assert repo.settings_bytes() == before and repo.status() == ""
+
+
+def test_a_symlinked_settings_file_is_removed_for_the_spawn(tmp_path):
+    outside = tmp_path / "outside" / "settings.json"
+    write(outside.parent, "settings.json", hostile(tmp_path / "markers"))
+    repo = make_pr_repo(tmp_path, {}, {})
+    (repo.wt / ".claude").mkdir()
+    os.symlink(str(outside), repo.wt / SETTINGS)
+    git(repo.wt, "add", "-A")
+    git(repo.wt, "commit", "-qm", "link settings outside")
+    snap = _snapshot(outside.parent)
+    with guard.window(str(repo.wt)):
+        assert not os.path.lexists(repo.wt / SETTINGS)
+    assert os.readlink(repo.wt / SETTINGS) == str(outside)
+    assert _snapshot(outside.parent) == snap and repo.status() == ""
+
+
+def test_a_pr_committed_file_named_like_a_temp_file_is_never_deleted(tmp_path):
+    """Recovery removes only the temp names of the interrupted window's own random
+    token, so a PR that commits look-alike files loses none of them."""
+    repo = make_pr_repo(tmp_path, {}, {
+        SETTINGS: hostile(tmp_path / "markers"),
+        ".claude/.settings.json.0123456789abcdef.guard-tmp": "tracked\n",
+        "..claude.0123456789abcdef.guard-tmp": "tracked\n",
+    })
+    _kill_mid_window(repo, tmp_path)
+    assert guard.recover(str(repo.wt)) is True
+    assert repo.status() == ""
+
+
+def test_a_dotdot_through_a_pr_planted_symlink_is_checked_where_it_really_leads(tmp_path):
+    """``..`` is resolved on disk: a base-identical hook that climbs through a
+    directory the PR turned into a symlink reaches a PR file, and is held back."""
+    markers = tmp_path / "markers"
+    hook = 'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/../../scripts/lint.py'
+    base = {SETTINGS: {"hooks": command_hook("SessionStart", hook)},
+            ".claude/hooks/keep.txt": "x\n", "scripts/lint.py": touch(markers, "lint") + "\n"}
+    repo = make_pr_repo(tmp_path, base, {"evil/deep/keep.txt": "x\n",
+                                         "evil/scripts/lint.py": touch(markers, "evil") + "\n"},
+                        removed=(".claude/hooks/keep.txt",))
+    guard.install_base_resolver(lambda checkout: repo.base)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]  # a real directory: live
+    os.rmdir(repo.wt / ".claude" / "hooks")
+    os.symlink("../evil/deep", repo.wt / ".claude" / "hooks")
+    assert _hooks(_spawn(str(repo.wt))) == []
+    assert markers_present(markers) == []
+
+
+def test_a_dotdot_inside_a_base_identical_symlink_is_followed_on_disk(tmp_path):
+    """Base holds ``tools/check.py -> impl/../real_check.py``; the PR turns
+    ``tools/impl`` into a symlink elsewhere. The link and its lexical target are
+    unchanged, but the kernel now reaches a PR file, so the hook is held back."""
+    markers = tmp_path / "markers"
+    hook = 'python3 "$CLAUDE_PROJECT_DIR"/tools/check.py'
+    base = {SETTINGS: {"hooks": command_hook("SessionStart", hook)},
+            "tools/impl/keep.txt": "x\n", "tools/real_check.py": touch(markers, "real") + "\n"}
+    repo = make_pr_repo(tmp_path, base, {})
+    os.symlink("impl/../real_check.py", repo.wt / "tools" / "check.py")
+    git(repo.wt, "add", "-A")
+    git(repo.wt, "commit", "-qm", "link")
+    trusted = git(repo.wt, "rev-parse", "HEAD").strip()
+    guard.install_base_resolver(lambda checkout: trusted)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "evil/deep/keep.txt", "x\n")
+    write(repo.wt, "evil/real_check.py", touch(markers, "evil") + "\n")
+    shutil.rmtree(repo.wt / "tools" / "impl")
+    os.symlink("../evil/deep", repo.wt / "tools" / "impl")
+    assert _hooks(_spawn(str(repo.wt))) == []
+    assert markers_present(markers) == []
+
+
+def test_an_absolute_path_spelled_another_way_still_names_the_checkout_file(tmp_path):
+    """An absolute path that reaches the checkout through an alias — a symlinked
+    parent here, another letter case on a case-insensitive filesystem — is
+    recognised by file identity, not by its spelling."""
+    markers = tmp_path / "markers"
+    alias = tmp_path / "alias"
+    hook = f"python3 {alias}/tools/check.py"
+    base = {SETTINGS: {"hooks": command_hook("SessionStart", hook)},
+            "tools/check.py": touch(markers, "check") + "\n"}
+    repo = make_pr_repo(tmp_path, base, {"tools/check.py": touch(markers, "changed") + "\n"})
+    os.symlink(str(repo.wt), alias)
+    guard.install_base_resolver(lambda checkout: repo.base)
+    assert guard.named_paths(hook, str(repo.wt)).paths == {"tools/check.py"}
+    assert _hooks(_spawn(str(repo.wt))) == []
+    assert markers_present(markers) == []
+
+
+@pytest.mark.parametrize("value", [":/usr/bin:/bin", "/usr/bin::/bin", "/usr/bin:", ""])
+def test_a_search_path_with_an_empty_element_names_the_checkout_root(value):
+    """An empty element of ``PATH`` (or ``PYTHONPATH`` …) is the current directory:
+    a base-identical ``env`` would make a bare ``python3`` in any hook run a file the
+    PR added at the checkout root."""
+    assert guard.named_paths({"PATH": value}, key="env").unsafe == "it names the checkout root"
+    assert guard.named_paths(f"PATH={value} python3 x", key="hooks").unsafe == \
+        "it names the checkout root"
+    assert guard.named_paths({"PATH": "/usr/bin:/bin"}, key="env").unsafe is None
+
+
+def test_a_claude_dir_swapped_for_a_symlink_mid_spawn_is_never_written_through(tmp_path, capfd):
+    """A spawn that swaps ``.claude/`` for a symlink to a directory outside the
+    checkout: the restore never writes through it."""
+    outside = tmp_path / "outside"
+    write(outside, "settings.json", {"model": "x"})
+    repo, rel = _hostile_tracked(tmp_path)
+    snap = _snapshot(outside)
+    with guard.window(str(repo.wt)):
+        shutil.rmtree(repo.wt / ".claude")
+        os.symlink(str(outside), repo.wt / ".claude")
+    assert _snapshot(outside) == snap
+    assert ".claude was replaced while settings were held back" in capfd.readouterr().err
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+def test_after_a_crash_a_claude_symlink_is_never_written_through(tmp_path, capfd):
+    """The window holding an untracked local file is killed; ``.claude`` is then
+    replaced by a symlink into the checkout. Recovery never writes the user's
+    local settings through it (``git add -A`` would pick them up there): their
+    original is saved beside the journal instead, owner-only, and named."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    before = (repo.wt / rel).read_bytes()
+    _kill_mid_window(repo, tmp_path)
+    shutil.rmtree(repo.wt / ".claude")
+    (repo.wt / "docs").mkdir()
+    os.symlink("docs", repo.wt / ".claude")
+    assert guard.recover(str(repo.wt)) is True
+    assert os.listdir(repo.wt / "docs") == []
+    assert _saved_bytes() == [before]
+    saved = Path(os.environ[guard.STATE_DIR_ENV]) / _saved_copies()[0]
+    assert _mode(saved) == 0o600 and str(saved) in capfd.readouterr().err
+    assert markers_present(repo.markers) == []
+
+
+def test_an_edited_local_file_is_never_merged_and_its_original_is_saved(tmp_path, capfd):
+    """An untracked local file's bytes exist only in the journal. Whatever edits it
+    during the window keeps its edit untouched — nothing is merged into a file the
+    next ``git add -A`` could pick up — and the original (forty permission rules
+    and a secret) is saved, owner-only, and named."""
+    repo = make_pr_repo(tmp_path, {".gitignore": ".claude/settings.local.json\n"}, {})
+    rules = [f"Bash(tool{i})" for i in range(40)]
+    path = write(repo.wt, LOCAL_SETTINGS, {"permissions": {"allow": rules}, "env": {"K": "secret"}})
+    os.chmod(path, 0o600)
+    before = path.read_bytes()
+    with guard.window(str(repo.wt)):
+        write(repo.wt, LOCAL_SETTINGS, {"permissions": {"allow": ["Bash(new)"]}})
+    assert json.loads(path.read_text()) == {"permissions": {"allow": ["Bash(new)"]}}
+    assert _saved_bytes() == [before]
+    assert "its original, which exists nowhere else, was saved to" in capfd.readouterr().err
+    assert not any(f.endswith(".json") and ".settings" not in f for f in _state_files())
+
+
+_TERM_CHILD = """
+import subprocess, sys
+from buddhi_review import claude_settings_guard as guard
+with guard.window(sys.argv[1]):
+    subprocess.run([sys.executable, "-c",
+                    "import os, sys, time; open(sys.argv[1], 'w').write(str(os.getpid())); "
+                    "time.sleep(120)", sys.argv[2]])
+"""
+
+
+def test_a_sigterm_mid_spawn_kills_the_child_and_restores(tmp_path):
+    """``kill <pid>`` of the loop mid-spawn: the spawn's child is killed with it and
+    the settings are put back, instead of the child running on while a restarted
+    loop puts the PR's settings back underneath it."""
+    repo, rel = _hostile_tracked(tmp_path)
+    before, flags = repo.settings_bytes(), repo.flags()
+    pidfile = tmp_path / "child.pid"
+    proc = subprocess.Popen([sys.executable, "-c", _TERM_CHILD, str(repo.wt), str(pidfile)],
+                            env=_child_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 30
+    while not pidfile.exists() or not pidfile.read_text():
+        assert proc.poll() is None and time.monotonic() < deadline
+        time.sleep(0.02)
+    child = int(pidfile.read_text())
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=30) == 128 + signal.SIGTERM
+    with pytest.raises(ProcessLookupError):
+        os.kill(child, 0)
+    assert repo.settings_bytes() == before and repo.flags() == flags and repo.status() == ""
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+def test_a_journal_temp_left_by_a_kill_is_swept_on_the_next_entry(tmp_path):
+    repo, rel = _hostile_tracked(tmp_path)
+    state = Path(os.environ[guard.STATE_DIR_ENV])
+    state.mkdir(mode=0o700)
+    leftover = state / f".{guard._key(str(repo.wt))}.json.0123456789abcdef.guard-tmp"
+    leftover.write_text("{a crashed journal write}")
+    _spawn(str(repo.wt))
+    assert not leftover.exists()
+
+
+_KILL_AT_RESTORE = """
+import os, signal, sys, time
+from buddhi_review import claude_settings_guard as guard
+calls = []
+_replace = os.replace
+def replace(*a, **k):
+    calls.append(a)
+    if len(calls) == 3:   # journal, scrub, then the restore's own write
+        os.kill(os.getpid(), signal.SIGKILL)
+    return _replace(*a, **k)
+os.replace = replace
+with guard.window(sys.argv[1]):
+    pass
+"""
+
+
+def test_a_kill_during_the_restore_leaves_no_temp_file_behind(tmp_path):
+    """Killed between writing the restore's temp file (the original bytes — a
+    local secret, for a local file) and renaming it: the next entry removes the
+    temp and finishes the restore; nothing named ``*.guard-tmp`` survives."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    path = repo.wt / rel
+    before = path.read_bytes()
+    proc = subprocess.run([sys.executable, "-c", _KILL_AT_RESTORE, str(repo.wt)],
+                          env=_child_env(), capture_output=True)
+    assert proc.returncode == -signal.SIGKILL
+    assert any(n.endswith(".guard-tmp") for n in os.listdir(repo.wt / ".claude"))
+    assert guard.recover(str(repo.wt)) is True
+    assert path.read_bytes() == before and _mode(path) == 0o600
+    assert not [p for p in repo.wt.rglob("*.guard-tmp")]
+    assert repo.status() == ""
+
+
+def test_every_byte_is_written_at_or_below_the_original_mode(tmp_path, monkeypatch):
+    """C5: the scrub, the journal and the restore write every byte into a file
+    already at its final, owner-only mode — never wider, not even briefly."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    real = os.write
+    modes = []
+
+    def spy(fd, data):
+        modes.append(stat.S_IMODE(os.fstat(fd).st_mode))
+        return real(fd, data)
+
+    monkeypatch.setattr(os, "write", spy)
+    _spawn(str(repo.wt))
+    monkeypatch.undo()
+    assert modes and all(m & ~0o600 == 0 for m in modes), [oct(m) for m in modes]
+
+
+def test_the_restore_never_clears_the_users_own_skip_worktree_bit(tmp_path):
+    """A7, widened: the user marked ``settings.json`` skip-worktree (a local
+    override), and the PR commits a hostile ``settings.local.json`` that the guard
+    marks for the window. Only the guard's own bit is cleared afterwards."""
+    repo = make_pr_repo(tmp_path, {SETTINGS: {"model": "sonnet"}},
+                        {LOCAL_SETTINGS: hostile(tmp_path / "markers")})
+    git(repo.wt, "update-index", "--skip-worktree", SETTINGS)
+    write(repo.wt, SETTINGS, {"model": "opus"})
+    view = _spawn(str(repo.wt))
+    assert _hooks(view) == []
+    assert git(repo.wt, "ls-files", "-v", SETTINGS).startswith("S ")
+    assert git(repo.wt, "ls-files", "-v", LOCAL_SETTINGS).startswith("H ")
+
+
+def test_a_journal_for_another_checkout_is_never_replayed(tmp_path):
+    repo, rel = _hostile_tracked(tmp_path)
+    journal = Path(guard._journal_path(str(repo.wt)))
+    journal.parent.mkdir(parents=True, mode=0o700)
+    journal.write_text(json.dumps({"version": 1, "checkout": "/somewhere/else",
+                                   "token": "0123456789abcdef", "entries": []}))
+    assert guard.recover(str(repo.wt)) is False
+    with pytest.raises(guard.SettingsGuardRefusal, match="belongs to another checkout"):
+        _spawn(str(repo.wt))
+
+
+def test_a_state_dir_open_to_others_is_narrowed_before_a_journal_is_written(tmp_path):
+    repo, rel = _hostile_untracked_local(tmp_path)
+    state = Path(os.environ[guard.STATE_DIR_ENV])
+    state.mkdir()
+    os.chmod(state, 0o755)
+    with guard.window(str(repo.wt)):
+        assert _mode(state) == 0o700
+        assert _mode(guard._journal_path(str(repo.wt))) == 0o600
+
+
+# ── round two: what the journal is the only copy of is never dropped ─────────────
+
+@pytest.mark.parametrize("replacement", ["symlink", "directory", "deleted", "claude-removed"])
+def test_an_untracked_file_a_spawn_replaces_is_saved_not_lost(tmp_path, replacement):
+    """An untracked local file a spawn deletes, or replaces with a symlink or a
+    directory, or whose ``.claude`` it removes: nothing is written into the
+    checkout, no later spawn is refused, and the original is saved."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    path = repo.wt / rel
+    before = path.read_bytes()
+    with guard.window(str(repo.wt)):
+        if replacement == "claude-removed":
+            shutil.rmtree(repo.wt / ".claude")
+        else:
+            path.unlink()
+            if replacement == "symlink":
+                os.symlink(str(tmp_path / "elsewhere.json"), path)
+            elif replacement == "directory":
+                path.mkdir()
+    assert _saved_bytes() == [before]
+    assert not os.path.isfile(path) or os.path.islink(path)
+    _spawn(str(repo.wt))                                  # the next spawn is not refused
+
+
+def test_a_local_override_the_spawn_deletes_is_saved(tmp_path):
+    """A tracked file with a local-only edit (the user's ``--skip-worktree``
+    override): git does not hold those bytes, so a spawn deleting the file does
+    not lose them — they are saved."""
+    repo = make_pr_repo(tmp_path, {SETTINGS: {"model": "sonnet"}}, {})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    git(repo.wt, "update-index", "--skip-worktree", SETTINGS)
+    path = write(repo.wt, SETTINGS, {"model": "opus", "env": {"ANTHROPIC_API_KEY": "sk-local"}})
+    before = path.read_bytes()
+    with guard.window(str(repo.wt)):
+        path.unlink()
+    assert not path.exists() and _saved_bytes() == [before]
+    assert git(repo.wt, "ls-files", "-v", SETTINGS).startswith("S ")
+
+
+def test_a_widened_claude_dir_is_narrowed_before_a_local_secret_goes_back(tmp_path):
+    """``.claude`` at 0o700 keeps an untracked 0o644 local file private. A spawn
+    opens ``.claude`` to 0o755; the file goes back only into a directory no wider
+    than it was."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    path = repo.wt / rel
+    os.chmod(path, 0o644)
+    os.chmod(repo.wt / ".claude", 0o700)
+    before = path.read_bytes()
+    with guard.window(str(repo.wt)):
+        os.chmod(repo.wt / ".claude", 0o755)
+    assert _mode(repo.wt / ".claude") == 0o700
+    assert path.read_bytes() == before and _mode(path) == 0o644
+
+
+def test_a_removed_claude_dir_saves_every_untracked_file_whole(tmp_path):
+    repo = make_pr_repo(tmp_path, {".gitignore": ".claude/\n"}, {})
+    one = write(repo.wt, SETTINGS, {"model": "opus", **hostile(tmp_path / "markers")})
+    two = write(repo.wt, LOCAL_SETTINGS, {"theme": "dark", "env": {"K": "secret"}})
+    os.chmod(two, 0o600)
+    before = sorted([one.read_bytes(), two.read_bytes()])
+    with guard.window(str(repo.wt)):
+        shutil.rmtree(repo.wt / ".claude")
+    assert sorted(_saved_bytes()) == before and not (repo.wt / ".claude").exists()
+
+
+def test_a_held_local_secret_is_never_merged_into_a_file_git_now_tracks(tmp_path):
+    """An untracked local file holding a secret is held back; during the window
+    the spawn pulls a commit that now TRACKS that path. Nothing is merged into the
+    tracked file (the next ``git add -A`` would publish the secret): it keeps the
+    commit's bytes, and the user's original is saved."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    before = (repo.wt / rel).read_bytes()
+    theirs = json.dumps({"model": "sonnet"}).encode()
+    with guard.window(str(repo.wt)):
+        (repo.wt / rel).write_bytes(theirs)
+        git(repo.wt, "add", "-f", rel)
+        git(repo.wt, "commit", "-qm", "track the local file")
+    assert (repo.wt / rel).read_bytes() == theirs
+    assert b"secret" not in (repo.wt / rel).read_bytes()
+    assert _saved_bytes() == [before]
+
+
+def test_a_lone_surrogate_from_a_pr_neither_crashes_nor_leaks(tmp_path, monkeypatch, capfd):
+    """A PR's ``"\\ud800"`` escape in a kept value cannot be encoded back to
+    UTF-8. It must neither end the run nor put settings bytes into a message."""
+    raw = b'{"model": "\\ud800", "env": {"K": "secret"}}'
+    repo = make_pr_repo(tmp_path, {}, {SETTINGS: raw})
+    stub = ClaudeStub(real_run=subprocess.run)
+    monkeypatch.setattr(subprocess, "run", stub)
+    model_call.run_model_text("p", role="classifier", cwd=str(repo.wt))
+    assert stub.spawns and stub.spawns[-1].hooks == [] and "env" not in stub.spawns[-1].keys
+    assert repo.settings_bytes() == raw and repo.status() == ""
+    assert "secret" not in capfd.readouterr().err
+
+
+def test_a_corrupt_file_in_the_state_dir_never_breaks_loop_entry(tmp_path):
+    repo, rel = _hostile_tracked(tmp_path)
+    state = Path(os.environ[guard.STATE_DIR_ENV])
+    state.mkdir(mode=0o700)
+    (state / ("e" * 32 + ".json")).write_text("[" * 200000 + "]" * 200000)
+    os.mkfifo(state / ("d" * 32 + ".json"))
+    assert guard.recover(str(repo.wt)) is True
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_recovery_says_restored_only_for_what_it_restored(tmp_path, capfd):
+    repo, rel = _hostile_tracked(tmp_path)
+    _kill_mid_window(repo, tmp_path)
+    (repo.wt / rel).unlink()                           # the user deletes it after the crash
+    capfd.readouterr()
+    assert guard.recover(str(repo.wt)) is True
+    err = capfd.readouterr().err
+    assert "after an interrupted claude run" not in err
+    assert "the file was deleted while settings were held back from it" in err
+
+
+def test_a_journal_is_never_replayed_into_a_different_tracked_file(tmp_path, capfd):
+    """A window on one PR is killed; the worktree is then recreated at the same
+    path for another branch. Recovery must not write the first PR's hooks into the
+    second PR's settings file, where the next ``git add -A`` would commit them."""
+    repo, rel = _hostile_tracked(tmp_path)
+    _kill_mid_window(repo, tmp_path)
+    git(repo.primary, "worktree", "remove", "--force", str(repo.wt))
+    git(repo.primary, "branch", "-q", "other", "main")
+    git(repo.primary, "worktree", "add", "-q", str(repo.wt), "other")
+    write(repo.wt, SETTINGS, {"model": "haiku"})
+    git(repo.wt, "add", "-A")
+    git(repo.wt, "commit", "-qm", "other")
+    theirs = repo.settings_bytes()
+    assert guard.recover(str(repo.wt)) is True
+    assert repo.settings_bytes() == theirs and repo.status() == ""
+    assert "git now holds a different .claude/settings.json" in capfd.readouterr().err
+
+
+def test_a_spawn_re_stating_a_key_of_a_git_held_file_wins_outright(tmp_path):
+    """C6: when git holds the original, a re-stated held key is the spawn's —
+    a fixer asked to drop a hook the PR added can do so."""
+    markers = tmp_path / "markers"
+    base = {"hooks": command_hook("PostToolUse", touch(markers, "lint"), "Edit")}
+    pr = {"hooks": {**base["hooks"], **command_hook("SessionStart", touch(markers, "evil"))}}
+    repo = make_pr_repo(tmp_path, {SETTINGS: base}, {SETTINGS: pr})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    with guard.window(str(repo.wt)):
+        write(repo.wt, SETTINGS, base)                      # the fixer restores base's hooks
+    assert json.loads(repo.settings_bytes()) == base
+
+
+def test_json_nested_past_the_limit_is_unparseable_at_any_stack_depth():
+    def nested(n):
+        return ("{\"a\": " + "[" * (n - 1) + "]" * (n - 1) + "}").encode()
+    assert guard._parse(nested(guard._MAX_JSON_DEPTH)) is not None
+    assert guard._parse(nested(guard._MAX_JSON_DEPTH + 1)) is None
+
+    def deep(k):
+        return guard._parse(nested(guard._MAX_JSON_DEPTH + 1)) if k == 0 else deep(k - 1)
+    assert deep(900) is None                                # the same answer, deep in a stack
+
+
+def test_non_path_variables_with_colons_stay_live():
+    env = {"RUST_LOG": "my_crate::db=debug", "DISPLAY": ":0", "NO_PROXY": "localhost,::1"}
+    assert guard.named_paths(env, key="env").unsafe is None
+    assert guard.named_paths("RUST_LOG=app::db=debug cargo check").unsafe is None
+
+
+def test_a_value_glued_to_a_cluster_of_short_options_is_named():
+    assert "lib" in guard.named_paths("perl -wI./lib tools/x.pl").paths
+    assert "lib" in guard.named_paths("perl -wIlib tools/x.pl").bare
+
+
+_TERM_DURING_RESTORE = """
+import os, signal, sys, time
+from buddhi_review import claude_settings_guard as guard
+real = guard._put_back
+def slow(*a, **k):
+    open(sys.argv[2], "w").write("restoring")
+    time.sleep(1.0)
+    return real(*a, **k)
+guard._put_back = slow
+with guard.window(sys.argv[1]):
+    pass
+sys.exit(3)
+"""
+
+
+def test_a_sigterm_during_the_restore_waits_for_it(tmp_path):
+    repo, rel = _hostile_tracked(tmp_path)
+    before, flags = repo.settings_bytes(), repo.flags()
+    marker = tmp_path / "restoring"
+    proc = subprocess.Popen([sys.executable, "-c", _TERM_DURING_RESTORE, str(repo.wt), str(marker)],
+                            env=_child_env(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 30
+    while not marker.exists():
+        assert proc.poll() is None and time.monotonic() < deadline
+        time.sleep(0.02)
+    proc.send_signal(signal.SIGTERM)
+    assert proc.wait(timeout=30) == 128 + signal.SIGTERM   # delivered once the restore was done
+    assert repo.settings_bytes() == before and repo.flags() == flags
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+def test_a_window_leaves_sigterm_handling_and_the_signal_mask_as_it_found_them(tmp_path):
+    repo, rel = _hostile_tracked(tmp_path)
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+    try:
+        _spawn(str(repo.wt))
+        assert signal.SIGTERM in signal.pthread_sigmask(signal.SIG_BLOCK, set())
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+    _spawn(str(repo.wt))
+    assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+def test_loop_entry_sweeps_a_journal_temp_and_names_an_orphaned_journal(tmp_path, capfd):
+    repo, rel = _hostile_tracked(tmp_path)
+    state = Path(os.environ[guard.STATE_DIR_ENV])
+    state.mkdir(mode=0o700)
+    leftover = state / f".{guard._key(str(repo.wt))}.json.0123456789abcdef.guard-tmp"
+    leftover.write_text("{a crashed journal write}")
+    orphan = state / ("f" * 32 + ".json")
+    orphan.write_text(json.dumps({"version": 1, "checkout": str(tmp_path / "gone")}))
+    assert guard.recover(str(repo.wt)) is True
+    assert not leftover.exists() and orphan.exists()
+    assert f"{orphan} holds .claude settings held back from {tmp_path / 'gone'}" in \
+        capfd.readouterr().err
+
+
+def test_when_only_the_index_flag_was_owed_a_later_edit_is_left_alone(tmp_path, monkeypatch):
+    """The content was restored but clearing the skip-worktree flag failed: the
+    journal owes only the flag, so a later edit to the file is never re-merged."""
+    repo, rel = _hostile_tracked(tmp_path)
+    real = guard._update_index
+
+    def flaky(checkout, flag, paths):
+        if flag == "--no-skip-worktree":
+            raise OSError("index.lock held")
+        return real(checkout, flag, paths)
+
+    monkeypatch.setattr(guard, "_update_index", flaky)
+    _spawn(str(repo.wt))
+    monkeypatch.setattr(guard, "_update_index", real)
+    edited = write(repo.wt, SETTINGS, {"model": "opus"}).read_bytes()  # the user removes the hooks
+    assert guard.recover(str(repo.wt)) is True
+    assert repo.settings_bytes() == edited
+    assert git(repo.wt, "ls-files", "-v", SETTINGS).startswith("H ")
+
+
+# ── round three: contract clauses pinned by execution ────────────────────────────
+
+def test_the_allowlist_is_exactly_the_audited_set():
+    assert guard.INERT_KEYS == frozenset({
+        "alwaysThinkingEnabled", "cleanupPeriodDays", "disabledMcpjsonServers",
+        "includeCoAuthoredBy", "messageIdleNotifThresholdMs", "model", "preferredNotifChannel",
+        "spinnerTipsEnabled", "syntaxHighlightingDisabled", "theme", "verbose",
+    })
+
+
+def test_the_journal_lives_in_the_durable_cache_dir_by_default(tmp_path, monkeypatch):
+    import tempfile
+    monkeypatch.delenv(guard.STATE_DIR_ENV)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    assert guard.state_dir() == str(tmp_path / ".cache" / "buddhi" / "settings-guard")
+    assert not guard.state_dir().startswith(tempfile.gettempdir())
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores directory permissions")
+def test_a_journal_that_cannot_be_written_refuses_the_spawn(tmp_path, monkeypatch):
+    repo, rel = _hostile_tracked(tmp_path)
+    before = repo.settings_bytes()
+    stub = ClaudeStub(real_run=subprocess.run)
+    monkeypatch.setattr(subprocess, "run", stub)
+    state = Path(os.environ[guard.STATE_DIR_ENV])
+    state.mkdir(mode=0o700)
+    (state / (guard._key(str(repo.wt)) + ".lock")).touch(mode=0o600)
+    os.chmod(state, 0o500)
+    try:
+        with pytest.raises(guard.SettingsGuardRefusal, match="cannot record the original"):
+            with guard.window(str(repo.wt)):
+                stub(["claude", "-p", "x"], cwd=str(repo.wt), text=True)
+    finally:
+        os.chmod(state, 0o700)
+    assert stub.spawns == [] and repo.settings_bytes() == before and repo.status() == ""
+
+
+def test_a_scrub_that_does_not_read_back_refuses_the_spawn(tmp_path, monkeypatch):
+    repo, rel = _hostile_tracked(tmp_path)
+    before, flags = repo.settings_bytes(), repo.flags()
+    real = guard._Dir.write
+
+    def lost(self, name, data, mode, token, full=False):
+        if name == "settings.json" and data != before:
+            return  # a write that silently never lands
+        return real(self, name, data, mode, token, full=full)
+
+    monkeypatch.setattr(guard._Dir, "write", lost)
+    with pytest.raises(guard.SettingsGuardRefusal, match="did not read back as written"):
+        _spawn(str(repo.wt))
+    assert repo.settings_bytes() == before and repo.flags() == flags
+
+
+def test_a_nested_window_on_the_same_checkout_does_not_deadlock(tmp_path):
+    repo, rel = _hostile_tracked(tmp_path)
+    before = repo.settings_bytes()
+    with guard.window(str(repo.wt)):
+        with guard.window(str(repo.wt)):
+            assert _hooks(seen_settings(str(repo.wt))) == []
+    assert repo.settings_bytes() == before
+
+
+_HOLD = """
+import json, sys, time
+from buddhi_review import claude_settings_guard as guard
+from settings_guard_support import seen_settings
+with guard.window(sys.argv[1]):
+    open(sys.argv[2], "w").write("ready")
+    seen = []
+    for _ in range(40):
+        seen.append(sorted((seen_settings(sys.argv[1]).get(".claude/settings.json") or {}).get("hooks", {})))
+        time.sleep(0.05)
+    open(sys.argv[3], "w").write(json.dumps(seen))
+"""
+
+
+@pytest.mark.parametrize("second", ["recover", "window"])
+def test_another_process_never_replays_a_live_window(tmp_path, second):
+    """C9(i): while one process holds a window, another's loop-entry recovery or
+    window waits for it — never mistaking the live journal for a crash, which would
+    put the PR's hooks back under the running spawn."""
+    repo, rel = _hostile_tracked(tmp_path)
+    ready, log = tmp_path / "ready", tmp_path / "seen.json"
+    env = _child_env()
+    env["PYTHONPATH"] += os.pathsep + str(Path(__file__).parent)
+    proc = subprocess.Popen([sys.executable, "-c", _HOLD, str(repo.wt), str(ready), str(log)],
+                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    deadline = time.monotonic() + 30
+    while not ready.exists():
+        assert proc.poll() is None and time.monotonic() < deadline
+        time.sleep(0.02)
+    started = time.monotonic()
+    if second == "recover":
+        assert guard.recover(str(repo.wt)) is True
+    else:
+        _spawn(str(repo.wt))
+    waited = time.monotonic() - started
+    assert proc.wait(timeout=30) == 0
+    assert all(hooks == [] for hooks in json.loads(log.read_text()))
+    assert waited > 1.0                                    # it blocked until the window closed
+
+
+def test_an_unexpected_error_during_the_restore_is_reported_not_raised(tmp_path, monkeypatch):
+    repo, rel = _hostile_tracked(tmp_path)
+
+    def broken(*a, **k):
+        raise TypeError("a guard bug")
+
+    monkeypatch.setattr(guard, "_put_back_file", broken)
+    stub = ClaudeStub(real_run=subprocess.run, claude_stdout="answer")
+    monkeypatch.setattr(subprocess, "run", stub)
+    assert model_call.run_model_text("p", role="classifier", cwd=str(repo.wt)) == "answer"
+    assert os.path.exists(guard._journal_path(str(repo.wt)))
+    monkeypatch.undo()
+    assert guard.recover(str(repo.wt)) is True             # the journal replays
+
+
+@pytest.mark.skipif(not os.path.exists("/System/Library") and sys.platform != "darwin",
+                    reason="needs a case-insensitive filesystem")
+def test_a_case_variant_settings_path_is_marked_skip_worktree(tmp_path):
+    repo = make_pr_repo(tmp_path, {}, {".Claude/Settings.json": hostile(tmp_path / "markers")})
+    if not (repo.wt / ".claude" / "settings.json").exists():
+        pytest.skip("the filesystem is case-sensitive")
+    flags = repo.flags()
+    with guard.window(str(repo.wt)):
+        assert repo.status() == ""
+        assert git(repo.wt, "ls-files", "-v", ".Claude/Settings.json").startswith("S ")
+    assert repo.flags() == flags and repo.status() == ""
+
+
+# ── A14: fail closed (C7) ────────────────────────────────────────────────────────
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores directory permissions")
+def test_a_read_only_claude_dir_refuses_every_spawn(tmp_path, monkeypatch, capfd):
+    """A14: a hostile file in a read-only ``.claude/`` cannot be made inert, so no
+    ``claude`` starts: the fixer escalates, naming the refusal, without retries;
+    a model call fails to launch; the checkout is left as found."""
+    repo, rel = _hostile_tracked(tmp_path)
+    before, flags = repo.settings_bytes(), repo.flags()
+    claude_dir = repo.wt / ".claude"
+    os.chmod(claude_dir, 0o555)
+    stub = ClaudeStub(real_run=subprocess.run)
+    monkeypatch.setattr(subprocess, "run", stub)
+    try:
+        with pytest.raises(guard.SettingsGuardRefusal):
+            _spawn(str(repo.wt))
+        outcome = fix_apply.apply_fix("this null check is missing", cwd=str(repo.wt),
+                                      model="sonnet", effort="low", retries=3)
+        with pytest.raises(RuntimeError, match="failed to launch claude"):
+            model_call.run_model_text("p", role="classifier", cwd=str(repo.wt))
+        delivered = []
+        adapter = SimpleNamespace(escalation=SimpleNamespace(
+            delivered=delivered, notifier=SimpleNamespace(send=lambda ask: None)))
+        result = CommentResult("c1", Classification(label="SUBSTANTIVE"), "decided", "fix")
+        action = act_on_result(Comment(id="c1", text="fix it"), result, adapter=adapter,
+                               fix_dispatch=lambda c, r: outcome)
+    finally:
+        os.chmod(claude_dir, 0o755)
+    assert stub.spawns == []
+    assert outcome.status == "transient-failed" and outcome.attempts == 1
+    assert outcome.detail.startswith(f"fixer spawn failed: the .claude settings in {repo.wt} "
+                                     f"could not be made safe: cannot rewrite {rel}")
+    assert action.final == "escalated" and delivered[0].detail == outcome.detail
+    assert "[settings-guard] not starting claude in" in capfd.readouterr().err
+    assert repo.settings_bytes() == before and repo.flags() == flags and repo.status() == ""
+    assert not any(f.endswith(".json") for f in _state_files())
+
+
+def test_an_unreadable_journal_refuses_until_it_is_dealt_with(tmp_path, capfd):
+    repo, rel = _hostile_tracked(tmp_path)
+    journal = Path(guard._journal_path(str(repo.wt)))
+    journal.parent.mkdir(parents=True, mode=0o700)
+    journal.write_text("{not json")
+    assert guard.recover(str(repo.wt)) is False
+    with pytest.raises(guard.SettingsGuardRefusal, match="is unreadable"):
+        _spawn(str(repo.wt))
+    assert "claude will not start there until they are restored" in capfd.readouterr().err
+
+
+# ── A15: a spawn that edits the settings file keeps its edit (C6) ─────────────────
+
+def test_a_spawn_edit_is_kept_and_held_back_keys_come_back(tmp_path, capfd):
+    """A15: the spawn changes ``model`` and deletes a base-trusted hook it could
+    see; afterwards its ``model`` wins, the key the guard held back comes back, and
+    the deleted visible hook stays deleted. Mode and index flags are exact."""
+    markers = tmp_path / "markers"
+    base = {"model": "sonnet", "hooks": command_hook("PostToolUse", touch(markers, "base"), "Edit")}
+    pr = dict(base, statusLine={"type": "command", "command": touch(markers, "status")})
+    repo = make_pr_repo(tmp_path, {SETTINGS: base}, {SETTINGS: pr})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    path = repo.wt / SETTINGS
+    os.chmod(path, 0o640)
+    flags = repo.flags()
+    with guard.window(str(repo.wt)):
+        visible = json.loads(path.read_text())
+        assert visible == base                               # statusLine held back
+        write(repo.wt, SETTINGS, {"model": "opus"})          # the spawn's own edit
+    assert json.loads(path.read_text()) == {"model": "opus", "statusLine": pr["statusLine"]}
+    assert _mode(path) == 0o640 and repo.flags() == flags
+    assert ("kept the edit made to this file while settings were held back, and put back "
+            "statusLine") in capfd.readouterr().err
+    assert markers_present(markers) == []
+
+
+def test_a_spawn_restating_a_held_key_wins(tmp_path):
+    markers = tmp_path / "markers"
+    repo = make_pr_repo(tmp_path, {}, {SETTINGS: {"model": "sonnet", "env": {"A": "1"},
+                                                  "apiKeyHelper": touch(markers, "k")}})
+    path = repo.wt / SETTINGS
+    with guard.window(str(repo.wt)):
+        write(repo.wt, SETTINGS, {"env": {"A": "2"}})
+    assert json.loads(path.read_text()) == {"env": {"A": "2"}, "apiKeyHelper": touch(markers, "k")}
+
+
+@pytest.mark.parametrize("how", ["file", "claude-dir", "into-a-directory"])
+def test_a_spawn_that_removes_the_settings_keeps_its_change_and_never_jams(tmp_path, capfd, how):
+    """A spawn that deletes the settings file (or all of ``.claude/``), or puts a
+    directory in its place, keeps that change: the held-back keys are not
+    resurrected into a file its author removed — the next commit would carry them
+    again — and the journal does not jam every later spawn."""
+    repo, rel = _hostile_tracked(tmp_path)
+    path = repo.wt / rel
+    with guard.window(str(repo.wt)):
+        if how == "file":
+            path.unlink()
+        elif how == "claude-dir":
+            shutil.rmtree(repo.wt / ".claude")
+        else:
+            path.unlink()
+            path.mkdir()
+    assert not path.is_file()
+    assert "they (hooks) were not put back" in capfd.readouterr().err
+    assert not any(f.endswith(".json") for f in _state_files())
+    view = _spawn(str(repo.wt))                           # the next spawn is not refused
+    assert _hooks(view) == []
+    assert markers_present(repo.markers) == []
+
+
+@pytest.mark.parametrize("original", [b'["not", "an", "object"]\n', b'{"hooks": {"SessionStart": '])
+def test_a_non_object_original_wins_and_the_dropped_edit_is_announced(tmp_path, capfd, original):
+    """A15, the non-object case: the guard writes ``{}``; a spawn that edits it
+    cannot be merged into the PR's original, so the PR's bytes are restored and the
+    drop is announced. Without an edit the restore is byte-identical."""
+    repo = make_pr_repo(tmp_path, {}, {SETTINGS: original})
+    path = repo.wt / SETTINGS
+    with guard.window(str(repo.wt)):
+        assert json.loads(path.read_text()) == {}
+    assert path.read_bytes() == original
+    capfd.readouterr()
+    with guard.window(str(repo.wt)):
+        write(repo.wt, SETTINGS, {"model": "opus"})
+    assert path.read_bytes() == original and repo.status() == ""
+    assert "could not be merged with the original" in capfd.readouterr().err
+
+
+# ── parsing: what counts as one JSON object ──────────────────────────────────────
+
+@pytest.mark.parametrize("raw,keeps", [
+    (b'\xef\xbb\xbf{"model": "opus"}', {"model": "opus"}),                  # BOM tolerated
+    (b'{"model": "opus", "model": "haiku"}', {}),                            # duplicate key
+    (b'{"model": NaN}', {}),                                                 # not JSON
+    (b"   \n", None),                                                        # blank: nothing to hold
+])
+def test_strict_parsing(tmp_path, raw, keeps):
+    repo = make_pr_repo(tmp_path, {}, {SETTINGS: raw})
+    view = _spawn(str(repo.wt))
+    if keeps is None:
+        assert (repo.wt / SETTINGS).read_bytes() == raw and view[SETTINGS] is None
+    else:
+        assert view[SETTINGS] == keeps
+    assert repo.settings_bytes() == raw
+
+
+def test_disable_all_hooks_must_match_base(tmp_path):
+    """``disableAllHooks`` is not allowlisted: a PR-supplied ``true`` would switch
+    off the base-trusted hooks the guard keeps live."""
+    base = {"hooks": command_hook("SessionStart", touch(tmp_path / "markers", "b"))}
+    repo = make_pr_repo(tmp_path, {SETTINGS: base}, {SETTINGS: dict(base, disableAllHooks=True)})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    view = _spawn(str(repo.wt))
+    assert "disableAllHooks" not in view[SETTINGS] and _hooks(view) == ["SessionStart"]
+
+
+def test_the_containment_survives_a_reload_of_the_guard(tmp_path):
+    import importlib
+    state = os.environ[guard.STATE_DIR_ENV]
+    reloaded = importlib.reload(guard)
+    assert reloaded.state_dir() == state
+    assert reloaded._checkout(None) == os.path.abspath(os.environ[guard.FALLBACK_CWD_ENV])
+
+
+# ── round four: where a cd leaves the shell, code that runs a shell, patterns ────
+
+@pytest.mark.parametrize("command", [
+    "(cd sub && true) && sh scripts/check.sh",       # the subshell's cd is undone
+    "pushd sub && popd && sh scripts/check.sh",
+    "cd sub; cd -; sh scripts/check.sh",
+    "cd missing; sh scripts/check.sh",               # a cd that fails
+    "cd sub || true; sh scripts/check.sh",
+    "cd /tmp; sh scripts/check.sh",
+    "cd sub >/dev/null && sh scripts/check.sh",      # a redirect is not where cd goes
+    "cd sub 2>/dev/null && sh scripts/check.sh",
+    "cd sub && true; cd - >/dev/null && sh scripts/check.sh",
+    "true | cd sub && sh scripts/check.sh",          # cd in a pipeline changes nothing
+    "env cd sub && sh scripts/check.sh",
+    "! cd missing && sh scripts/check.sh",
+    "pushd -n sub && sh scripts/check.sh",
+    'cd "" && sh scripts/check.sh',
+])
+def test_a_path_is_checked_wherever_a_cd_may_have_left_the_shell(tmp_path, command):
+    """A ``cd`` only adds places to check. However the shell reads it — undone by a
+    subshell, a ``popd`` or a ``cd -``, failed, or never run in this shell — a
+    relative path is still checked from the checkout root."""
+    repo = _hook_repo(tmp_path, command, {"scripts/check.sh": "true\n", "sub/keep.txt": "x\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "scripts/check.sh", "echo changed\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("command", [
+    "cd sub && sh ../scripts/check.sh",               # climbs out of a cd directory
+    "cd sub >/dev/null && sh ../scripts/check.sh",
+    "mkdir -p build && cd build && ../configure",     # a directory the hook creates
+    "cd link && cd ../c && sh x.sh",                  # cd reads .. by name
+    "cd sub && sh .*/x.sh",                           # .* can match ..
+    "echo sub | xargs -I{} sh -c 'cd {} && sh run.sh'",
+    'cd "$SOMEWHERE" && sh run.sh',
+    "cd - && sh run.sh",                              # the directory before the hook ran
+    "cd -- -dir && sh run.sh",
+])
+def test_a_climb_after_a_cd_or_a_cd_nobody_can_follow_is_unsafe(command):
+    assert guard.named_paths(command).unsafe, command
+
+
+def test_a_cd_above_the_checkout_is_unsafe(tmp_path):
+    checkout = tmp_path / "wt"
+    checkout.mkdir()
+    assert guard.named_paths(f"cd {tmp_path} && sh wt/x.sh", str(checkout)).unsafe
+    assert guard.named_paths("cd / && sh x.sh", str(checkout)).unsafe
+    assert guard.named_paths("cd /tmp && sh x.sh", str(checkout)).unsafe is None
+
+
+def test_cd_reads_dotdot_by_name_so_the_named_directory_is_walked(tmp_path):
+    """``cd link/../c`` enters ``c`` whatever ``link`` points at, so ``c`` is what
+    must be unchanged — not the directory the symlink's parent holds."""
+    repo = _hook_repo(tmp_path, "cd link/../c && sh x.sh",
+                      {"a/b/keep.txt": "x\n", "a/c/x.sh": "true\n", "c/x.sh": "true\n"})
+    os.symlink("a/b", repo.wt / "link")
+    git(repo.wt, "add", "link")
+    git(repo.wt, "commit", "-qm", "link")
+    guard.install_base_resolver(lambda checkout: git(repo.wt, "rev-parse", "HEAD").strip())
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "c/x.sh", "echo changed\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_path_climbing_out_of_git_is_never_exempt(tmp_path):
+    repo = _hook_repo(tmp_path, "sh .git/../x.sh", {"x.sh": "true\n"})
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_directory_literal_in_interpreter_code_is_walked_not_opened(tmp_path):
+    command = ("python3 -c \"import sys; p = sys.argv[-1]; "
+               "sys.exit(2 if p.startswith('docs/') else 0)\"")
+    repo = _hook_repo(tmp_path, command, {"docs/guide.md": "x\n"}, {"README.md": "changed\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "docs/new.md", "y\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("command", [
+    "python3 -c \"import os; os.system('sh tools/x.sh')\"",
+    "perl -e 'system(\"sh tools/x.sh\")'",
+    "node -e \"require('child_process').execSync('sh tools/x.sh')\"",
+])
+def test_a_command_line_inside_interpreter_code_is_checked(tmp_path, command):
+    repo = _hook_repo(tmp_path, command, {"tools/x.sh": "true\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "tools/x.sh", "echo changed\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("command", [
+    'case "$1" in $(sh scripts/check.sh)) true ;; esac',
+    'case "$1" in `sh scripts/check.sh`) true ;; esac',
+    '[[ "$1" == $(sh scripts/check.sh) ]] && true',
+])
+def test_a_command_substitution_in_a_pattern_is_unsafe(command):
+    """A pattern is matched, not opened, but the shell expands it first: a command
+    substitution in it runs."""
+    assert guard.named_paths(command).unsafe
+
+
+def test_a_multi_line_case_reads_its_patterns_as_patterns():
+    named = guard.named_paths('case "$f" in\n  docs) make html ;;\n  *) true ;;\nesac')
+    assert named.unsafe is None
+    assert "esac" not in named.bare and "docs" not in named.bare
+
+
+# ── round four: the index moves under a held file ─────────────────────────────────
+
+def test_a_spawn_untracking_the_settings_leaves_the_original_not_the_scrub(tmp_path):
+    """A spawn runs ``git rm --sparse --cached`` on the PR's settings file. What the
+    guard wrote must not stay behind for the next ``git add -A`` to commit: the
+    file gets its original bytes back, which git still has."""
+    repo, rel = _hostile_tracked(tmp_path)
+    before = repo.settings_bytes()
+    with guard.window(str(repo.wt)):
+        git(repo.wt, "rm", "-q", "--sparse", "--cached", rel)
+    assert repo.settings_bytes() == before
+    git(repo.wt, "add", "-A")
+    assert git(repo.wt, "diff", "--cached", "--stat") == ""
+    assert _saved_copies() == []
+
+
+def test_a_local_edit_a_spawn_untracks_gets_its_original_back(tmp_path):
+    """A tracked file with an unstaged local edit; a spawn runs ``git rm --sparse
+    --cached``. The file is left as it was on disk before — never the guard's
+    scrub, which the next ``git add -A`` would stage."""
+    repo = make_pr_repo(tmp_path, {SETTINGS: {"model": "sonnet"}}, {})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    path = write(repo.wt, SETTINGS, '{\n    "model": "sonnet",\n    "env": {"K": "local"}\n}\n')
+    before = path.read_bytes()
+    with guard.window(str(repo.wt)):
+        git(repo.wt, "rm", "-q", "--sparse", "--cached", SETTINGS)
+    assert path.read_bytes() == before
+
+
+def test_a_staged_original_a_spawn_unstages_is_saved(tmp_path, capfd):
+    """The user staged an edit to the settings file; a spawn runs ``git reset``.
+    The staged bytes were the only copy: the file now matches what git holds, and
+    the staged original is saved and named."""
+    committed = '{\n    "model": "sonnet"\n}\n'           # not how the guard would write it
+    repo = make_pr_repo(tmp_path, {SETTINGS: committed}, {})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    path = write(repo.wt, SETTINGS, {"model": "sonnet", "env": {"K": "staged-secret"}})
+    git(repo.wt, "add", SETTINGS)
+    before = path.read_bytes()
+    with guard.window(str(repo.wt)):
+        git(repo.wt, "reset", "-q")
+    assert path.read_text() == committed and repo.status() == ""
+    assert _saved_bytes() == [before]
+    assert "so the file now matches it; its earlier bytes were saved to" in capfd.readouterr().err
+
+
+# ── round four: restore edge cases ───────────────────────────────────────────────
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0,
+                    reason="root ignores directory permissions")
+def test_a_journal_that_cannot_be_removed_never_fails_a_finished_spawn(tmp_path, capfd):
+    repo, rel = _hostile_tracked(tmp_path)
+    before, flags = repo.settings_bytes(), repo.flags()
+    state = Path(os.environ[guard.STATE_DIR_ENV])
+    try:
+        with guard.window(str(repo.wt)):
+            os.chmod(state, 0o500)
+    finally:
+        os.chmod(state, 0o700)
+    assert repo.settings_bytes() == before and repo.flags() == flags
+    assert "could not be removed" in capfd.readouterr().err
+    assert _hooks(_spawn(str(repo.wt))) == []                # the replay changes nothing
+    assert repo.settings_bytes() == before and repo.status() == ""
+    assert not os.path.exists(guard._journal_path(str(repo.wt)))
+
+
+def test_a_rollback_names_the_original_it_saved(tmp_path, monkeypatch, capfd):
+    """Another writer lands its bytes between the scrub's write and its read-back:
+    the spawn is refused, and the local original it replaced is saved and named."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    before = (repo.wt / rel).read_bytes()
+    theirs = b'{"permissions": {"allow": ["Bash(npm test)"]}}'
+    real = guard._Dir.write
+
+    def racing(self, name, data, mode, token, full=False):
+        if name == "settings.local.json" and data != before:
+            data = theirs
+        return real(self, name, data, mode, token, full=full)
+
+    monkeypatch.setattr(guard._Dir, "write", racing)
+    with pytest.raises(guard.SettingsGuardRefusal, match="did not read back as written"):
+        _spawn(str(repo.wt))
+    monkeypatch.setattr(guard._Dir, "write", real)
+    assert _saved_bytes() == [before]
+    saved = Path(os.environ[guard.STATE_DIR_ENV]) / _saved_copies()[0]
+    assert str(saved) in capfd.readouterr().err
+
+
+def test_a_saved_copy_temp_left_by_a_kill_is_swept(tmp_path):
+    """A kill while an original was being saved leaves a temp in the state dir
+    under the journal's token; the replay must sweep it rather than collide with
+    it and jam the checkout."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    before = (repo.wt / rel).read_bytes()
+    journal = _kill_mid_window(repo, tmp_path)
+    write(repo.wt, rel, {"model": "opus"})                    # the killed spawn's edit
+    token = json.loads(Path(journal).read_text())["token"]
+    state = Path(os.environ[guard.STATE_DIR_ENV])
+    for kind in (*guard.SETTINGS_FILES, guard._DIR_LINK):
+        name = f"{guard._key(str(repo.wt))}.{token}.{kind}"
+        (state / guard._tmp_name(name, token)).write_bytes(b"partial")
+    assert guard.recover(str(repo.wt)) is True
+    assert _saved_bytes() == [before]
+    assert not [f for f in _state_files() if f.endswith(guard._TMP_SUFFIX)]
+    _spawn(str(repo.wt))                                      # the next spawn is not refused
+
+
+def test_a_hard_link_made_during_the_window_is_replaced_not_chmodded(tmp_path):
+    repo, rel = _hostile_tracked(tmp_path)
+    path = repo.wt / rel
+    before, mode = path.read_bytes(), _mode(path)
+    outside = tmp_path / "outside.json"
+    outside.write_bytes(before)
+    os.chmod(outside, 0o600)
+    with guard.window(str(repo.wt)):
+        path.unlink()
+        os.link(outside, path)
+    assert _mode(outside) == 0o600
+    assert path.read_bytes() == before and _mode(path) == mode
+    assert os.stat(path).st_ino != os.stat(outside).st_ino
+
+
+def test_a_spawn_edit_that_is_not_json_is_kept_when_git_holds_the_original(tmp_path, capfd):
+    """C6: the spawn's edit is kept. When it is not one JSON object there is
+    nothing to merge the held keys into; they stay out (git still has them)."""
+    repo, rel = _hostile_tracked(tmp_path)
+    edit = b'{"model": "opus",}\n'
+    with guard.window(str(repo.wt)):
+        write(repo.wt, rel, edit)
+    assert repo.settings_bytes() == edit
+    assert ("kept the edit made to this file while settings were held back; it is not one "
+            "JSON object, so hooks were not put back") in capfd.readouterr().err
+    assert markers_present(repo.markers) == []
+
+
+# ── round six: what an interpreter imports and runs ──────────────────────────────
+
+_JSON_HOOK = ("python3 -c \"import json,sys; p=json.load(sys.stdin)['tool_input']['file_path']; "
+              "sys.exit(2 if p.endswith('.lock') else 0)\"")
+
+
+@pytest.mark.parametrize("command", [
+    _JSON_HOOK,
+    "python3 - <<'PY'\nimport json\nPY",
+    "python3 <<< 'import json'",
+    "python3 -m json.tool",
+])
+def test_a_module_the_pr_adds_at_the_root_holds_back_a_python_program_run_there(tmp_path, command):
+    """``-c``, ``-m`` and a program on stdin put the checkout root first on Python's
+    path: a ``json.py`` the PR adds there replaces the standard library's."""
+    repo = _hook_repo(tmp_path, command, {}, {"README.md": "changed\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "json.py", "x = 1\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_package_python_code_imports_by_name_is_walked(tmp_path):
+    repo = _hook_repo(tmp_path, "python3 -c 'from tools.lint import main; main()'",
+                      {"tools/lint.py": "def main(): pass\n"}, {"README.md": "changed\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "tools/lint.py", "def main(): print(1)\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_an_isolated_python_program_does_not_import_from_the_root(tmp_path):
+    repo = _hook_repo(tmp_path, 'python3 -I -c "import json"', {}, {"json.py": "x = 1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+
+
+_HOOKS = '"$CLAUDE_PROJECT_DIR"/.claude/hooks'
+_PY = {".claude/hooks/check.py": "#!/usr/bin/env python3\nimport helper\n"}
+
+
+@pytest.mark.parametrize("command,files", [
+    (f"timeout 30 {_HOOKS}/check.py", _PY),                 # run through a wrapper
+    (f"nice -n 5 {_HOOKS}/check.py", _PY),
+    (f"env -u NOT_SET {_HOOKS}/check.py", _PY),
+    (f"ruby -W {_HOOKS}/check.rb", {".claude/hooks/check.rb": "require_relative 'helper'\n"}),
+    (f"node --disable-warning ExperimentalWarning {_HOOKS}/check.js",
+     {".claude/hooks/check.js": "require('./helper')\n"}),
+    (f"perl -p {_HOOKS}/check.pl", {".claude/hooks/check.pl": "use FindBin;\n"}),
+    ("node -e \"require('./.claude/hooks/check.js')\"", {".claude/hooks/check.js": "require('./helper')\n"}),
+    ("node -r ./.claude/hooks/check.js \"$CLAUDE_PROJECT_DIR\"/tools/run.js",
+     {".claude/hooks/check.js": "require('./helper')\n", "tools/run.js": "1\n"}),
+])
+def test_a_script_an_interpreter_may_run_names_its_directory(tmp_path, command, files):
+    """Whatever the options around it, a script an interpreter may run (or a module
+    it preloads) imports from its own directory: a sibling the PR changes holds
+    the hook back."""
+    repo = _hook_repo(tmp_path, command, {**files, ".claude/hooks/helper.txt": "1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, ".claude/hooks/helper.txt", "2\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_here_string_program_is_read_as_a_command_line(tmp_path):
+    repo = _hook_repo(tmp_path, "bash <<< 'cd .claude/hooks && ./check.sh'",
+                      {".claude/hooks/check.sh": "true\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, ".claude/hooks/check.sh", "echo changed\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_module_node_options_preloads_names_its_directory(tmp_path):
+    base = {SETTINGS: {"env": {"NODE_OPTIONS": "--require ./.claude/hooks/setup.js"}},
+            ".claude/hooks/setup.js": "require('./helper')\n", ".claude/hooks/helper.js": "1\n"}
+    repo = make_pr_repo(tmp_path, base, {"docs/guide.md": "x\n"})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    assert "env" in _spawn(str(repo.wt))[SETTINGS]
+    write(repo.wt, ".claude/hooks/helper.js", "2\n")
+    assert "env" not in _spawn(str(repo.wt))[SETTINGS]

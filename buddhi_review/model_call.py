@@ -10,7 +10,9 @@ so there is exactly one place that owns:
 * **explicit role-sized** ``--effort`` from :mod:`buddhi_review.plan_profile`
   (never host-inherited from ``~/.claude/settings.json``),
 * MCP isolation (``--strict-mcp-config`` — these calls never use an MCP tool),
-* the ``[1m]`` long-context escalation (ONLY on a >160K-token prompt).
+* the ``[1m]`` long-context escalation (ONLY on a >160K-token prompt),
+* the settings guard: the PR's committed ``.claude`` settings never run code
+  in the spawn (:mod:`buddhi_review.claude_settings_guard`).
 
 A model error after the bounded retry surfaces as ``None`` / a raise, and the
 caller escalates rather than retrying the call on another model.
@@ -26,7 +28,7 @@ import sys
 import time
 from typing import Callable, Dict, List, Optional, TextIO, Tuple
 
-from buddhi_review import plan_profile
+from buddhi_review import claude_settings_guard, plan_profile
 from buddhi_review.classify import extract_json_object
 
 
@@ -78,15 +80,21 @@ def _make_default_spawn(cwd: Optional[str] = None) -> Spawn:
     must actually run in the target repo, not inherit the launcher's process cwd.
     ``cwd=None`` preserves the inherited-cwd behaviour (the in-checkout launch,
     where the launcher cwd already IS the repo). The seam stays a 3-arg
-    ``Spawn`` — cwd is bound here at construction, not added to the call signature."""
+    ``Spawn`` — cwd is bound here at construction, not added to the call signature.
+
+    This is where every model call's real ``claude`` starts, so this is where the
+    PR's committed ``.claude`` settings are kept from running code in it
+    (:func:`buddhi_review.claude_settings_guard.window`). An injected custom spawn
+    owns its own subprocess and is not guarded."""
     def _spawn(
         argv: List[str], input_text: Optional[str], timeout: int
     ) -> "subprocess.CompletedProcess[str]":
-        return subprocess.run(
-            argv, capture_output=True, text=True, timeout=timeout,
-            input=input_text, stdin=(subprocess.DEVNULL if input_text is None else None),
-            cwd=cwd,
-        )
+        with claude_settings_guard.window(cwd):
+            return subprocess.run(
+                argv, capture_output=True, text=True, timeout=timeout,
+                input=input_text, stdin=(subprocess.DEVNULL if input_text is None else None),
+                cwd=cwd,
+            )
     return _spawn
 
 
@@ -98,9 +106,11 @@ _default_spawn: Spawn = _make_default_spawn()
 
 def build_argv(prompt: str, *, model: str, effort: str) -> Tuple[List[str], Optional[str]]:
     """Return ``(argv, stdin_text)``. The flag set is fixed by contract:
-    explicit ``--model`` + ``--effort``, no session persistence, zero MCP."""
+    explicit ``--model`` + ``--effort``, no local settings
+    (:data:`buddhi_review.claude_settings_guard.CLAUDE_ARGS`), no session
+    persistence, zero MCP."""
     base = [
-        "claude", "--model", model, "--effort", effort,
+        "claude", "--model", model, "--effort", effort, *claude_settings_guard.CLAUDE_ARGS,
         "--no-session-persistence", "--strict-mcp-config",
     ]
     if len(prompt) > STDIN_THRESHOLD:
@@ -164,15 +174,18 @@ def run_model_json(
     retries: Optional[int] = None,
     timeout: Optional[int] = None,
     sleep: Callable[[float], None] = time.sleep,
+    cwd: Optional[str] = None,
 ) -> Optional[Dict]:
     """Bounded-retry JSON call: spawn → extract ONE JSON object → dict, or None
     after every attempt fails (spawn error / non-zero rc / unparseable). The
     caller decides what a None means (usually: escalate or fall back
-    conservatively)."""
+    conservatively). ``cwd`` pins the default spawn to the target repo (see
+    ``run_model_text``)."""
     attempts = (RETRIES if retries is None else max(0, retries)) + 1
     for attempt in range(1, attempts + 1):
         try:
-            raw = run_model_text(prompt, role=role, plan=plan, spawn=spawn, timeout=timeout)
+            raw = run_model_text(prompt, role=role, plan=plan, spawn=spawn, timeout=timeout,
+                                 cwd=cwd)
         except (RuntimeError, subprocess.TimeoutExpired):
             raw = ""
         obj = extract_json_object(raw) if raw else None

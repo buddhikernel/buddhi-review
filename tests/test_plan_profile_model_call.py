@@ -64,7 +64,7 @@ def _cp(argv, rc=0, stdout="", stderr=""):
 def test_argv_contract_small_prompt():
     argv, stdin_text = model_call.build_argv("p", model="sonnet", effort="medium")
     assert argv == [
-        "claude", "--model", "sonnet", "--effort", "medium",
+        "claude", "--model", "sonnet", "--effort", "medium", "--setting-sources", "user,project",
         "--no-session-persistence", "--strict-mcp-config", "-p", "p",
     ]
     assert stdin_text is None
