@@ -1,5 +1,5 @@
 {
-  "version": 4,
-  "sha256": "d617b69782db095ffc33875724b1c54e956c2dff1f0bc41609b8c45b4c88f5a3",
+  "version": 5,
+  "sha256": "f030862754936e0f286ddcb7bd708f69c953550e0ab0ef9500c13de5ab8ac199",
   "_note": "Rev lock for the claude-code-review.yml master copy (buddhi_review/skills/review-pr/references/claude-code-review.yml, byte-identical to .github/workflows/claude-code-review.yml). Guarded by test_master_copy_matches_the_rev_lock. On any content change: bump # buddhi-managed-version in BOTH copies, then set version + sha256 here to match."
 }
