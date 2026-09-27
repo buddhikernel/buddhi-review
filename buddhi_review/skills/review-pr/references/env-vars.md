@@ -6,8 +6,8 @@ are sane; the skill works with no env vars at all.
 
 | Var | Controls | Default | If unset/invalid |
 |---|---|---|---|
-| `BUDDHI_CONFIG` | Path to the config file the skill reads/writes (test/CI seam; normally `~/.config/review-loop/config.yaml`) | `~/.config/review-loop/config.yaml` | uses the default path |
-| `BUDDHI_LOOP_PLAN` | Active plan tier override (test/CI seam; normally set via `~/.config/review-loop/config.yaml`) | config → `max-5x` | uses config/default |
+| `BUDDHI_CONFIG` | Path to the config file the skill reads/writes (test/CI seam; normally `~/.config/buddhi/config.yaml`) | `~/.config/buddhi/config.yaml` | uses the default path |
+| `BUDDHI_LOOP_PLAN` | Active plan tier override (test/CI seam; normally set via `~/.config/buddhi/config.yaml`) | config → `max-5x` | uses config/default |
 | `CLAUDE_BIN` | Claude CLI path override | PATH + common dirs | hard exit if unresolved |
 | `BUDDHI_MAX_ROUNDS` | Max fix/review rounds | auto-size from the PR diff → 10 | positive int wins; else auto-size, else a stderr-warned fallback of 10 |
 | `BUDDHI_BOT_QUIESCENCE_SECS` | Silence window (seconds) after a bot's last comment before it is done for the round | 60 | positive int wins; `0`/negative/garbage/blank → default |
@@ -38,7 +38,7 @@ plan profile (see [`configuration.md`](configuration.md)).
 
 The reviewer fleet is **not** an env var either: the enabled set
 (`active_reviewers`) and the per-bot "reviews on PR open" facts (`auto_on_open`)
-live only in `~/.config/review-loop/config.yaml`, written by `/review-pr setup`.
+live only in `~/.config/buddhi/config.yaml`, written by `/review-pr setup`.
 See [`configuration.md`](configuration.md) and [`reviewer-setup.md`](reviewer-setup.md).
 
 ## Effort levels & CLI portability

@@ -1,6 +1,6 @@
 # Configuration & tuning
 
-All configuration below lives in `~/.config/review-loop/config.yaml`, written by
+All configuration below lives in `~/.config/buddhi/config.yaml`, written by
 `/review-pr setup`. Until that file exists the loop runs on defaults and prints a
 short config-unset note to its log rather than asking you to onboard. The skills
 run a first-run gate before launching: if the config is absent they ask once
@@ -49,7 +49,7 @@ gracefully with no failed round-trips.
 
 ## Reviewer fleet
 
-`active_reviewers` in `~/.config/review-loop/config.yaml` sets the starting
+`active_reviewers` in `~/.config/buddhi/config.yaml` sets the starting
 universe of reviewers. Defaults to `[copilot, gemini, codex, claude]` when no
 config exists. See [`reviewer-setup.md`](reviewer-setup.md).
 
