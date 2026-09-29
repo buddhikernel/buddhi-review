@@ -2361,10 +2361,13 @@ class RoundDriver:
         git cannot answer. Each caller picks its own reading of None: the
         push-off progress probe (:meth:`_worktree_has_changes`) reads it as "no
         change proven", the round-start sample in :meth:`_run_loop` as "not
-        provably clean"."""
+        provably clean". Unstaged content inside a submodule is ignored: it does
+        not change the gitlink and ``git add -A`` cannot carry it in this round's
+        commit."""
         try:
             proc = self.gh_run(
-                ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                ["git", "status", "--porcelain", "-z", "--untracked-files=all",
+                 "--ignore-submodules=dirty"],
                 cwd=self.cwd)
         # ``UnicodeDecodeError`` is a ValueError (neither of the other two) and is
         # reachable only via ``-z``, which emits a non-UTF-8 path's bytes verbatim

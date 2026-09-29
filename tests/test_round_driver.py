@@ -115,6 +115,25 @@ class FreshTreeGh(GhRecorder):
         return self._reply(argv)
 
 
+def test_worktree_residue_ignores_unstaged_submodule_content():
+    # A dirty submodule's worktree does not alter its parent gitlink, so the
+    # round's ``git add -A`` cannot stage it.  The round-start residue sample must
+    # ask git to suppress precisely that non-stageable status.
+    class SubmoduleDirtyGh(GhRecorder):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            argv = list(argv)
+            self.calls.append(argv)
+            if argv[:3] == ["git", "status", "--porcelain"]:
+                assert "--ignore-submodules=dirty" in argv
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return self._reply(argv)
+
+    gh = SubmoduleDirtyGh()
+    driver, _, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+
+    assert driver._worktree_residue() is False
+
+
 def label_runner(label):
     return lambda prompt: json.dumps({"label": label, "reason": "t"})
 
