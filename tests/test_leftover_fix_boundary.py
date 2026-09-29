@@ -336,3 +336,132 @@ def test_an_edit_made_during_the_poll_is_never_merged_on_an_earlier_review(env):
     assert any(SUBST in world.markers(tip) for tip in world.summons), (
         "the reviewer was asked to review a head that contains the edit")
     assert world.merges == [] and outcome.merged is False
+
+
+def _assert_edit_needs_its_own_review(world, driver, outcome):
+    assert SUBST in world.markers(world.remote_tip()), "the cosmetic commit carried the edit"
+    assert SUBST in world.markers(driver._last_substantive_head), (
+        "the carrying commit moved the reviewed-commit boundary")
+    assert any(SUBST in world.markers(tip) for tip in world.summons), (
+        "the reviewer was asked to review a head that contains the edit")
+    assert world.merges == [] and outcome.merged is False
+
+
+def _edit_engine(world):
+    with open(world.repo / "engine.py", "a") as fh:
+        fh.write(SUBST + "\n")
+
+
+def test_an_edit_made_during_classification_is_never_merged_on_an_earlier_review(env):
+    # The classification pass (one model call per comment) runs after the poll and
+    # before the first fixer; an outside edit landing while it runs is sampled too.
+    world, gate = env
+    reviewer = Reviewer(world)
+    reviewer.post(1, "n2", "[cosmetic] nit: wording in style")
+    driver = make_driver(world, reviewer, {"n2": writes("style.py", COSM)}, test_gate=True)
+
+    def classify_during_an_edit(prompt):
+        if not world.dirty():
+            _edit_engine(world)
+        return classify(prompt)
+    driver.classify_runner = classify_during_an_edit
+
+    outcome = driver.run()
+
+    _assert_edit_needs_its_own_review(world, driver, outcome)
+
+
+def test_an_edit_made_during_the_test_gate_is_never_merged_on_an_earlier_review(
+        env, monkeypatch):
+    # The fixers have finished and the gate is running: an outside edit lands in the
+    # tree the commit step is about to stage.
+    world, gate = env
+    reviewer = Reviewer(world)
+    reviewer.post(1, "n2", "[cosmetic] nit: wording in style")
+    edits = []
+
+    def gate_during_an_edit(cwd, repo=None, run=None, notice=None, **k):
+        if not edits:
+            edits.append(True)
+            _edit_engine(world)
+        return "green", ""
+    monkeypatch.setattr(commit_push, "run_test_gate", gate_during_an_edit)
+
+    driver = make_driver(world, reviewer, {"n2": writes("style.py", COSM)}, test_gate=True)
+    outcome = driver.run()
+
+    assert edits
+    _assert_edit_needs_its_own_review(world, driver, outcome)
+
+
+@pytest.mark.parametrize("operator_edits", [True, False])
+def test_an_operator_repair_at_a_red_gate_is_never_merged_on_an_earlier_review(
+        env, monkeypatch, operator_edits):
+    # The gate goes red after a COSMETIC fix and the operator answers "I've fixed it —
+    # re-run the gate & continue". Their repair is committed with the round's fix and
+    # has never been reviewed. The twin: the operator re-runs a flaky gate without
+    # touching the tree, and the cosmetic commit still merges on the review in hand.
+    world, gate = env
+    reviewer = Reviewer(world)
+    reviewer.post(1, "n2", "[cosmetic] nit: wording in style")
+    gate["verdicts"] = ["red"]
+
+    def operator_answers(n, ask, **k):
+        if operator_edits:
+            _edit_engine(world)
+        return "3"
+    monkeypatch.setattr(escalation_wait, "wait_for_answer", operator_answers)
+
+    driver = make_driver(world, reviewer, {"n2": writes("style.py", COSM)}, test_gate=True)
+    start = world.local_head()
+    outcome = driver.run()
+
+    assert COSM in (world.repo / "style.py").read_text()
+    if operator_edits:
+        _assert_edit_needs_its_own_review(world, driver, outcome)
+    else:
+        assert outcome.merged is True and world.merges == [world.remote_tip()]
+        assert driver._last_substantive_head == start, (
+            "a commit holding only the fixers' output keeps the boundary")
+
+
+def test_the_commit_check_vouches_only_for_what_the_fixers_left_on_disk(env):
+    # Direct form of the comparison: a commit holding exactly what the fixers left
+    # (an edit, a deletion, a new symlink) is theirs; any other content, or a
+    # fingerprint that could not be taken, is not.
+    world, gate = env
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    assert driver._commit_carries_foreign(None) is True
+
+    def fixers_write(edit):
+        driver._round_review_head = world.local_head()
+        edit()
+        return driver._fixer_output_fingerprint()
+
+    def commit():
+        git(world.repo, "add", "-A")
+        git(world.repo, "commit", "-qm", "round")
+
+    def fixes():
+        with open(world.repo / "style.py", "a") as fh:
+            fh.write(COSM + "\n")
+        (world.repo / "x.py").unlink()
+        os.symlink("style.py", world.repo / "link")
+    output = fixers_write(fixes)
+    commit()
+    assert driver._commit_carries_foreign(output) is False
+
+    output = fixers_write(lambda: writes("style.py", COSM)(world))
+    _edit_engine(world)                     # a file the fixers never touched
+    commit()
+    assert driver._commit_carries_foreign(output) is True
+
+    output = fixers_write(lambda: writes("style.py", COSM)(world))
+    writes("style.py", SUBST)(world)        # more content in the file they did touch
+    commit()
+    assert driver._commit_carries_foreign(output) is True
+
+    output = fixers_write(lambda: writes("style.py", COSM)(world))
+    driver._round_review_head = "0" * 40    # someone committed under the fixers
+    commit()
+    assert driver._commit_carries_foreign(output) is True

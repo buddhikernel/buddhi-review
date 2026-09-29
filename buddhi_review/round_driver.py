@@ -13,9 +13,10 @@ actually landed AND changed files. A cosmetic / PR-description / outdated /
 invalid-only round — or a substantive comment the fixer skipped, or a
 substantive fix that changed nothing — is a clean finish: any applied fixes are
 committed/pushed, then the run exits clean without re-summoning anyone. The one
-exception is a round that STARTED on a worktree already holding uncommitted
-changes: its commit may carry content no fixer of that round wrote and no reviewer
-has seen, so it earns a review round exactly like a substantive fix. When the
+exception is a round whose commit carries content no fixer of that round wrote —
+it STARTED on a worktree already holding uncommitted changes, or the commit holds
+anything other than what its fixers left on disk: no reviewer has seen that
+content, so the round earns a review round exactly like a substantive fix. When the
 round budget is spent and the final round completed cleanly (no unanswered
 escalation, no poisoned worktree, no failed push, no operator stop), the exit
 routes through the same clean-exit gates as a naturally-clean finish rather than
@@ -61,6 +62,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import sys
 import textwrap
@@ -1191,9 +1193,10 @@ class RoundDriver:
         self._process_start_head: Optional[str] = None
         # _last_substantive_head: the PR head after this run's most recent
         #   SUBSTANTIVE push; init to _process_start_head, advanced only on a
-        #   substantive round — or on a round whose commit carried changes already
-        #   uncommitted in the worktree when it began. Every commit after it is a
-        #   loop-authored cosmetic-only fix made on a tree that started clean. None
+        #   substantive round — or on a round whose commit carried changes no fixer
+        #   of that round made (already uncommitted in the worktree when it began,
+        #   or written there while it ran). Every commit after it is a loop-authored
+        #   cosmetic-only fix holding only its own fixers' output. None
         #   (unresolvable local head) → the gate BLOCKS (fail-closed).
         self._last_substantive_head: Optional[str] = None
         # _round_review_head: the local HEAD captured at the START of the current
@@ -2379,6 +2382,145 @@ class RoundDriver:
         return commit_push._dirty_beyond_held_back(
             getattr(proc, "stdout", "") or "", self.cwd, run=self.gh_run)
 
+    def _fixer_output_fingerprint(self) -> Optional[Tuple[str, Dict[str, tuple]]]:
+        """What this round's fixers left on disk, read the moment the last of them
+        returns: ``(HEAD, {path: identity})`` over every uncommitted path the
+        round's commit could stage, or None when any part of it cannot be read.
+
+        The identity is what git would record for the path: ``("file", blob)`` for
+        a regular file (``git hash-object``, which applies the path's own filters
+        exactly as ``git add`` does), ``("link", target)`` for a symlink (which
+        hash-object would follow instead), ``("deleted",)`` for a path that is gone,
+        and ``("other",)`` — matching nothing — for anything else, such as a
+        submodule's directory. ``--no-renames`` reports a staged rename as its
+        deletion plus its addition, the same two paths the commit's tree diff
+        shows. The untracked artifacts the staging guard holds back
+        (:func:`commit_push._held_back_new_artifacts`) are skipped so a cold
+        worktree's ``node_modules/`` is never read; one of them that reaches the
+        commit anyway is simply not vouched for (:meth:`_commit_carries_foreign`).
+
+        Known limit: an edit made WHILE a fixer runs lands in the same tree the
+        fixer is writing and reads as that fixer's output. Every window a human is
+        actually handed — the escalation wait, the red test gate and its "I've
+        fixed it" re-run — comes after this read."""
+        head = self._local_head_sha()
+        if head is None:
+            return None
+        try:
+            proc = self.gh_run(
+                ["git", "status", "--porcelain", "-z", "--untracked-files=all",
+                 "--ignore-submodules=dirty", "--no-renames"],
+                cwd=self.cwd)
+            if getattr(proc, "returncode", 1) != 0:
+                return None
+            # Porcelain paths are repo-root-relative; ``cwd`` may be a subdirectory.
+            cdup = self.gh_run(["git", "rev-parse", "--show-cdup"], cwd=self.cwd)
+            if getattr(cdup, "returncode", 1) != 0:
+                return None
+            root = os.path.normpath(
+                os.path.join(self.cwd, (getattr(cdup, "stdout", "") or "").strip()))
+            entries = list(commit_push._iter_porcelain_z(getattr(proc, "stdout", "") or ""))
+            source_dirs = commit_push._tracked_source_dirs(self.cwd, entries, run=self.gh_run)
+            held_back = commit_push._held_back_new_artifacts(entries, source_dirs=source_dirs)
+            identity: Dict[str, tuple] = {}
+            regular: List[str] = []
+            for xy, path in entries:
+                if xy == "??" and path in held_back:
+                    continue
+                full = os.path.join(root, path)
+                try:
+                    info = os.lstat(full)
+                except (FileNotFoundError, NotADirectoryError):
+                    identity[path] = ("deleted",)
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    identity[path] = ("link", os.readlink(full))
+                elif stat.S_ISREG(info.st_mode):
+                    regular.append(path)
+                else:
+                    identity[path] = ("other",)
+            if regular:
+                hashed = commit_push._run_batched_stdout(
+                    self.gh_run, ["git", "hash-object", "--"],
+                    [os.path.join(root, p) for p in regular], cwd=self.cwd)
+                shas = (hashed or "").split()
+                if hashed is None or len(shas) != len(regular):
+                    return None
+                identity.update((p, ("file", sha)) for p, sha in zip(regular, shas))
+        # ``UnicodeDecodeError``: a non-UTF-8 path under ``-z`` (see
+        # :meth:`_worktree_residue`). Any unreadable part → no fingerprint, which
+        # :meth:`_commit_carries_foreign` reads as "not provably the fixers' own".
+        except (subprocess.SubprocessError, UnicodeDecodeError, OSError, ValueError):
+            return None
+        return head, identity
+
+    def _commit_carries_foreign(
+            self, fixer_output: Optional[Tuple[str, Dict[str, tuple]]]) -> bool:
+        """Did the commit(s) this round pushed carry anything its fixers did NOT
+        leave on disk? Every path the pushed head changed relative to the head the
+        fixers worked on must hold exactly the identity
+        :meth:`_fixer_output_fingerprint` recorded for it; anything else — a path
+        the fixers never touched, different content, a submodule pointer — is
+        foreign. Fail-closed: no fingerprint, a head that moved under the fixers
+        (someone committed mid-round), or any unreadable git answer counts as
+        foreign, because nothing then shows the commit is the fixers' own.
+
+        The commit is compared rather than the tree just before staging because it
+        is what actually ships: it also covers an operator's own commit and the
+        red gate's "I've fixed it" commit. The price is paid by a pre-commit hook
+        that REWRITES what it commits (a formatter re-staging its output): that
+        commit no longer matches the fixers' bytes, so the round takes one more
+        review round — the fail-closed direction, never an unreviewed merge."""
+        if fixer_output is None:
+            return True
+        base, identity = fixer_output
+        if base != self._round_review_head:
+            return True
+        try:
+            proc = self.gh_run(["git", "diff-tree", "-r", "-z", "--no-renames", base, "HEAD"],
+                               cwd=self.cwd)
+        except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
+            return True
+        if getattr(proc, "returncode", 1) != 0:
+            return True
+        # ``:<old mode> <new mode> <old sha> <new sha> <status>`` NUL ``<path>`` NUL,
+        # one record per changed path (no rename/copy pairs under --no-renames).
+        fields = (getattr(proc, "stdout", "") or "").split("\0")
+        i = 0
+        while i < len(fields):
+            meta = fields[i]
+            if not meta:
+                i += 1
+                continue
+            parts = meta[1:].split()
+            if (not meta.startswith(":") or len(parts) != 5 or i + 1 >= len(fields)
+                    or parts[4][:1] in ("R", "C")):
+                return True
+            new_mode, new_sha, path = parts[1], parts[3], fields[i + 1]
+            i += 2
+            have = identity.get(path)
+            if new_mode == "000000":
+                ok = have == ("deleted",)
+            elif new_mode == "120000":
+                ok = (have is not None and have[0] == "link"
+                      and self._blob_text(new_sha) == have[1])
+            elif new_mode in ("100644", "100755"):
+                ok = have == ("file", new_sha)
+            else:
+                ok = False
+            if not ok:
+                return True
+        return False
+
+    def _blob_text(self, sha: str) -> Optional[str]:
+        """The raw content of blob ``sha`` (a symlink blob is its target), or None."""
+        try:
+            proc = self.gh_run(["git", "cat-file", "blob", sha], cwd=self.cwd)
+        except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
+            return None
+        return (getattr(proc, "stdout", None)
+                if getattr(proc, "returncode", 1) == 0 else None)
+
     # --------------------------------------------------- --rr-active restart
 
     def _head_sha(self) -> str:
@@ -3323,9 +3465,12 @@ class RoundDriver:
             # (``node_modules/``, ``target/``, coverage) never reads as dirty. An
             # unreadable status is not provably clean and counts as dirty.
             #
-            # This is only the FIRST of two samples: the summon and the poll below can
-            # take many minutes, and the shared checkout may be edited in that window,
-            # so the sample is taken again just before the fix batch (see below).
+            # This is only the FIRST of two samples: the summon, the poll and the
+            # classification pass below can take many minutes, and the shared
+            # checkout may be edited in that window, so the sample is taken again
+            # just before the first fixer (see below). What reaches the tree AFTER
+            # the fixers is caught by comparing the commit with what they left on
+            # disk (``fixer_output`` below).
             round_start_dirty = self._worktree_residue() is not False
             # Snapshot the stale-reaction set before re-requesting: a +1 already on
             # the PR is stale; one arriving after the re-request is a fresh signal.
@@ -3364,24 +3509,38 @@ class RoundDriver:
                 self._render_round(round_no, [], [], expected)  # status-only round summary
                 return self._clean_exit(round_no)
 
-            # Second residue sample, after the summon and the poll and still ahead of
-            # every fixer of this round: an edit that landed in the worktree DURING
-            # the wait (an operator or a background process on the shared checkout)
-            # is as unreviewed as one left behind by an earlier run, and this round's
-            # commit would stage it just the same. Either sample reading dirty makes
-            # the round dirty; sampling any later would read this round's own fixes.
-            round_start_dirty = round_start_dirty or self._worktree_residue() is not False
-
             results = process_comments(
                 actionable, adapter=self.adapter, classify_runner=self.classify_runner,
                 max_rounds=self.max_rounds,
             )
+            # Second residue sample, after the summon, the poll and the (model-bound,
+            # possibly slow) classification pass, and still ahead of every fixer of
+            # this round — classification only decides, it never writes. An edit
+            # that landed in the worktree DURING that wait (an operator or a
+            # background process on the shared checkout) is as unreviewed as one
+            # left behind by an earlier run, and this round's commit would stage it
+            # just the same. Either sample reading dirty makes the round dirty;
+            # sampling any later would read this round's own fixes.
+            round_start_dirty = round_start_dirty or self._worktree_residue() is not False
             round_actions = []
             for c, r in zip(actionable, results):
                 self._maybe_errored_comeback(c, r)  # review-output retract (subst/cosmetic)
                 round_actions.append(
                     act_on_result(c, r, adapter=self.adapter, fix_dispatch=self.fix_dispatch))
             self.actions.extend(round_actions)
+            # What this round's fixers left on disk, read the moment the last one
+            # returns — BEFORE the escalation wait and the commit step's test gate,
+            # each of which can hand the tree to a human for many minutes: a failed
+            # fix offers "apply the change manually", and a red gate's "I've fixed
+            # it" commits the operator's own edits along with the round's fixes.
+            # The pushed commit is compared with it below (``carried_residue``), so
+            # anything it carries that the fixers did not write moves the boundary.
+            # Only a round that started clean and is about to commit needs it — a
+            # dirty start already denies the commit the cosmetic exemption.
+            fixer_output = (self._fixer_output_fingerprint()
+                            if (not round_start_dirty and self.push
+                                and any(a.final == "fixed" for a in round_actions))
+                            else None)
             # Record which INLINE comments (path-anchored — the only comments that
             # are review-thread ROOTS) the run genuinely finished, so the pre-merge
             # thread gate resolves ONLY the run's own inline threads and can never
@@ -3460,9 +3619,12 @@ class RoundDriver:
                     return self._handback("needs-human", round_no, rebase_skip=True)
                 committed_changes = (pushed == "pushed")
 
-            # A round that STARTED dirty and then pushed a commit may have carried
-            # content no fixer of this round wrote and no reviewer has seen (see
-            # ``round_start_dirty`` above). That commit never rides the review
+            # A pushed commit may have carried content no fixer of this round wrote
+            # and no reviewer has seen: the round STARTED dirty (see
+            # ``round_start_dirty`` above), or the commit holds something other than
+            # what the fixers left on disk (``fixer_output`` above — an edit made
+            # during the escalation wait or the test gate, including the operator's
+            # own "I've fixed it" repair). That commit never rides the review
             # already in hand, whatever this round's labels: it moves the head-aware
             # boundary below exactly like a substantive fix, so the merge gate
             # demands a review of this exact head, and the run takes another round
@@ -3472,17 +3634,23 @@ class RoundDriver:
             # finding dismissed) — whose verdicts were reached on the head the commit
             # replaced — are re-asked instead of the round asking nobody. Un-parked
             # before the stamp below, their verdict is never recorded against the new
-            # tip. A round that started clean keeps the cosmetic exemption untouched.
-            carried_residue = round_start_dirty and committed_changes
+            # tip. A round that started clean and committed only its fixers' output
+            # keeps the cosmetic exemption untouched.
+            carried_residue = committed_changes and (
+                round_start_dirty or self._commit_carries_foreign(fixer_output))
             if carried_residue:
                 reask: Set[str] = set()
                 if not self.expected_bots():
                     reask = (self.polishing | self.reviewed_no_change) - parked_before
                     self.polishing -= reask
                     self.reviewed_no_change -= reask
-                print("[round] this round's commit carried uncommitted changes that "
-                      "were already in the worktree when the round began — no "
-                      "reviewer has seen them, so this head needs its own review"
+                print("[round] this round's commit carried "
+                      + ("uncommitted changes that were already in the worktree when "
+                         "the round began" if round_start_dirty else
+                         "changes that do not match what this round's fixers left on "
+                         "disk")
+                      + " — no reviewer has seen them, so this head needs its own "
+                        "review"
                       + (f"; re-asking {', '.join(sorted(reask))}" if reask else ""))
 
             # Persist this round's polish-only verdicts against the tip the loop
@@ -3512,9 +3680,10 @@ class RoundDriver:
             # hand. Nothing here looks inside the commit, so a production edit
             # applied under a COSMETIC label merges unseen — an accepted hole,
             # pinned by a documented-decision test, not a defect to re-wire. The
-            # exemption covers the round's OWN fixes only: a round that started on
-            # an already-dirty worktree carries changes no fixer of it wrote, and its
-            # commit moves the boundary (``carried_residue`` above).
+            # exemption covers the round's OWN fixes only: a commit carrying changes
+            # no fixer of the round wrote — the tree was already dirty when it
+            # began, or was edited after its fixers finished — moves the boundary
+            # (``carried_residue`` above).
             round_substantive = any(
                 r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
                 for r, a in zip(results, round_actions)
@@ -3537,7 +3706,7 @@ class RoundDriver:
                 committed_changes or self._worktree_has_changes())) or carried_residue
             if take_substantive_round:
                 # F2: this round pushed a SUBSTANTIVE fix, or a commit that carried
-                # content already in the worktree when the round began — the head
+                # content no fixer of the round wrote — the head
                 # now carries commits no reviewer has seen. Advance the head-aware
                 # boundary so the gate requires a review at/after this head; only a
                 # cosmetic-only tail after it may ride an earlier reviewed head. Read
