@@ -89,9 +89,13 @@ class GhHead:
     the loop being killed mid-run."""
 
     def __init__(self, head="H0", advance_to="H1", kill_on=None, kill_after=0,
-                 head_fails=False, name_with_owner=None):
+                 head_fails=False, name_with_owner=None, dirty=True):
         self.calls = []
         self.head = head
+        # Whether the worktree reads as holding an uncommitted change. Dirty from the
+        # start by default; a test that models a clean tree passes ``dirty=False``
+        # and flips it when its fix lands.
+        self.dirty = dirty
         self.advance_to = advance_to
         self.kill_on = kill_on           # substring of the spawn that kills the loop
         self.kill_after = kill_after     # …but let this many of them through first
@@ -109,7 +113,7 @@ class GhHead:
             self.kill_after -= 1
         out = ""
         if argv[:3] == ["git", "status", "--porcelain"]:
-            out = " M x.py\n"
+            out = " M x.py\n" if self.dirty else ""
         elif ".head.sha" in argv or (argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD"):
             # Both the polish tip guard (`gh api …/pulls -q .head.sha`) and the F2
             # head-aware gate (`git rev-parse HEAD`) read the SAME moving tip here.
@@ -531,7 +535,14 @@ def test_all_polish_restart_auto_merges_when_the_killed_run_pushed_nothing():
     # (no substantive fix moved the head after they looked), so the head-aware gate
     # anchors them to H1 and the merge is the one the operator is entitled to.
     polish_state.write_polish_state(PR, REPO, "H1", ["claude", "copilot"])
-    gh = GhHead(head="H1")
+    # The worktree starts CLEAN (nothing was left behind); only the round's own fix
+    # dirties it. A dirty start would hand the commit content no reviewer has seen, and
+    # the restored reviewers — who spoke this round — would rightly be re-asked.
+    gh = GhHead(head="H1", dirty=False)
+
+    def fix_dirties_the_tree(c, r):
+        gh.dirty = True
+        return FixOutcome(status="applied")
     # Their cosmetic comments are still on the PR, anchored (by GitHub) to H1 — the
     # head they were written against. THAT is what credits them at the merge gate; no
     # synthetic anchor is involved, so nothing can drift.
@@ -539,7 +550,8 @@ def test_all_polish_restart_auto_merges_when_the_killed_run_pushed_nothing():
                               source="claude[bot]", path="a.py", diff_hunk="@@ -1 +1 @@")
     driver, clock = make_driver([(0, claude_cosmetic), (0, COSMETIC)], gh=gh,
                                 rr_active=True, preflight=True,
-                                auto_merge=True, max_rounds=3)
+                                auto_merge=True, max_rounds=3,
+                                fix_dispatch=fix_dirties_the_tree)
     outcome = driver.run()
     assert driver.polishing == {"claude", "copilot"}
     assert driver._run_start_fleet == {"claude", "copilot"}   # the gate's universe is intact

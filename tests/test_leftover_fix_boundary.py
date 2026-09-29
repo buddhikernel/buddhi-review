@@ -465,3 +465,88 @@ def test_the_commit_check_vouches_only_for_what_the_fixers_left_on_disk(env):
     driver._round_review_head = "0" * 40    # someone committed under the fixers
     commit()
     assert driver._commit_carries_foreign(output) is True
+
+
+def test_the_commit_check_does_not_vouch_for_an_executable_bit_changed_after_the_fixers(env):
+    # A chmod leaves the blob sha alone, so the mode is part of the identity: one made
+    # after the fixers finished (the test gate, an operator repair) is foreign, while
+    # the fixers' own chmod, made before the fingerprint, is theirs.
+    world, gate = env
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+
+    def commit():
+        git(world.repo, "add", "-A")
+        git(world.repo, "commit", "-qm", "round")
+
+    def fixers_write_then(after):
+        driver._round_review_head = world.local_head()
+        writes("style.py", COSM)(world)
+        output = driver._fixer_output_fingerprint()
+        after()
+        commit()
+        return output
+
+    def chmod(bits):
+        return lambda: os.chmod(world.repo / "style.py", bits)
+
+    assert driver._commit_carries_foreign(fixers_write_then(lambda: None)) is False
+    assert driver._commit_carries_foreign(fixers_write_then(chmod(0o755))) is True, (
+        "a chmod +x after the fingerprint, with the blob unchanged, went unnoticed")
+    assert driver._commit_carries_foreign(fixers_write_then(chmod(0o644))) is True, (
+        "a chmod -x after the fingerprint, with the blob unchanged, went unnoticed")
+
+    driver._round_review_head = world.local_head()
+    os.chmod(world.repo / "style.py", 0o755)
+    writes("style.py", COSM)(world)
+    output = driver._fixer_output_fingerprint()
+    commit()
+    assert driver._commit_carries_foreign(output) is False, (
+        "an executable bit the fixers themselves set is theirs")
+
+
+def test_the_commit_check_skips_the_mode_when_git_ignores_the_executable_bit(env):
+    # With core.filemode off ``git add`` keeps the recorded mode whatever the disk
+    # says, so a chmod the fixers made cannot mismatch the commit and is not foreign.
+    world, gate = env
+    git(world.repo, "config", "core.filemode", "false")
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    writes("style.py", COSM)(world)
+    os.chmod(world.repo / "style.py", 0o755)
+    output = driver._fixer_output_fingerprint()
+    git(world.repo, "add", "-A")
+    git(world.repo, "commit", "-qm", "round")
+    assert git(world.repo, "ls-tree", "HEAD", "style.py").startswith("100644")
+    assert driver._commit_carries_foreign(output) is False
+
+
+def test_a_reviewer_parked_earlier_that_speaks_again_is_re_asked_for_a_carrying_commit(
+        env, monkeypatch):
+    # The only reviewer was parked polish-only before this round (an --rr-active
+    # restore does exactly this), then a delayed cosmetic comment of its own reaches
+    # the round's batch. An edit lands in the tree during the test gate, so the
+    # round's commit carries it. Nobody else is expected, and the reviewer whose
+    # comment the round acted on must be asked to review the new head — otherwise
+    # the run clean-exits with a head nobody reviewed.
+    world, gate = env
+    reviewer = Reviewer(world)
+    edits = []
+
+    def gate_during_an_edit(cwd, repo=None, run=None, notice=None, **k):
+        if not edits:
+            edits.append(True)
+            _edit_engine(world)
+        return "green", ""
+    monkeypatch.setattr(commit_push, "run_test_gate", gate_during_an_edit)
+
+    driver = make_driver(world, reviewer, {"n2": writes("style.py", COSM)}, test_gate=True)
+    driver.polishing.add("claude")
+    assert driver.expected_bots() == []
+    driver._preflight_batch = [Comment(
+        id="n2", text="[cosmetic] nit: wording in style", source="claude[bot]",
+        path="x.py", diff_hunk="@@ -1 +1 @@", created_at="2026-01-01T00:30:00+00:00")]
+
+    outcome = driver.run()
+
+    assert edits
+    _assert_edit_needs_its_own_review(world, driver, outcome)

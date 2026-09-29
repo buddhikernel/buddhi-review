@@ -2387,9 +2387,13 @@ class RoundDriver:
         returns: ``(HEAD, {path: identity})`` over every uncommitted path the
         round's commit could stage, or None when any part of it cannot be read.
 
-        The identity is what git would record for the path: ``("file", blob)`` for
-        a regular file (``git hash-object``, which applies the path's own filters
-        exactly as ``git add`` does), ``("link", target)`` for a symlink (which
+        The identity is what git would record for the path: ``("file", blob, mode)``
+        for a regular file (``git hash-object``, which applies the path's own
+        filters exactly as ``git add`` does, plus the ``100644`` / ``100755`` mode
+        ``git add`` would record from the file's executable bit — a blob sha alone
+        does not see a chmod — or None for the mode when ``core.filemode`` is off,
+        because ``git add`` then ignores the disk's executable bit and there is
+        nothing on disk to compare), ``("link", target)`` for a symlink (which
         hash-object would follow instead), ``("deleted",)`` for a path that is gone,
         and ``("other",)`` — matching nothing — for anything else, such as a
         submodule's directory. ``--no-renames`` reports a staged rename as its
@@ -2419,11 +2423,18 @@ class RoundDriver:
                 return None
             root = os.path.normpath(
                 os.path.join(self.cwd, (getattr(cdup, "stdout", "") or "").strip()))
+            # Exit 1 is "key unset", where git trusts the executable bit.
+            filemode = self.gh_run(["git", "config", "--bool", "core.filemode"],
+                                   cwd=self.cwd)
+            if getattr(filemode, "returncode", 1) not in (0, 1):
+                return None
+            trust_mode = (getattr(filemode, "stdout", "") or "").strip().lower() != "false"
             entries = list(commit_push._iter_porcelain_z(getattr(proc, "stdout", "") or ""))
             source_dirs = commit_push._tracked_source_dirs(self.cwd, entries, run=self.gh_run)
             held_back = commit_push._held_back_new_artifacts(entries, source_dirs=source_dirs)
             identity: Dict[str, tuple] = {}
             regular: List[str] = []
+            modes: Dict[str, Optional[str]] = {}
             for xy, path in entries:
                 if xy == "??" and path in held_back:
                     continue
@@ -2437,6 +2448,8 @@ class RoundDriver:
                     identity[path] = ("link", os.readlink(full))
                 elif stat.S_ISREG(info.st_mode):
                     regular.append(path)
+                    modes[path] = (("100755" if info.st_mode & stat.S_IXUSR else "100644")
+                                   if trust_mode else None)
                 else:
                     identity[path] = ("other",)
             if regular:
@@ -2446,7 +2459,8 @@ class RoundDriver:
                 shas = (hashed or "").split()
                 if hashed is None or len(shas) != len(regular):
                     return None
-                identity.update((p, ("file", sha)) for p, sha in zip(regular, shas))
+                identity.update(
+                    (p, ("file", sha, modes[p])) for p, sha in zip(regular, shas))
         # ``UnicodeDecodeError``: a non-UTF-8 path under ``-z`` (see
         # :meth:`_worktree_residue`). Any unreadable part → no fingerprint, which
         # :meth:`_commit_carries_foreign` reads as "not provably the fixers' own".
@@ -2505,7 +2519,10 @@ class RoundDriver:
                 ok = (have is not None and have[0] == "link"
                       and self._blob_text(new_sha) == have[1])
             elif new_mode in ("100644", "100755"):
-                ok = have == ("file", new_sha)
+                # The mode is compared as well as the blob: a chmod made after the
+                # fingerprint leaves the blob sha unchanged. None = mode untracked.
+                ok = (have is not None and have[0] == "file" and have[1] == new_sha
+                      and have[2] in (None, new_mode))
             else:
                 ok = False
             if not ok:
@@ -3566,7 +3583,6 @@ class RoundDriver:
             # whose whole round was non-substantive has nothing left to fix, and
             # one whose real findings were ALL dismissed on reassessment must
             # not be re-asked (it would loop against the same verdict).
-            parked_before = self.polishing | self.reviewed_no_change
             self._update_polishing(actionable, results, round_actions)
             self._render_round(round_no, actionable, results, expected)  # per-reviewer round summary
 
@@ -3630,18 +3646,21 @@ class RoundDriver:
             # demands a review of this exact head, and the run takes another round
             # to ask for one. One anchored review of the new head is all the gate
             # needs, so while some reviewer is still expected the parks stand; when
-            # nobody is, the reviewers THIS round parked (polish-only, or every
-            # finding dismissed) — whose verdicts were reached on the head the commit
-            # replaced — are re-asked instead of the round asking nobody. Un-parked
-            # before the stamp below, their verdict is never recorded against the new
-            # tip. A round that started clean and committed only its fixers' output
-            # keeps the cosmetic exemption untouched.
+            # nobody is, the parked reviewers that spoke THIS round are re-asked
+            # instead of the round asking nobody. They were parked polish-only, or
+            # with every finding dismissed, by this round or by an earlier one whose
+            # delayed comment reached this round's batch; either way their verdicts
+            # were reached on the head the commit replaced. Un-parked before the
+            # stamp below, their verdict is never recorded against the new tip. A
+            # round that started clean and committed only its fixers' output keeps
+            # the cosmetic exemption untouched.
             carried_residue = committed_changes and (
                 round_start_dirty or self._commit_carries_foreign(fixer_output))
             if carried_residue:
                 reask: Set[str] = set()
                 if not self.expected_bots():
-                    reask = (self.polishing | self.reviewed_no_change) - parked_before
+                    spoke = {detectors.bot_for_login(c.source) for c in actionable}
+                    reask = (self.polishing | self.reviewed_no_change) & spoke
                     self.polishing -= reask
                     self.reviewed_no_change -= reask
                 print("[round] this round's commit carried "
