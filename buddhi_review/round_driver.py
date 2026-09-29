@@ -3322,6 +3322,10 @@ class RoundDriver:
             # guard's own, so a cold worktree's permanently held-back runner output
             # (``node_modules/``, ``target/``, coverage) never reads as dirty. An
             # unreadable status is not provably clean and counts as dirty.
+            #
+            # This is only the FIRST of two samples: the summon and the poll below can
+            # take many minutes, and the shared checkout may be edited in that window,
+            # so the sample is taken again just before the fix batch (see below).
             round_start_dirty = self._worktree_residue() is not False
             # Snapshot the stale-reaction set before re-requesting: a +1 already on
             # the PR is stale; one arriving after the re-request is a fresh signal.
@@ -3359,6 +3363,14 @@ class RoundDriver:
             if not actionable:
                 self._render_round(round_no, [], [], expected)  # status-only round summary
                 return self._clean_exit(round_no)
+
+            # Second residue sample, after the summon and the poll and still ahead of
+            # every fixer of this round: an edit that landed in the worktree DURING
+            # the wait (an operator or a background process on the shared checkout)
+            # is as unreviewed as one left behind by an earlier run, and this round's
+            # commit would stage it just the same. Either sample reading dirty makes
+            # the round dirty; sampling any later would read this round's own fixes.
+            round_start_dirty = round_start_dirty or self._worktree_residue() is not False
 
             results = process_comments(
                 actionable, adapter=self.adapter, classify_runner=self.classify_runner,

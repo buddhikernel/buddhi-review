@@ -302,3 +302,37 @@ def test_the_same_cosmetic_run_on_a_cleaned_tree_merges_on_the_existing_review(
         # re-asks for its own reason: the old finding reported already fixed.)
         assert world.remote_tip() not in world.summons
         assert world.summons[asked_before:] == ([start] if mode == "plain" else [])
+
+
+class EditingReviewer(Reviewer):
+    """A reviewer whose poll window coincides with an outside edit to the shared
+    checkout: the first fetch after the summon writes SUBST into engine.py."""
+
+    def __init__(self, world):
+        super().__init__(world)
+        self.edited = False
+
+    def fetch(self, pr, repo=None, cwd=None):
+        if self.world.summons and not self.edited:
+            self.edited = True
+            with open(self.world.repo / "engine.py", "a") as fh:
+                fh.write(SUBST + "\n")
+        return super().fetch(pr, repo=repo, cwd=cwd)
+
+
+def test_an_edit_made_during_the_poll_is_never_merged_on_an_earlier_review(env):
+    world, gate = env
+    reviewer = EditingReviewer(world)
+    reviewer.post(1, "n2", "[cosmetic] nit: wording in style")
+    assert not world.dirty()          # the round starts on a clean tree
+
+    driver = make_driver(world, reviewer, {"n2": writes("style.py", COSM)}, test_gate=True)
+    outcome = driver.run()
+
+    assert reviewer.edited
+    assert SUBST in world.markers(world.remote_tip()), "the cosmetic commit carried the edit"
+    assert SUBST in world.markers(driver._last_substantive_head), (
+        "the carrying commit moved the reviewed-commit boundary")
+    assert any(SUBST in world.markers(tip) for tip in world.summons), (
+        "the reviewer was asked to review a head that contains the edit")
+    assert world.merges == [] and outcome.merged is False
