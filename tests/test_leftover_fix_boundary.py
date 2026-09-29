@@ -504,7 +504,7 @@ def test_the_commit_check_does_not_vouch_for_an_executable_bit_changed_after_the
         "an executable bit the fixers themselves set is theirs")
 
 
-def test_the_commit_check_skips_the_mode_when_git_ignores_the_executable_bit(env):
+def test_the_commit_check_ignores_a_disk_chmod_when_git_ignores_the_executable_bit(env):
     # With core.filemode off ``git add`` keeps the recorded mode whatever the disk
     # says, so a chmod the fixers made cannot mismatch the commit and is not foreign.
     world, gate = env
@@ -517,6 +517,60 @@ def test_the_commit_check_skips_the_mode_when_git_ignores_the_executable_bit(env
     git(world.repo, "add", "-A")
     git(world.repo, "commit", "-qm", "round")
     assert git(world.repo, "ls-tree", "HEAD", "style.py").startswith("100644")
+    assert driver._commit_carries_foreign(output) is False
+
+
+@pytest.mark.parametrize("chmod_flag, committed", [("+x", "100755"), ("-x", "100644")])
+def test_the_commit_check_does_not_vouch_for_an_index_chmod_after_the_fixers_when_filemode_is_off(
+        env, chmod_flag, committed):
+    # With core.filemode off the mode the commit stages is the INDEX's, so a
+    # ``git update-index --chmod`` made after the fixers finished (a hook, an
+    # operator) is an unreviewed change the blob sha does not show.
+    world, gate = env
+    git(world.repo, "config", "core.filemode", "false")
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    if chmod_flag == "-x":
+        git(world.repo, "update-index", "--chmod=+x", "style.py")
+        git(world.repo, "commit", "-qm", "make style.py executable")
+    driver._round_review_head = world.local_head()
+    writes("style.py", COSM)(world)
+    output = driver._fixer_output_fingerprint()
+    git(world.repo, "update-index", f"--chmod={chmod_flag}", "style.py")
+    git(world.repo, "add", "-A")
+    git(world.repo, "commit", "-qm", "round")
+    assert git(world.repo, "ls-tree", "HEAD", "style.py").startswith(committed)
+    assert driver._commit_carries_foreign(output) is True, (
+        "an index chmod after the fingerprint went unnoticed with core.filemode off")
+
+
+def test_the_commit_check_vouches_for_an_index_chmod_the_fixers_made_when_filemode_is_off(env):
+    # The fixers' own ``update-index --chmod`` is in the index before the fingerprint
+    # is read, so the mode it records is theirs.
+    world, gate = env
+    git(world.repo, "config", "core.filemode", "false")
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    writes("style.py", COSM)(world)
+    git(world.repo, "update-index", "--chmod=+x", "style.py")
+    output = driver._fixer_output_fingerprint()
+    git(world.repo, "add", "-A")
+    git(world.repo, "commit", "-qm", "round")
+    assert git(world.repo, "ls-tree", "HEAD", "style.py").startswith("100755")
+    assert driver._commit_carries_foreign(output) is False
+
+
+def test_the_commit_check_vouches_for_a_new_file_when_filemode_is_off(env):
+    # A path the index does not hold is staged as ``100644`` whatever the disk says.
+    world, gate = env
+    git(world.repo, "config", "core.filemode", "false")
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    (world.repo / "fresh.py").write_text("x = 1\n")
+    os.chmod(world.repo / "fresh.py", 0o755)
+    output = driver._fixer_output_fingerprint()
+    git(world.repo, "add", "-A")
+    git(world.repo, "commit", "-qm", "round")
+    assert git(world.repo, "ls-tree", "HEAD", "fresh.py").startswith("100644")
     assert driver._commit_carries_foreign(output) is False
 
 

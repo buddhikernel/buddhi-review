@@ -2391,9 +2391,11 @@ class RoundDriver:
         for a regular file (``git hash-object``, which applies the path's own
         filters exactly as ``git add`` does, plus the ``100644`` / ``100755`` mode
         ``git add`` would record from the file's executable bit — a blob sha alone
-        does not see a chmod — or None for the mode when ``core.filemode`` is off,
-        because ``git add`` then ignores the disk's executable bit and there is
-        nothing on disk to compare), ``("link", target)`` for a symlink (which
+        does not see a chmod. When ``core.filemode`` is off ``git add`` ignores the
+        disk's executable bit and keeps the INDEX's regular-file mode, so that is
+        what the mode records: ``git update-index --chmod`` made after this read
+        still changes what the commit stages, and must not read as the fixers'),
+        ``("link", target)`` for a symlink (which
         hash-object would follow instead), ``("deleted",)`` for a path that is gone,
         and ``("other",)`` — matching nothing — for anything else, such as a
         submodule's directory. ``--no-renames`` reports a staged rename as its
@@ -2434,7 +2436,7 @@ class RoundDriver:
             held_back = commit_push._held_back_new_artifacts(entries, source_dirs=source_dirs)
             identity: Dict[str, tuple] = {}
             regular: List[str] = []
-            modes: Dict[str, Optional[str]] = {}
+            modes: Dict[str, str] = {}
             for xy, path in entries:
                 if xy == "??" and path in held_back:
                     continue
@@ -2448,8 +2450,8 @@ class RoundDriver:
                     identity[path] = ("link", os.readlink(full))
                 elif stat.S_ISREG(info.st_mode):
                     regular.append(path)
-                    modes[path] = (("100755" if info.st_mode & stat.S_IXUSR else "100644")
-                                   if trust_mode else None)
+                    if trust_mode:
+                        modes[path] = "100755" if info.st_mode & stat.S_IXUSR else "100644"
                 else:
                     identity[path] = ("other",)
             if regular:
@@ -2459,6 +2461,11 @@ class RoundDriver:
                 shas = (hashed or "").split()
                 if hashed is None or len(shas) != len(regular):
                     return None
+                if not trust_mode:
+                    indexed = self._indexed_file_modes(root, regular)
+                    if indexed is None:
+                        return None
+                    modes.update(indexed)
                 identity.update(
                     (p, ("file", sha, modes[p])) for p, sha in zip(regular, shas))
         # ``UnicodeDecodeError``: a non-UTF-8 path under ``-z`` (see
@@ -2467,6 +2474,27 @@ class RoundDriver:
         except (subprocess.SubprocessError, UnicodeDecodeError, OSError, ValueError):
             return None
         return head, identity
+
+    def _indexed_file_modes(self, root: str, paths: List[str]) -> Optional[Dict[str, str]]:
+        """``{path: mode}`` that ``git add`` would record for each regular file in
+        ``paths`` (repo-root-relative) while ``core.filemode`` is off: it keeps the
+        mode of a stage-0 regular-file index entry and gives anything else — an
+        untracked path, an unmerged one, a path the index holds as a symlink — plain
+        ``100644``. None when git cannot answer."""
+        out = commit_push._run_batched_stdout(
+            self.gh_run, ["git", "--literal-pathspecs", "ls-files", "-s", "-z",
+                          "--full-name", "--"],
+            [os.path.join(root, p) for p in paths], cwd=self.cwd)
+        if out is None:
+            return None
+        modes = {p: "100644" for p in paths}
+        for record in out.split("\0"):
+            # ``<mode> <sha> <stage>`` TAB ``<path>``
+            meta, _, path = record.partition("\t")
+            parts = meta.split()
+            if len(parts) == 3 and parts[2] == "0" and parts[0] == "100755" and path in modes:
+                modes[path] = "100755"
+        return modes
 
     def _commit_carries_foreign(
             self, fixer_output: Optional[Tuple[str, Dict[str, tuple]]]) -> bool:
@@ -2520,9 +2548,11 @@ class RoundDriver:
                       and self._blob_text(new_sha) == have[1])
             elif new_mode in ("100644", "100755"):
                 # The mode is compared as well as the blob: a chmod made after the
-                # fingerprint leaves the blob sha unchanged. None = mode untracked.
+                # fingerprint leaves the blob sha unchanged. With core.filemode off
+                # the fingerprinted mode is the index's, not the disk's, so an
+                # ``update-index --chmod`` after it is foreign too.
                 ok = (have is not None and have[0] == "file" and have[1] == new_sha
-                      and have[2] in (None, new_mode))
+                      and have[2] == new_mode)
             else:
                 ok = False
             if not ok:
