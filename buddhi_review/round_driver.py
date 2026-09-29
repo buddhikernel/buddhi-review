@@ -3680,10 +3680,14 @@ class RoundDriver:
             # instead of the round asking nobody. They were parked polish-only, or
             # with every finding dismissed, by this round or by an earlier one whose
             # delayed comment reached this round's batch; either way their verdicts
-            # were reached on the head the commit replaced. Un-parked before the
-            # stamp below, their verdict is never recorded against the new tip. A
-            # round that started clean and committed only its fixers' output keeps
-            # the cosmetic exemption untouched.
+            # were reached on the head the commit replaced. A reviewer that spoke
+            # this round AND is already done (an actionable cosmetic comment plus a
+            # clean signal in the same round — ``_update_polishing`` leaves it in
+            # neither parking set) is re-admitted the same way, so the round never
+            # asks nobody just because its only reviewer signed off on the old head.
+            # Un-parked before the stamp below, their verdict is never recorded
+            # against the new tip. A round that started clean and committed only its
+            # fixers' output keeps the cosmetic exemption untouched.
             carried_residue = committed_changes and (
                 round_start_dirty or self._commit_carries_foreign(fixer_output))
             if carried_residue:
@@ -3693,6 +3697,26 @@ class RoundDriver:
                     reask = (self.polishing | self.reviewed_no_change) & spoke
                     self.polishing -= reask
                     self.reviewed_no_change -= reask
+                    # A done reviewer's sign-off (and its "approved" crown) is for
+                    # the head the commit replaced: drop it, as ``--rr`` does, so
+                    # ``expected_bots()`` asks it again and its next verdict folds
+                    # fresh. ``reviewed_ever`` and the head-aware anchor stay — the
+                    # earlier review was genuine, and the merge gate compares its
+                    # head with the boundary advanced below. A hard-excluded or
+                    # rate-limited bot stays out: a clean fold never survives those.
+                    readmit = {
+                        b for b in (self.done & spoke)
+                        if b is not None
+                        and not self.store.is_excluded(b)
+                        and b not in self._rate_limited_until
+                    }
+                    for b in readmit:
+                        self.done.discard(b)
+                        self.approved.discard(b)
+                        self._reaction_done.discard(b)
+                        if self._bot_state(b).signal == detectors.SIGNAL_CLEAN:
+                            self._bot_state(b).signal = None
+                    reask |= readmit
                 print("[round] this round's commit carried "
                       + ("uncommitted changes that were already in the worktree when "
                          "the round began" if round_start_dirty else

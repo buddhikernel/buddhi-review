@@ -604,3 +604,36 @@ def test_a_reviewer_parked_earlier_that_speaks_again_is_re_asked_for_a_carrying_
 
     assert edits
     _assert_edit_needs_its_own_review(world, driver, outcome)
+
+
+def test_a_done_reviewer_that_speaks_this_round_is_re_asked_for_a_carrying_commit(
+        env, monkeypatch):
+    # The only reviewer already signed off (done) and, in the same round, posts an
+    # actionable cosmetic comment — ``_update_polishing`` parks it in neither set.
+    # An edit lands in the tree during the test gate, so the round's commit carries
+    # it. Nobody else is expected, so the done reviewer that spoke this round must
+    # be re-admitted and asked to review the new head — otherwise the next round
+    # clean-exits without the review the merge gate demands.
+    world, gate = env
+    reviewer = Reviewer(world)
+    edits = []
+
+    def gate_during_an_edit(cwd, repo=None, run=None, notice=None, **k):
+        if not edits:
+            edits.append(True)
+            _edit_engine(world)
+        return "green", ""
+    monkeypatch.setattr(commit_push, "run_test_gate", gate_during_an_edit)
+
+    driver = make_driver(world, reviewer, {"n2": writes("style.py", COSM)}, test_gate=True)
+    driver.done.add("claude")
+    driver.approved.add("claude")
+    assert driver.expected_bots() == []
+    driver._preflight_batch = [Comment(
+        id="n2", text="[cosmetic] nit: wording in style", source="claude[bot]",
+        path="x.py", diff_hunk="@@ -1 +1 @@", created_at="2026-01-01T00:30:00+00:00")]
+
+    outcome = driver.run()
+
+    assert edits
+    _assert_edit_needs_its_own_review(world, driver, outcome)

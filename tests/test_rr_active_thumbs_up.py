@@ -88,6 +88,10 @@ HEAD_SHA = "restarthead0000"
 class Gh:
     def __init__(self):
         self.calls = []
+        # The fake worktree reads dirty from the start. A test that models a round
+        # beginning on a CLEAN tree (so its commit carries nothing but the fixers'
+        # own output) sets this False and lets the fixer flip it on.
+        self.dirty = True
 
     def __call__(self, argv, *, cwd=None, timeout=None):
         self.calls.append(list(argv))
@@ -98,7 +102,8 @@ class Gh:
             return subprocess.CompletedProcess(argv, 0, stdout=HEAD_TIME + "\n", stderr="")
         if argv[:2] == ["git", "merge-base"]:
             return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
-        out = " M x.py\n" if argv[:3] == ["git", "status", "--porcelain"] else ""
+        out = (" M x.py\n" if self.dirty and argv[:3] == ["git", "status", "--porcelain"]
+               else "")
         return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
 
     def matching(self, *needles):
@@ -109,11 +114,12 @@ def make_driver(comments, *, reactions=(), cfg=None, **kw):
     """A restart driver: every comment/reaction is ALREADY on the PR at launch."""
     clock = FakeClock()
     gh = Gh()
+    fix_dispatch = kw.pop("fix_dispatch", None) or (lambda c, r: FixOutcome(status="applied"))
     driver = RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg or CLAUDE_ONLY,
         adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),
         classify_runner=lambda prompt: json.dumps({"label": "SUBSTANTIVE", "reason": "t"}),
-        fix_dispatch=lambda c, r: FixOutcome(status="applied"),
+        fix_dispatch=lambda c, r: fix_dispatch(c, r),
         fetch=lambda pr, repo=None, cwd=None: list(comments),
         reactions_fetch=lambda pr, repo=None, cwd=None: list(reactions),
         # F2 head-aware gate: model the raw pulls/<pr>/reviews payload. Each seeded
@@ -270,8 +276,18 @@ def test_fresh_plus_one_after_a_finding_outranks_it_and_is_not_resummoned():
         Comment(id="f", text="this null check is missing", source="claude[bot]",
                 path="x.py", diff_hunk="@@ -1 +1 @@", created_at=OLD),
     ]
+    # The round starts on a CLEAN tree and its commit holds only the fixer's own
+    # output, so nothing unreviewed rides it (a commit carrying content no fixer
+    # wrote would rightly re-ask a done reviewer that spoke this round).
+    holder = {}
+
+    def fix(c, r):
+        holder["gh"].dirty = True
+        return FixOutcome(status="applied")
     driver, clock, gh = make_driver(comments, reactions=[_plus_one(created_at=NEW)],
-                                    auto_merge=True)
+                                    auto_merge=True, fix_dispatch=fix)
+    holder["gh"] = gh
+    gh.dirty = False
     outcome = driver.run()
     assert "claude" in driver.done and "claude" in driver.approved
     assert gh.matching(SUMMON) == []             # never re-asked
