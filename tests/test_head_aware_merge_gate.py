@@ -796,12 +796,14 @@ def test_placeholder_review_at_merged_head_still_blocks():
 
 class SteppingGh(MainlineGh):
     """MainlineGh whose tip advances H0 → H1 → H2 … on successive pushes, and whose
-    tree reads dirty again whenever a fixer applied something (the fixer stub sets
-    `dirty`), so every round that applied a fix really commits and pushes."""
+    tree reads dirty whenever a fixer applied something (the fixer stub sets
+    `dirty`), so every round that applied a fix really commits and pushes. It starts
+    clean — the tree a fresh run meets: a tree already dirty before any fixer ran
+    would be content no reviewer has seen."""
 
     def __init__(self):
         super().__init__()
-        self.dirty = True
+        self.dirty = False
         self.n = 0
 
     def __call__(self, argv, *, cwd=None, timeout=None):
@@ -822,27 +824,50 @@ class SteppingGh(MainlineGh):
 
 def _content_round_driver(*, label, timeline, gh, clock, cfg=CLAUDE_ONLY,
                           inline_h0=True, reviews=None, max_rounds=3, fix=None,
-                          inline_fetch=None):
+                          inline_fetch=None, fresh_tree=True):
     """The mainline harness (a tip that really advances on the fix push),
-    parameterised by the classifier's LABEL for the round's findings."""
+    parameterised by the classifier's LABEL for the round's findings.
+    ``fresh_tree=False`` hands every ``git status`` straight to ``gh``, so a fake
+    that reads dirty before any fixer ran models a worktree already carrying
+    uncommitted changes when the run starts."""
     def fetch(pr, repo=None, cwd=None):
         return [c for t, c in timeline if t <= clock.t]
 
     def classify(prompt):
         return json.dumps({"label": "COSMETIC" if "nit:" in prompt else label,
                            "reason": "t"})
+
+    # The tree a fresh run meets is CLEAN. These fakes answer `git status` dirty
+    # to stand for the fixer's own write, so it reads clean until a fix has been
+    # applied: a tree already dirty at the top of round 1 is content no reviewer
+    # has seen, which a cosmetic-only round's commit may not carry.
+    fixer = fix or (lambda c, r: FixOutcome(status="applied"))
+    wrote = []
+
+    def dispatch(c, r):
+        outcome = fixer(c, r)
+        if outcome.status == "applied":
+            wrote.append(c.id)
+        return outcome
+
+    def run(argv, *, cwd=None, timeout=None):
+        if (fresh_tree and not wrote
+                and list(argv)[:3] == ["git", "status", "--porcelain"]):
+            gh.calls.append(list(argv))
+            return _CP(0, "")
+        return gh(argv, cwd=cwd, timeout=timeout)
     return RoundDriver(
         "7", repo="o/r", cwd="/nonexistent", cfg=cfg,
         adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),
         classify_runner=classify,
-        fix_dispatch=fix or (lambda c, r: FixOutcome(status="applied")),
+        fix_dispatch=dispatch,
         fetch=fetch, reactions_fetch=lambda pr, repo=None, cwd=None: [],
         reviews_fetch=lambda pr, repo=None, cwd=None: list(reviews or []),
         inline_fetch=inline_fetch or (lambda pr, repo=None, cwd=None: (
             [_inline("claude", "H0")] if inline_h0 else [])),
         threads_fetch=lambda pr, repo=None, cwd=None: [],
         resolve_thread=lambda thread_id, cwd=None: True,
-        gh_run=gh, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
+        gh_run=run, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
         wall_clock=lambda: datetime(2026, 1, 1, 1, 30, tzinfo=timezone.utc),
         times=RoundTimes(quiescence=60, poll_interval=30, min_bot_wait=420,
                          idle_timeout=900, max_wait_total=1800, register_delay=0),
@@ -1262,3 +1287,146 @@ def test_an_unreadable_head_after_a_substantive_push_blocks_the_merge(capsys):
     assert outcome.merged is False
     assert gh.matching("gh", "merge", "--squash") == []
     assert "[gate-unverified]" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# A round that STARTS on a dirty worktree does not keep the review in hand for its
+# commit. The commit stages the whole tree, so it can carry changes that were
+# already sitting uncommitted before any fixer of the round ran — a fix a stopped
+# red test gate or a rejected pre-commit hook left behind — which no reviewer has
+# seen. That head needs its own review. A round that started clean keeps the
+# cosmetic exemption (the decision tests above). The end-to-end form, on a real
+# repository, is tests/test_leftover_fix_boundary.py.
+# ---------------------------------------------------------------------------
+
+def test_a_cosmetic_commit_from_an_already_dirty_tree_needs_its_own_review():
+    # MainlineGh reads dirty from the start: changes were already uncommitted when
+    # round 1 began. The COSMETIC fix's commit carries them to H1, so the boundary
+    # follows to H1, claude — parked polish-only by this round, with nobody else
+    # expected — is re-asked, and with no review of H1 nothing merges.
+    gh, clock = MainlineGh(), FakeClock()
+    driver = _content_round_driver(label="COSMETIC", timeline=[(0, _FINDING)],
+                                   gh=gh, clock=clock, fresh_tree=False)
+    outcome = driver.run()
+    assert gh.head == "H1"
+    assert driver._last_substantive_head == "H1"
+    assert "claude" not in driver.polishing, "re-asked, not left parked"
+    assert len(gh.matching("@claude review")) == 2
+    assert outcome.merged is False
+    assert gh.matching("gh", "merge", "--squash") == []
+
+
+def test_an_unreadable_round_start_status_counts_as_dirty():
+    # The round-start read of the worktree fails. A tree that cannot be shown clean
+    # is treated as dirty: the COSMETIC commit that follows moves the boundary and
+    # needs its own review. (Readable and clean, the same run merges on the review
+    # of H0 — test_a_cosmetic_commit_merges_in_one_round_without_a_sign_off.)
+    class BlindStartGh(MainlineGh):
+        def __init__(self):
+            super().__init__()
+            self.status_reads = 0
+
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            argv = list(argv)
+            if argv[:3] == ["git", "status", "--porcelain"]:
+                self.status_reads += 1
+                if self.status_reads == 1:
+                    self.calls.append(argv)
+                    return _CP(128, "")
+            return super().__call__(argv, cwd=cwd, timeout=timeout)
+    gh, clock = BlindStartGh(), FakeClock()
+    driver = _content_round_driver(label="COSMETIC", timeline=[(0, _FINDING)],
+                                   gh=gh, clock=clock, fresh_tree=False)
+    outcome = driver.run()
+    assert gh.status_reads >= 2, "the failed read came before the commit step's own"
+    assert gh.head == "H1"
+    assert driver._last_substantive_head == "H1"
+    assert outcome.merged is False
+
+
+def test_a_dirty_start_round_that_commits_nothing_neither_moves_the_boundary_nor_asks_again():
+    # The tree is dirty at round start, but the fixer reports the finding already
+    # handled and nothing is committed. Nothing new reached the PR, so the boundary
+    # stays at H0, nobody is re-asked, and the unchanged head merges on its review.
+    gh, clock = MainlineGh(), FakeClock()
+    driver = _content_round_driver(
+        label="COSMETIC", timeline=[(0, _FINDING)], gh=gh, clock=clock,
+        fresh_tree=False,
+        fix=lambda c, r: FixOutcome(status="skipped", detail="SKIP: already fixed"))
+    outcome = driver.run()
+    assert gh.head == "H0" and driver._last_substantive_head == "H0"
+    assert len(gh.matching("@claude review")) == 1
+    assert outcome.merged is True
+    assert _pinned(gh) == ["H0"]
+
+
+_COPILOT_NIT = Comment(id="n1", text="nit: rename tmp", source="copilot[bot]",
+                       path="x.py", diff_hunk="@@ -2 +2 @@",
+                       created_at="2026-01-01T00:30:00+00:00")
+
+
+def _two_reviewer_inline(anchors, timeline, clock):
+    def inline_fetch(pr, repo=None, cwd=None):
+        return [_inline("copilot" if c.source.startswith("copilot") else "claude",
+                        anchors[c.id]) for t, c in timeline if t <= clock.t]
+    return inline_fetch
+
+
+def test_a_leftover_carrying_round_leaves_the_parks_alone_while_another_reviewer_covers_the_head():
+    # The tree is dirty at round 1. claude's SUBSTANTIVE finding is fixed (claude
+    # stays expected, to verify its fix) and copilot's nit is fixed (copilot parked
+    # polish-only). The commit carries the leftover, but claude's review of the new
+    # head is all the gate needs, so copilot stays parked and is not re-asked.
+    gh, clock = SteppingGh(), FakeClock()
+    gh.dirty = True
+    timeline = [(0, _FINDING), (0, _COPILOT_NIT)]
+
+    def fix(c, r):
+        gh.dirty = True
+        return FixOutcome(status="applied")
+    driver = _content_round_driver(
+        label="SUBSTANTIVE", timeline=timeline, gh=gh, clock=clock, cfg=TWO_REVIEWERS,
+        fix=fix, fresh_tree=False,
+        inline_fetch=_two_reviewer_inline({"f1": "H0", "n1": "H0"}, timeline, clock))
+    outcome = driver.run()
+    assert driver._last_substantive_head == "H1"
+    assert "copilot" in driver.polishing
+    assert len(gh.matching("requested_reviewers")) == 1, "copilot: round 1 only"
+    assert len(gh.matching("@claude review")) == 2
+    assert outcome.merged is False
+
+
+def test_only_the_reviewer_parked_by_the_carrying_round_is_re_asked():
+    # Round 1 starts clean: claude's SUBSTANTIVE fix and copilot's nit are pushed
+    # (H1) and copilot is parked polish-only. The push leaves the tree dirty (a
+    # pre-commit hook rewrote a file after staging it), so round 2 STARTS dirty.
+    # Round 2's only work is a nit from claude; its commit (H2) carries the
+    # leftover, so the boundary follows, and — nobody else being expected — the
+    # reviewer THIS round parked (claude) is re-asked. copilot, parked by round 1
+    # for its own verdict, stays parked.
+    class HookLeavesDirtyGh(SteppingGh):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            out = super().__call__(argv, cwd=cwd, timeout=timeout)
+            if list(argv)[:2] == ["git", "push"] and self.n == 1:
+                self.dirty = True
+            return out
+    gh, clock = HookLeavesDirtyGh(), FakeClock()
+    nit2 = Comment(id="n2", text="nit: wording", source="claude[bot]", path="x.py",
+                   diff_hunk="@@ -4 +4 @@", created_at="2026-01-01T02:00:00+00:00")
+    timeline = [(0, _FINDING), (0, _COPILOT_NIT), (200, nit2)]
+
+    def fix(c, r):
+        gh.dirty = True
+        return FixOutcome(status="applied")
+    driver = _content_round_driver(
+        label="SUBSTANTIVE", timeline=timeline, gh=gh, clock=clock, cfg=TWO_REVIEWERS,
+        fix=fix, fresh_tree=False,
+        inline_fetch=_two_reviewer_inline({"f1": "H0", "n1": "H0", "n2": "H1"},
+                                          timeline, clock))
+    outcome = driver.run()
+    assert gh.head == "H2"
+    assert driver._last_substantive_head == "H2", "round 2 sampled its own start"
+    assert len(gh.matching("@claude review")) == 3, "claude re-asked about H2"
+    assert len(gh.matching("requested_reviewers")) == 1, "copilot stays parked"
+    assert "copilot" in driver.polishing
+    assert outcome.merged is False

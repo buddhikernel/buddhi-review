@@ -84,6 +84,37 @@ class GhRecorder:
         return [c for c in self.calls if all(any(n in a for a in c) for n in needles)]
 
 
+class FreshTreeGh(GhRecorder):
+    """A :class:`GhRecorder` whose worktree reads CLEAN until a fixer applies a
+    change, and clean again once the round's push has shipped it — the tree a fresh
+    run meets. The base recorder's always-dirty tree reads, at the top of round 1,
+    as changes already sitting uncommitted before any fixer ran: content no
+    reviewer has seen, which a cosmetic-only round's commit may not carry on the
+    review already in hand. Wrap the test's fix seam with :meth:`writes`."""
+
+    def __init__(self):
+        super().__init__()
+        self.dirty = False
+
+    def writes(self, fix):
+        def dispatch(c, r):
+            outcome = fix(c, r)
+            if outcome.status == "applied":
+                self.dirty = True
+            return outcome
+        return dispatch
+
+    def __call__(self, argv, *, cwd=None, timeout=None):
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[:3] == ["git", "status", "--porcelain"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=" M x.py\n" if self.dirty else "", stderr="")
+        if argv[:2] == ["git", "push"]:
+            self.dirty = False
+        return self._reply(argv)
+
+
 def label_runner(label):
     return lambda prompt: json.dumps({"label": label, "reason": "t"})
 
@@ -1084,8 +1115,10 @@ def test_cosmetic_only_round_ends_the_run_clean():
     # auto-merge) with NO re-request round.
     timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]"))]
     fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    tree = FreshTreeGh()   # the tree is clean until the fixer writes to it
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=tree.writes(fix), gh=tree,
         auto_merge=True, answer_waiter=lambda esc, **k: {},
     )
     outcome = driver.run()
@@ -1287,8 +1320,9 @@ def test_mixed_dismissed_substantive_and_cosmetic_is_reviewed_no_change(capsys):
             return FixOutcome(status="skipped", detail="SKIP: the cited path is unreachable")
         return FixOutcome(status="applied")
 
+    tree = FreshTreeGh()   # the tree is clean until the fixer writes to it
     driver, clock, gh = make_driver(
-        timeline, cfg=cfg, classify=classify, fix=fix,
+        timeline, cfg=cfg, classify=classify, fix=tree.writes(fix), gh=tree,
         max_rounds=3, answer_waiter=lambda esc, **k: {},
     )
     driver.run()
@@ -1551,8 +1585,10 @@ def test_preflight_processes_pre_existing_comment_in_round1_without_waiting():
         return FixOutcome(status="applied")
 
     timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]"))]
+    tree = FreshTreeGh()   # the tree is clean until the fixer writes to it
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=tree.writes(fix), gh=tree,
         auto_merge=True, answer_waiter=lambda esc, **k: {}, preflight=True)
     outcome = driver.run()
     assert outcome.status == "clean" and outcome.rounds == 1
@@ -1947,8 +1983,10 @@ def test_rr_active_cosmetic_only_responder_is_not_force_re_reviewed():
                        idle_timeout=900, max_wait_total=1800, register_delay=60)
     timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
                             path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    tree = FreshTreeGh()   # the tree is clean until the fixer writes to it
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=tree.writes(fix), gh=tree,
         rr_active=True, preflight=True, max_rounds=3, times=times,
         answer_waiter=lambda esc, **k: {})
     outcome = driver.run()

@@ -450,6 +450,24 @@ def test_unknown_tip_on_write_stamps_nothing():
     assert not os.path.exists(polish_state.state_path(PR, REPO))
 
 
+def test_a_commit_carrying_leftover_changes_never_stamps_its_parked_reviewer_at_the_new_tip():
+    # GhHead's worktree reads dirty from the start: changes were already sitting
+    # uncommitted when round 1 began. copilot's nit is fixed and the commit (H1)
+    # carries those changes too, so copilot's polish verdict — reached on H0 — is
+    # not a verdict on H1: copilot is re-asked, and H1 is never stamped with it
+    # (a restart at H1 would otherwise skip the one reviewer left to look at it).
+    gh = GhHead(head="H0", advance_to="H1")
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    driver, clock = make_driver([(0, COSMETIC)], gh=gh, cfg=cfg, max_rounds=3)
+    outcome = driver.run()
+    assert gh.head == "H1"
+    assert "copilot" not in driver.polishing
+    assert gh.matching("requested_reviewers"), "copilot is re-asked about H1"
+    state = polish_state.read_polish_state(PR, REPO)
+    assert state is None or "copilot" not in state["bots"]
+    assert outcome.merged is False
+
+
 def test_unknown_live_head_on_restore_restores_nothing():
     # State exists, but the restart cannot read the PR's live head → restore nothing
     # (never crash, never guess), and summon the reviewer as usual.

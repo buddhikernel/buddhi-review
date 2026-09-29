@@ -12,7 +12,10 @@ real substantive progress — at least one ``SUBSTANTIVE`` comment whose fix
 actually landed AND changed files. A cosmetic / PR-description / outdated /
 invalid-only round — or a substantive comment the fixer skipped, or a
 substantive fix that changed nothing — is a clean finish: any applied fixes are
-committed/pushed, then the run exits clean without re-summoning anyone. When the
+committed/pushed, then the run exits clean without re-summoning anyone. The one
+exception is a round that STARTED on a worktree already holding uncommitted
+changes: its commit may carry content no fixer of that round wrote and no reviewer
+has seen, so it earns a review round exactly like a substantive fix. When the
 round budget is spent and the final round completed cleanly (no unanswered
 escalation, no poisoned worktree, no failed push, no operator stop), the exit
 routes through the same clean-exit gates as a naturally-clean finish rather than
@@ -1188,8 +1191,10 @@ class RoundDriver:
         self._process_start_head: Optional[str] = None
         # _last_substantive_head: the PR head after this run's most recent
         #   SUBSTANTIVE push; init to _process_start_head, advanced only on a
-        #   substantive round. Every commit after it is a loop-authored cosmetic-only
-        #   fix. None (unresolvable local head) → the gate BLOCKS (fail-closed).
+        #   substantive round — or on a round whose commit carried changes already
+        #   uncommitted in the worktree when it began. Every commit after it is a
+        #   loop-authored cosmetic-only fix made on a tree that started clean. None
+        #   (unresolvable local head) → the gate BLOCKS (fail-closed).
         self._last_substantive_head: Optional[str] = None
         # _round_review_head: the local HEAD captured at the START of the current
         #   round == the remote head reviewers check out this round (the loop pushes
@@ -2346,6 +2351,17 @@ class RoundDriver:
         committed nothing would still be taken as substantive and would advance
         ``_last_substantive_head`` to a head that never moved. ``-z
         --untracked-files=all`` matches the form that predicate expects."""
+        return self._worktree_residue() is True
+
+    def _worktree_residue(self) -> Optional[bool]:
+        """Would the round's own commit stage anything the worktree holds right now?
+        True / False by the staging guard's own residue predicate
+        (:func:`commit_push._dirty_beyond_held_back`, the same ``-z
+        --untracked-files=all`` read ``commit_and_push`` makes first), or None when
+        git cannot answer. Each caller picks its own reading of None: the
+        push-off progress probe (:meth:`_worktree_has_changes`) reads it as "no
+        change proven", the round-start sample in :meth:`_run_loop` as "not
+        provably clean"."""
         try:
             proc = self.gh_run(
                 ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
@@ -2354,9 +2370,9 @@ class RoundDriver:
         # reachable only via ``-z``, which emits a non-UTF-8 path's bytes verbatim
         # instead of C-quoting them into ASCII.
         except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
-            return False
+            return None
         if getattr(proc, "returncode", 1) != 0:
-            return False
+            return None
         return commit_push._dirty_beyond_held_back(
             getattr(proc, "stdout", "") or "", self.cwd, run=self.gh_run)
 
@@ -3285,6 +3301,25 @@ class RoundDriver:
             # on an already-reviewed PR. Later rounds re-request + poll it as usual.
             poll_expected = ([b for b in expected if b not in self._preflight_responders]
                              if round_no == 1 else list(expected))
+            # Was the worktree ALREADY carrying uncommitted content when this round
+            # began, before any fixer of this round could write to it? Sampled here,
+            # ahead of the summon, the poll and the fix batch — sampled any later it
+            # would read this round's own fixes and every round would count as dirty.
+            #
+            # Why it matters: the round's commit stages the whole tree, and a
+            # COSMETIC-only round's commit keeps the review already in hand. Content
+            # left behind earlier — a SUBSTANTIVE fix stranded uncommitted when the
+            # operator stopped on a red test gate (or left it unanswered), a fix a
+            # pre-commit hook rejected, a run that was killed mid-round — would ride
+            # that commit onto the PR and merge on a review of an older head that
+            # never contained it. A round that STARTED dirty therefore does not get
+            # the cosmetic exemption for its commit (see ``carried_residue`` below).
+            #
+            # The predicate is "would the round's commit stage any of it", the staging
+            # guard's own, so a cold worktree's permanently held-back runner output
+            # (``node_modules/``, ``target/``, coverage) never reads as dirty. An
+            # unreadable status is not provably clean and counts as dirty.
+            round_start_dirty = self._worktree_residue() is not False
             # Snapshot the stale-reaction set before re-requesting: a +1 already on
             # the PR is stale; one arriving after the re-request is a fresh signal.
             self._capture_reaction_baseline()
@@ -3357,6 +3392,7 @@ class RoundDriver:
             # whose whole round was non-substantive has nothing left to fix, and
             # one whose real findings were ALL dismissed on reassessment must
             # not be re-asked (it would loop against the same verdict).
+            parked_before = self.polishing | self.reviewed_no_change
             self._update_polishing(actionable, results, round_actions)
             self._render_round(round_no, actionable, results, expected)  # per-reviewer round summary
 
@@ -3409,6 +3445,31 @@ class RoundDriver:
                     return self._handback("needs-human", round_no, rebase_skip=True)
                 committed_changes = (pushed == "pushed")
 
+            # A round that STARTED dirty and then pushed a commit may have carried
+            # content no fixer of this round wrote and no reviewer has seen (see
+            # ``round_start_dirty`` above). That commit never rides the review
+            # already in hand, whatever this round's labels: it moves the head-aware
+            # boundary below exactly like a substantive fix, so the merge gate
+            # demands a review of this exact head, and the run takes another round
+            # to ask for one. One anchored review of the new head is all the gate
+            # needs, so while some reviewer is still expected the parks stand; when
+            # nobody is, the reviewers THIS round parked (polish-only, or every
+            # finding dismissed) — whose verdicts were reached on the head the commit
+            # replaced — are re-asked instead of the round asking nobody. Un-parked
+            # before the stamp below, their verdict is never recorded against the new
+            # tip. A round that started clean keeps the cosmetic exemption untouched.
+            carried_residue = round_start_dirty and committed_changes
+            if carried_residue:
+                reask: Set[str] = set()
+                if not self.expected_bots():
+                    reask = (self.polishing | self.reviewed_no_change) - parked_before
+                    self.polishing -= reask
+                    self.reviewed_no_change -= reask
+                print("[round] this round's commit carried uncommitted changes that "
+                      "were already in the worktree when the round began — no "
+                      "reviewer has seen them, so this head needs its own review"
+                      + (f"; re-asking {', '.join(sorted(reask))}" if reask else ""))
+
             # Persist this round's polish-only verdicts against the tip the loop
             # now carries — AFTER the fixes are pushed, so the stamp names the head
             # a restart would meet. A polish-only reviewer is sticky within a run
@@ -3435,7 +3496,10 @@ class RoundDriver:
             # head-aware merge boundary and the PR merges on the review already in
             # hand. Nothing here looks inside the commit, so a production edit
             # applied under a COSMETIC label merges unseen — an accepted hole,
-            # pinned by a documented-decision test, not a defect to re-wire.
+            # pinned by a documented-decision test, not a defect to re-wire. The
+            # exemption covers the round's OWN fixes only: a round that started on
+            # an already-dirty worktree carries changes no fixer of it wrote, and its
+            # commit moves the boundary (``carried_residue`` above).
             round_substantive = any(
                 r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
                 for r, a in zip(results, round_actions)
@@ -3454,14 +3518,15 @@ class RoundDriver:
                 and r.classification.label in _REAL_FINDING_LABELS
                 for r, a in zip(results, round_actions)
             )
-            take_substantive_round = round_substantive and (
-                committed_changes or self._worktree_has_changes())
+            take_substantive_round = (round_substantive and (
+                committed_changes or self._worktree_has_changes())) or carried_residue
             if take_substantive_round:
-                # F2: this round pushed a SUBSTANTIVE fix — the head now carries
-                # commits no reviewer has seen. Advance the head-aware boundary so
-                # the gate requires a review at/after this head; only a cosmetic-only
-                # tail after it may ride an earlier reviewed head. Read from LOCAL git
-                # (None on failure → the gate blocks, fail-closed).
+                # F2: this round pushed a SUBSTANTIVE fix, or a commit that carried
+                # content already in the worktree when the round began — the head
+                # now carries commits no reviewer has seen. Advance the head-aware
+                # boundary so the gate requires a review at/after this head; only a
+                # cosmetic-only tail after it may ride an earlier reviewed head. Read
+                # from LOCAL git (None on failure → the gate blocks, fail-closed).
                 self._last_substantive_head = self._local_head_sha()
             if round_no >= self.max_rounds and restart_reverify:
                 # Final round, but the restart's re-fixed pre-existing finding was never
