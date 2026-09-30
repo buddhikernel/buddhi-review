@@ -21,6 +21,7 @@ review already in hand.
 """
 import json
 import os
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -923,6 +924,112 @@ def test_what_the_fixers_left_is_vouched_for_when_nothing_moves_while_it_is_reco
     assert driver._commit_carries_foreign(output) is False
 
 
+def around(driver, prefix, before, after):
+    """Perform ``before`` just before the first git command the driver issues that
+    starts with ``prefix``, and ``after`` as soon as that command returns. Returns
+    the prefixes that fired."""
+    inner_run, fired = driver.gh_run, []
+
+    def run(argv, **kw):
+        if fired or list(argv[:len(prefix)]) != prefix:
+            return inner_run(argv, **kw)
+        fired.append(prefix)
+        before()
+        try:
+            return inner_run(argv, **kw)
+        finally:
+            after()
+
+    driver.gh_run = run
+    return fired
+
+
+def _identity(path):
+    info = os.lstat(path)
+    return (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            info.st_ino, info.st_dev)
+
+
+@pytest.mark.parametrize("filemode", ["true", "false"])
+@pytest.mark.parametrize("swapped", [".", "pkg", "pkg/sub", None])
+def test_a_folder_swapped_out_and_back_while_the_fixers_output_is_recorded_is_not_vouched_for(
+        env, swapped, filemode):
+    # Just before the record reads the content of the file the fixers touched,
+    # another process renames a folder above it (the repository's own folder, a
+    # top folder or a middle one) out of the way and puts a copy holding other
+    # bytes in its place; as soon as the read is done it renames the first folder
+    # back. The file itself is never touched, so its own identity reads the same
+    # before and after, and when the folder swapped is a middle one ("pkg/sub")
+    # neither the top of the repository nor the file's own folder reads any
+    # different either. The process then writes the bytes the record read into
+    # that file, and the round commits them. The twin: nothing moves, and the
+    # fixers' commit (an edit three folders down, a new file in new folders and a
+    # removed folder) is theirs.
+    world, gate = env
+    git(world.repo, "config", "core.filemode", filemode)
+    mod = world.repo / "pkg" / "sub" / "deep" / "mod.py"
+    mod.parent.mkdir(parents=True)
+    mod.write_text("# mod\n")
+    (world.repo / "gone").mkdir()
+    (world.repo / "gone" / "old.py").write_text("o = 1\n")
+    git(world.repo, "add", "-A")
+    git(world.repo, "commit", "-qm", "add pkg and gone")
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    writes("pkg/sub/deep/mod.py", COSM)(world)
+    (world.repo / "lib" / "deep").mkdir(parents=True)
+    (world.repo / "lib" / "deep" / "new.py").write_text("n = 1\n")
+    shutil.rmtree(world.repo / "gone")
+    evil = mod.read_bytes().replace(COSM.encode(), b"EVIL-99")
+    folder, parked = world.repo / (swapped or "pkg"), world.repo.parent / "parked"
+    if swapped == ".":
+        folder = world.repo
+    seen = {}
+
+    def swap_out():
+        seen.update(file=_identity(mod), folder=_identity(folder),
+                    top=_identity(world.repo), own=_identity(mod.parent))
+        os.rename(folder, parked)
+        shutil.copytree(parked, folder, symlinks=True)
+        mod.write_bytes(evil)
+
+    def swap_back():
+        shutil.rmtree(folder)
+        os.rename(parked, folder)
+        # On a coarse filesystem clock the renames can share the folder's tick; a
+        # later rename moves its change time on, as any later one would.
+        deadline = time.monotonic() + 5
+        while (os.lstat(folder).st_ctime_ns == seen["folder"][3]
+               and time.monotonic() < deadline):
+            time.sleep(0.002)
+            os.rename(folder, parked)
+            os.rename(parked, folder)
+
+    fired = (around(driver, HASH, swap_out, swap_back) if swapped
+             else around(driver, HASH, lambda: None, lambda: None))
+
+    output = driver._fixer_output_fingerprint()
+    if swapped:
+        assert _identity(mod) == seen["file"], "the file itself was touched"
+        assert _identity(folder)[3] != seen["folder"][3]
+        if swapped == "pkg/sub":
+            assert _identity(world.repo) == seen["top"]
+            assert _identity(mod.parent) == seen["own"]
+        mod.write_bytes(evil)
+    _commit(world)
+
+    assert fired == [HASH]
+    if swapped:
+        assert "EVIL-99" in git(world.repo, "show", "HEAD:pkg/sub/deep/mod.py")
+        assert driver._commit_carries_foreign(output) is True, (
+            f"bytes read while {swapped!r} was swapped out were vouched for")
+    else:
+        assert output is not None and set(output[1]) == {
+            "pkg/sub/deep/mod.py", "lib/deep/new.py", "gone/old.py"}
+        assert driver._commit_carries_foreign(output) is False, (
+            "the fixers' own output, with nothing moving, was not vouched for")
+
+
 @pytest.mark.parametrize("race", ["reverted", "arrives", "reverted-and-back", "none"])
 def test_a_commit_made_while_the_round_s_commit_is_compared_is_not_vouched_for(env, race):
     # The comparison reads the commit's changes and then checks them path by path.
@@ -967,6 +1074,36 @@ def test_a_commit_made_while_the_round_s_commit_is_compared_is_not_vouched_for(e
     else:
         assert verdict is True, (
             f"a commit that {race} during the comparison was vouched for")
+
+
+@pytest.mark.parametrize("head", ["unreadable", "readable"])
+def test_a_commit_compared_while_head_cannot_be_read_is_not_vouched_for(env, head):
+    # The comparison reads HEAD to learn which commit it is judging. Just before
+    # that read, HEAD is pointed at a branch with no commit yet, as it is midway
+    # through another process's checkout of a new orphan branch, so git cannot name
+    # the commit. Nothing then shows the commit is the fixers' own, and it counts
+    # as foreign. The twin: HEAD reads, and the fixers' own commit is theirs.
+    world, gate = env
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    writes("style.py", COSM)(world)
+    output = driver._fixer_output_fingerprint()
+    assert output is not None
+    _commit(world)
+
+    def orphan():
+        git(world.repo, "symbolic-ref", "HEAD", "refs/heads/unborn")
+    fired = interleave(driver, "_commit_carries_foreign",
+                       (HEAD_READ, orphan if head == "unreadable" else (lambda: None)))
+
+    verdict = driver._commit_carries_foreign(output)
+
+    assert fired == [HEAD_READ]
+    if head == "unreadable":
+        assert driver._local_head_sha() is None
+        assert verdict is True, "a commit judged with no readable HEAD was vouched for"
+    else:
+        assert verdict is False, "the fixers' own commit was not vouched for"
 
 
 @pytest.mark.parametrize("filemode", ["true", "false"])

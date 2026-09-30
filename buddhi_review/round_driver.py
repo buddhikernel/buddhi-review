@@ -2446,16 +2446,23 @@ class RoundDriver:
         modes are read before the first ``lstat`` and again after the last, and
         every path's lstat identity (:func:`_lstat_identity`, which a rewrite that
         keeps the size and puts the modification time back still changes) is taken
-        before its content is read and again after. Any difference is None, the
-        same as a read that fails. The listing itself needs no second read: a path
-        it does not name is never vouched for, and neither is a held-back one.
+        before its content is read and again after. So is that of every folder from
+        the top of the repository down to each path's parent, read once per folder:
+        renaming a folder away, putting one holding other bytes in its place for the
+        read and then renaming the first one back leaves the file's own identity
+        untouched, but not the folders'. Any difference is None, the same as a read
+        that fails, so a file another process creates or removes in one of those
+        folders during the read also sends the commit to a reviewer. The listing
+        itself needs no second read: a path it does not name is never vouched for,
+        and neither is a held-back one.
 
         Known limits: an edit made WHILE a fixer runs lands in the same tree the
         fixer is writing and reads as that fixer's output, and so does one made
         before this read's first ``lstat`` — or, where the filesystem's clock ticks
-        coarsely, a same-size rewrite within that tick of it. Every window a human
-        is actually handed — the escalation wait, the red test gate and its "I've
-        fixed it" re-run — comes after this read."""
+        coarsely, a same-size rewrite within that tick of it. Folders above the top
+        of the repository are not checked. Every window a human is actually handed —
+        the escalation wait, the red test gate and its "I've fixed it" re-run —
+        comes after this read."""
         head = self._local_head_sha()
         if head is None:
             return None
@@ -2497,6 +2504,15 @@ class RoundDriver:
                 indexed = self._indexed_file_modes(paths)
                 if indexed is None:
                     return None
+            # Every folder a path is reached through, each once: a folder already
+            # collected has had its own parents collected too.
+            folders = {root}
+            for path in paths:
+                folder = os.path.dirname(full[path])
+                while folder not in folders and len(folder) > len(root):
+                    folders.add(folder)
+                    folder = os.path.dirname(folder)
+            folders_before = {folder: _lstat_identity(folder) for folder in folders}
             before = {path: _lstat_identity(full[path]) for path in paths}
             identity: Dict[str, tuple] = {}
             regular: List[str] = []
@@ -2521,9 +2537,13 @@ class RoundDriver:
                 if hashed is None or len(shas) != len(regular):
                     return None
             # Nothing may have moved while the content was read: the same entry
-            # (kind, bits, size, times, inode) at every path, and the same index
-            # modes. Otherwise the bytes just read may be another process's.
+            # (kind, bits, size, times, inode) at every path and at every folder
+            # above it, and the same index modes. Otherwise the bytes just read may
+            # be another process's.
             if any(_lstat_identity(full[path]) != before[path] for path in paths):
+                return None
+            if any(_lstat_identity(folder) != seen
+                   for folder, seen in folders_before.items()):
                 return None
             if indexed is not None:
                 closing = self._indexed_file_modes(paths)
