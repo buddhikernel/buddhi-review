@@ -1236,6 +1236,14 @@ class RoundDriver:
         # _vouched_head: the head the last :meth:`_commit_carries_foreign` call found
         #   to hold exactly what the round's fixers left on disk, else None.
         self._vouched_head: Optional[str] = None
+        # _absorbed_head: the local head the last :meth:`_absorb_foreign_head` call
+        #   checked; None when it could not be read (the boundary is then unset and
+        #   the gate blocks) or when the PR's head on GitHub is a commit this
+        #   worktree does not hold (the run hands back). The clean exit's merge gate
+        #   judges exactly this head: a commit landing in the checkout after the
+        #   check read it was never checked, so the re-read of the head just before
+        #   the merge finds it moved and blocks.
+        self._absorbed_head: Optional[str] = None
         # _carry_head: the boundary this run advanced to — a head carrying changes
         #   no reviewer had seen (a SUBSTANTIVE fix, a commit that carried content
         #   no fixer of its round wrote, or a commit the loop did not make). None
@@ -2877,6 +2885,7 @@ class RoundDriver:
         Fail-closed: when the PR's head on GitHub or the history cannot be read,
         the boundary moves onto the local head as if it held a foreign commit."""
         verdict, head = self._head_provenance()
+        self._absorbed_head = head if verdict != "diverged" else None
         if verdict in ("own", "unset"):
             return None
         if verdict == "unreadable" and not head:
@@ -4285,7 +4294,13 @@ class RoundDriver:
             # check). This SUBSUMES the old name-based (b)/(c): reviewed_ever now only
             # picks the block REASON, never grants a pass. The empty-fleet --rr-none
             # lift is handled inside the gate (empty fleet → no block).
-            blocked, reason, merged_head = self._head_aware_merge_gate(clean_exit=True)
+            # The gate judges the head the pre-merge check above vetted, never a
+            # fresh read: a commit made in the checkout while that check was
+            # reading GitHub would otherwise be judged against the boundary the
+            # check left in place and could merge on an older review. A later move
+            # is caught by the re-read before the merge and by the merge's pin.
+            blocked, reason, merged_head = self._head_aware_merge_gate(
+                clean_exit=True, merged_head=self._absorbed_head)
             if blocked:
                 self._block_unreviewed_merge(fleet, reason)
                 return RunOutcome("clean", rounds, False, self.actions)

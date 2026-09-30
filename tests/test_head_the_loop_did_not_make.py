@@ -15,7 +15,9 @@ never ride the review in hand:
   reviewer can see it — or, with no round left, the run hands back;
 * a PR head the worktree does not hold is handed back, and never rebased and
   force-pushed over on the way out;
-* a head that cannot be read counts as one the loop did not make.
+* a head that cannot be read counts as one the loop did not make;
+* the merge gate judges the head the last check vetted, so a commit landing in the
+  checkout while the merge is being decided never merges on an earlier review.
 
 These tests drive the REAL round loop, commit step and fixer harness against a real
 git repository with a bare remote; only ``gh`` is faked (a merge succeeds only when
@@ -39,8 +41,9 @@ LATE = "2099-01-01T00:00:00+00:00"
 class GitHub(World):
     """:class:`World` plus the PR's base and head branch names (so the manual-landing
     rebase runs as it would against GitHub), scripted answers for the PR-head read
-    (``gh api …/pulls/N -q .head.sha``), a record of every push the loop attempts,
-    and a second clone for pushes made elsewhere."""
+    (``gh api …/pulls/N -q .head.sha``), a record of every push the loop attempts
+    and of every git command it runs, git failures on demand (the history, or the
+    worktree's head), and a second clone for pushes made elsewhere."""
 
     def __init__(self, tmp):
         super().__init__(tmp)
@@ -50,9 +53,19 @@ class GitHub(World):
         self._stale = None
         self._lag_left = 0
         self.push_attempts = []
+        self.git_calls = []
+        self.history_unreadable = False   # every ``git rev-list`` fails
+        self.head_read_failures = 0       # the next N ``git rev-parse HEAD`` fail
 
     def gh_run(self, argv, *, cwd=None, timeout=None):
         argv = list(argv)
+        if argv[:1] == ["git"]:
+            self.git_calls.append(argv)
+            if argv[:2] == ["git", "rev-list"] and self.history_unreadable:
+                return _CP(128, "", "fatal: bad object")
+            if argv == ["git", "rev-parse", "HEAD"] and self.head_read_failures:
+                self.head_read_failures -= 1
+                return _CP(128, "", "fatal: unable to read HEAD")
         if argv[:2] == ["gh", "api"] and ".head.sha" in argv:
             if self.head_read is not None:
                 answer = self.head_read()
@@ -293,15 +306,16 @@ CHECKOUT_ACTIONS = {"commit-and-push": _commit_and_push,
 
 
 class During(Fleet):
-    """A :class:`Fleet` whose first fetch after the first summon runs ``action``
-    — something done to the PR branch while the loop waits for reviewers."""
+    """A :class:`Fleet` whose first fetch after claude's ``after``-th summon runs
+    ``action`` — something done to the PR branch while the loop waits for
+    reviewers."""
 
-    def __init__(self, world, action):
+    def __init__(self, world, action, after=1):
         super().__init__(world)
-        self.action, self.done = action, False
+        self.action, self.after, self.done = action, after, False
 
     def fetch(self, pr, repo=None, cwd=None):
-        if self.world.summons and not self.done:
+        if len(self.world.summons) >= self.after and not self.done:
             self.done = True
             if self.action:
                 self.action(self.world)
@@ -491,3 +505,313 @@ def test_a_commit_pushed_after_the_last_round_is_checked_is_caught_before_the_me
         return
     assert SUBST in world.markers(world.remote_tip())
     assert driver._last_substantive_head == world.remote_tip()
+
+
+# ── a commit landing while the merge is being decided ────────────────────────
+
+
+def _checkout_commit(world, *, push):
+    with open(world.repo / "engine.py", "a") as fh:
+        fh.write(SUBST + "\n")
+    git(world.repo, "commit", "-qam", "an operator's commit")
+    if push:
+        git(world.repo, "push", "-q", "origin", "HEAD:refs/heads/feat")
+
+
+@pytest.mark.parametrize("when", ["while-the-check-reads-github", "after-the-check",
+                                  "never"])
+def test_a_commit_made_while_the_merge_is_decided_never_merges_on_an_earlier_review(
+        world, when):
+    # The last round's cosmetic commit is pushed and the merge decision starts: the
+    # pre-merge check reads the worktree's head, then asks GitHub for the PR's head.
+    # A commit is made in the loop's checkout while that answer is on its way, and
+    # pushed while the review threads are resolved — or made and pushed right after
+    # the check, before the merge gate. Either way the check never saw the commit:
+    # the gate judges the head the check vetted, the head is found to have moved
+    # before the merge, and the commit never merges on claude's review of H0. The
+    # twin (no commit) merges on the review in hand.
+    fleet = Fleet(world)
+    fleet.post("claude", 1, "n1", "[cosmetic] nit: wording in style")
+    driver = make_driver(world, fleet, {"n1": writes("style.py", COSM)}, test_gate=True,
+                         cfg=CLAUDE_ONLY)
+    state = {"deciding": False, "committed": False, "pushed": False}
+
+    clean_exit = driver._clean_exit
+
+    def deciding(rounds):
+        state["deciding"] = True
+        return clean_exit(rounds)
+    driver._clean_exit = deciding
+
+    def head_read():
+        if (when == "while-the-check-reads-github" and state["deciding"]
+                and not state["committed"]):
+            state["committed"] = True
+            _checkout_commit(world, push=False)
+        return None                        # GitHub answers with the head it has
+    world.head_read = head_read
+
+    fetch_threads = driver.fetch_threads
+
+    def resolving_threads(pr, repo=None, cwd=None):
+        if state["committed"] and not state["pushed"]:
+            state["pushed"] = True
+            git(world.repo, "push", "-q", "origin", "HEAD:refs/heads/feat")
+        return fetch_threads(pr, repo=repo, cwd=cwd)
+    driver.fetch_threads = resolving_threads
+
+    warn = driver._maybe_warn_claude_never_reviewed
+
+    def right_after_the_check():
+        if when == "after-the-check" and not state["committed"]:
+            state["committed"] = state["pushed"] = True
+            _checkout_commit(world, push=True)
+        return warn()
+    driver._maybe_warn_claude_never_reviewed = right_after_the_check
+
+    outcome = driver.run()
+
+    if when == "never":
+        _merged_on_the_review_in_hand(world, driver, outcome)
+        return
+    assert state["committed"] and state["pushed"]
+    moved = world.remote_tip()
+    assert SUBST in world.markers(moved) and world.local_head() == moved
+    assert world.merges == [] and outcome.merged is False
+    assert driver._last_substantive_head == moved
+    assert world.summons == [world.h0]
+
+
+# ── git cannot answer ────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("label", ["cosmetic", "substantive"])
+def test_a_history_that_cannot_be_read_never_lets_a_fixer_s_commit_ride_an_earlier_review(
+        world, label):
+    # Every ``git rev-list`` fails, so the check cannot tell which commits after
+    # the boundary the loop made itself. A fixer commits and pushes its own fix;
+    # that head counts as one the loop did not make: claude is asked about it, and
+    # the PR merges only on its sign-off there, never on the review of H0.
+    world.history_unreadable = True
+    fleet = Fleet(world)
+    fleet.post("claude", 1, "f1", f"[{label}] the null check in engine is missing")
+    sign_off(fleet, "claude", 2, "s2")
+    driver, outcome = run(world, fleet, {"f1": self_commits("engine.py", SUBST, push=True)})
+
+    fixers_head = world.remote_tip()
+    assert SUBST in world.markers(fixers_head)
+    assert outcome.merged is True and world.merges == [fixers_head]
+    assert world.summons == [world.h0, fixers_head], (
+        "the fixer's commit merged only after claude was asked about it")
+    assert driver._last_substantive_head == fixers_head
+
+
+def test_the_cosmetic_twin_of_an_unreadable_history_merges_with_nobody_asked_again(world):
+    # The same fix left in the tree for the round's commit step, with a history git
+    # can read: the loop's own commit keeps the review in hand.
+    fleet = Fleet(world)
+    fleet.post("claude", 1, "f1", "[cosmetic] the null check in engine is missing")
+    sign_off(fleet, "claude", 2, "s2")
+    driver, outcome = run(world, fleet, {"f1": writes("engine.py", "COSM-f1")})
+
+    _merged_on_the_review_in_hand(world, driver, outcome)
+
+
+@pytest.mark.parametrize("case", ["a-commit-lands-and-the-read-fails", "the-read-fails",
+                                  "nothing"])
+def test_a_worktree_head_that_cannot_be_read_at_the_pre_merge_check_is_never_merged(
+        world, case):
+    # The last round's cosmetic commit is pushed and checked. Then a commit is
+    # pushed from the checkout, and the pre-merge check's read of the worktree's
+    # head fails once. What the head holds is unknown, so the boundary is dropped
+    # and the merge gate blocks: the commit never merges on claude's review of H0 —
+    # nor does the loop's own commit when only the read fails. The twin (nothing
+    # lands, the head reads) merges on the review in hand.
+    fleet = Fleet(world)
+    fleet.post("claude", 1, "n1", "[cosmetic] nit: wording in style")
+    driver = make_driver(world, fleet, {"n1": writes("style.py", COSM)}, test_gate=True,
+                         cfg=CLAUDE_ONLY)
+    persist = driver._persist_polish_state
+    armed = []
+
+    def persist_then_the_read_fails(**kwargs):
+        result = persist(**kwargs)
+        if not armed:
+            armed.append(True)
+            if case == "a-commit-lands-and-the-read-fails":
+                _checkout_commit(world, push=True)
+            if case != "nothing":
+                world.head_read_failures = 1
+        return result
+    driver._persist_polish_state = persist_then_the_read_fails
+
+    outcome = driver.run()
+
+    if case == "nothing":
+        _merged_on_the_review_in_hand(world, driver, outcome)
+        return
+    assert world.head_read_failures == 0, "the pre-merge check's read failed"
+    assert world.merges == [] and outcome.merged is False
+    assert driver._last_substantive_head is None
+    if case == "a-commit-lands-and-the-read-fails":
+        assert SUBST in world.markers(world.remote_tip())
+
+
+# ── a sign-off already on the PR when the run starts ─────────────────────────
+
+
+@pytest.mark.parametrize("mode", ["preflight", "rr-active"])
+@pytest.mark.parametrize("leftover", [True, False])
+def test_a_sign_off_already_on_the_pr_is_never_credited_to_a_commit_only_the_worktree_has(
+        world, mode, leftover):
+    # An earlier run's fixer committed a fix without pushing it, and claude signed
+    # off on H0 before this run started. The run finds that sign-off already on
+    # the PR, so round 1 asks only codex, which signs off too. Both sign-offs are
+    # about H0, not the leftover: the leftover is pushed, both reviewers are asked
+    # about the head that carries it, and the PR merges on their sign-offs there.
+    # The twin (no leftover) merges on the sign-offs of H0 with nobody asked again.
+    if leftover:
+        with open(world.repo / "engine.py", "a") as fh:
+            fh.write(SUBST + "\n")
+        git(world.repo, "commit", "-qam", "left by a fixer, never pushed")
+    fleet = Fleet(world)
+    sign_off(fleet, "claude", 0, "s0")      # on the PR before this run
+    sign_off(fleet, "codex", 1, "c1")
+    sign_off(fleet, "claude", 1, "s1")
+    sign_off(fleet, "codex", 2, "c2")
+    driver = make_driver(world, fleet, {}, test_gate=True, cfg=TWO, preflight=True,
+                         rr_active=mode == "rr-active")
+    outcome = driver.run()
+
+    assert outcome.merged is True and world.merges == [world.remote_tip()]
+    if not leftover:
+        assert world.merges == [world.h0]
+        assert driver._last_substantive_head == world.h0
+        assert world.summons == [] and world.codex_summons == [world.h0]
+        return
+    carrying = world.remote_tip()
+    assert SUBST in world.markers(carrying)
+    assert world.summons == [carrying] and world.codex_summons == [world.h0, carrying], (
+        "the leftover merged only after both reviewers were asked about it")
+    assert driver._last_substantive_head == carrying
+
+
+# ── what the reviewers were shown, and who is asked again ────────────────────
+
+
+@pytest.mark.parametrize("lag", [0, 4])
+def test_a_sign_off_on_the_loop_s_own_substantive_push_counts_while_github_lags(world, lag):
+    # Round 1's substantive fix is the loop's own commit. GitHub keeps reporting
+    # H0 for a few reads after the push, and round 2 asks claude about the pushed
+    # commit. claude's sign-off is about that commit — the head the loop pushed —
+    # so the PR merges on it rather than asking again or handing back.
+    world.lag = lag
+    fleet = Fleet(world)
+    fleet.post("claude", 1, "f1", "[substantive] the null check in engine is missing")
+    sign_off(fleet, "claude", 2, "s2")
+    driver, outcome = run(world, fleet, {"f1": writes("engine.py", "SUBST-loop")})
+
+    fixed = world.remote_tip()
+    if lag:
+        assert world._lag_left < lag, "the loop read the lagging head"
+    assert world.summons == [world.h0, fixed]
+    assert driver._last_substantive_head == fixed
+    assert outcome.merged is True and world.merges == [fixed]
+
+
+def test_a_reviewer_set_aside_this_round_is_asked_at_once_about_a_head_the_loop_did_not_make(
+        world):
+    # claude's finding is cosmetic, which sets claude aside once it is fixed — and
+    # the fixer commits and pushes the fix itself. Nobody else is expected, so
+    # claude, who spoke this round, is asked about the fixer's head right away: in
+    # the one round left, its sign-off there lets the PR merge.
+    fleet = Fleet(world)
+    fleet.post("claude", 1, "f1", "[cosmetic] the null check in engine is missing")
+    sign_off(fleet, "claude", 2, "s2")
+    driver, outcome = run(world, fleet, {"f1": self_commits("engine.py", SUBST, push=True)},
+                          max_rounds=2)
+
+    fixers_head = world.remote_tip()
+    assert SUBST in world.markers(fixers_head)
+    assert world.summons == [world.h0, fixers_head]
+    assert outcome.merged is True and world.merges == [fixers_head]
+
+
+def test_each_head_the_loop_did_not_make_gets_its_own_turn_of_the_fallback(world):
+    # Round 1: the fixer commits and pushes its own fix, so claude — set aside by
+    # its cosmetic finding — is asked about that head, and signs off in round 2.
+    # Meanwhile a commit is pushed from the checkout: a new head no reviewer has
+    # seen. claude already had its turn for the fixer's head, but this is another
+    # head, so it is asked again, and the PR merges on its sign-off there.
+    fleet = During(world, _commit_and_push, after=2)
+    fleet.post("claude", 1, "f1", "[cosmetic] the null check in engine is missing")
+    sign_off(fleet, "claude", 2, "s2")
+    sign_off(fleet, "claude", 3, "s3")
+    driver, outcome = run(world, fleet, {"f1": self_commits("engine.py", "SUBST-fixer",
+                                                            push=True)}, max_rounds=4)
+
+    assert fleet.done
+    fixers_head, pushed = world.summons[1], world.remote_tip()
+    assert world.markers(fixers_head) == {"SUBST-fixer"}
+    assert world.markers(pushed) == {"SUBST-fixer", SUBST}
+    assert outcome.merged is True and world.merges == [pushed]
+    assert world.summons == [world.h0, fixers_head, pushed], (
+        "claude was asked about the head pushed from the checkout")
+
+
+def test_a_sign_off_counts_for_the_head_github_showed_the_reviewer(world):
+    # Round 1's substantive fix is the loop's own commit S1. Before round 2 asks
+    # claude about it, the branch is force-pushed from another machine to a
+    # commit without that fix; while claude looks at it, the branch is
+    # force-pushed back to S1. claude's sign-off is about the head it was shown,
+    # not S1: claude is asked about S1, and the PR merges on its sign-off there.
+    shown = []
+
+    def force_push_back(world):
+        git(world.tmp / "elsewhere", "push", "-q", "-f", "origin",
+            f"{world.local_head()}:refs/heads/feat")
+
+    fleet = During(world, force_push_back, after=2)
+    fleet.post("claude", 1, "f1", "[substantive] the null check in engine is missing")
+    sign_off(fleet, "claude", 2, "s2")
+    sign_off(fleet, "claude", 3, "s3")
+    driver = make_driver(world, fleet, {"f1": writes("engine.py", "SUBST-loop")},
+                         test_gate=True, cfg=CLAUDE_ONLY)
+    persist = driver._persist_polish_state
+
+    def persist_then_force_push_elsewhere(**kwargs):
+        result = persist(**kwargs)
+        if not shown:
+            other = world.elsewhere()
+            git(other, "reset", "-q", "--hard", world.h0)
+            with open(other / "style.py", "a") as fh:
+                fh.write("pushed from another machine\n")
+            git(other, "commit", "-qam", "another machine's commit")
+            git(other, "push", "-q", "-f", "origin", "HEAD:refs/heads/feat")
+            shown.append(world.remote_tip())
+        return result
+    driver._persist_polish_state = persist_then_force_push_elsewhere
+
+    outcome = driver.run()
+
+    fixed = world.local_head()
+    assert fleet.done and world.summons[1] == shown[0] != fixed
+    assert "SUBST-loop" not in git(world.remote, "show", f"{shown[0]}:engine.py")
+    assert outcome.merged is True and world.merges == [fixed]
+    assert world.summons == [world.h0, shown[0], fixed], (
+        "S1 merged only after claude was asked about it")
+
+
+def test_a_pr_head_that_reads_like_a_git_option_is_never_handed_to_git(world):
+    # GitHub's answer for the PR's head is not a commit id but a string git would
+    # take for an option. It counts as a head that cannot be read — the PR does not
+    # merge on it — and it never reaches a git command line.
+    bogus = "--output=/dev/null"
+    world.head_read = lambda: _CP(0, bogus + "\n")
+    fleet = Fleet(world)
+    fleet.post("claude", 1, "n1", "[cosmetic] nit: wording in style")
+    driver, outcome = run(world, fleet, {"n1": writes("style.py", COSM)})
+
+    assert world.git_calls, "the loop ran git"
+    assert not [argv for argv in world.git_calls if any(bogus in a for a in argv)]
+    assert world.merges == [] and outcome.merged is False

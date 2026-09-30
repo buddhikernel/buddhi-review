@@ -477,7 +477,7 @@ def test_post_gate_content_push_advances_boundary_and_reblocks():
     driver, gh = _gate_driver(
         fleet={"claude"}, reviewed_ever={"claude"},
         # the pre-merge head check and the gate see c1; the post-gate re-read sees c2
-        rev_parse_seq=["c1", "c1", "c2"],
+        rev_parse_seq=["c1", "c2"],
         last_substantive="c1", reviews=[_review("claude", "c1")])
     assert _merged(driver) is False
     assert gh.matching("gh", "merge", "--squash") == []
@@ -491,7 +491,7 @@ def test_regate_pins_the_head_it_read_not_a_later_reread():
     # tail after c2 and merge the UNREVIEWED c3. The fixed gate pins the reviewed c2.
     driver, gh = _gate_driver(
         fleet={"claude"}, reviewed_ever={"claude"},
-        rev_parse_seq=["c1", "c1", "c2", "c3"],   # the pre-merge head check reads c1 too
+        rev_parse_seq=["c1", "c2", "c3"],
         last_substantive="c1", reviews=[_review("claude", "c1"), _review("claude", "c2")])
     assert _merged(driver) is True
     pinned = gh.matching("gh", "merge", "--match-head-commit")
