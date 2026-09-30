@@ -646,6 +646,21 @@ def _git_line(argv: Sequence[str], cwd: Optional[str], run) -> Optional[str]:
     return out.splitlines()[0].strip() if out else None
 
 
+def _lstat_identity(path: str) -> Optional[tuple]:
+    """What ``lstat`` says about the entry at ``path`` itself — kind and permission
+    bits, size, modification and change times in nanoseconds, inode and device —
+    or None when nothing is there. Two equal readings bracketing a read of the
+    entry show nobody wrote, chmodded or replaced it in between: every such change
+    moves the change time, which ``utime`` cannot put back the way it can the
+    modification time. Any other ``OSError`` propagates to the caller."""
+    try:
+        info = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return (info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns,
+            info.st_ino, info.st_dev)
+
+
 def _is_primary_checkout(cwd: str, run) -> bool:
     """True only when ``cwd`` is CONFIRMED to be the repository's PRIMARY working
     tree (the first ``git worktree list --porcelain`` entry), not a linked
@@ -2422,9 +2437,24 @@ class RoundDriver:
         worktree's ``node_modules/`` is never read; one of them that reaches the
         commit anyway is simply not vouched for (:meth:`_commit_carries_foreign`).
 
-        Known limit: an edit made WHILE a fixer runs lands in the same tree the
-        fixer is writing and reads as that fixer's output. Every window a human is
-        actually handed — the escalation wait, the red test gate and its "I've
+        Each identity is assembled from several reads of the path — an ``lstat``
+        for its kind and executable bit, then ``hash-object`` or ``readlink`` for
+        its content, and the index for its mode when ``core.filemode`` is off — so
+        another process writing the path or the index between two of them would
+        have its bytes recorded as the fixers'. Every one of them is therefore
+        PROVEN STABLE across the whole read, or there is no fingerprint: the index
+        modes are read before the first ``lstat`` and again after the last, and
+        every path's lstat identity (:func:`_lstat_identity`, which a rewrite that
+        keeps the size and puts the modification time back still changes) is taken
+        before its content is read and again after. Any difference is None, the
+        same as a read that fails. The listing itself needs no second read: a path
+        it does not name is never vouched for, and neither is a held-back one.
+
+        Known limits: an edit made WHILE a fixer runs lands in the same tree the
+        fixer is writing and reads as that fixer's output, and so does one made
+        before this read's first ``lstat`` — or, where the filesystem's clock ticks
+        coarsely, a same-size rewrite within that tick of it. Every window a human
+        is actually handed — the escalation wait, the red test gate and its "I've
         fixed it" re-run — comes after this read."""
         head = self._local_head_sha()
         if head is None:
@@ -2458,38 +2488,49 @@ class RoundDriver:
             entries = list(commit_push._iter_porcelain_z(getattr(proc, "stdout", "") or ""))
             source_dirs = commit_push._tracked_source_dirs(self.cwd, entries, run=self.gh_run)
             held_back = commit_push._held_back_new_artifacts(entries, source_dirs=source_dirs)
+            paths = [path for xy, path in entries if not (xy == "??" and path in held_back)]
+            full = {path: os.path.join(root, path) for path in paths}
+            # The index read opens and closes the capture, so it brackets every
+            # worktree read below as well as the blob it pairs a mode with.
+            indexed: Optional[Dict[str, str]] = None
+            if not trust_mode:
+                indexed = self._indexed_file_modes(paths)
+                if indexed is None:
+                    return None
+            before = {path: _lstat_identity(full[path]) for path in paths}
             identity: Dict[str, tuple] = {}
             regular: List[str] = []
             modes: Dict[str, str] = {}
-            for xy, path in entries:
-                if xy == "??" and path in held_back:
-                    continue
-                full = os.path.join(root, path)
-                try:
-                    info = os.lstat(full)
-                except (FileNotFoundError, NotADirectoryError):
+            for path in paths:
+                seen = before[path]
+                if seen is None:
                     identity[path] = ("deleted",)
-                    continue
-                if stat.S_ISLNK(info.st_mode):
-                    identity[path] = ("link", os.readlink(full))
-                elif stat.S_ISREG(info.st_mode):
+                elif stat.S_ISLNK(seen[0]):
+                    identity[path] = ("link", os.readlink(full[path]))
+                elif stat.S_ISREG(seen[0]):
                     regular.append(path)
                     if trust_mode:
-                        modes[path] = "100755" if info.st_mode & stat.S_IXUSR else "100644"
+                        modes[path] = "100755" if seen[0] & stat.S_IXUSR else "100644"
                 else:
                     identity[path] = ("other",)
             if regular:
                 hashed = commit_push._run_batched_stdout(
                     self.gh_run, ["git", "hash-object", "--"],
-                    [os.path.join(root, p) for p in regular], cwd=self.cwd)
+                    [full[p] for p in regular], cwd=self.cwd)
                 shas = (hashed or "").split()
                 if hashed is None or len(shas) != len(regular):
                     return None
-                if not trust_mode:
-                    indexed = self._indexed_file_modes(regular)
-                    if indexed is None:
-                        return None
-                    modes.update(indexed)
+            # Nothing may have moved while the content was read: the same entry
+            # (kind, bits, size, times, inode) at every path, and the same index
+            # modes. Otherwise the bytes just read may be another process's.
+            if any(_lstat_identity(full[path]) != before[path] for path in paths):
+                return None
+            if indexed is not None:
+                closing = self._indexed_file_modes(paths)
+                if closing != indexed:
+                    return None
+                modes.update((p, closing[p]) for p in regular)
+            if regular:
                 identity.update(
                     (p, ("file", sha, modes[p])) for p, sha in zip(regular, shas))
         # ``UnicodeDecodeError``: a non-UTF-8 path under ``-z`` (see
@@ -2500,11 +2541,12 @@ class RoundDriver:
         return head, identity
 
     def _indexed_file_modes(self, paths: List[str]) -> Optional[Dict[str, str]]:
-        """``{path: mode}`` that ``git add`` would record for each regular file in
-        ``paths`` (repo-root-relative) while ``core.filemode`` is off: it keeps the
-        mode of a merged (not conflicted) regular-file index entry and gives
-        anything else — an untracked path, an unmerged one, a path the index holds
-        as a symlink — plain ``100644``. None when git cannot answer.
+        """``{path: mode}`` that ``git add`` would record for each path in ``paths``
+        (repo-root-relative), were it staged as a regular file while
+        ``core.filemode`` is off: it keeps the mode of a merged (not conflicted)
+        regular-file index entry and gives anything else — an untracked path, an
+        unmerged one, a path the index holds as a symlink — plain ``100644``. None
+        when git cannot answer.
 
         Each path is anchored at the top of the repository (``:(top,literal)``)
         instead of being joined onto a directory: ``ls-files`` answers a path that
@@ -2540,14 +2582,23 @@ class RoundDriver:
         red gate's "I've fixed it" commit. The price is paid by a pre-commit hook
         that REWRITES what it commits (a formatter re-staging its output): that
         commit no longer matches the fixers' bytes, so the round takes one more
-        review round — the fail-closed direction, never an unreviewed merge."""
+        review round — the fail-closed direction, never an unreviewed merge.
+
+        The comparison is several reads too, so the same rule holds: the commit is
+        resolved to its sha once and compared by that sha (a tree diff and blobs,
+        which never change), and HEAD must still name it once every path has been
+        checked. A commit landing while the comparison runs — a revert that makes
+        the tree look like the fixers', or new content — counts as foreign."""
         if fixer_output is None:
             return True
         base, identity = fixer_output
         if base != self._round_review_head:
             return True
+        head = self._local_head_sha()
+        if head is None:
+            return True
         try:
-            proc = self.gh_run(["git", "diff-tree", "-r", "-z", "--no-renames", base, "HEAD"],
+            proc = self.gh_run(["git", "diff-tree", "-r", "-z", "--no-renames", base, head],
                                cwd=self.cwd)
         except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
             return True
@@ -2585,7 +2636,7 @@ class RoundDriver:
                 ok = False
             if not ok:
                 return True
-        return False
+        return self._local_head_sha() != head
 
     def _blob_text(self, sha: str) -> Optional[str]:
         """The raw content of blob ``sha`` (a symlink blob is its target), or None."""

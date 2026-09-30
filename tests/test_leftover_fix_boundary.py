@@ -22,6 +22,7 @@ review already in hand.
 import json
 import os
 import subprocess
+import time
 from datetime import datetime, timezone
 
 import pytest
@@ -750,6 +751,258 @@ def test_the_index_mode_read_is_anchored_at_the_top_of_the_repository(
 
     assert driver._indexed_file_modes(["style.py", "pkg/mod.py", "fresh.py"]) == {
         "style.py": "100755", "pkg/mod.py": "100644", "fresh.py": "100644"}
+
+
+# ---------------------------------------------------------------------------
+# Races with the record itself. What the fixers left is read in several steps per
+# path: an lstat for its kind and executable bit, then ``hash-object`` or
+# ``readlink`` for its content, and the index for its mode when core.filemode is
+# off. Comparing the commit with that record takes several more. Another process
+# that writes the path, the index or a commit between two of those reads must
+# never have its content read as the fixers': the record then counts as not taken,
+# and the head goes to a reviewer. Each race is injected just before the read it
+# slips in front of, and each has a twin in which nothing moves, whose commit
+# still rides the review in hand.
+# ---------------------------------------------------------------------------
+
+HASH = ["git", "hash-object"]
+DIFF = ["git", "diff-tree"]
+HEAD_READ = ["git", "rev-parse", "HEAD"]
+
+
+def interleave(driver, during, *steps):
+    """While ``driver.<during>`` runs, perform each ``(argv prefix, action)`` step
+    once, in order, just before the first git command it issues that starts with
+    that prefix. Returns the prefixes that fired."""
+    inner_run, method = driver.gh_run, getattr(driver, during)
+    pending, fired, active = list(steps), [], []
+
+    def run(argv, **kw):
+        if active and pending and list(argv[:len(pending[0][0])]) == pending[0][0]:
+            prefix, action = pending.pop(0)
+            action()
+            fired.append(prefix)
+        return inner_run(argv, **kw)
+
+    def wrapped(*args, **kwargs):
+        active.append(True)
+        try:
+            return method(*args, **kwargs)
+        finally:
+            active.pop()
+
+    driver.gh_run = run
+    setattr(driver, during, wrapped)
+    return fired
+
+
+def _style_at(world, sha):
+    return git(world.repo, "show", f"{sha}:style.py")
+
+
+def _commit(world):
+    git(world.repo, "add", "-A")
+    git(world.repo, "commit", "-qm", "round")
+
+
+def _rewrite_style_keeping_size_and_mtime(world):
+    """Another process swaps the fixers' bytes for others of the same length in
+    place and puts the modification time back, as ``cp -p``, ``rsync -t`` and
+    ``touch -r`` do: only the change time and the content itself tell."""
+    path = world.repo / "style.py"
+    was = os.lstat(path)
+    path.write_bytes(path.read_bytes().replace(COSM.encode(), b"EVIL-99"))
+    os.utime(path, ns=(was.st_atime_ns, was.st_mtime_ns))
+    # On a coarse filesystem clock the rewrite can share the fixers' tick; a
+    # later utime moves the change time on, as any later rewrite would.
+    deadline = time.monotonic() + 5
+    while os.lstat(path).st_ctime_ns == was.st_ctime_ns and time.monotonic() < deadline:
+        time.sleep(0.002)
+        os.utime(path, ns=(was.st_atime_ns, was.st_mtime_ns))
+    now = os.lstat(path)
+    assert (now.st_size, now.st_mtime_ns, now.st_ino) == (
+        was.st_size, was.st_mtime_ns, was.st_ino)
+    assert now.st_ctime_ns != was.st_ctime_ns
+
+
+FILE_RACES = {
+    "appended": lambda world: writes("style.py", SUBST)(world),
+    "same-size-mtime-kept": _rewrite_style_keeping_size_and_mtime,
+    "index-chmod": lambda world: git(world.repo, "update-index", "--chmod=+x", "style.py"),
+}
+
+
+def _carried(world, race):
+    """Did the round's commit carry what the racing process wrote?"""
+    if race == "appended":
+        return SUBST in _style_at(world, "HEAD")
+    if race == "same-size-mtime-kept":
+        return "EVIL-99" in _style_at(world, "HEAD")
+    return git(world.repo, "ls-tree", "HEAD", "style.py").startswith("100755")
+
+
+@pytest.mark.parametrize("race,filemode", [
+    ("appended", "true"), ("appended", "false"),
+    ("same-size-mtime-kept", "true"), ("same-size-mtime-kept", "false"),
+    ("index-chmod", "false")])
+def test_a_fixer_touched_file_changed_while_it_is_recorded_is_not_vouched_for(
+        env, race, filemode):
+    # Another process changes the file the fixers touched after the record has read
+    # its kind and executable bit, just before it reads the content: new bytes, the
+    # same number of bytes with the modification time put back, or (core.filemode
+    # off, where the commit takes the INDEX's mode) an index chmod. The round then
+    # commits exactly what that process left.
+    world, gate = env
+    git(world.repo, "config", "core.filemode", filemode)
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    writes("style.py", COSM)(world)
+    fired = interleave(driver, "_fixer_output_fingerprint",
+                       (HASH, lambda: FILE_RACES[race](world)))
+
+    output = driver._fixer_output_fingerprint()
+    _commit(world)
+
+    assert fired == [HASH] and _carried(world, race)
+    assert driver._commit_carries_foreign(output) is True, (
+        f"the {race} change made while the fixers' output was being read was "
+        f"vouched for as theirs")
+
+
+def test_a_symlink_the_fixers_made_retargeted_while_it_is_recorded_is_not_vouched_for(
+        env, monkeypatch):
+    # Between the lstat that finds the fixers' new symlink and the readlink of its
+    # target, another process points it somewhere else.
+    world, gate = env
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    link = world.repo / "link"
+    os.symlink("style.py", link)
+    real_readlink, swapped = os.readlink, []
+
+    def readlink(path, *args, **kwargs):
+        if os.fspath(path).endswith(os.sep + "link") and not swapped:
+            swapped.append(True)
+            os.unlink(link)
+            os.symlink("engine.py", link)
+        return real_readlink(path, *args, **kwargs)
+    monkeypatch.setattr(os, "readlink", readlink)
+
+    output = driver._fixer_output_fingerprint()
+    monkeypatch.setattr(os, "readlink", real_readlink)
+    _commit(world)
+
+    assert swapped and git(world.repo, "cat-file", "-p", "HEAD:link") == "engine.py"
+    assert driver._commit_carries_foreign(output) is True, (
+        "a symlink retargeted between its lstat and its readlink was vouched for")
+
+
+@pytest.mark.parametrize("filemode", ["true", "false"])
+def test_what_the_fixers_left_is_vouched_for_when_nothing_moves_while_it_is_recorded(
+        env, filemode):
+    # The twin: the same reads with nothing changing under them. An edit, a
+    # deletion and a new symlink are all the fixers'. With core.filemode on, an
+    # index chmod made during the read is not a change either: ``git add`` then
+    # records the disk's bit, so the commit still holds exactly the fixers' output.
+    world, gate = env
+    git(world.repo, "config", "core.filemode", filemode)
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    writes("style.py", COSM)(world)
+    (world.repo / "x.py").unlink()
+    os.symlink("style.py", world.repo / "link")
+    during = ((lambda: FILE_RACES["index-chmod"](world)) if filemode == "true"
+              else (lambda: None))
+    fired = interleave(driver, "_fixer_output_fingerprint", (HASH, during))
+
+    output = driver._fixer_output_fingerprint()
+    _commit(world)
+
+    assert fired == [HASH] and output is not None
+    assert git(world.repo, "ls-tree", "HEAD", "style.py").startswith("100644")
+    assert driver._commit_carries_foreign(output) is False
+
+
+@pytest.mark.parametrize("race", ["reverted", "arrives", "reverted-and-back", "none"])
+def test_a_commit_made_while_the_round_s_commit_is_compared_is_not_vouched_for(env, race):
+    # The comparison reads the commit's changes and then checks them path by path.
+    # A commit landing meanwhile must not change which commit is being judged:
+    # "reverted" — the round's commit carries an edit the fixers never made, and a
+    # revert lands just as its changes are read; "arrives" — the round's commit is
+    # the fixers' own, and a commit with new content lands just as its changes are
+    # read; "reverted-and-back" — that revert lands, and HEAD is put back on the
+    # carrying commit just before the comparison reads HEAD again. The twin: nothing
+    # lands, and the fixers' own commit is theirs.
+    world, gate = env
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False)
+    driver._round_review_head = world.local_head()
+    writes("style.py", COSM)(world)
+    output = driver._fixer_output_fingerprint()
+    assert output is not None
+    if race in ("reverted", "reverted-and-back"):
+        _edit_engine(world)                 # after the record: the commit carries it
+    _commit(world)
+    judged = world.local_head()
+
+    def revert():
+        git(world.repo, "checkout", "-q", "HEAD~1", "--", "engine.py")
+        git(world.repo, "commit", "-qm", "revert engine.py")
+
+    def arrive():
+        _edit_engine(world)
+        _commit(world)
+
+    steps = {"reverted": [(DIFF, revert)],
+             "arrives": [(DIFF, arrive)],
+             "reverted-and-back": [
+                 (DIFF, revert),
+                 (HEAD_READ, lambda: git(world.repo, "reset", "-q", "--soft", judged))],
+             "none": [(DIFF, lambda: None)]}[race]
+    interleave(driver, "_commit_carries_foreign", *steps)
+
+    verdict = driver._commit_carries_foreign(output)
+
+    if race == "none":
+        assert verdict is False, "the fixers' own commit was not vouched for"
+    else:
+        assert verdict is True, (
+            f"a commit that {race} during the comparison was vouched for")
+
+
+@pytest.mark.parametrize("filemode", ["true", "false"])
+@pytest.mark.parametrize("edited", [True, False])
+def test_an_edit_made_while_the_fixers_output_is_recorded_is_never_merged_on_an_earlier_review(
+        env, edited, filemode):
+    # A COSMETIC round on a clean tree. While the loop reads what its fixer left,
+    # another process appends to the very file the fixer touched; the round's
+    # commit carries that edit, and no reviewer has seen it. The twin: nobody
+    # touches the tree, and the cosmetic commit merges on the review in hand with
+    # nobody asked again.
+    world, gate = env
+    git(world.repo, "config", "core.filemode", filemode)
+    reviewer = Reviewer(world)
+    reviewer.post(1, "n2", "[cosmetic] nit: wording in style")
+    driver = make_driver(world, reviewer, {"n2": writes("style.py", COSM)}, test_gate=True)
+    fired = interleave(driver, "_fixer_output_fingerprint", (HASH, (
+        (lambda: writes("style.py", SUBST)(world)) if edited else (lambda: None))))
+    start = world.local_head()
+
+    outcome = driver.run()
+
+    tip = world.remote_tip()
+    assert fired == [HASH] and COSM in _style_at(world, tip)
+    if edited:
+        assert SUBST in _style_at(world, tip), "the cosmetic commit carried the edit"
+        assert SUBST in _style_at(world, driver._last_substantive_head), (
+            "the carrying commit moved the reviewed-commit boundary")
+        assert any(SUBST in _style_at(world, t) for t in world.summons), (
+            "the reviewer was asked to review a head that contains the edit")
+        assert world.merges == [] and outcome.merged is False
+    else:
+        assert outcome.merged is True and world.merges == [tip]
+        assert driver._last_substantive_head == start, (
+            "a commit holding only the fixers' output keeps the boundary")
+        assert world.summons == [start], "nobody is asked to review the cosmetic commit"
 
 
 # ---------------------------------------------------------------------------

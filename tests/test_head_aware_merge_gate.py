@@ -1270,11 +1270,12 @@ def test_an_unreadable_head_after_a_substantive_push_blocks_the_merge(capsys):
     # back to an older head whose review would then cover the pushed commit.
     class BlipGh(MainlineGh):
         blipped = False
+        comparing = False
 
         def __call__(self, argv, *, cwd=None, timeout=None):
             argv = list(argv)
-            if (self.pushed and not self.blipped and argv[:2] == ["git", "rev-parse"]
-                    and argv[-1] == "HEAD"):
+            if (self.pushed and not self.blipped and not self.comparing
+                    and argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD"):
                 self.blipped = True
                 self.calls.append(argv)
                 return _CP(128, "")
@@ -1282,6 +1283,17 @@ def test_an_unreadable_head_after_a_substantive_push_blocks_the_merge(capsys):
     gh, clock = BlipGh(), FakeClock()
     driver = _content_round_driver(label="SUBSTANTIVE", timeline=[(0, _FINDING)],
                                    gh=gh, clock=clock, max_rounds=3)
+    # The check of the pushed commit against the fixers' output reads HEAD too, and
+    # comes first; the blip is aimed past it, at the boundary read.
+    check = driver._commit_carries_foreign
+
+    def check_without_blip(fixer_output):
+        gh.comparing = True
+        try:
+            return check(fixer_output)
+        finally:
+            gh.comparing = False
+    driver._commit_carries_foreign = check_without_blip
     outcome = driver.run()
     assert driver._last_substantive_head is None
     assert outcome.merged is False
