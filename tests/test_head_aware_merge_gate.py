@@ -70,7 +70,8 @@ class HeadGh:
     """A gh/git fake modelling a linear commit history (``order``: sha → index).
 
     ``git rev-parse HEAD`` yields the next entry of ``rev_parse_seq`` (last one
-    repeated), so a test can move the local head between the gate and the merge.
+    repeated), so a test can move the local head between the gate and the merge;
+    GitHub's PR head (``gh api …/pulls/N -q .head.sha``) is the head last yielded.
     ``git merge-base --is-ancestor a b`` is rc 0 iff BOTH shas are known and
     ``order[a] <= order[b]`` (fail-closed on an unknown sha). Every gh spawn is
     recorded; ``gh pr merge`` / ``gh pr view`` answer so the clean-exit merge path
@@ -92,6 +93,8 @@ class HeadGh:
         self.calls.append(argv)
         if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
             return _CP(0, self._head() + "\n")
+        if argv[:2] == ["gh", "api"] and ".head.sha" in argv:
+            return _CP(0, self._seq[min(max(self._i - 1, 0), len(self._seq) - 1)] + "\n")
         if argv[:3] == ["git", "show", "-s"]:
             # The committer date of the requested sha — the F2 freshness cutoff.
             ref = argv[-1]
@@ -473,7 +476,8 @@ def test_post_gate_content_push_advances_boundary_and_reblocks():
     # re-runs, and c2 is unreviewed → BLOCK, no merge.
     driver, gh = _gate_driver(
         fleet={"claude"}, reviewed_ever={"claude"},
-        rev_parse_seq=["c1", "c2"],   # gate sees c1; the post-gate re-read sees c2
+        # the pre-merge head check and the gate see c1; the post-gate re-read sees c2
+        rev_parse_seq=["c1", "c1", "c2"],
         last_substantive="c1", reviews=[_review("claude", "c1")])
     assert _merged(driver) is False
     assert gh.matching("gh", "merge", "--squash") == []
@@ -487,7 +491,7 @@ def test_regate_pins_the_head_it_read_not_a_later_reread():
     # tail after c2 and merge the UNREVIEWED c3. The fixed gate pins the reviewed c2.
     driver, gh = _gate_driver(
         fleet={"claude"}, reviewed_ever={"claude"},
-        rev_parse_seq=["c1", "c2", "c3"],
+        rev_parse_seq=["c1", "c1", "c2", "c3"],   # the pre-merge head check reads c1 too
         last_substantive="c1", reviews=[_review("claude", "c1"), _review("claude", "c2")])
     assert _merged(driver) is True
     pinned = gh.matching("gh", "merge", "--match-head-commit")
@@ -510,8 +514,9 @@ def test_post_gate_no_move_merges_pinned():
 
 class MainlineGh:
     """A gh/git fake whose tip really advances H0 → H1 on the round's fix push, with
-    per-head committer dates. Proves the ROUND LOOP wires the round-review head and
-    its freshness cutoff correctly — a gate-level test cannot."""
+    per-head committer dates; GitHub's PR head is that tip. Proves the ROUND LOOP
+    wires the round-review head and its freshness cutoff correctly — a gate-level
+    test cannot."""
 
     def __init__(self, head_times=None):
         self.head = "H0"
@@ -528,7 +533,8 @@ class MainlineGh:
     def __call__(self, argv, *, cwd=None, timeout=None):
         argv = list(argv)
         self.calls.append(argv)
-        if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
+        if (argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD") or (
+                argv[:2] == ["gh", "api"] and ".head.sha" in argv):
             return _CP(0, self.head + "\n")
         if argv[:3] == ["git", "show", "-s"]:
             ref = argv[-1]
@@ -1283,17 +1289,19 @@ def test_an_unreadable_head_after_a_substantive_push_blocks_the_merge(capsys):
     gh, clock = BlipGh(), FakeClock()
     driver = _content_round_driver(label="SUBSTANTIVE", timeline=[(0, _FINDING)],
                                    gh=gh, clock=clock, max_rounds=3)
-    # The check of the pushed commit against the fixers' output reads HEAD too, and
-    # comes first; the blip is aimed past it, at the boundary read.
-    check = driver._commit_carries_foreign
-
-    def check_without_blip(fixer_output):
-        gh.comparing = True
-        try:
-            return check(fixer_output)
-        finally:
-            gh.comparing = False
-    driver._commit_carries_foreign = check_without_blip
+    # The check of the pushed commit against the fixers' output, and the check of
+    # the head for commits the loop did not make, read HEAD too and come first; the
+    # blip is aimed past them, at the boundary read.
+    def without_blip(check):
+        def run(*args, **kwargs):
+            gh.comparing = True
+            try:
+                return check(*args, **kwargs)
+            finally:
+                gh.comparing = False
+        return run
+    driver._commit_carries_foreign = without_blip(driver._commit_carries_foreign)
+    driver._absorb_foreign_head = without_blip(driver._absorb_foreign_head)
     outcome = driver.run()
     assert driver._last_substantive_head is None
     assert outcome.merged is False

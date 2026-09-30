@@ -1216,13 +1216,30 @@ class RoundDriver:
         #   SUBSTANTIVE push; init to _process_start_head, advanced only on a
         #   substantive round — or on a round whose commit carried changes no fixer
         #   of that round made (already uncommitted in the worktree when it began,
-        #   or written there while it ran). Every commit after it is a loop-authored
-        #   cosmetic-only fix holding only its own fixers' output. None
-        #   (unresolvable local head) → the gate BLOCKS (fail-closed).
+        #   or written there while it ran), or whenever the head holds a commit the
+        #   loop did not make itself (:meth:`_absorb_foreign_head`). Every commit
+        #   after it is a loop-authored cosmetic-only fix holding only its own
+        #   fixers' output. None (unresolvable local head) → the gate BLOCKS
+        #   (fail-closed).
         self._last_substantive_head: Optional[str] = None
+        # _own_commits: every commit this run's own commit step created and pushed
+        #   (the round's ``commit_and_push``). The only commits allowed to sit between
+        #   the boundary and the head being merged: anything else there — a fixer
+        #   that committed (and pushed) by itself, an operator's commit, a rebase —
+        #   moves the boundary onto the head (:meth:`_absorb_foreign_head`).
+        self._own_commits: Set[str] = set()
+        # _pushed_heads: every head a push by this run left on the PR branch. A head
+        #   in it is on GitHub even while GitHub's API still reports an earlier one
+        #   (the PR's head sha trails a push by a moment), so reviewers asked now see
+        #   it.
+        self._pushed_heads: Set[str] = set()
+        # _vouched_head: the head the last :meth:`_commit_carries_foreign` call found
+        #   to hold exactly what the round's fixers left on disk, else None.
+        self._vouched_head: Optional[str] = None
         # _carry_head: the boundary this run advanced to — a head carrying changes
-        #   no reviewer had seen (a SUBSTANTIVE fix, or a commit that carried content
-        #   no fixer of its round wrote). None until a round advances the boundary.
+        #   no reviewer had seen (a SUBSTANTIVE fix, a commit that carried content
+        #   no fixer of its round wrote, or a commit the loop did not make). None
+        #   until a round advances the boundary.
         #   While the merge gate still finds no review at or after it, every exit
         #   that would end the run looks for a fallback reviewer to ask
         #   (_readmit_fallback_reviewers).
@@ -1231,11 +1248,13 @@ class RoundDriver:
         #   each is re-admitted at most once per carrying head, which is what bounds
         #   the fallback. Reset whenever a new carrying head is pushed.
         self._fallback_readmitted: Set[str] = set()
-        # _round_review_head: the local HEAD captured at the START of the current
-        #   round == the remote head reviewers check out this round (the loop pushes
-        #   only at round end). A FRESH sha-less clean signal (approval reaction /
-        #   issue-channel "no findings" sentinel — no commit_id) anchors here, to the
-        #   commit the bot was actually asked to review.
+        # _round_review_head: the head reviewers check out this round, captured at
+        #   its START (the loop pushes only at round end): the local HEAD when the
+        #   PR on GitHub shows it too, else the PR's head on GitHub, else None
+        #   (:meth:`_published_review_head`). A FRESH sha-less clean signal (approval
+        #   reaction / issue-channel "no findings" sentinel — no commit_id) anchors
+        #   here, to the commit the bot was actually asked to review; a local commit
+        #   GitHub does not have is never credited with a review.
         self._round_review_head: Optional[str] = None
         # _round_review_head_time: the COMMITTER DATE of _round_review_head — the
         #   FRESHNESS CUTOFF a sha-less clean signal must post-date before it may be
@@ -2608,7 +2627,11 @@ class RoundDriver:
         resolved to its sha once and compared by that sha (a tree diff and blobs,
         which never change), and HEAD must still name it once every path has been
         checked. A commit landing while the comparison runs — a revert that makes
-        the tree look like the fixers', or new content — counts as foreign."""
+        the tree look like the fixers', or new content — counts as foreign.
+
+        A commit it vouches for is recorded in ``_vouched_head``: the round then
+        counts the commits up to it as the loop's own (:meth:`_note_own_commits`)."""
+        self._vouched_head = None
         if fixer_output is None:
             return True
         base, identity = fixer_output
@@ -2656,7 +2679,10 @@ class RoundDriver:
                 ok = False
             if not ok:
                 return True
-        return self._local_head_sha() != head
+        if self._local_head_sha() != head:
+            return True
+        self._vouched_head = head
+        return False
 
     def _blob_text(self, sha: str) -> Optional[str]:
         """The raw content of blob ``sha`` (a symlink blob is its target), or None."""
@@ -2711,6 +2737,183 @@ class RoundDriver:
         except (subprocess.SubprocessError, OSError):
             return False
         return getattr(proc, "returncode", 1) == 0
+
+    # ------------------------------------------- heads the loop did not produce
+
+    def _rev_list(self, base: str, head: str) -> Optional[List[str]]:
+        """Every commit ``head`` has and ``base`` does not (``git rev-list
+        base..head``) — after a rebase or a force-push, every rewritten commit — or
+        None when git cannot answer."""
+        try:
+            proc = self.gh_run(["git", "rev-list", f"{base}..{head}", "--"], cwd=self.cwd)
+        except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
+            return None
+        if getattr(proc, "returncode", 1) != 0:
+            return None
+        return [line.strip() for line in (getattr(proc, "stdout", "") or "").splitlines()
+                if line.strip()]
+
+    def _remote_head_sha(self) -> Optional[str]:
+        """The PR's head on GitHub, or None when it cannot be read (or reads as
+        something git would take for an option)."""
+        head = self._head_sha()
+        return head if head and not head.startswith("-") else None
+
+    def _note_own_commits(self, base: Optional[str], head: Optional[str]) -> None:
+        """Count the commits from ``base`` (exclusive) to ``head`` as the loop's own:
+        the round's commit step made and pushed them, and
+        :meth:`_commit_carries_foreign` found ``head`` holding exactly what the
+        round's fixers left on disk. Unreadable → nothing is counted, so those
+        commits read as foreign and the head needs its own review (fail-closed)."""
+        if not (base and head):
+            return
+        made = self._rev_list(base, head)
+        if made is None:
+            return
+        self._own_commits.update(made)
+        self._pushed_heads.add(head)
+
+    def _published_review_head(self) -> Optional[str]:
+        """The head reviewers asked now will check out: the local HEAD when GitHub
+        shows it as the PR's head (or still shows an earlier head this run pushed
+        past a moment ago), else the PR's head on GitHub — a commit only this
+        worktree has is not something any reviewer can see. None when GitHub's
+        head cannot be read: then nothing is credited to any head (fail-closed)."""
+        remote = self._remote_head_sha()
+        if not remote:
+            return None
+        local = self._local_head_sha()
+        if local and (local == remote or (local in self._pushed_heads
+                                          and self._is_ancestor(remote, local))):
+            return local
+        return remote
+
+    def _head_provenance(self) -> Tuple[str, Optional[str]]:
+        """Is the head the loop would merge made only of commits it made itself?
+
+        Returns ``(verdict, head)``:
+
+        * ``own`` — the local HEAD is on GitHub as the PR's head and every commit
+          after the reviewed-commit boundary is one this run's own commit step made;
+        * ``foreign`` — the local HEAD is on GitHub, but some commit after the
+          boundary is not the loop's own (a fixer that committed and pushed by
+          itself, an operator's commit or push from this checkout, a rebase or
+          merge done here and force-pushed);
+        * ``unpublished`` — the local HEAD has commits the PR on GitHub does not
+          (a fixer or an operator committed here without pushing): no reviewer can
+          see them;
+        * ``diverged`` — the PR's head on GitHub is not the local HEAD nor an
+          ancestor of it (a push, force-push, rebase or "Update branch" made
+          somewhere else); ``head`` is the PR's head;
+        * ``unset`` — the boundary itself is unset (an earlier read failed), which
+          already blocks the merge gate;
+        * ``unreadable`` — a head, or the commits between them, cannot be read.
+
+        ``head`` is the local HEAD (None when unreadable) except for ``diverged``."""
+        local = self._local_head_sha()
+        remote = self._remote_head_sha()
+        if not (local and remote):
+            return "unreadable", local
+        unpublished = False
+        if remote != local:
+            if not self._is_ancestor(remote, local):
+                return "diverged", remote
+            unpublished = local not in self._pushed_heads
+        if unpublished:
+            return "unpublished", local
+        boundary = self._last_substantive_head
+        if not boundary:
+            return "unset", local
+        since = self._rev_list(boundary, local)
+        if since is None:
+            return "unreadable", local
+        if any(c not in self._own_commits for c in since):
+            return "foreign", local
+        return "own", local
+
+    def _publish_head(self, sha: str) -> bool:
+        """Push exactly ``sha`` to the PR branch (never forced) so reviewers can
+        see it. False when the branch's push target cannot be resolved or the push
+        fails."""
+        remote, branch = commit_push._resolve_push_target(self.cwd, run=self.gh_run)
+        if not (remote and branch):
+            return False
+        try:
+            proc = self.gh_run(["git", "push", remote, f"{sha}:refs/heads/{branch}"],
+                               cwd=self.cwd)
+        except (subprocess.SubprocessError, OSError):
+            return False
+        if getattr(proc, "returncode", 1) != 0:
+            return False
+        self._pushed_heads.add(sha)
+        return True
+
+    def _absorb_foreign_head(self, *, may_publish: bool) -> Optional[str]:
+        """Run at the end of every round and before every merge decision: when
+        the head the loop would merge holds a commit it did not make itself, move
+        the reviewed-commit boundary onto that head, so the merge gate demands a
+        review of a head that contains the commit. The cosmetic exemption covers
+        only the loop's own commits (``_own_commits``); nothing else may ride a
+        review of an older head, whatever the round's labels were.
+
+        Returns:
+
+        * None — every commit is the loop's own; or the boundary is unset (an
+          earlier read failed), or the worktree's own head cannot be read and the
+          boundary is unset now. An unset boundary blocks the merge gate, and no
+          further round is taken for it.
+        * ``"carry"`` — the boundary moved; the caller takes another round while
+          one remains, exactly as for a commit that carried residue.
+        * ``"handback"`` — no review this run asks for could ever let the head
+          merge: the PR's head on GitHub is a commit this worktree does not have,
+          or a commit only this worktree has is not pushed for review. The caller
+          hands back without the exit rebase, which would otherwise force-push over
+          the head GitHub has, or push the unreviewed commit onto the PR.
+
+        ``may_publish``: a round remains in which reviewers could look at a commit
+        pushed now, so a commit only this worktree has is pushed (never forced);
+        without one the loop pushes nothing it did not make.
+
+        Fail-closed: when the PR's head on GitHub or the history cannot be read,
+        the boundary moves onto the local head as if it held a foreign commit."""
+        verdict, head = self._head_provenance()
+        if verdict in ("own", "unset"):
+            return None
+        if verdict == "unreadable" and not head:
+            # The worktree's own head cannot be read: nothing can be merged from it
+            # and no review can be matched to it. The unset boundary blocks the gate
+            # (``[gate-unverified]``); asking a reviewer again cannot change that.
+            self._last_substantive_head = None
+            return None
+        if verdict == "diverged":
+            print(f"[round] the PR's head on GitHub ({(head or '')[:7]}) is a commit "
+                  "this worktree does not have — the branch was pushed to, "
+                  "force-pushed or updated somewhere else. The loop merges only the "
+                  "head it holds, so no review it asks for can land it — handing back")
+            return "handback"
+        if verdict == "unpublished":
+            if not (may_publish and self.push):
+                print(f"[round] {head[:7]} holds a commit that is only in this "
+                      "worktree — no reviewer can see it, and no round remains in "
+                      "which to ask one — handing back")
+                return "handback"
+            if not self._publish_head(head):
+                print(f"[round] {head[:7]} holds a commit that is only in this "
+                      "worktree, and pushing it for review failed — handing back")
+                return "handback"
+        self._last_substantive_head = head
+        short = (head or "")[:7] or "the current head"
+        if verdict == "unreadable":
+            why = ("this worktree's head, the PR's head on GitHub or the commits "
+                   "between them could not be read")
+        elif verdict == "unpublished":
+            why = ("it holds a commit that was only in this worktree, pushed now so "
+                   "a reviewer can see it")
+        else:
+            why = "it holds a commit this run did not make itself"
+        print(f"[round] {short}: {why} — no reviewer has seen that, so this head "
+              "needs its own review")
+        return "carry"
 
     def _fetch_reviews_raw(self) -> Optional[List[dict]]:
         """Raw top-level reviews for the gate, or None on failure (fail-closed)."""
@@ -3588,11 +3791,15 @@ class RoundDriver:
         # the PR is unknown-provenance ⇒ substantive), as does round 1's review head.
         self._process_start_head = self._local_head_sha()
         self._last_substantive_head = self._process_start_head
-        self._round_review_head = self._process_start_head
+        # Preflight / restore signals are credited to the head reviewers could
+        # see — a commit only this worktree has (a fixer's unpushed commit left
+        # by an earlier run) never is.
+        self._round_review_head = self._published_review_head()
         # The freshness cutoff preflight / restore signals are date-anchored against:
         # a sign-off older than the run-start commit reviewed an EARLIER head.
-        self._round_review_head_time = self._local_head_commit_time(
-            self._process_start_head)
+        self._round_review_head_time = (
+            self._local_head_commit_time(self._round_review_head)
+            if self._round_review_head else None)
         if self.preflight and not (self.rr or self.rr_active or self.rr_none):
             self._preflight_snapshot()
         elif self.preflight and self.rr_active:
@@ -3616,18 +3823,21 @@ class RoundDriver:
     def _run_loop(self) -> RunOutcome:
         for round_no in range(1, self.max_rounds + 1):
             self._apply_rate_limit_comeback()
-            # F2: capture the round-START local head == the remote head reviewers
-            # check out this round (the loop pushes fixes only at round end, so the
-            # local head at round top equals the previous round's pushed tip). A
+            # F2: capture the round-START head reviewers check out this round (the
+            # loop pushes fixes only at round end, so the local head at round top
+            # is normally the previous round's pushed tip): the local head when
+            # GitHub shows it, else GitHub's (:meth:`_published_review_head`). A
             # fresh sha-less clean signal folded this round anchors to it — the
-            # commit the bot was actually asked to review, never a mid-round head.
-            self._round_review_head = self._local_head_sha() or self._process_start_head
+            # commit the bot was actually asked to review, never a mid-round head
+            # and never a commit only this worktree has.
+            self._round_review_head = self._published_review_head()
             # …and its commit time, the cutoff a sha-less clean signal folded THIS
             # round must post-date. Re-read per round: the head advances on each
             # substantive push, so a sign-off written against the PREVIOUS head is
             # stale for this one and must not be credited with reviewing it.
-            self._round_review_head_time = self._local_head_commit_time(
-                self._round_review_head)
+            self._round_review_head_time = (
+                self._local_head_commit_time(self._round_review_head)
+                if self._round_review_head else None)
             expected = _canonical(self.expected_bots())
             # Round 1 consumes the preflight batch — actionable comments already on
             # the PR, folded through _classify_signal at run start. Consumed once;
@@ -3733,6 +3943,19 @@ class RoundDriver:
 
             if not actionable:
                 self._render_round(round_no, [], [], expected)  # status-only round summary
+                # Nothing was fixed, but the head may still have moved while the
+                # round polled: a fixer of an earlier round, an operator or another
+                # process committed or pushed. A commit the loop did not make needs
+                # its own review — asked for while a round remains.
+                moved = self._absorb_foreign_head(may_publish=round_no < self.max_rounds)
+                if moved == "handback":
+                    return self._handback("needs-human", round_no, rebase_skip=True)
+                if moved == "carry":
+                    self._carry_head = self._last_substantive_head
+                    self._fallback_readmitted = set()
+                    if round_no < self.max_rounds:
+                        continue
+                    return self._clean_exit(round_no)
                 # Nothing to act on — but the reviewer this round asked may have
                 # stayed silent or sent only a can't-review notice, leaving a head
                 # that carries unseen changes unreviewed. Ask the fallback while a
@@ -3878,20 +4101,36 @@ class RoundDriver:
             # untouched.
             carried_residue = committed_changes and (
                 round_start_dirty or self._commit_carries_foreign(fixer_output))
+            if committed_changes and not carried_residue:
+                # The pushed commits hold exactly this round's fixers' output: they
+                # are the loop's own, the only commits the cosmetic exemption covers.
+                self._note_own_commits(fixer_output[0], self._vouched_head)
+            # Whatever this round committed, the head may hold a commit the loop did
+            # not make: a fixer that committed (and pushed) by itself — the round's
+            # commit step then finds a clean tree and pushes nothing — or an
+            # operator's or another process's commit, push, rebase or force-push.
+            # Such a commit moves the boundary exactly like a carrying commit.
+            moved = self._absorb_foreign_head(may_publish=round_no < self.max_rounds)
+            if moved == "handback":
+                return self._handback("needs-human", round_no, rebase_skip=True)
+            head_carried = moved == "carry"
             reask: Set[str] = set()
-            if carried_residue:
+            if carried_residue or head_carried:
                 if not self.expected_bots():
                     spoke = {detectors.bot_for_login(c.source) for c in actionable}
                     reask = self._fallback_candidates() & spoke
                     self._readmit(reask)
-                print("[round] this round's commit carried "
-                      + ("uncommitted changes that were already in the worktree when "
-                         "the round began" if round_start_dirty else
-                         "changes that do not match what this round's fixers left on "
-                         "disk")
-                      + " — no reviewer has seen them, so this head needs its own "
-                        "review"
-                      + (f"; re-asking {', '.join(sorted(reask))}" if reask else ""))
+                if carried_residue:
+                    print("[round] this round's commit carried "
+                          + ("uncommitted changes that were already in the worktree "
+                             "when the round began" if round_start_dirty else
+                             "changes that do not match what this round's fixers left "
+                             "on disk")
+                          + " — no reviewer has seen them, so this head needs its own "
+                            "review"
+                          + (f"; re-asking {', '.join(sorted(reask))}" if reask else ""))
+                elif reask:
+                    print(f"[round] re-asking {', '.join(sorted(reask))}")
 
             # Persist this round's polish-only verdicts against the tip the loop
             # now carries — AFTER the fixes are pushed, so the stamp names the head
@@ -3923,7 +4162,8 @@ class RoundDriver:
             # exemption covers the round's OWN fixes only: a commit carrying changes
             # no fixer of the round wrote — the tree was already dirty when it
             # began, or was edited after its fixers finished — moves the boundary
-            # (``carried_residue`` above).
+            # (``carried_residue`` above), and so does any commit on the head the
+            # loop did not make itself (``head_carried`` above).
             round_substantive = any(
                 r.classification.label == "SUBSTANTIVE" and a.final == "fixed"
                 for r, a in zip(results, round_actions)
@@ -3943,10 +4183,12 @@ class RoundDriver:
                 for r, a in zip(results, round_actions)
             )
             take_substantive_round = (round_substantive and (
-                committed_changes or self._worktree_has_changes())) or carried_residue
+                committed_changes or self._worktree_has_changes())) or carried_residue \
+                or head_carried
             if take_substantive_round:
                 # F2: this round pushed a SUBSTANTIVE fix, or a commit that carried
-                # content no fixer of the round wrote — the head
+                # content no fixer of the round wrote, or the head holds a commit
+                # the loop did not make — the head
                 # now carries commits no reviewer has seen. Advance the head-aware
                 # boundary so the gate requires a review at/after this head; only a
                 # cosmetic-only tail after it may ride an earlier reviewed head. Read
@@ -4000,6 +4242,14 @@ class RoundDriver:
         return RunOutcome(status, rounds, False, self.actions, rebase_skip=rebase_skip)
 
     def _clean_exit(self, rounds: int) -> RunOutcome:
+        # Before any merge decision: a commit on the head the loop did not make
+        # itself moves the boundary onto the head (the gate below then demands a
+        # review of it), and a PR head this worktree does not hold, or a commit
+        # only this worktree has, can never be merged from here — hand back without
+        # the exit rebase, which would force-push over the head GitHub has, or
+        # push the unreviewed local commit onto the PR.
+        if self._absorb_foreign_head(may_publish=False) == "handback":
+            return self._handback("needs-human", rounds, rebase_skip=True)
         print("[round] clean — every expected reviewer is done/excluded and "
               "no actionable comments remain")
         # #g9a NOTIFICATION (never a block, never gates the flow below): if the

@@ -18,7 +18,7 @@ clear ``BUDDHI_TEST_COMMAND``; a test that wants a config writes to
 """
 import pytest
 
-from buddhi_review import fix_apply, gh_ingest
+from buddhi_review import fix_apply, gh_ingest, polish_state
 
 
 def _log_line(stdout):
@@ -51,6 +51,9 @@ def _hermetic_config(monkeypatch, tmp_path):
     so an unpinned suite is machine-dependent."""
     monkeypatch.setenv("BUDDHI_CONFIG", str(tmp_path / "absent-config.yaml"))
     monkeypatch.delenv("BUDDHI_TEST_COMMAND", raising=False)
+    # A round driver whose gh fake reports the PR's head stamps polish verdicts
+    # against it; keep those stamps in the test's own directory.
+    monkeypatch.setenv(polish_state.STATE_DIR_ENV, str(tmp_path / "polish-state"))
 
 
 @pytest.fixture(autouse=True)

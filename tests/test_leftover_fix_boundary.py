@@ -126,6 +126,8 @@ class World:
                 return _CP(1, "", "GraphQL: Head branch was modified.")
             self.merges.append(pin)
             return _CP(0)
+        if argv[:2] == ["gh", "api"] and ".head.sha" in argv:
+            return _CP(0, self.remote_tip() + "\n")
         if any("@claude review" in a for a in argv):
             self.summons.append(self.remote_tip())
             return _CP(0)

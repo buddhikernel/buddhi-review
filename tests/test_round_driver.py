@@ -53,9 +53,10 @@ HEAD_TIME = "2020-01-01T00:00:00+00:00"
 
 class GhRecorder:
     """Records every gh/git/test spawn; answers `git status` with a dirty tree,
-    `git rev-parse HEAD` with the constant :data:`HEAD_SHA`, and
-    `git merge-base --is-ancestor` as satisfied (rc 0) — so the F2 head-aware
-    merge gate resolves a stable single-commit head in the network-free harness.
+    `git rev-parse HEAD` — and GitHub's PR head (`gh api …/pulls/N -q .head.sha`) —
+    with the constant :data:`HEAD_SHA`, and `git merge-base --is-ancestor` as
+    satisfied (rc 0) — so the F2 head-aware merge gate resolves a stable
+    single-commit head in the network-free harness.
 
     A subclass that overrides ``__call__`` for its own gh answers should record the
     call itself and fall through to :meth:`_reply` (NOT ``super().__call__``, which
@@ -66,7 +67,8 @@ class GhRecorder:
     def _reply(argv):
         """The canned reply for the common git reads (F2 gate + round loop),
         WITHOUT recording — the caller has already appended to ``self.calls``."""
-        if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
+        if (argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD") or (
+                argv[:2] == ["gh", "api"] and ".head.sha" in argv):
             return subprocess.CompletedProcess(argv, 0, stdout=HEAD_SHA + "\n", stderr="")
         if argv[:3] == ["git", "show", "-s"]:
             # The head's committer date — F2's freshness cutoff. Dated BEFORE the
@@ -2167,8 +2169,8 @@ def test_rr_active_run_start_fleet_still_full_after_restores(tmp_path, monkeypat
     # an all-approved + all-polish restart still reads as "reviewers existed and
     # reviewed" (merge), never "no reviewers configured" (quiet skip).
     monkeypatch.setenv(polish_state.STATE_DIR_ENV, str(tmp_path))
-    monkeypatch.setenv(round_driver.HEAD_SHA_ENV, "H1")
-    polish_state.write_polish_state("7", "o/r", "H1", ["copilot"])
+    monkeypatch.setenv(round_driver.HEAD_SHA_ENV, HEAD_SHA)
+    polish_state.write_polish_state("7", "o/r", HEAD_SHA, ["copilot"])
     cfg = {"active_reviewers": ["claude", "copilot"],
            "auto_on_open": {"claude": False, "copilot": True}}
     timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]",

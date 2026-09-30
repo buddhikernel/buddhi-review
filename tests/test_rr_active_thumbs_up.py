@@ -95,7 +95,8 @@ class Gh:
 
     def __call__(self, argv, *, cwd=None, timeout=None):
         self.calls.append(list(argv))
-        if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
+        if (argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD") or (
+                argv[:2] == ["gh", "api"] and ".head.sha" in argv):
             return subprocess.CompletedProcess(argv, 0, stdout=HEAD_SHA + "\n", stderr="")
         if argv[:3] == ["git", "show", "-s"]:
             # The head's committer date — F2's freshness cutoff for sha-less signals.
