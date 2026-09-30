@@ -181,17 +181,18 @@ def already_fixed(world):
 
 
 def make_driver(world, reviewer, behaviours, *, test_gate, rr_active=False,
-                preflight=False):
+                preflight=False, cwd=None):
     clock = FakeClock()
+    cwd = cwd or str(world.repo)
 
     def dispatch(c, r):
         def runner(prompt, *, model, effort, timeout, cwd):
             return behaviours[c.id](world)
-        return fix_apply.apply_fix(c.text, cwd=str(world.repo), runner=runner,
+        return fix_apply.apply_fix(c.text, cwd=cwd, runner=runner,
                                    verify_runner=None, label=r.classification.label,
                                    commented_files=[c.path] if c.path else ())
     return RoundDriver(
-        "7", repo="o/r", cwd=str(world.repo), cfg=CLAUDE_ONLY,
+        "7", repo="o/r", cwd=cwd, cfg=CLAUDE_ONLY,
         adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),
         classify_runner=classify, fix_dispatch=dispatch,
         fetch=reviewer.fetch, reactions_fetch=lambda pr, repo=None, cwd=None: [],
@@ -637,3 +638,111 @@ def test_a_done_reviewer_that_speaks_this_round_is_re_asked_for_a_carrying_commi
 
     assert edits
     _assert_edit_needs_its_own_review(world, driver, outcome)
+
+
+def test_a_cosmetic_round_driven_from_a_relative_cwd_merges_on_the_existing_review(
+        env, monkeypatch):
+    # ``--cwd`` accepts a relative path. The fixers' output must then be read from
+    # the same files git hashes; otherwise it cannot be fingerprinted, a purely
+    # COSMETIC commit reads as one carrying unreviewed content, and the PR is held
+    # for a review it does not need.
+    world, gate = env
+    monkeypatch.chdir(world.repo.parent)
+    reviewer = Reviewer(world)
+    reviewer.post(1, "n2", "[cosmetic] nit: wording in style")
+    driver = make_driver(world, reviewer, {"n2": writes("style.py", COSM)},
+                         test_gate=True, cwd=world.repo.name)
+    start = world.local_head()
+
+    outcome = driver.run()
+
+    assert COSM in git(world.repo, "show", f"{world.remote_tip()}:style.py")
+    assert world.remote_tip() != start, "the cosmetic fix was committed and pushed"
+    assert driver._last_substantive_head == start, "a cosmetic-only commit keeps the boundary"
+    assert world.remote_tip() not in world.summons, (
+        "nobody is asked to review a commit holding only the fixers' output")
+    assert outcome.merged is True and world.merges == [world.remote_tip()]
+
+
+def _executable_style(world, filemode):
+    """``style.py`` committed as ``100755`` under the given ``core.filemode``, so the
+    mode the fingerprint records is read from the disk or from the index."""
+    git(world.repo, "config", "core.filemode", filemode)
+    os.chmod(world.repo / "style.py", 0o755)
+    git(world.repo, "update-index", "--chmod=+x", "style.py")
+    git(world.repo, "commit", "-qm", "make style.py executable")
+
+
+def _driver_cwds(world):
+    """Every spelling of the driver's directory the fingerprint has to resolve the
+    way git does: relative to the process's own directory, the repository's top or
+    a subdirectory of it, and a symlink that points INTO a subdirectory (where
+    ``..`` taken lexically lands outside the repository)."""
+    (world.repo / "pkg").mkdir()
+    (world.repo / "pkg" / "mod.py").write_text("m = 1\n")
+    git(world.repo, "add", "pkg/mod.py")
+    git(world.repo, "commit", "-qm", "add pkg")
+    os.symlink(world.repo / "pkg", world.repo.parent / "pkg-link")
+    return {"relative-top": world.repo.name,
+            "relative-subdir": os.path.join(world.repo.name, "pkg"),
+            "symlinked-subdir": str(world.repo.parent / "pkg-link"),
+            "relative-symlinked-subdir": "pkg-link"}
+
+
+@pytest.mark.parametrize("filemode", ["true", "false"])
+@pytest.mark.parametrize("where", ["relative-top", "relative-subdir", "symlinked-subdir",
+                                   "relative-symlinked-subdir"])
+def test_the_commit_check_reads_the_fixers_output_wherever_the_driver_runs(
+        env, monkeypatch, where, filemode):
+    # Direct form: a commit holding exactly what the fixers left is theirs, and one
+    # carrying an edit they never made is not, whatever spelling of the worktree
+    # the driver was given.
+    world, gate = env
+    _executable_style(world, filemode)
+    cwd = _driver_cwds(world)[where]
+    monkeypatch.chdir(world.repo.parent)
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False, cwd=cwd)
+
+    def fixers_write():
+        driver._round_review_head = world.local_head()
+        writes("style.py", COSM)(world)
+        (world.repo / "pkg" / "mod.py").unlink()
+        return driver._fixer_output_fingerprint()
+
+    def commit():
+        git(world.repo, "add", "-A")
+        git(world.repo, "commit", "-qm", "round")
+
+    output = fixers_write()
+    assert output is not None, "the fixers' output could not be read"
+    assert output[1] == {
+        "style.py": ("file", git(world.repo, "hash-object", "style.py"), "100755"),
+        "pkg/mod.py": ("deleted",)}
+    commit()
+    assert git(world.repo, "ls-tree", "HEAD", "style.py").startswith("100755")
+    assert driver._commit_carries_foreign(output) is False
+
+    git(world.repo, "checkout", "-q", "HEAD~1", "--", "pkg/mod.py")
+    git(world.repo, "commit", "-qm", "restore pkg")
+    output = fixers_write()
+    _edit_engine(world)                     # a file the fixers never touched
+    commit()
+    assert driver._commit_carries_foreign(output) is True
+
+
+@pytest.mark.parametrize("where", ["relative-top", "relative-subdir", "symlinked-subdir"])
+def test_the_index_mode_read_is_anchored_at_the_top_of_the_repository(
+        env, monkeypatch, where):
+    # With core.filemode off the mode is read from the index. ``ls-files`` answers a
+    # path that resolves outside the index with no output and exit 0, which would
+    # silently read every file as ``100644``; the read must name each path from the
+    # top of the repository, not from wherever the driver happens to run.
+    world, gate = env
+    _executable_style(world, "false")
+    cwd = _driver_cwds(world)[where]
+    monkeypatch.chdir(world.repo.parent)
+    driver = make_driver(world, Reviewer(world), {}, test_gate=False, cwd=cwd)
+    (world.repo / "fresh.py").write_text("f = 1\n")
+
+    assert driver._indexed_file_modes(["style.py", "pkg/mod.py", "fresh.py"]) == {
+        "style.py": "100755", "pkg/mod.py": "100644", "fresh.py": "100644"}

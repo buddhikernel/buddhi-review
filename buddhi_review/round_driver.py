@@ -2423,7 +2423,14 @@ class RoundDriver:
             cdup = self.gh_run(["git", "rev-parse", "--show-cdup"], cwd=self.cwd)
             if getattr(cdup, "returncode", 1) != 0:
                 return None
-            root = os.path.normpath(
+            # ABSOLUTE, and resolved the way git resolves it: every path below is
+            # read by this process AND handed to git running in ``cwd``, so a
+            # relative root would name one file to ``lstat`` and another to
+            # ``hash-object``. ``realpath`` rather than ``abspath`` because git
+            # takes the ``..`` of ``--show-cdup`` from the directory it is really
+            # in: through a symlink pointing INTO a subdirectory, a lexical ``..``
+            # would land outside the repository.
+            root = os.path.realpath(
                 os.path.join(self.cwd, (getattr(cdup, "stdout", "") or "").strip()))
             # Exit 1 is "key unset", where git trusts the executable bit.
             filemode = self.gh_run(["git", "config", "--bool", "core.filemode"],
@@ -2462,7 +2469,7 @@ class RoundDriver:
                 if hashed is None or len(shas) != len(regular):
                     return None
                 if not trust_mode:
-                    indexed = self._indexed_file_modes(root, regular)
+                    indexed = self._indexed_file_modes(regular)
                     if indexed is None:
                         return None
                     modes.update(indexed)
@@ -2475,16 +2482,20 @@ class RoundDriver:
             return None
         return head, identity
 
-    def _indexed_file_modes(self, root: str, paths: List[str]) -> Optional[Dict[str, str]]:
+    def _indexed_file_modes(self, paths: List[str]) -> Optional[Dict[str, str]]:
         """``{path: mode}`` that ``git add`` would record for each regular file in
         ``paths`` (repo-root-relative) while ``core.filemode`` is off: it keeps the
-        mode of a stage-0 regular-file index entry and gives anything else — an
-        untracked path, an unmerged one, a path the index holds as a symlink — plain
-        ``100644``. None when git cannot answer."""
+        mode of a merged (not conflicted) regular-file index entry and gives
+        anything else — an untracked path, an unmerged one, a path the index holds
+        as a symlink — plain ``100644``. None when git cannot answer.
+
+        Each path is anchored at the top of the repository (``:(top,literal)``)
+        instead of being joined onto a directory: ``ls-files`` answers a path that
+        resolves outside the index with no output and exit 0, which would read
+        every file as ``100644`` without a trace."""
         out = commit_push._run_batched_stdout(
-            self.gh_run, ["git", "--literal-pathspecs", "ls-files", "-s", "-z",
-                          "--full-name", "--"],
-            [os.path.join(root, p) for p in paths], cwd=self.cwd)
+            self.gh_run, ["git", "ls-files", "-s", "-z", "--full-name", "--"],
+            [f":(top,literal){p}" for p in paths], cwd=self.cwd)
         if out is None:
             return None
         modes = {p: "100644" for p in paths}
