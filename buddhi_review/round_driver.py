@@ -16,7 +16,13 @@ committed/pushed, then the run exits clean without re-summoning anyone. The one
 exception is a round whose commit carries content no fixer of that round wrote —
 it STARTED on a worktree already holding uncommitted changes, or the commit holds
 anything other than what its fixers left on disk: no reviewer has seen that
-content, so the round earns a review round exactly like a substantive fix. When the
+content, so the round earns a review round exactly like a substantive fix. Until
+some reviewer has reviewed a head that carries such changes, the reviewers the
+run set aside (polish-only, reviewed — no change, or done) are kept as a
+fallback: a round that would otherwise end the run with that head unreviewed —
+nobody left to ask, or the reviewer that was asked stayed silent, sent only a
+can't-review notice, or reviewed an older head — asks each of them once more
+while rounds remain. When the
 round budget is spent and the final round completed cleanly (no unanswered
 escalation, no poisoned worktree, no failed push, no operator stop), the exit
 routes through the same clean-exit gates as a naturally-clean finish rather than
@@ -1199,6 +1205,17 @@ class RoundDriver:
         #   cosmetic-only fix holding only its own fixers' output. None
         #   (unresolvable local head) → the gate BLOCKS (fail-closed).
         self._last_substantive_head: Optional[str] = None
+        # _carry_head: the boundary this run advanced to — a head carrying changes
+        #   no reviewer had seen (a SUBSTANTIVE fix, or a commit that carried content
+        #   no fixer of its round wrote). None until a round advances the boundary.
+        #   While the merge gate still finds no review at or after it, every exit
+        #   that would end the run looks for a fallback reviewer to ask
+        #   (_readmit_fallback_reviewers).
+        self._carry_head: Optional[str] = None
+        # _fallback_readmitted: the reviewers already taken back for _carry_head —
+        #   each is re-admitted at most once per carrying head, which is what bounds
+        #   the fallback. Reset whenever a new carrying head is pushed.
+        self._fallback_readmitted: Set[str] = set()
         # _round_review_head: the local HEAD captured at the START of the current
         #   round == the remote head reviewers check out this round (the loop pushes
         #   only at round end). A FRESH sha-less clean signal (approval reaction /
@@ -3063,13 +3080,19 @@ class RoundDriver:
             print(f"[rr-active] {bot}: polish-only at this HEAD — not re-requesting")
         return restored
 
-    def _persist_polish_state(self) -> None:
+    def _persist_polish_state(self, *, readmitted: bool = False) -> None:
         """Stamp the run's CURRENT polish-only set against the tip this round
         leaves behind — called at every round end, AFTER the round's fixes are
         pushed, so the tip is the one the loop carries into the next round (and the
         one a restart would meet as live HEAD). Fail-closed: an unreadable tip
         writes nothing, so a later restore can never match a stamp taken on an
-        unknown head. Best-effort — a failed write only costs a re-summon."""
+        unknown head. Best-effort — a failed write only costs a re-summon.
+
+        ``readmitted``: this run has just taken parked reviewers back at an
+        unmoved tip (:meth:`_readmit_fallback_reviewers`). The record at this tip
+        is the one this run stamped at its last round end, so the smaller set —
+        even an empty one — replaces it; otherwise a restart would restore the
+        re-admitted reviewers as polish-only and skip them again."""
         tip = self._head_sha()
         if not tip:
             return
@@ -3078,7 +3101,75 @@ class RoundDriver:
         # that restored nothing keeps write_polish_state's empty no-clobber guard.
         polish_state.write_polish_state(
             self.pr, self._polish_repo_key(), tip, sorted(self.polishing),
-            restored_prior=self._polish_restored)
+            restored_prior=self._polish_restored or readmitted)
+
+    def _fallback_candidates(self) -> Set[str]:
+        """The reviewers the run set aside that could still be asked to review:
+        enabled reviewers parked polish-only or reviewed — no change, or done (a
+        sign-off, or a review with nothing to act on). One that has since hit a
+        quota / PR-too-large / errored exclusion or is inside a usage-limit window
+        is not: it cannot answer. (A reviewer dropped for silence is never in
+        these sets — it was expected, not set aside.)"""
+        pool = self.polishing | self.reviewed_no_change | self.done
+        enabled = set(active_reviewers(self.cfg, self.repo))
+        return {
+            b for b in pool
+            if b in enabled
+            and b not in self._rate_limited_until
+            and not self.store.is_excluded(b)
+        }
+
+    def _readmit(self, bots: Iterable[str]) -> None:
+        """Take ``bots`` back into the re-request gate: un-park them, and drop a
+        done reviewer's sign-off (and its "approved" crown) exactly as ``--rr``
+        does, so ``expected_bots()`` asks it again and its next verdict folds
+        fresh. ``reviewed_ever`` and the head-aware anchors stay — the earlier
+        reviews were genuine, and the merge gate compares their heads with the
+        boundary."""
+        for b in bots:
+            self.polishing.discard(b)
+            self.reviewed_no_change.discard(b)
+            if b in self.done:
+                self.done.discard(b)
+                self.approved.discard(b)
+                self._reaction_done.discard(b)
+                if self._bot_state(b).signal == detectors.SIGNAL_CLEAN:
+                    self._bot_state(b).signal = None
+
+    def _readmit_fallback_reviewers(self) -> Set[str]:
+        """At an exit that would end the run: when this run pushed a head carrying
+        changes no reviewer had seen (``_carry_head``) and the head it would now
+        hand to the merge gate is still unreviewed, take the fallback reviewers
+        back so the caller can run one more round. Returns the reviewers taken back
+        — empty when there is nothing to do, and the caller exits as before.
+
+        "Unreviewed" is the merge gate's own answer (:meth:`_head_aware_merge_gate`),
+        so the loop asks for exactly the review the gate will demand: the reviewer
+        that was expected may have stayed silent, sent only a can't-review notice
+        (quota, PR too large, errored, a usage-limit marker), or answered with a
+        comment written against an older head. A head nobody pushed changes onto —
+        a COSMETIC-only run on a clean tree — never arms this, so nobody is asked
+        again for polish.
+
+        Each fallback reviewer is taken back at most once per carrying head, so
+        the fallback ends: it either produces a review of the head or runs out of
+        reviewers, and the gate then blocks the merge as before."""
+        if not self._carry_head:
+            return set()
+        fallback = self._fallback_candidates() - self._fallback_readmitted
+        if not fallback:
+            return set()
+        blocked, _, head = self._head_aware_merge_gate(clean_exit=True)
+        if not blocked:
+            return set()
+        self._readmit(fallback)
+        self._fallback_readmitted |= fallback
+        self._persist_polish_state(readmitted=True)
+        print("[round] no reviewer has reviewed "
+              + (head[:7] if head else "the current head")
+              + ", which carries changes none of them has seen; re-asking "
+              + ", ".join(sorted(fallback)))
+        return fallback
 
     # ------------------------------------------------------------------- run
 
@@ -3479,9 +3570,15 @@ class RoundDriver:
             # done/exclusions is exactly how an already-reviewed PR reaches this
             # with round_no == 1, so the poll wait is skipped entirely.
             if not expected and not self.rr_none and not preflight_batch:
-                if self.rr_active and round_no == 1:
-                    print("[round] --rr-active: no still-active reviewers — clean exit")
-                return self._clean_exit(round_no - 1)
+                # …unless a head carrying changes no reviewer has seen is still
+                # unreviewed: then this round asks the reviewers the run set aside
+                # (_readmit_fallback_reviewers) instead of ending there.
+                if self._readmit_fallback_reviewers():
+                    expected = _canonical(self.expected_bots())
+                if not expected:
+                    if self.rr_active and round_no == 1:
+                        print("[round] --rr-active: no still-active reviewers — clean exit")
+                    return self._clean_exit(round_no - 1)
 
             if self.rr_none:
                 # --rr-none: no reviewer is summoned or polled (expected is empty).
@@ -3565,6 +3662,12 @@ class RoundDriver:
 
             if not actionable:
                 self._render_round(round_no, [], [], expected)  # status-only round summary
+                # Nothing to act on — but the reviewer this round asked may have
+                # stayed silent or sent only a can't-review notice, leaving a head
+                # that carries unseen changes unreviewed. Ask the fallback while a
+                # round remains; with none left, the merge gate blocks as before.
+                if round_no < self.max_rounds and self._readmit_fallback_reviewers():
+                    continue
                 return self._clean_exit(round_no)
 
             results = process_comments(
@@ -3687,47 +3790,29 @@ class RoundDriver:
             # demands a review of this exact head, and the run takes another round
             # to ask for one. One anchored review of the new head is all the gate
             # needs, so while some reviewer is still expected the parks stand; when
-            # nobody is, the parked reviewers that spoke THIS round are re-asked
-            # instead of the round asking nobody. They were parked polish-only, or
-            # with every finding dismissed, by this round or by an earlier one whose
-            # delayed comment reached this round's batch; either way their verdicts
-            # were reached on the head the commit replaced. A reviewer that spoke
-            # this round AND is already done (an actionable cosmetic comment plus a
-            # clean signal in the same round — ``_update_polishing`` leaves it in
-            # neither parking set) is re-admitted the same way, so the round never
-            # asks nobody just because its only reviewer signed off on the old head.
-            # Un-parked before the stamp below, their verdict is never recorded
-            # against the new tip. A round that started clean and committed only its
-            # fixers' output keeps the cosmetic exemption untouched.
+            # nobody is, the set-aside reviewers that spoke THIS round are re-asked
+            # at once instead of the round asking nobody. They were parked
+            # polish-only, or with every finding dismissed, by this round or by an
+            # earlier one whose delayed comment reached this round's batch, or are
+            # already done (an actionable cosmetic comment plus a clean signal in
+            # the same round — ``_update_polishing`` leaves it in neither parking
+            # set); either way their verdicts were reached on the head the commit
+            # replaced. Un-parked before the stamp below, their verdict is never
+            # recorded against the new tip. The other set-aside reviewers are kept
+            # as the fallback: should the round that follows still leave this head
+            # unreviewed — the expected reviewer stays silent or sends only a
+            # can't-review notice — they are asked then
+            # (``_readmit_fallback_reviewers``). A round that started clean and
+            # committed only its fixers' output keeps the cosmetic exemption
+            # untouched.
             carried_residue = committed_changes and (
                 round_start_dirty or self._commit_carries_foreign(fixer_output))
+            reask: Set[str] = set()
             if carried_residue:
-                reask: Set[str] = set()
                 if not self.expected_bots():
                     spoke = {detectors.bot_for_login(c.source) for c in actionable}
-                    reask = (self.polishing | self.reviewed_no_change) & spoke
-                    self.polishing -= reask
-                    self.reviewed_no_change -= reask
-                    # A done reviewer's sign-off (and its "approved" crown) is for
-                    # the head the commit replaced: drop it, as ``--rr`` does, so
-                    # ``expected_bots()`` asks it again and its next verdict folds
-                    # fresh. ``reviewed_ever`` and the head-aware anchor stay — the
-                    # earlier review was genuine, and the merge gate compares its
-                    # head with the boundary advanced below. A hard-excluded or
-                    # rate-limited bot stays out: a clean fold never survives those.
-                    readmit = {
-                        b for b in (self.done & spoke)
-                        if b is not None
-                        and not self.store.is_excluded(b)
-                        and b not in self._rate_limited_until
-                    }
-                    for b in readmit:
-                        self.done.discard(b)
-                        self.approved.discard(b)
-                        self._reaction_done.discard(b)
-                        if self._bot_state(b).signal == detectors.SIGNAL_CLEAN:
-                            self._bot_state(b).signal = None
-                    reask |= readmit
+                    reask = self._fallback_candidates() & spoke
+                    self._readmit(reask)
                 print("[round] this round's commit carried "
                       + ("uncommitted changes that were already in the worktree when "
                          "the round began" if round_start_dirty else
@@ -3796,6 +3881,11 @@ class RoundDriver:
                 # cosmetic-only tail after it may ride an earlier reviewed head. Read
                 # from LOCAL git (None on failure → the gate blocks, fail-closed).
                 self._last_substantive_head = self._local_head_sha()
+                # Until some reviewer reviews this head, the reviewers set aside so
+                # far stay the fallback, each asked at most once for it; the ones
+                # this round already re-asked have had their turn.
+                self._carry_head = self._last_substantive_head
+                self._fallback_readmitted = set(reask)
             if round_no >= self.max_rounds and restart_reverify:
                 # Final round, but the restart's re-fixed pre-existing finding was never
                 # re-reviewed and no verification round remains. A `continue` here would
@@ -3806,6 +3896,12 @@ class RoundDriver:
                 # _restart_reverify_ids, populated only on the --rr-active preflight path.
                 return self._handback("max-rounds", round_no)
             if take_substantive_round or restart_reverify:
+                continue
+            # A clean finish — unless this round acted only on comments written
+            # against an OLDER head (a late one, or one from a reviewer parked
+            # earlier) while the head carrying unseen changes is still unreviewed:
+            # then the fallback is asked while a round remains.
+            if round_no < self.max_rounds and self._readmit_fallback_reviewers():
                 continue
             return self._clean_exit(round_no)
 

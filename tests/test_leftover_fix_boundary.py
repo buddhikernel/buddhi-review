@@ -87,6 +87,7 @@ class World:
         git(self.repo, "push", "-qu", "origin", "feat")
         self.h0 = self.remote_tip()
         self.summons = []   # the remote tip at each '@claude review' summon
+        self.codex_summons = []   # …and at each '@codex review' summon
         self.merges = []    # the pins GitHub accepted
 
     def remote_tip(self):
@@ -125,6 +126,9 @@ class World:
             return _CP(0)
         if any("@claude review" in a for a in argv):
             self.summons.append(self.remote_tip())
+            return _CP(0)
+        if any("@codex review" in a for a in argv):
+            self.codex_summons.append(self.remote_tip())
             return _CP(0)
         if argv[:3] == ["gh", "pr", "view"] and ".state" in argv:
             return _CP(0, "MERGED\n" if self.merges else "OPEN\n")
@@ -181,7 +185,7 @@ def already_fixed(world):
 
 
 def make_driver(world, reviewer, behaviours, *, test_gate, rr_active=False,
-                preflight=False, cwd=None):
+                preflight=False, cwd=None, cfg=CLAUDE_ONLY, max_rounds=3):
     clock = FakeClock()
     cwd = cwd or str(world.repo)
 
@@ -192,7 +196,7 @@ def make_driver(world, reviewer, behaviours, *, test_gate, rr_active=False,
                                    verify_runner=None, label=r.classification.label,
                                    commented_files=[c.path] if c.path else ())
     return RoundDriver(
-        "7", repo="o/r", cwd=cwd, cfg=CLAUDE_ONLY,
+        "7", repo="o/r", cwd=cwd, cfg=cfg,
         adapter=ReviewAdapter(escalation=ConsoleEscalation(notifier=FakeNotifier())),
         classify_runner=classify, fix_dispatch=dispatch,
         fetch=reviewer.fetch, reactions_fetch=lambda pr, repo=None, cwd=None: [],
@@ -202,7 +206,7 @@ def make_driver(world, reviewer, behaviours, *, test_gate, rr_active=False,
         gh_run=world.gh_run, clock=clock, sleep=clock.sleep, notice=lambda *a, **k: "",
         wall_clock=lambda: datetime(2026, 1, 1, 1, 30, tzinfo=timezone.utc),
         times=TIMES, answer_waiter=lambda esc, **k: {}, auto_merge=True,
-        preflight=preflight, push=True, test_gate=test_gate, max_rounds=3,
+        preflight=preflight, push=True, test_gate=test_gate, max_rounds=max_rounds,
         rr_active=rr_active,
     )
 
@@ -746,3 +750,431 @@ def test_the_index_mode_read_is_anchored_at_the_top_of_the_repository(
 
     assert driver._indexed_file_modes(["style.py", "pkg/mod.py", "fresh.py"]) == {
         "style.py": "100755", "pkg/mod.py": "100644", "fresh.py": "100644"}
+
+
+# ---------------------------------------------------------------------------
+# The fallback reviewers. A round that pushes changes no reviewer has seen — a
+# SUBSTANTIVE fix, or a commit carrying a fix an earlier run left uncommitted —
+# moves the reviewed-commit boundary, and the run takes another round to get that
+# head reviewed. The reviewer that round asks may stay silent, answer only with a
+# can't-review notice, be inside a usage-limit window, or answer with a comment
+# written against an older head. The reviewers the run set aside (polish-only, or
+# done) are the fallback: rather than end the run with the head unreviewed, the
+# loop asks each of them once more while a round remains. Every case has a COSMETIC
+# twin on a clean tree: nothing moved the boundary, the PR merges on the review in
+# hand, and nobody is summoned after round 1.
+# ---------------------------------------------------------------------------
+
+TWO = {"active_reviewers": ["claude", "codex"],
+       "auto_on_open": {"claude": False, "codex": False}}
+LOGINS = {"claude": "claude[bot]", "codex": "chatgpt-codex-connector[bot]"}
+# What the reviewer asked about the carrying head answers with, instead of a review.
+NO_REVIEW = {
+    "silent": None,
+    "too-large": "The pull request is too large to review.",
+    "errored": "Codex encountered an unexpected error while reviewing this PR.",
+    "quota": "Codex usage limit reached: you have exhausted your quota for this period.",
+}
+FORMS = ["substantive", "leftover"]
+
+
+class Fleet:
+    """claude and codex, each answering its own summons. An entry becomes visible
+    once ``after`` (by default its own reviewer) has been summoned ``k`` times
+    (k=0: already on the PR). An inline finding is anchored to the remote tip that
+    summon asked about, or to ``anchor`` for a comment written against an older
+    head; anything else (an acknowledgment, a sign-off, a can't-review notice) is
+    posted on the conversation and anchors nothing. After its script a reviewer is
+    silent."""
+
+    def __init__(self, world):
+        self.world = world
+        self.script = []
+        self.anchor = {}
+
+    def asked(self, bot):
+        return {"claude": self.world.summons, "codex": self.world.codex_summons}[bot]
+
+    def post(self, bot, k, cid, text, *, inline=True, after=None, anchor=None,
+             source=None):
+        c = Comment(id=cid, text=text, source=source or LOGINS[bot],
+                    path="x.py" if inline else None,
+                    diff_hunk="@@ -1 +1 @@" if inline else None,
+                    from_issue_channel=not inline,
+                    created_at="2026-01-01T00:30:00+00:00")
+        self.script.append((after or bot, k, c, anchor))
+
+    def visible(self):
+        out = []
+        for after, k, c, anchor in self.script:
+            asked = self.asked(after)
+            if len(asked) < k:
+                continue
+            if c.path and c.id not in self.anchor:
+                self.anchor[c.id] = anchor or (asked[k - 1] if k else self.world.h0)
+            out.append(c)
+        return out
+
+    def fetch(self, pr, repo=None, cwd=None):
+        return self.visible()
+
+    def inline(self, pr, repo=None, cwd=None):
+        return [{"user": {"login": c.source}, "original_commit_id": self.anchor[c.id]}
+                for c in self.visible() if c.path]
+
+
+def _fleet_run(world, fleet, behaviours, max_rounds=3):
+    driver = make_driver(world, fleet, behaviours, test_gate=True, cfg=TWO,
+                         max_rounds=max_rounds)
+    return driver, driver.run()
+
+
+def _round_one(world, fleet, form, *, cosmetic):
+    """Round 1 asks claude and codex about H0. claude's nit is fixed, which parks
+    claude polish-only; codex stays expected. ``form`` is how the round's commit
+    comes to carry changes no reviewer has seen:
+
+    * "substantive" — codex's finding is SUBSTANTIVE and its fix lands (in the
+      COSMETIC twin the same finding is cosmetic);
+    * "leftover" — a fix an earlier run left uncommitted is still on disk and the
+      commit carries it, while codex has only acknowledged the PR (in the twin the
+      tree is clean).
+
+    Returns the fixers for the round-1 comments."""
+    fleet.post("claude", 1, "n1", "[cosmetic] nit: wording in style")
+    behaviours = {"n1": writes("style.py", COSM)}
+    if form == "substantive":
+        label = "[cosmetic]" if cosmetic else "[substantive]"
+        fleet.post("codex", 1, "f1", f"{label} the null check in engine is missing")
+        behaviours["f1"] = writes("engine.py", "COSM-f1" if cosmetic else SUBST)
+    else:
+        fleet.post("codex", 1, "a1", "Codex is reviewing this pull request.",
+                   inline=False)
+        if not cosmetic:
+            _edit_engine(world)            # the leftover, uncommitted before the run
+    return behaviours
+
+
+def _assert_merged_on_the_review_in_hand(world, driver, outcome):
+    # The cosmetic twin: the commit moved nothing, so the PR merges on round 1's
+    # reviews of H0, and neither reviewer is summoned after round 1.
+    assert outcome.merged is True and world.merges == [world.remote_tip()]
+    assert SUBST not in world.markers(world.remote_tip())
+    assert driver._last_substantive_head == world.h0
+    assert world.summons == [world.h0] and world.codex_summons == [world.h0]
+
+
+@pytest.mark.parametrize("answer", sorted(NO_REVIEW))
+@pytest.mark.parametrize("form", FORMS)
+def test_a_carrying_head_the_expected_reviewer_does_not_review_goes_to_the_fallback(
+        env, form, answer):
+    # Round 2 asks codex — the reviewer still expected — about the carrying head
+    # H1, and codex does not review it. claude, parked by round 1, is the fallback:
+    # round 3 asks it about H1, its review arrives, and the PR merges on it.
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _round_one(world, fleet, form, cosmetic=False)
+    if NO_REVIEW[answer]:
+        fleet.post("codex", 2, "x2", NO_REVIEW[answer], inline=False)
+    fleet.post("claude", 2, "n3", "[cosmetic] nit: docstring in style")
+    behaviours["n3"] = writes("style.py", "COSM-n3")
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    h1 = driver._last_substantive_head
+    assert SUBST in world.markers(h1), "round 1's commit carried the unseen change"
+    assert world.codex_summons == [world.h0, h1], "codex was asked about H1"
+    assert world.summons == [world.h0, h1], "the parked reviewer was asked about H1"
+    assert outcome.merged is True and world.merges == [world.remote_tip()]
+    assert "COSM-n3" in git(world.repo, "show", f"{world.remote_tip()}:style.py")
+
+
+@pytest.mark.parametrize("answer", sorted(NO_REVIEW))
+@pytest.mark.parametrize("form", FORMS)
+def test_the_cosmetic_twin_of_an_unreviewed_carrying_head_merges_with_nobody_asked_again(
+        env, form, answer):
+    # The same script, but codex's finding is cosmetic (or the tree is clean): round
+    # 1's commit holds only its fixers' cosmetic output, so the run ends there and
+    # codex's round-2 answer and claude's round-3 nit are never reached.
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _round_one(world, fleet, form, cosmetic=True)
+    if NO_REVIEW[answer]:
+        fleet.post("codex", 2, "x2", NO_REVIEW[answer], inline=False)
+    fleet.post("claude", 2, "n3", "[cosmetic] nit: docstring in style")
+    behaviours["n3"] = writes("style.py", "COSM-n3")
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    _assert_merged_on_the_review_in_hand(world, driver, outcome)
+
+
+def test_nobody_set_aside_is_asked_again_once_the_expected_reviewer_reviews_the_head(env):
+    # codex, asked about the carrying head H1, reviews it (a nit anchored to H1).
+    # That review is all the merge gate needs: claude stays parked.
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _round_one(world, fleet, "substantive", cosmetic=False)
+    fleet.post("codex", 2, "n2", "[cosmetic] nit: rename in engine")
+    behaviours["n2"] = writes("engine.py", "COSM-n2b")
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    h1 = driver._last_substantive_head
+    assert world.codex_summons == [world.h0, h1]
+    assert world.summons == [world.h0], "claude was not asked again"
+    assert "claude" in driver.polishing
+    assert outcome.merged is True and world.merges == [world.remote_tip()]
+
+
+def test_a_carrying_round_that_leaves_nobody_expected_asks_the_set_aside_reviewers(
+        env, capsys):
+    # codex posts its SUBSTANTIVE finding together with a sign-off, so it is done
+    # as well as fixed-for; claude is parked. Round 2 opens with nobody expected
+    # and H1 unreviewed: the set-aside reviewers are asked about it instead of the
+    # run ending there. A reviewer this repository does not enable (gemini, which
+    # signed off too) is not one of them.
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _round_one(world, fleet, "substantive", cosmetic=False)
+    fleet.post("codex", 1, "s1", "No issues found.", inline=False)
+    fleet.post("gemini", 1, "g1", "No issues found.", inline=False, after="codex",
+               source="gemini-code-assist[bot]")
+    fleet.post("claude", 2, "n3", "[cosmetic] nit: docstring in style")
+    behaviours["n3"] = writes("style.py", "COSM-n3")
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    h1 = driver._last_substantive_head
+    assert SUBST in world.markers(h1)
+    assert world.summons == [world.h0, h1] and world.codex_summons == [world.h0, h1]
+    assert outcome.merged is True and world.merges == [world.remote_tip()]
+    assert "re-asking claude, codex\n" in capsys.readouterr().out
+
+
+def test_the_cosmetic_twin_of_a_round_that_leaves_nobody_expected_merges(env):
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _round_one(world, fleet, "substantive", cosmetic=True)
+    fleet.post("codex", 1, "s1", "No issues found.", inline=False)
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    _assert_merged_on_the_review_in_hand(world, driver, outcome)
+
+
+def _late_nit_round(world, fleet, *, cosmetic):
+    """Round 1 as in the "substantive" form; in round 2 codex stays silent and the
+    only comment is a late nit from claude written against H0."""
+    behaviours = _round_one(world, fleet, "substantive", cosmetic=cosmetic)
+    fleet.post("claude", 2, "n2", "[cosmetic] nit: spacing in style", after="codex",
+               anchor=world.h0)
+    behaviours["n2"] = writes("style.py", "COSM-n2b")
+    fleet.post("claude", 2, "n3", "[cosmetic] nit: docstring in style")
+    behaviours["n3"] = writes("style.py", "COSM-n3")
+    return behaviours
+
+
+def test_a_round_that_acts_only_on_a_comment_about_an_older_head_asks_the_fallback(env):
+    # Round 2's only comment is claude's late nit on H0. Its fix is committed (H2)
+    # and the round would finish clean — with nobody having reviewed a head at or
+    # after H1. claude, parked, is asked about H2 instead, and its review lands.
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _late_nit_round(world, fleet, cosmetic=False)
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    h1 = driver._last_substantive_head
+    assert SUBST in world.markers(h1)
+    h2 = world.summons[-1]
+    assert h2 != h1 and "COSM-n2b" in git(world.repo, "show", f"{h2}:style.py")
+    assert world.summons == [world.h0, h2], "claude was asked about the head after H1"
+    assert outcome.merged is True and world.merges == [world.remote_tip()]
+
+
+def test_the_cosmetic_twin_of_a_late_comment_round_merges_with_nobody_asked_again(env):
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _late_nit_round(world, fleet, cosmetic=True)
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    _assert_merged_on_the_review_in_hand(world, driver, outcome)
+
+
+def _usage_limited_round(world, fleet, *, cosmetic):
+    """The roles swapped: claude's finding is the one fixed in round 1 and codex's
+    nit parks codex. When round 2 asks claude, the review workflow reports claude's
+    usage window exhausted until long after the run."""
+    fleet.post("codex", 1, "n1", "[cosmetic] nit: wording in style")
+    label = "[cosmetic]" if cosmetic else "[substantive]"
+    fleet.post("claude", 1, "f1", f"{label} the null check in engine is missing")
+    fleet.post("claude", 2, "m2",
+               "<!-- claude-review-unavailable-v1 type=rate_limited "
+               "resets_at=4000000000 -->", inline=False, source="github-actions[bot]")
+    fleet.post("codex", 2, "n3", "[cosmetic] nit: docstring in style")
+    return {"n1": writes("style.py", COSM),
+            "f1": writes("engine.py", "COSM-f1" if cosmetic else SUBST),
+            "n3": writes("style.py", "COSM-n3")}
+
+
+def test_a_reviewer_inside_a_usage_limit_window_hands_the_carrying_head_to_the_fallback(
+        env):
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _usage_limited_round(world, fleet, cosmetic=False)
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    h1 = driver._last_substantive_head
+    assert SUBST in world.markers(h1)
+    assert world.summons == [world.h0, h1], "claude was asked about H1"
+    assert "claude" in driver._rate_limited_until
+    assert world.codex_summons == [world.h0, h1], "the parked codex was asked about H1"
+    assert outcome.merged is True and world.merges == [world.remote_tip()]
+
+
+def test_the_cosmetic_twin_of_a_usage_limited_round_merges_with_nobody_asked_again(env):
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _usage_limited_round(world, fleet, cosmetic=True)
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    _assert_merged_on_the_review_in_hand(world, driver, outcome)
+
+
+@pytest.mark.parametrize("fallback_answer", ["silent", "stale-sign-off"])
+def test_the_fallback_asks_each_set_aside_reviewer_once_then_the_run_ends_blocked(
+        env, capsys, fallback_answer):
+    # A generous round budget, and nobody ever reviews H1: codex stays silent, and
+    # claude, asked once as the fallback, stays silent too or answers only with a
+    # sign-off written before it was asked (done again, but not a review of H1).
+    # Each set-aside reviewer is asked once: the run ends at round 3, blocked.
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _round_one(world, fleet, "substantive", cosmetic=False)
+    if fallback_answer == "stale-sign-off":
+        fleet.post("claude", 2, "s3", "No issues found.", inline=False)
+
+    driver, outcome = _fleet_run(world, fleet, behaviours, max_rounds=10)
+
+    h1 = driver._last_substantive_head
+    assert world.summons == [world.h0, h1] and world.codex_summons == [world.h0, h1]
+    assert outcome.rounds == 3
+    assert world.merges == [] and outcome.merged is False
+    assert capsys.readouterr().out.count("; re-asking ") == 1
+
+
+@pytest.mark.parametrize("path", ["nothing-to-act-on", "late-comment"])
+def test_with_no_round_left_the_carrying_head_is_handed_back_blocked(env, path):
+    # The round that would need the fallback is the last one the budget allows.
+    # Nobody is taken back or asked; the merge gate blocks the unreviewed head.
+    world, gate = env
+    fleet = Fleet(world)
+    if path == "late-comment":
+        behaviours = _late_nit_round(world, fleet, cosmetic=False)
+    else:
+        behaviours = _round_one(world, fleet, "substantive", cosmetic=False)
+
+    driver, outcome = _fleet_run(world, fleet, behaviours, max_rounds=2)
+
+    assert world.summons == [world.h0], "claude was not asked with no round left"
+    assert "claude" in driver.polishing, "and was not taken back either"
+    assert outcome.rounds == 2
+    assert world.merges == [] and outcome.merged is False
+
+
+def test_a_cosmetic_round_whose_only_review_is_of_an_older_head_asks_nobody_again(env):
+    # Nothing this run pushed carries unseen changes: claude's nit (written against
+    # the commit before H0) is fixed on a clean tree. The merge gate still finds no
+    # review of H0 or later and blocks — as it always has — but nobody is re-asked
+    # for a cosmetic-only round.
+    world, gate = env
+    fleet = Fleet(world)
+    older = git(world.repo, "rev-parse", "HEAD~1")
+    fleet.post("claude", 1, "n1", "[cosmetic] nit: wording in style", anchor=older)
+    fleet.post("codex", 1, "s1", "No issues found.", inline=False)
+
+    driver, outcome = _fleet_run(world, fleet, {"n1": writes("style.py", COSM)})
+
+    assert driver._last_substantive_head == world.h0
+    assert world.summons == [world.h0] and world.codex_summons == [world.h0]
+    assert outcome.rounds == 1
+    assert world.merges == [] and outcome.merged is False
+
+
+@pytest.mark.parametrize("why", ["usage-limited", "quota"])
+def test_a_set_aside_reviewer_that_cannot_answer_is_not_asked(env, capsys, why):
+    # claude was parked by round 1, but by the time codex leaves H1 unreviewed it
+    # cannot answer: its usage window ran out in round 1 (long after the run ends),
+    # or its quota notice arrived in round 2. Nobody is left to ask, so the run ends
+    # blocked at round 2 without claiming to re-ask anyone.
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _round_one(world, fleet, "substantive", cosmetic=False)
+    if why == "usage-limited":
+        fleet.post("claude", 1, "m1",
+                   "<!-- claude-review-unavailable-v1 type=rate_limited "
+                   "resets_at=4000000000 -->", inline=False, source="github-actions[bot]")
+    else:
+        fleet.post("claude", 2, "q2", "Usage limit reached: you have exhausted your "
+                   "quota for this period.", inline=False, after="codex")
+
+    driver, outcome = _fleet_run(world, fleet, behaviours)
+
+    assert "claude" in driver.polishing
+    assert world.summons == [world.h0]
+    assert outcome.rounds == 2
+    assert world.merges == [] and outcome.merged is False
+    assert "re-asking" not in capsys.readouterr().out
+
+
+def test_a_reviewer_already_re_asked_for_a_carrying_commit_is_not_asked_again(env):
+    # A leftover is on disk. Round 1: claude's nit is fixed (claude parked) and codex
+    # signs off (done), so nobody is expected when the round's commit (H1) carries the
+    # leftover: claude, which spoke, is re-asked about H1 at once. It answers only
+    # with a sign-off that cannot be credited to H1 — done again, but no review of
+    # it. claude has had its turn for H1; codex, set aside and not yet asked about
+    # H1, is the one the fallback asks.
+    world, gate = env
+    fleet = Fleet(world)
+    fleet.post("claude", 1, "n1", "[cosmetic] nit: wording in style")
+    fleet.post("codex", 1, "s1", "No issues found.", inline=False)
+    fleet.post("claude", 2, "s2", "No issues found.", inline=False)
+    _edit_engine(world)
+
+    driver, outcome = _fleet_run(world, fleet, {"n1": writes("style.py", COSM)})
+
+    h1 = driver._last_substantive_head
+    assert SUBST in world.markers(h1)
+    assert world.summons == [world.h0, h1], "claude: asked about H1 once"
+    assert world.codex_summons == [world.h0, h1], "codex: the fallback for H1"
+    assert outcome.rounds == 3
+    assert world.merges == [] and outcome.merged is False
+
+
+def test_each_new_carrying_head_gets_its_own_fallback(env):
+    # H1 carries codex's fix; codex leaves it unreviewed and claude, the fallback,
+    # reviews it — with a SUBSTANTIVE finding of its own, whose fix makes H2 another
+    # carrying head. claude, re-asked about H2 as its reviewer, answers only with a
+    # sign-off that cannot be credited to H2. H2 is a new head: claude may be taken
+    # back for it once more, and its review of H2 then lands.
+    world, gate = env
+    fleet = Fleet(world)
+    behaviours = _round_one(world, fleet, "substantive", cosmetic=False)
+    fleet.post("claude", 2, "f3", "[substantive] the bounds check in engine is missing")
+    behaviours["f3"] = writes("engine.py", "SUBST-f3")
+    fleet.post("claude", 3, "s4", "No issues found.", inline=False)
+    fleet.post("claude", 4, "n5", "[cosmetic] nit: docstring in style")
+    behaviours["n5"] = writes("style.py", "COSM-n5")
+
+    driver, outcome = _fleet_run(world, fleet, behaviours, max_rounds=6)
+
+    h1, h2 = world.codex_summons[1], driver._last_substantive_head
+    assert SUBST in world.markers(h1) and "SUBST-f3" in world.markers(h2)
+    # claude: round 1 about H0, the fallback for H1, the re-review of its own fix,
+    # then the fallback for H2.
+    assert world.summons == [world.h0, h1, h2, h2]
+    assert outcome.merged is True and world.merges == [world.remote_tip()]

@@ -1372,28 +1372,59 @@ def _two_reviewer_inline(anchors, timeline, clock):
     return inline_fetch
 
 
-def test_a_leftover_carrying_round_leaves_the_parks_alone_while_another_reviewer_covers_the_head():
-    # The tree is dirty at round 1. claude's SUBSTANTIVE finding is fixed (claude
-    # stays expected, to verify its fix) and copilot's nit is fixed (copilot parked
-    # polish-only). The commit carries the leftover, but claude's review of the new
-    # head is all the gate needs, so copilot stays parked and is not re-asked.
-    gh, clock = SteppingGh(), FakeClock()
+_CLAUDE_SIGNS_OFF_H1 = Comment(id="s2", text="No issues found.", source="claude[bot]",
+                               from_issue_channel=True,
+                               created_at="2026-01-01T02:00:00+00:00")
+
+
+def _leftover_carrying_round_with_claude_expected(gh, clock, round_2):
+    """The tree is dirty at round 1. claude's SUBSTANTIVE finding is fixed (claude
+    stays expected, to verify its fix) and copilot's nit is fixed (copilot parked
+    polish-only); the commit (H1) carries the leftover. ``round_2`` is what claude
+    posts once re-asked about H1."""
     gh.dirty = True
-    timeline = [(0, _FINDING), (0, _COPILOT_NIT)]
+    timeline = [(0, _FINDING), (0, _COPILOT_NIT)] + [(200, c) for c in round_2]
 
     def fix(c, r):
         gh.dirty = True
         return FixOutcome(status="applied")
-    driver = _content_round_driver(
+    inline = [(t, c) for t, c in timeline if c.path]
+    return _content_round_driver(
         label="SUBSTANTIVE", timeline=timeline, gh=gh, clock=clock, cfg=TWO_REVIEWERS,
         fix=fix, fresh_tree=False,
-        inline_fetch=_two_reviewer_inline({"f1": "H0", "n1": "H0"}, timeline, clock))
+        inline_fetch=_two_reviewer_inline({"f1": "H0", "n1": "H0"}, inline, clock))
+
+
+def test_a_leftover_carrying_round_leaves_the_parks_alone_while_another_reviewer_covers_the_head():
+    # claude, still expected, reviews H1 in round 2 (a sign-off after it was asked).
+    # That review is all the gate needs, so copilot stays parked, is not re-asked,
+    # and the PR merges on claude's review of H1.
+    gh, clock = SteppingGh(), FakeClock()
+    driver = _leftover_carrying_round_with_claude_expected(
+        gh, clock, [_CLAUDE_SIGNS_OFF_H1])
     outcome = driver.run()
     assert driver._last_substantive_head == "H1"
+    assert driver._clean_signal_head.get("claude") == "H1"
     assert "copilot" in driver.polishing
     assert len(gh.matching("requested_reviewers")) == 1, "copilot: round 1 only"
     assert len(gh.matching("@claude review")) == 2
+    assert outcome.merged is True and _pinned(gh) == ["H1"]
+
+
+def test_a_leftover_carrying_round_asks_the_parked_reviewer_when_the_expected_one_stays_silent():
+    # claude, still expected, leaves its round-2 re-request about H1 unanswered. With
+    # a round left, the run does not end on an unreviewed H1: copilot — parked, not
+    # finished with — is asked about it in round 3. It stays silent too, so nothing
+    # merges, and nobody is asked a second time.
+    gh, clock = SteppingGh(), FakeClock()
+    driver = _leftover_carrying_round_with_claude_expected(gh, clock, [])
+    outcome = driver.run()
+    assert driver._last_substantive_head == "H1"
+    assert len(gh.matching("requested_reviewers")) == 2, "copilot: round 1, then about H1"
+    assert len(gh.matching("@claude review")) == 2
+    assert outcome.rounds == 3
     assert outcome.merged is False
+    assert gh.matching("gh", "merge", "--squash") == []
 
 
 def test_only_the_reviewer_parked_by_the_carrying_round_is_re_asked():
