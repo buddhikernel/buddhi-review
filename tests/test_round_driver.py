@@ -53,9 +53,10 @@ HEAD_TIME = "2020-01-01T00:00:00+00:00"
 
 class GhRecorder:
     """Records every gh/git/test spawn; answers `git status` with a dirty tree,
-    `git rev-parse HEAD` with the constant :data:`HEAD_SHA`, and
-    `git merge-base --is-ancestor` as satisfied (rc 0) — so the F2 head-aware
-    merge gate resolves a stable single-commit head in the network-free harness.
+    `git rev-parse HEAD` — and GitHub's PR head (`gh api …/pulls/N -q .head.sha`) —
+    with the constant :data:`HEAD_SHA`, and `git merge-base --is-ancestor` as
+    satisfied (rc 0) — so the F2 head-aware merge gate resolves a stable
+    single-commit head in the network-free harness.
 
     A subclass that overrides ``__call__`` for its own gh answers should record the
     call itself and fall through to :meth:`_reply` (NOT ``super().__call__``, which
@@ -66,7 +67,8 @@ class GhRecorder:
     def _reply(argv):
         """The canned reply for the common git reads (F2 gate + round loop),
         WITHOUT recording — the caller has already appended to ``self.calls``."""
-        if argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD":
+        if (argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD") or (
+                argv[:2] == ["gh", "api"] and ".head.sha" in argv):
             return subprocess.CompletedProcess(argv, 0, stdout=HEAD_SHA + "\n", stderr="")
         if argv[:3] == ["git", "show", "-s"]:
             # The head's committer date — F2's freshness cutoff. Dated BEFORE the
@@ -82,6 +84,56 @@ class GhRecorder:
         return self._reply(argv)
     def matching(self, *needles):
         return [c for c in self.calls if all(any(n in a for a in c) for n in needles)]
+
+
+class FreshTreeGh(GhRecorder):
+    """A :class:`GhRecorder` whose worktree reads CLEAN until a fixer applies a
+    change, and clean again once the round's push has shipped it — the tree a fresh
+    run meets. The base recorder's always-dirty tree reads, at the top of round 1,
+    as changes already sitting uncommitted before any fixer ran: content no
+    reviewer has seen, which a cosmetic-only round's commit may not carry on the
+    review already in hand. Wrap the test's fix seam with :meth:`writes`."""
+
+    def __init__(self):
+        super().__init__()
+        self.dirty = False
+
+    def writes(self, fix):
+        def dispatch(c, r):
+            outcome = fix(c, r)
+            if outcome.status == "applied":
+                self.dirty = True
+            return outcome
+        return dispatch
+
+    def __call__(self, argv, *, cwd=None, timeout=None):
+        argv = list(argv)
+        self.calls.append(argv)
+        if argv[:3] == ["git", "status", "--porcelain"]:
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=" M x.py\n" if self.dirty else "", stderr="")
+        if argv[:2] == ["git", "push"]:
+            self.dirty = False
+        return self._reply(argv)
+
+
+def test_worktree_residue_ignores_unstaged_submodule_content():
+    # A dirty submodule's worktree does not alter its parent gitlink, so the
+    # round's ``git add -A`` cannot stage it.  The round-start residue sample must
+    # ask git to suppress precisely that non-stageable status.
+    class SubmoduleDirtyGh(GhRecorder):
+        def __call__(self, argv, *, cwd=None, timeout=None):
+            argv = list(argv)
+            self.calls.append(argv)
+            if argv[:3] == ["git", "status", "--porcelain"]:
+                assert "--ignore-submodules=dirty" in argv
+                return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
+            return self._reply(argv)
+
+    gh = SubmoduleDirtyGh()
+    driver, _, _ = make_driver([], cfg=CLAUDE_ONLY, gh=gh)
+
+    assert driver._worktree_residue() is False
 
 
 def label_runner(label):
@@ -1084,8 +1136,10 @@ def test_cosmetic_only_round_ends_the_run_clean():
     # auto-merge) with NO re-request round.
     timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]"))]
     fix: FixDispatch = lambda c, r: FixOutcome(status="applied")
+    tree = FreshTreeGh()   # the tree is clean until the fixer writes to it
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=tree.writes(fix), gh=tree,
         auto_merge=True, answer_waiter=lambda esc, **k: {},
     )
     outcome = driver.run()
@@ -1287,8 +1341,9 @@ def test_mixed_dismissed_substantive_and_cosmetic_is_reviewed_no_change(capsys):
             return FixOutcome(status="skipped", detail="SKIP: the cited path is unreachable")
         return FixOutcome(status="applied")
 
+    tree = FreshTreeGh()   # the tree is clean until the fixer writes to it
     driver, clock, gh = make_driver(
-        timeline, cfg=cfg, classify=classify, fix=fix,
+        timeline, cfg=cfg, classify=classify, fix=tree.writes(fix), gh=tree,
         max_rounds=3, answer_waiter=lambda esc, **k: {},
     )
     driver.run()
@@ -1551,8 +1606,10 @@ def test_preflight_processes_pre_existing_comment_in_round1_without_waiting():
         return FixOutcome(status="applied")
 
     timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]"))]
+    tree = FreshTreeGh()   # the tree is clean until the fixer writes to it
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=tree.writes(fix), gh=tree,
         auto_merge=True, answer_waiter=lambda esc, **k: {}, preflight=True)
     outcome = driver.run()
     assert outcome.status == "clean" and outcome.rounds == 1
@@ -1947,8 +2004,10 @@ def test_rr_active_cosmetic_only_responder_is_not_force_re_reviewed():
                        idle_timeout=900, max_wait_total=1800, register_delay=60)
     timeline = [(0, Comment(id="a", text="rename tmp for clarity", source="claude[bot]",
                             path="x.py", diff_hunk="@@ -1 +1 @@"))]
+    tree = FreshTreeGh()   # the tree is clean until the fixer writes to it
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"), fix=fix,
+        timeline, cfg=CLAUDE_ONLY, classify=label_runner("COSMETIC"),
+        fix=tree.writes(fix), gh=tree,
         rr_active=True, preflight=True, max_rounds=3, times=times,
         answer_waiter=lambda esc, **k: {})
     outcome = driver.run()
@@ -2110,8 +2169,8 @@ def test_rr_active_run_start_fleet_still_full_after_restores(tmp_path, monkeypat
     # an all-approved + all-polish restart still reads as "reviewers existed and
     # reviewed" (merge), never "no reviewers configured" (quiet skip).
     monkeypatch.setenv(polish_state.STATE_DIR_ENV, str(tmp_path))
-    monkeypatch.setenv(round_driver.HEAD_SHA_ENV, "H1")
-    polish_state.write_polish_state("7", "o/r", "H1", ["copilot"])
+    monkeypatch.setenv(round_driver.HEAD_SHA_ENV, HEAD_SHA)
+    polish_state.write_polish_state("7", "o/r", HEAD_SHA, ["copilot"])
     cfg = {"active_reviewers": ["claude", "copilot"],
            "auto_on_open": {"claude": False, "copilot": True}}
     timeline = [(0, Comment(id="a", text="No issues found.", source="claude[bot]",

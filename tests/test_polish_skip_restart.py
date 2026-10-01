@@ -89,9 +89,13 @@ class GhHead:
     the loop being killed mid-run."""
 
     def __init__(self, head="H0", advance_to="H1", kill_on=None, kill_after=0,
-                 head_fails=False, name_with_owner=None):
+                 head_fails=False, name_with_owner=None, dirty=True):
         self.calls = []
         self.head = head
+        # Whether the worktree reads as holding an uncommitted change. Dirty from the
+        # start by default; a test that models a clean tree passes ``dirty=False``
+        # and flips it when its fix lands.
+        self.dirty = dirty
         self.advance_to = advance_to
         self.kill_on = kill_on           # substring of the spawn that kills the loop
         self.kill_after = kill_after     # …but let this many of them through first
@@ -109,7 +113,7 @@ class GhHead:
             self.kill_after -= 1
         out = ""
         if argv[:3] == ["git", "status", "--porcelain"]:
-            out = " M x.py\n"
+            out = " M x.py\n" if self.dirty else ""
         elif ".head.sha" in argv or (argv[:2] == ["git", "rev-parse"] and argv[-1] == "HEAD"):
             # Both the polish tip guard (`gh api …/pulls -q .head.sha`) and the F2
             # head-aware gate (`git rev-parse HEAD`) read the SAME moving tip here.
@@ -253,7 +257,19 @@ def _killed_mixed_round():
 # The anchor: a mixed round, killed, restarted
 # ---------------------------------------------------------------------------
 
-def test_mixed_round_polish_verdict_survives_a_kill_and_restart():
+def _copilot_asks(gh):
+    """Where each copilot re-request falls: the number of '@claude review' summons
+    posted before it."""
+    claude_so_far, asks = 0, []
+    for argv in gh.calls:
+        if any("@claude review" in a for a in argv):
+            claude_so_far += 1
+        elif any("requested_reviewers" in a for a in argv):
+            asks.append(claude_so_far)
+    return asks
+
+
+def test_mixed_round_polish_verdict_survives_a_kill_and_restart(capsys):
     driver1, gh1 = _killed_mixed_round()
     assert driver1.polishing == {"copilot"}          # round 1's polish-only verdict
     assert gh1.head == "H1"                          # the fix push advanced the tip
@@ -271,9 +287,16 @@ def test_mixed_round_polish_verdict_survives_a_kill_and_restart():
                                   rr_active=True, preflight=True, auto_merge=True,
                                   max_rounds=3)
     outcome = driver2.run()
-    assert "copilot" in driver2.polishing                  # verdict restored …
-    assert gh2.matching("requested_reviewers") == []       # … so it is never re-asked
+    # The verdict is restored, so copilot is not re-asked for its polish: neither the
+    # restart's round 1 nor round 2 (claude's re-review of the re-applied fix, H2)
+    # summons it. (claude, which spoke at preflight, is first re-requested in round 2.)
+    assert "[rr-active] copilot: polish-only at this HEAD" in capsys.readouterr().out
     assert "copilot" in driver2.reviewed_ever              # and it still counts as reviewed
+    # claude stays silent about H2, a head carrying a fix nobody has reviewed, so with a
+    # round left the run asks copilot — set aside, not finished with — once, after
+    # claude's re-request, as the fallback reviewer (tests/test_leftover_fix_boundary.py
+    # pins that rule).
+    assert _copilot_asks(gh2) == [1]
     # This test's SUBJECT — the polish verdict surviving the kill — is unchanged above.
     # The merge outcome is not: copilot's verdict was reached against H0, and the
     # killed run's fix (H1) plus the restart's re-applied fix (H2) are commits NO
@@ -283,8 +306,32 @@ def test_mixed_round_polish_verdict_survives_a_kill_and_restart():
     # onto the post-fix head — the blindness this suite's fetches no longer have.)
     assert outcome.merged is False
     assert gh2.matching("gh", "merge", "--squash") == []
-    # Not merged → the polish verdict is still live for the next restart.
-    assert os.path.exists(polish_state.state_path(PR, REPO))
+    # Not merged → the record stays for the next restart, but copilot is no longer in
+    # it: it was taken back to review H2 and has not, so a restart must ask it again.
+    state = polish_state.read_polish_state(PR, REPO)
+    assert state["tip_sha"] == "H2" and state["bots"] == []
+
+
+def test_a_reviewer_taken_back_as_the_fallback_is_no_longer_stamped_polish_only():
+    # A plain run: round 1 fixes claude's finding and copilot's nit (H1) and stamps
+    # copilot polish-only at H1. claude leaves its re-request about H1 unanswered, so
+    # copilot is taken back to review H1 — and the record at H1 must stop listing it,
+    # or a restart there would restore it as polish-only and skip the one reviewer
+    # asked to look at H1. (The record is this run's own, so the smaller set replaces
+    # it even though the tip has not moved.)
+    gh = GhHead(head="H0", advance_to="H1", dirty=False)
+
+    def fix_dirties_the_tree(c, r):
+        gh.dirty = True
+        return FixOutcome(status="applied")
+    driver, clock = make_driver([(0, SUBSTANTIVE), (0, COSMETIC)], gh=gh, max_rounds=3,
+                                fix_dispatch=fix_dirties_the_tree)
+    outcome = driver.run()
+    assert gh.head == "H1" and driver._last_substantive_head == "H1"
+    assert _copilot_asks(gh) == [2], "copilot asked about H1 after claude's silence"
+    assert outcome.merged is False
+    state = polish_state.read_polish_state(PR, REPO)
+    assert state["tip_sha"] == "H1" and state["bots"] == []
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +453,7 @@ def test_repo_less_run_keys_polish_state_on_the_cwd_inferred_repo():
     assert not os.path.exists(polish_state.state_path(PR, None))
 
 
-def test_restart_omitting_repo_still_restores_a_run_that_passed_it():
+def test_restart_omitting_repo_still_restores_a_run_that_passed_it(capsys):
     # Run 1 passes --repo explicitly; the restart omits it but shares the same
     # cwd/remote, so it must resolve to the SAME key and restore the verdict.
     _killed_mixed_round()
@@ -416,8 +463,11 @@ def test_restart_omitting_repo_still_restores_a_run_that_passed_it():
     driver2, clock2 = make_driver([(0, SUBSTANTIVE), (0, COSMETIC)], gh=gh2,
                                   repo=None, rr_active=True, preflight=True, max_rounds=3)
     driver2.run()
-    assert "copilot" in driver2.polishing                  # restored despite --repo omitted
-    assert gh2.matching("requested_reviewers") == []
+    # Restored despite --repo omitted: copilot is not summoned for polish. (Its one
+    # request comes after claude's re-request, which claude leaves unanswered: it is the
+    # fallback reviewer for a head nobody has reviewed.)
+    assert "[rr-active] copilot: polish-only at this HEAD" in capsys.readouterr().out
+    assert _copilot_asks(gh2) == [1]
 
 
 def test_polish_is_not_restored_when_head_has_moved():
@@ -448,6 +498,24 @@ def test_unknown_tip_on_write_stamps_nothing():
     assert driver.polishing == {"copilot"}                    # the verdict was reached …
     assert polish_state.read_polish_state(PR, REPO) is None   # … but never stamped
     assert not os.path.exists(polish_state.state_path(PR, REPO))
+
+
+def test_a_commit_carrying_leftover_changes_never_stamps_its_parked_reviewer_at_the_new_tip():
+    # GhHead's worktree reads dirty from the start: changes were already sitting
+    # uncommitted when round 1 began. copilot's nit is fixed and the commit (H1)
+    # carries those changes too, so copilot's polish verdict — reached on H0 — is
+    # not a verdict on H1: copilot is re-asked, and H1 is never stamped with it
+    # (a restart at H1 would otherwise skip the one reviewer left to look at it).
+    gh = GhHead(head="H0", advance_to="H1")
+    cfg = {"active_reviewers": ["copilot"], "auto_on_open": {"copilot": True}}
+    driver, clock = make_driver([(0, COSMETIC)], gh=gh, cfg=cfg, max_rounds=3)
+    outcome = driver.run()
+    assert gh.head == "H1"
+    assert "copilot" not in driver.polishing
+    assert gh.matching("requested_reviewers"), "copilot is re-asked about H1"
+    state = polish_state.read_polish_state(PR, REPO)
+    assert state is None or "copilot" not in state["bots"]
+    assert outcome.merged is False
 
 
 def test_unknown_live_head_on_restore_restores_nothing():
@@ -513,7 +581,14 @@ def test_all_polish_restart_auto_merges_when_the_killed_run_pushed_nothing():
     # (no substantive fix moved the head after they looked), so the head-aware gate
     # anchors them to H1 and the merge is the one the operator is entitled to.
     polish_state.write_polish_state(PR, REPO, "H1", ["claude", "copilot"])
-    gh = GhHead(head="H1")
+    # The worktree starts CLEAN (nothing was left behind); only the round's own fix
+    # dirties it. A dirty start would hand the commit content no reviewer has seen, and
+    # the restored reviewers — who spoke this round — would rightly be re-asked.
+    gh = GhHead(head="H1", dirty=False)
+
+    def fix_dirties_the_tree(c, r):
+        gh.dirty = True
+        return FixOutcome(status="applied")
     # Their cosmetic comments are still on the PR, anchored (by GitHub) to H1 — the
     # head they were written against. THAT is what credits them at the merge gate; no
     # synthetic anchor is involved, so nothing can drift.
@@ -521,7 +596,8 @@ def test_all_polish_restart_auto_merges_when_the_killed_run_pushed_nothing():
                               source="claude[bot]", path="a.py", diff_hunk="@@ -1 +1 @@")
     driver, clock = make_driver([(0, claude_cosmetic), (0, COSMETIC)], gh=gh,
                                 rr_active=True, preflight=True,
-                                auto_merge=True, max_rounds=3)
+                                auto_merge=True, max_rounds=3,
+                                fix_dispatch=fix_dirties_the_tree)
     outcome = driver.run()
     assert driver.polishing == {"claude", "copilot"}
     assert driver._run_start_fleet == {"claude", "copilot"}   # the gate's universe is intact
@@ -630,9 +706,16 @@ def test_polish_verdict_survives_an_escalation_handback_and_restart():
     assert state["bots"] == ["copilot"] and state["tip_sha"] == "H0"
 
     # The operator answers the question, then re-runs --rr-active at the same head.
-    gh2 = GhHead(head="H0")
+    # The restart's worktree is CLEAN (the hand-back fired before anything was written),
+    # so its only commit is copilot's cosmetic fix: nothing unreviewed rides it.
+    gh2 = GhHead(head="H0", dirty=False)
+
+    def fix_dirties_the_tree(c, r):
+        gh2.dirty = True
+        return FixOutcome(status="applied")
     driver2, _ = make_driver([(0, question), (0, COSMETIC)], gh=gh2, rr_active=True,
-                             preflight=True, max_rounds=3)
+                             preflight=True, max_rounds=3,
+                             fix_dispatch=fix_dirties_the_tree)
     driver2.run()
     assert "copilot" in driver2.polishing                # verdict restored …
     assert gh2.matching("requested_reviewers") == []     # … so it is never re-asked
