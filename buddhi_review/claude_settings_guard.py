@@ -75,9 +75,10 @@ from typing import Callable, Dict, Iterator, List, Optional, Set, Tuple
 # switch servers OFF) and ``model`` (the spawn's explicit ``--model`` outranks
 # it). ``disableAllHooks`` is deliberately absent: a PR-supplied ``true`` would
 # switch off the base-trusted hooks this guard keeps live, so it must match base.
+# So is ``cleanupPeriodDays``: it drives a sweep that deletes the user's
+# transcripts and other history under ``~/.claude`` older than that many days.
 INERT_KEYS = frozenset({
     "alwaysThinkingEnabled",
-    "cleanupPeriodDays",
     "disabledMcpjsonServers",
     "includeCoAuthoredBy",
     "messageIdleNotifThresholdMs",
@@ -1078,7 +1079,7 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
             if text in _CODE_OPTIONS[family] or (flags and flags.group(2)):
                 st.script_next = False
                 st.code_next = "-m" if (flags and flags.group(2) == "m") or text == "-m" else "-c"
-            elif text in _ARG_OPTIONS:
+            elif text in _ARG_OPTIONS and not flags:  # Python's -I is a flag, not ruby's -I DIR
                 st.arg_next = True
         elif st.script_next:
             script, st.script_next = True, False
@@ -2396,21 +2397,27 @@ def _put_back_file(checkout: str, root: _Dir, h: _Held, rel: str, token: str, sa
     """Put the original back.
 
     Found exactly as the guard left it, the file gets its original bytes back.
-    Otherwise a spawn changed it, and what happens depends on who else holds the
-    original:
+    Otherwise a spawn changed it:
 
-    * git holds it (a tracked file with no local edit): the spawn's change is kept
-      as C6 asks — an edited file keeps the edit and gets back the held keys it
-      did not re-state; a deleted or replaced file (or a removed ``.claude``)
-      stays that way, since resurrecting held-back keys into a file its author
-      removed would ride the next commit, and git can always bring it back;
-    * only the journal holds it (an untracked file, or a local edit such as a
-      ``--skip-worktree`` override): nothing is merged or recreated in the
-      checkout, where the next ``git add -A`` could pick a secret up; the
-      original is saved, owner-only, beside the journal, and named.
+    * it left an edited file whose bytes are one JSON object: the edit is kept,
+      and each key the guard held back that the spawn did not re-state is merged
+      back in — read off the bytes the guard wrote, so a key the spawn could see
+      and deleted stays deleted;
+    * the original is not one JSON object: there is nothing to merge into, so the
+      original's bytes win and the dropped edit is announced;
+    * the spawn deleted or replaced the file, removed ``.claude``, or left bytes
+      that are not one JSON object: there is no edited object to merge into, so
+      the spawn's change stays. When git holds the original (a tracked file with
+      no local edit), git can always bring it back — and held keys resurrected
+      into a file its author removed would ride the next commit. When only the
+      journal holds it (an untracked file, or a local edit such as a
+      ``--skip-worktree`` override), the original is saved, owner-only, beside
+      the journal, and named.
 
-    Nothing is ever written through a ``.claude`` that is no longer a real
-    directory."""
+    Whatever is written goes through a temp file at the file's original mode.
+    Bytes only the journal holds go back only into a ``.claude`` no wider than it
+    was, flushed all the way before the journal is dropped. Nothing is ever
+    written through a ``.claude`` that is no longer a real directory."""
     cst = root.lstat(CLAUDE_DIR)
     claude = root.child(CLAUDE_DIR) if cst is not None and stat.S_ISDIR(cst.st_mode) else None
     try:
@@ -2431,21 +2438,25 @@ def _put_back_file(checkout: str, root: _Dir, h: _Held, rel: str, token: str, sa
             # that holds them is dropped.
             claude.write(name, h.original, h.mode, token, full=not h.git_holds)
             return "restored"
-        if not h.git_holds:
-            saved = _save_original(checkout, h, token)
-            say(f"{rel}: the file was changed while settings were held back from it; nothing "
-                f"was merged back into it, and its original, which exists nowhere else, was "
-                f"saved to {saved}")
-            return "saved"
-        if current is None:
+        unmergeable = current is not None and _parse(h.original) is not None and (
+            _blank(current) or _parse(current) is None)
+        if current is None or (unmergeable and not h.git_holds):
+            if not h.git_holds:
+                saved = _save_original(checkout, h, token)
+                say(f"{rel}: the file was changed while settings were held back from it; "
+                    f"nothing was merged back into it, and its original, which exists "
+                    f"nowhere else, was saved to {saved}")
+                return "saved"
             what = (f"{CLAUDE_DIR} was removed" if cst is None
                     else f"{CLAUDE_DIR} was replaced" if claude is None
                     else "the file was deleted" if st is None else "the file was replaced")
             say(f"{rel}: {what} while settings were held back from it; they "
                 f"({', '.join(_held_keys(h))}) were not put back")
             return "kept"
+        if not h.git_holds:
+            _narrow_dir(claude, h.dir_mode)
         data, note = _merge(h, current, rel)
-        claude.write(name, data, h.mode, token)
+        claude.write(name, data, h.mode, token, full=not h.git_holds)
         if note:
             say(note)
         return "merged"
@@ -2475,7 +2486,7 @@ def _save_original(checkout: str, h: _Held, token: str) -> str:
 
 
 def _merge(h: _Held, current: bytes, rel: str) -> Tuple[bytes, Optional[str]]:
-    """A spawn changed a file git holds the original of (an empty file reads as
+    """A spawn edited a held file (for a file git holds, an empty file reads as
     ``{}``). Its keys win — a key it re-stated is its own — and the keys the guard
     held back that it did not re-state are merged back, read off the bytes the
     guard actually wrote, so a key the spawn could see and deleted stays deleted.

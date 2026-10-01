@@ -407,6 +407,24 @@ def test_resolver_needs_the_fully_qualified_tracking_ref(monkeypatch, tmp_path):
     assert resolver.last_error == "refs/remotes/origin/main does not exist"
 
 
+def test_resolver_returns_where_the_pr_branched_not_the_base_tip(monkeypatch, tmp_path):
+    """C11: the trusted commit is the merge-base of HEAD and the base branch. The
+    base moved on after the PR branched; its tip holds commits the PR never saw,
+    so the resolver answers with the commit the PR branched from."""
+    repo = make_pr_repo(tmp_path, {}, {})
+    write(repo.primary, "later.txt", "main moved on\n")
+    git(repo.primary, "add", "-A")
+    git(repo.primary, "commit", "-qm", "main moves on")
+    tip = git(repo.primary, "rev-parse", "HEAD").strip()
+    git(repo.primary, "update-ref", "refs/remotes/origin/main", tip)
+    stub = ClaudeStub(real_run=subprocess.run)
+    for k, v in OFFLINE_GIT.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(subprocess, "run", stub)
+    found = merge.PullRequestBase("7", "o/r")(str(repo.wt))
+    assert tip != repo.base and found == repo.base
+
+
 # ── A16: a hook naming the checkout root is stripped, even on an empty PR ─────────
 
 def _root_forms(markers):
