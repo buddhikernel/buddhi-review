@@ -1,7 +1,7 @@
 """The interactive setup wizard — ``python3 -m buddhi_review setup``.
 
 Walks the user through the free configuration surface and writes
-``~/.config/review-loop/config.yaml`` (the path :mod:`buddhi_review.config`
+``~/.config/buddhi/config.yaml`` (the path :mod:`buddhi_review.config`
 reads). The ordered flow mirrors the reference wizard, with the two budget /
 monitoring steps shown as single-line locked upgrade teasers (they persist
 nothing):
@@ -803,7 +803,19 @@ def merge_preserving(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str,
 
 
 def write_config(cfg: Dict[str, Any], path: Path) -> bool:
-    """Atomically write ``cfg`` to ``path`` (temp file + ``os.replace``) at 0600."""
+    """Atomically write ``cfg`` to ``path`` (temp file + ``os.replace``) at 0600,
+    under the config lock (:func:`buddhi_review.config.config_lock`, re-entrant, so
+    a caller that already holds it for its read-modify-write simply continues).
+    Returns ``False``, writing nothing, when another process kept the lock past its
+    timeout: that holder may be mid read-modify-write and would overwrite this
+    write with its stale snapshot."""
+    with config.config_lock(path) as may_write:
+        if not may_write:
+            return False
+        return _write_config_unlocked(cfg, path)
+
+
+def _write_config_unlocked(cfg: Dict[str, Any], path: Path) -> bool:
     try:
         import yaml
     except ImportError:  # pragma: no cover - PyYAML is a hard dep
@@ -2856,16 +2868,24 @@ def _offer_first_review(repo: Optional[str], *, pal, stream, input_fn=input) -> 
 # ── Per-repo confirm mode (parity with the reference wizard) ───────────────────────
 
 def _write_global_default(reviewers: Sequence[str], auto_on_open: Dict[str, bool],
-                          path: Path) -> bool:
+                          path: Path, *, auto_merge: Optional[bool] = None,
+                          label_gated_ci: Optional[bool] = None) -> bool:
     """Persist the top-level (global-default) reviewer fleet + ``auto_on_open``,
     leaving every other key — sibling ``repos`` entries included — intact. The
     global default is the fall-back fleet for repos with no confirmed entry
-    (:func:`buddhi_review.config.has_global_default`)."""
-    existing = config.load_config(path) if path.exists() else {}
-    cfg = dict(existing)
-    cfg["active_reviewers"] = list(reviewers)
-    cfg["auto_on_open"] = {b: bool(v) for b, v in auto_on_open.items()}
-    return write_config(cfg, path)
+    (:func:`buddhi_review.config.has_global_default`). For each of ``auto_merge`` /
+    ``label_gated_ci`` that was asked (not ``None``) a top-level key is established
+    too — always ``False``, never the repo's own answer
+    (:func:`buddhi_review.config.establish_global_defaults`) — so a global exists
+    for the per-repo choice gates. One locked read-modify-write."""
+    with config.config_lock(path):
+        existing = config.load_config(path) if path.exists() else {}
+        cfg = dict(existing)
+        cfg["active_reviewers"] = list(reviewers)
+        cfg["auto_on_open"] = {b: bool(v) for b, v in auto_on_open.items()}
+        cfg = config.establish_global_defaults(cfg, auto_merge=auto_merge,
+                                               label_gated_ci=label_gated_ci)
+        return write_config(cfg, path)
 
 
 def _repo_auto_merge_default(cfg: Dict[str, Any], repo: Optional[str]) -> bool:
@@ -2990,9 +3010,28 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
         keys["test_command"] = str(tc).strip()
     elif config.repo_test_command(existing, repo) is not None:
         keys["test_command"] = None
-    ok = config.set_repo_keys(repo, keys, cfg_path)
-    if ok and set_gd:
-        ok = _write_global_default(reviewers, auto_on_open, cfg_path) and ok
+    # One lock hold across both writes, so this repo's entry and the global default
+    # it promotes land together (each writer re-reads the file under the lock).
+    with config.config_lock(cfg_path):
+        if set_gd and not _ask_global_default():
+            # The unprompted promotion is for the FIRST system-wide setup only: decide
+            # it again on the file as it is now, so a global default another setup
+            # established while this one was prompting is kept.
+            current = config.load_config(cfg_path) if cfg_path.exists() else {}
+            set_gd = not config.has_global_default(current)
+        ok = config.set_repo_keys(repo, keys, cfg_path)
+        if ok and set_gd:
+            ok = _write_global_default(reviewers, auto_on_open, cfg_path,
+                                       auto_merge=am, label_gated_ci=lgc) and ok
+        elif ok:
+            # A migrated global reviewer fleet can predate these choice gates.
+            # Confirming any repo asks both choices, so arm only the missing
+            # fail-closed globals without replacing that established fleet.
+            current = config.load_config(cfg_path) if cfg_path.exists() else {}
+            defaults = config.establish_global_defaults(
+                current, auto_merge=am, label_gated_ci=lgc)
+            if defaults != current:
+                ok = write_config(defaults, cfg_path) and ok
     if not ok:
         _row("bad", f"Could not write {cfg_path} — check the path's permissions",
              pal, stream)
@@ -3096,25 +3135,35 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
                 pal=pal, stream=stream, input_fn=input_fn)
 
         new_cfg = build_config(plan, repo, cwd, reviewers, auto_on_open)
-        merged = merge_preserving(existing, new_cfg)
-        ok = write_config(merged, cfg_path)
-        # Record the bound repo's per-repo entry (presence == confirmed). The
-        # top-level fleet written above is ALSO the global default — non-disruptive;
-        # the full wizard always establishes one.
-        if ok and repo:
-            repo_keys: Dict[str, Any] = {
-                "active_reviewers": list(reviewers),
-                "auto_on_open": {b: bool(v) for b, v in auto_on_open.items()},
-                "auto_merge": bool(repo_auto_merge),
-                "label_gated_ci": bool(repo_label_gated_ci),
-            }
-            # Same three-way `test_command` handling as confirm_repo_interactive:
-            # non-blank string persists, None clears only a previously-set command.
-            if repo_test_command is not None and str(repo_test_command).strip():
-                repo_keys["test_command"] = str(repo_test_command).strip()
-            elif config.repo_test_command(existing, repo) is not None:
-                repo_keys["test_command"] = None
-            config.set_repo_keys(repo, repo_keys, cfg_path)
+        # One locked read-modify-write for everything setup persists: the file is
+        # re-read HERE, under the lock, rather than reusing `existing` (read before
+        # the prompts above), so a write another process made meanwhile is kept.
+        with config.config_lock(cfg_path):
+            current = config.load_config(cfg_path) if cfg_path.exists() else {}
+            # For each auto-merge / label-gated-CI question the bound repo was asked
+            # (not None), a top-level key is established too — always False, never
+            # the repo's answer — so a global exists for the per-repo choice gates.
+            merged = config.establish_global_defaults(
+                merge_preserving(current, new_cfg),
+                auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
+            ok = write_config(merged, cfg_path)
+            # Record the bound repo's per-repo entry (presence == confirmed). The
+            # top-level fleet written above is ALSO the global default —
+            # non-disruptive; the full wizard always establishes one.
+            if ok and repo:
+                repo_keys: Dict[str, Any] = {
+                    "active_reviewers": list(reviewers),
+                    "auto_on_open": {b: bool(v) for b, v in auto_on_open.items()},
+                    "auto_merge": bool(repo_auto_merge),
+                    "label_gated_ci": bool(repo_label_gated_ci),
+                }
+                # Same three-way `test_command` handling as confirm_repo_interactive:
+                # non-blank string persists, None clears only a previously-set command.
+                if repo_test_command is not None and str(repo_test_command).strip():
+                    repo_keys["test_command"] = str(repo_test_command).strip()
+                elif config.repo_test_command(existing, repo) is not None:
+                    repo_keys["test_command"] = None
+                config.set_repo_keys(repo, repo_keys, cfg_path)
 
         step_summary(plan, repo, reviewers, auto_on_open, pal=pal, stream=stream,
                      auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
