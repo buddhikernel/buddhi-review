@@ -18,9 +18,10 @@ _PAID_KEYS = (
 )
 _FREE_KEYS = {"plan", "active_reviewers", "auto_on_open", "notifications", "repo", "cwd",
               "repos",
-              # The bound repo's answers, promoted to the top level so a global default
-              # exists for the per-repo choice gates (tests/test_canonical_config.py).
-              "auto_merge", "label_gated_ci", "promoted_global_defaults"}
+              # Established (always False) at the top level once the bound repo was
+              # asked, so a global exists for the per-repo choice gates
+              # (tests/test_canonical_config.py).
+              "auto_merge", "label_gated_ci"}
 
 
 # ── Pure helpers ─────────────────────────────────────────────────────────────────

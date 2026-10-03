@@ -805,11 +805,9 @@ def merge_preserving(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str,
 def write_config(cfg: Dict[str, Any], path: Path) -> bool:
     """Atomically write ``cfg`` to ``path`` (temp file + ``os.replace``) at 0600,
     under the config lock (:func:`buddhi_review.config.config_lock`, re-entrant, so
-    a caller that already holds it for its read-modify-write simply continues),
-    dropping any promotion record that no longer describes the file
-    (:func:`buddhi_review.config.drop_stale_promotions`)."""
+    a caller that already holds it for its read-modify-write simply continues)."""
     with config.config_lock(path):
-        return _write_config_unlocked(config.drop_stale_promotions(cfg), path)
+        return _write_config_unlocked(cfg, path)
 
 
 def _write_config_unlocked(cfg: Dict[str, Any], path: Path) -> bool:
@@ -2870,18 +2868,18 @@ def _write_global_default(reviewers: Sequence[str], auto_on_open: Dict[str, bool
     """Persist the top-level (global-default) reviewer fleet + ``auto_on_open``,
     leaving every other key — sibling ``repos`` entries included — intact. The
     global default is the fall-back fleet for repos with no confirmed entry
-    (:func:`buddhi_review.config.has_global_default`). ``auto_merge`` /
-    ``label_gated_ci`` (the repo's own answers) are promoted to the top level too,
-    each only when not ``None`` (:func:`buddhi_review.config.promote_global_defaults`),
-    so a global default exists for the per-repo choice gates. One locked
-    read-modify-write."""
+    (:func:`buddhi_review.config.has_global_default`). For each of ``auto_merge`` /
+    ``label_gated_ci`` that was asked (not ``None``) a top-level key is established
+    too — always ``False``, never the repo's own answer
+    (:func:`buddhi_review.config.establish_global_defaults`) — so a global exists
+    for the per-repo choice gates. One locked read-modify-write."""
     with config.config_lock(path):
         existing = config.load_config(path) if path.exists() else {}
         cfg = dict(existing)
         cfg["active_reviewers"] = list(reviewers)
         cfg["auto_on_open"] = {b: bool(v) for b, v in auto_on_open.items()}
-        cfg = config.promote_global_defaults(cfg, auto_merge=auto_merge,
-                                             label_gated_ci=label_gated_ci)
+        cfg = config.establish_global_defaults(cfg, auto_merge=auto_merge,
+                                               label_gated_ci=label_gated_ci)
         return write_config(cfg, path)
 
 
@@ -3128,10 +3126,10 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
         # the prompts above), so a write another process made meanwhile is kept.
         with config.config_lock(cfg_path):
             current = config.load_config(cfg_path) if cfg_path.exists() else {}
-            # The bound repo's auto-merge + label-gated-CI answers are also promoted
-            # to the top level (only when asked, i.e. not None), so a global default
-            # exists for the per-repo choice gates.
-            merged = config.promote_global_defaults(
+            # For each auto-merge / label-gated-CI question the bound repo was asked
+            # (not None), a top-level key is established too — always False, never
+            # the repo's answer — so a global exists for the per-repo choice gates.
+            merged = config.establish_global_defaults(
                 merge_preserving(current, new_cfg),
                 auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
             ok = write_config(merged, cfg_path)

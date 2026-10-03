@@ -14,6 +14,7 @@ Also here: the setup wizard's promotion of the bound repo's ``auto_merge`` /
 ``label_gated_ci`` to the top level, and the proof that a repo without its own
 ``label_gated_ci`` resolves exactly as it did before the promotion existed.
 """
+import contextlib
 import io
 import json
 import os
@@ -169,7 +170,7 @@ def test_legacy_only_is_migrated_and_backed_up(home, capsys):
     lines = err.strip().splitlines()
     assert len(lines) == 1
     assert str(_canonical(home)) in lines[0] and str(backup) in lines[0]
-    assert "No values conflicted" in lines[0]
+    assert "No settings conflicted" in lines[0]
 
 
 def test_backup_is_0600_even_when_the_legacy_file_was_world_readable(home):
@@ -327,7 +328,7 @@ def test_both_present_merges_losslessly(home, capsys):
     assert len(_backups(home)) == 1
     err = capsys.readouterr().err.strip().splitlines()
     assert len(err) == 1
-    assert "1 value(s) conflicted" in err[0] and "repos.Acme/Widgets.auto_merge" in err[0]
+    assert "1 setting(s) conflicted" in err[0] and "repos.Acme/Widgets.auto_merge" in err[0]
     assert str(_backups(home)[0]) in err[0]
 
 
@@ -345,7 +346,7 @@ def test_conflicts_take_the_newer_file_and_the_canonical_on_a_tie(home, newer, e
     assert cfg["plan"] == expect
     assert cfg["repos"][REPO]["label_gated_ci"] is (expect == "pro")
     err = capsys.readouterr().err
-    assert "2 value(s) conflicted" in err and "plan" in err
+    assert "2 setting(s) conflicted" in err and "plan" in err
 
 
 def test_partial_canonical_known_repos_only_adopts_the_legacy_settings(home):
@@ -383,7 +384,7 @@ def test_a_null_or_malformed_side_never_overrides_a_real_setting(home, capsys, n
     cfg = _load(_canonical(home))
     for key, value in expect.items():
         assert cfg[key] == value
-    assert "No values conflicted" in capsys.readouterr().err
+    assert "No settings conflicted" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("canonical_repos", [{"zeta/app": {"auto_merge": True}},
@@ -402,7 +403,7 @@ def test_case_variant_duplicates_inside_the_legacy_file_are_not_collapsed(home, 
     cfg = _load(_canonical(home))
     assert config.auto_merge(cfg, REPO) is config.auto_merge(legacy, REPO) is True
     assert config.label_gated_ci(cfg, REPO) is config.label_gated_ci(legacy, REPO) is False
-    assert "No values conflicted" in capsys.readouterr().err
+    assert "No settings conflicted" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("raw,configured", [("# setup ran; nothing chosen yet\n", True),
@@ -571,7 +572,7 @@ def test_a_run_stopped_after_the_write_reports_its_conflicts_on_the_next_run(hom
     capsys.readouterr()
     config.config_path()
     err = capsys.readouterr().err
-    assert "1 value(s) conflicted" in err and "plan" in err
+    assert "1 setting(s) conflicted" in err and "plan" in err
     assert not _canonical(home).with_name("config.yaml.legacy-merged").exists()
 
 
@@ -683,25 +684,6 @@ def test_the_entry_readers_use_first_follows_the_winning_file(home, canonical_re
     assert config.active_reviewers(_load(_canonical(home)), REPO) == expect
 
 
-@pytest.mark.parametrize("canonical,legacy,expect", [
-    # a record from one file never attaches to the other file's value
-    ({"label_gated_ci": True}, {"label_gated_ci": True,
-                                config.PROMOTED_GLOBALS_KEY: {"auto_merge": False}}, True),
-    ({"label_gated_ci": True}, {config.PROMOTED_GLOBALS_KEY: {"label_gated_ci": True}}, True),
-    ({"label_gated_ci": False, config.PROMOTED_GLOBALS_KEY: {"label_gated_ci": False}},
-     {"label_gated_ci": True, config.PROMOTED_GLOBALS_KEY: {"auto_merge": True}}, True),
-])
-def test_the_promotion_record_is_rebuilt_per_key(home, capsys, canonical, legacy, expect):
-    t = time.time_ns()
-    _put(_canonical(home), canonical, mtime_ns=t - 10**9)
-    _put(_legacy(home), legacy, mtime_ns=t)
-    config.config_path()
-    cfg = _load(_canonical(home))
-    assert config.label_gated_ci(cfg, "other/repo") is expect
-    # The record is bookkeeping, never reported to the user as a conflicting value.
-    assert config.PROMOTED_GLOBALS_KEY not in capsys.readouterr().err
-
-
 def test_the_skill_gate_never_answers_unconfigured_during_the_move(home):
     """Run the shipped gate line with a ``test`` that performs the whole move just
     before its SECOND check: at no point may a machine with settings read as
@@ -759,7 +741,7 @@ def test_a_blank_test_command_never_overrides_a_real_one(home, capsys, where):
              mtime_ns=t - 10**9)
     config.config_path()
     assert config.test_command(_load(_canonical(home)), REPO) == "make test"
-    assert "No values conflicted" in capsys.readouterr().err
+    assert "No settings conflicted" in capsys.readouterr().err
 
 
 def test_a_record_left_after_the_rename_is_dropped_not_reused(home, monkeypatch):
@@ -851,9 +833,7 @@ def test_one_and_true_are_different_settings(home, newer, capsys):
     """Readers accept only a real bool, so ``1`` is not ``true``: the two are a
     conflict, and the result resolves as the file that wins resolved alone."""
     t = time.time_ns()
-    canonical = {"label_gated_ci": True,
-                 config.PROMOTED_GLOBALS_KEY: {"label_gated_ci": True},
-                 "repos": {"o/r": {"label_gated_ci": True}}}
+    canonical = {"label_gated_ci": True, "repos": {"o/r": {"label_gated_ci": True}}}
     legacy = {"label_gated_ci": 1, "repos": {"o/r": {"label_gated_ci": 1}}}
     _put(_canonical(home), canonical, mtime_ns=t if newer == "canonical" else t - 10**9)
     _put(_legacy(home), legacy, mtime_ns=t if newer == "legacy" else t - 10**9)
@@ -862,7 +842,7 @@ def test_one_and_true_are_different_settings(home, newer, capsys):
     winner = legacy if newer == "legacy" else canonical
     for repo in ("o/r", "other/repo"):
         assert config.label_gated_ci(cfg, repo) is config.label_gated_ci(winner, repo)
-    assert "2 value(s) conflicted" in capsys.readouterr().err
+    assert "2 setting(s) conflicted" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("side", ["legacy", "canonical"])
@@ -897,23 +877,6 @@ def test_a_per_repo_null_that_shadows_the_global_is_a_setting(home, capsys):
     cfg = _load(_canonical(home))
     assert config.label_gated_ci(cfg, "o/r") is False
     assert "repos.o/r.label_gated_ci" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("promoted", [True, False], ids=["same-value", "other-value"])
-def test_a_legacy_hand_set_global_stays_inherited_through_the_merge(home, promoted):
-    """A top-level label_gated_ci in the legacy file was set by hand (no earlier
-    release promoted into it). It must keep being inherited after the merge even
-    when the canonical file recorded a promotion of the same key — whether that
-    promotion holds the same value or a different one."""
-    t = time.time_ns()
-    _put(_canonical(home), {"label_gated_ci": promoted,
-                            config.PROMOTED_GLOBALS_KEY: {"label_gated_ci": promoted}},
-         mtime_ns=t - 10**9)
-    _put(_legacy(home), {"label_gated_ci": True}, mtime_ns=t)
-    config.config_path()
-    cfg = _load(_canonical(home))
-    assert config.label_gated_ci(cfg, "other/repo") is True
-    assert config.PROMOTED_GLOBALS_KEY not in cfg
 
 
 def test_an_unsearchable_canonical_folder_fails_open(home):
@@ -974,7 +937,7 @@ def test_unreadable_legacy_is_left_untouched_and_reported_once(home, kind, capsy
     assert _backups(home) == []
     out, err = capsys.readouterr()
     assert out == ""
-    warn = [ln for ln in err.splitlines() if "could not read the old config file" in ln]
+    warn = [ln for ln in err.splitlines() if "Could not read the old config file" in ln]
     assert len(warn) == 1 and str(legacy) in warn[0]
     if kind == "permission":
         os.chmod(legacy, 0o600)
@@ -987,7 +950,7 @@ def test_unreadable_canonical_leaves_both_files_and_fails_open(home, capsys):
     assert config.config_path() == _canonical(home)
     assert _canonical(home).read_bytes() == canon_before
     assert _legacy(home).read_bytes() == legacy_before
-    assert "Both files were left as they are" in capsys.readouterr().err
+    assert "Both files were left unchanged" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("canonical_exists", [False, True])
@@ -1001,7 +964,7 @@ def test_a_failed_write_leaves_the_legacy_file_and_fails_open(home, monkeypatch,
     monkeypatch.setattr(config, "_write_bytes_atomic", lambda path, raw: False)
     assert config.config_path() == _canonical(home)
     assert _legacy(home).read_bytes() == before and _backups(home) == []
-    assert "the write failed" in capsys.readouterr().err
+    assert "because writing the file failed" in capsys.readouterr().err
 
 
 def test_a_migration_crash_never_escapes_the_resolver(home, monkeypatch, capsys):
@@ -1013,7 +976,7 @@ def test_a_migration_crash_never_escapes_the_resolver(home, monkeypatch, capsys)
     monkeypatch.setattr(config, "_migrate_locked", boom)
     assert config.config_path() == _canonical(home)
     err = capsys.readouterr().err
-    assert "could not move settings" in err and "disk on fire" in err
+    assert "Could not move settings" in err and "disk on fire" in err
 
 
 # ── Clause 4: stdout stays JSON-only on the status verb ─────────────────────────
@@ -1079,7 +1042,7 @@ def test_a_held_lock_is_waited_on_then_failed_open(home, tmp_path, capsys):
         with config.config_lock(p, timeout=0.3):
             waited = time.monotonic() - start
         assert 0.25 <= waited < 2.5
-        assert "held the config lock" in capsys.readouterr().err
+        assert "has held the config lock" in capsys.readouterr().err
     finally:
         holder.kill()
         holder.wait()
@@ -1291,14 +1254,15 @@ def _run_wizard(argv=None, *, auto_merge_on=False, lgc_on=True):
                       input_fn=lambda *a: "", stream=io.StringIO())
 
 
-@pytest.mark.parametrize("am,lgc", [(False, True), (True, False)])
+@pytest.mark.parametrize("am,lgc", [(False, True), (True, False), (True, True)])
 def test_full_wizard_run_writes_the_two_globals_to_the_canonical_file(home, monkeypatch, am, lgc):
+    """The top-level keys EXIST after a full setup (so the per-repo choice gates
+    arm) and always hold False, whatever the bound repo answered."""
     _stub_wizard(monkeypatch)
     assert _run_wizard(auto_merge_on=am, lgc_on=lgc) == 0
     cfg = _load(_canonical(home))
-    assert cfg["auto_merge"] is am and cfg["label_gated_ci"] is lgc
-    assert cfg[config.PROMOTED_GLOBALS_KEY] == {"auto_merge": am, "label_gated_ci": lgc}
-    # The per-repo entry carries the same explicit answers.
+    assert cfg["auto_merge"] is False and cfg["label_gated_ci"] is False
+    # The per-repo entry carries the explicit answers.
     assert cfg["repos"][REPO]["auto_merge"] is am
     assert cfg["repos"][REPO]["label_gated_ci"] is lgc
     assert cfg["active_reviewers"] == FLEET
@@ -1326,16 +1290,14 @@ def test_first_per_repo_confirm_promotes_the_two_globals(home, monkeypatch):
     assert _run_wizard(["--repo", REPO], auto_merge_on=True, lgc_on=False) == 0
     cfg = _load(_canonical(home))
     assert cfg["active_reviewers"] == FLEET  # first setup → promoted fleet
-    assert cfg["auto_merge"] is True and cfg["label_gated_ci"] is False
-    assert cfg[config.PROMOTED_GLOBALS_KEY] == {"auto_merge": True, "label_gated_ci": False}
+    assert cfg["auto_merge"] is False and cfg["label_gated_ci"] is False
+    assert cfg["repos"][REPO]["auto_merge"] is True
 
 
 def test_later_per_repo_confirm_leaves_the_established_globals(home, monkeypatch):
     _stub_wizard(monkeypatch)
     _put(_canonical(home), {"active_reviewers": ["claude"], "auto_merge": False,
-                            "label_gated_ci": False,
-                            config.PROMOTED_GLOBALS_KEY: {"auto_merge": False,
-                                                          "label_gated_ci": False}})
+                            "label_gated_ci": False})
     assert _run_wizard(["--repo", "zeta/app"], auto_merge_on=True, lgc_on=True) == 0
     cfg = _load(_canonical(home))
     assert cfg["active_reviewers"] == ["claude"]
@@ -1355,7 +1317,7 @@ def test_setup_leaves_a_hand_set_global_label_gated_ci_alone(home, monkeypatch, 
     assert cfg["label_gated_ci"] is True
     assert config.label_gated_ci(cfg, "old/repo") is True
     assert config.label_gated_ci(cfg, "other/x") is True
-    assert "label_gated_ci" not in cfg.get(config.PROMOTED_GLOBALS_KEY, {})
+    assert cfg["auto_merge"] is False  # the other key was still established
 
 
 def test_a_global_default_set_during_a_first_confirm_is_kept(home, monkeypatch):
@@ -1366,43 +1328,113 @@ def test_a_global_default_set_during_a_first_confirm_is_kept(home, monkeypatch):
 
     def meanwhile(*a, **k):
         wizard._write_global_default(["claude"], {"claude": False}, _canonical(home),
-                                     auto_merge=True, label_gated_ci=False)
+                                     auto_merge=False, label_gated_ci=False)
         return real(*a, **k)
 
     monkeypatch.setattr(wizard, "step_repo_auto_merge", meanwhile)
     assert _run_wizard(["--repo", REPO]) == 0
     cfg = _load(_canonical(home))
-    assert cfg["active_reviewers"] == ["claude"] and cfg["auto_merge"] is True
+    assert cfg["active_reviewers"] == ["claude"] and cfg["auto_merge"] is False
     assert cfg["repos"][REPO]["active_reviewers"] == FLEET
 
 
-def test_a_promotion_record_is_dropped_once_it_no_longer_describes_the_file(home):
-    """Setup promoted ``label_gated_ci: true``. The user then removes the key by hand
-    and, after any config write, sets it back by hand: that is a hand-set global,
-    inherited like any other."""
-    path = _canonical(home)
-    _put(path, config.promote_global_defaults({}, label_gated_ci=True))
-    assert config.label_gated_ci(_load(path), "other/repo") is False
-    hand = _load(path)
-    hand.pop("label_gated_ci")
-    _put(path, hand)
-    assert config.set_repo_keys("zeta/app", {"auto_merge": False}, path)
-    assert config.PROMOTED_GLOBALS_KEY not in _load(path)
-    hand = _load(path)
-    hand["label_gated_ci"] = True
-    _put(path, hand)
-    assert config.label_gated_ci(_load(path), "other/repo") is True
+_DEFAULT_TIMEOUT_WAIT = r"""
+import sys, time
+from buddhi_review import config
+start = time.monotonic()
+with config.config_lock(__import__("pathlib").Path(sys.argv[1])):   # the DEFAULT timeout
+    pass
+print(round(time.monotonic() - start, 2))
+"""
 
 
-def test_setup_drops_the_record_of_a_value_edited_by_hand(home, monkeypatch):
+def test_a_stuck_lock_holder_is_waited_on_for_ten_seconds_by_default(home, tmp_path):
+    """The default bound is 10 s: a stuck holder must never hang ``status``, which
+    the skills run before every launch. A fresh process takes the lock with no
+    explicit timeout while another process holds it for far longer."""
+    p = _canonical(home)
+    p.parent.mkdir(parents=True)
+    held = tmp_path / "held"
+    holder = subprocess.Popen([sys.executable, "-c", _HOLD_LOCK, str(p) + ".lock",
+                               str(held), "60"])
+    try:
+        _wait_for(held)
+        waiter = subprocess.Popen([sys.executable, "-c", _DEFAULT_TIMEOUT_WAIT, str(p)],
+                                  env=_env(home), cwd=str(home), stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True)
+        try:
+            out, err = waiter.communicate(timeout=25)
+        except subprocess.TimeoutExpired:
+            waiter.kill()
+            waiter.communicate()
+            raise AssertionError("config_lock did not give up within 25 s on a stuck holder")
+        assert waiter.returncode == 0, err
+        assert 9.5 <= float(out.strip()) <= 20
+        assert "for more than 10 seconds" in err
+    finally:
+        holder.kill()
+        holder.wait()
+    assert config.LOCK_TIMEOUT_S == 10.0
+
+
+@pytest.mark.parametrize("newer", ["legacy", "canonical"])
+@pytest.mark.parametrize("raw", ["", "# setup ran; nothing chosen\n", "{}\n", "null\n"],
+                         ids=["empty", "comment-only", "braces", "null"])
+def test_an_empty_legacy_file_never_replaces_an_existing_canonical_file(home, raw, newer):
+    """A legacy file that holds no settings beside a canonical file that does: the
+    canonical settings stay, the legacy file is retired, whichever is newer."""
+    t = time.time_ns()
+    _put(_canonical(home), LEGACY, mtime_ns=t if newer == "canonical" else t - 10**9)
+    _put(_legacy(home), None, raw=raw, mtime_ns=t if newer == "legacy" else t - 10**9)
+    config.config_path()
+    assert _load(_canonical(home)) == LEGACY
+    assert not _legacy(home).exists() and len(_backups(home)) == 1
+    assert _backups(home)[0].read_bytes() == raw.encode()
+
+
+def test_full_wizard_run_re_reads_the_file_under_the_lock(home, monkeypatch):
+    """A write that lands AFTER the end-of-run lock is requested and BEFORE the file
+    is re-read is kept: the re-read happens under the lock, not before it."""
     _stub_wizard(monkeypatch)
-    path = _canonical(home)
-    _put(path, {**config.promote_global_defaults({}, label_gated_ci=True),
-                "label_gated_ci": False})  # edited by hand after setup
-    assert _run_wizard(lgc_on=True) == 0
-    cfg = _load(path)
-    assert cfg["label_gated_ci"] is False  # the hand-set value is left alone …
-    assert "label_gated_ci" not in cfg[config.PROMOTED_GLOBALS_KEY]  # … and unrecorded
+    real_lock = config.config_lock
+    state = {"injected": False}
+
+    @contextlib.contextmanager
+    def lock_then_write(path, **kw):
+        with real_lock(path, **kw):
+            if not state["injected"]:
+                state["injected"] = True
+                config.set_repo_keys("zeta/app", {"active_reviewers": ["claude"]}, Path(path))
+            yield
+
+    monkeypatch.setattr(config, "config_lock", lock_then_write)
+    assert _run_wizard() == 0
+    cfg = _load(_canonical(home))
+    assert config.repo_entry(cfg, "zeta/app") == {"active_reviewers": ["claude"]}
+    assert config.repo_entry(cfg, REPO) is not None
+
+
+def test_a_setup_with_no_bound_repo_writes_no_top_level_choice_keys(home, monkeypatch):
+    """No repo bound means the auto-merge / label-gated-CI questions were never
+    asked, so no top-level key may be established (those keys arm the paid
+    per-repo gates)."""
+    _stub_wizard(monkeypatch)
+
+    def no_remote(argv, cwd=None, timeout=30, input=None):
+        if argv[:2] == ["git", "-C"] and "remote" in argv:
+            return types.SimpleNamespace(returncode=1, stdout="")
+        return _fake_run(argv, cwd=cwd, timeout=timeout, input=input)
+
+    rc = wizard.run(argv=None, run=no_remote, which=lambda x: None,
+                    single_select=_answers(auto_merge_on=True, lgc_on=True),
+                    multi_select=lambda *a, **k: set(), getpass_fn=lambda *a: "",
+                    spawn_command=lambda *a, **k: {"spawned": False},
+                    input_fn=lambda *a: "", stream=io.StringIO())
+    assert rc == 0
+    cfg = _load(_canonical(home))
+    assert "repo" not in cfg and "repos" not in cfg
+    assert "auto_merge" not in cfg and "label_gated_ci" not in cfg
+    assert cfg["active_reviewers"] == FLEET
 
 
 def test_an_interrupt_while_waiting_for_the_lock_leaks_no_fd(home, tmp_path, monkeypatch):
@@ -1429,41 +1461,17 @@ def test_an_interrupt_while_waiting_for_the_lock_leaks_no_fd(home, tmp_path, mon
         holder.wait()
 
 
-def test_promotion_writes_only_values_that_were_asked():
-    assert config.promote_global_defaults({"plan": "pro"}) == {"plan": "pro"}
-    out = config.promote_global_defaults({config.PROMOTED_GLOBALS_KEY: {"auto_merge": True},
-                                          "auto_merge": True}, label_gated_ci=True)
-    assert out == {"auto_merge": True, "label_gated_ci": True,
-                   config.PROMOTED_GLOBALS_KEY: {"auto_merge": True, "label_gated_ci": True}}
-
-
-def test_promotion_never_touches_a_hand_set_global():
-    hand = {"label_gated_ci": True, "auto_merge": False}
-    assert config.promote_global_defaults(hand, auto_merge=True, label_gated_ci=False) == hand
-    # A value setup promoted is updated by the next setup run …
-    ours = config.promote_global_defaults({}, label_gated_ci=False)
-    again = config.promote_global_defaults(ours, label_gated_ci=True)
-    assert again["label_gated_ci"] is True and config.is_promoted_global(again, "label_gated_ci")
-    # … but once edited by hand it is a hand-set global: inherited, and left alone.
-    edited = {**ours, "label_gated_ci": True}
-    assert not config.is_promoted_global(edited, "label_gated_ci")
-    assert config.label_gated_ci(edited, "other/repo") is True
-    assert config.promote_global_defaults(edited, label_gated_ci=False)["label_gated_ci"] is True
-
-
 # ── PRO-42 safety: an unconfirmed repo resolves exactly as before ───────────────
 # The config a fresh full setup writes for acme/widgets with label-gated CI ON, and
-# the same config WITHOUT the promoted top-level keys (what setup wrote before).
+# the same config WITHOUT the established top-level keys (what setup wrote before).
 
 PROMOTED = {
     "plan": "max-5x", "active_reviewers": ["claude"], "auto_on_open": {"claude": False},
-    "notifications": "console", "auto_merge": True, "label_gated_ci": True,
-    config.PROMOTED_GLOBALS_KEY: {"auto_merge": True, "label_gated_ci": True},
+    "notifications": "console", "auto_merge": False, "label_gated_ci": False,
     "repos": {REPO: {"active_reviewers": ["claude"], "auto_on_open": {"claude": False},
                      "auto_merge": True, "label_gated_ci": True}},
 }
-BEFORE = {k: v for k, v in PROMOTED.items()
-          if k not in ("auto_merge", "label_gated_ci", config.PROMOTED_GLOBALS_KEY)}
+BEFORE = {k: v for k, v in PROMOTED.items() if k not in ("auto_merge", "label_gated_ci")}
 
 
 @pytest.mark.parametrize("repo", ["o/r", "other/repo", None])
@@ -1540,6 +1548,17 @@ def test_the_wizard_default_for_a_new_repo_is_unchanged(cfg, home, monkeypatch):
 
 
 def test_a_hand_set_global_is_still_inherited():
-    """Only a PROMOTED global is skipped; a top-level value without the listing keeps
-    today's inheritance (tests/test_f1_perrepo_write_status.py pins the rest)."""
+    """A top-level value keeps today's inheritance (tests/test_f1_perrepo_write_status.py
+    pins the rest); setup only ever establishes False, which inherits as off."""
     assert config.label_gated_ci({"label_gated_ci": True}, "any/repo") is True
+    assert config.label_gated_ci({"label_gated_ci": False}, "any/repo") is False
+
+
+def test_establish_global_defaults_writes_false_only_for_what_was_asked():
+    assert config.establish_global_defaults({"plan": "pro"}) == {"plan": "pro"}
+    assert config.establish_global_defaults({}, auto_merge=True, label_gated_ci=True) == \
+        {"auto_merge": False, "label_gated_ci": False}
+    assert config.establish_global_defaults({}, label_gated_ci=False) == {"label_gated_ci": False}
+    # A value already there (set by hand) is left exactly as it is.
+    hand = {"label_gated_ci": True, "auto_merge": True}
+    assert config.establish_global_defaults(hand, auto_merge=False, label_gated_ci=False) == hand

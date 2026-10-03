@@ -151,8 +151,9 @@ def _flock_acquire(lock_file: Path, timeout: float) -> Optional[int]:
                 if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
                     break
             if time.monotonic() >= deadline:
-                print(f"Warning: another process held the config lock {lock_file} for over "
-                      f"{int(timeout)} seconds; continuing without it.", file=sys.stderr)
+                print(f"Warning: Another process has held the config lock {lock_file} for "
+                      f"more than {int(timeout)} seconds. Continuing without the lock.",
+                      file=sys.stderr)
                 break
             time.sleep(_LOCK_POLL_S)
     except BaseException:  # an interrupt while waiting must not leak the fd
@@ -221,7 +222,6 @@ _reported: set = set()
 # Per-repo keys whose readers treat a PRESENT null as a value (it shadows the global
 # default), so in a merge a null there is a setting, not an absence.
 _NULL_IS_A_VALUE_PER_REPO = ("active_reviewers", "auto_on_open", "label_gated_ci")
-_PROMOTABLE = ("auto_merge", "label_gated_ci")
 
 
 def _note_once(message: str) -> None:
@@ -368,17 +368,11 @@ def merge_config_files(canonical: Dict[str, Any], legacy: Dict[str, Any], *,
       canonical value on a tie. The newer write is the best available proxy for
       what the user intended most recently; the losing legacy value survives in
       the ``.migrated-<ts>`` backup.
-    * The :data:`PROMOTED_GLOBALS_KEY` record is not merged as a value: it is
-      rebuilt for each promotable key from the file whose top-level value the
-      merged file holds (the legacy file when both hold the same value), so a
-      record never attaches to a value the other file set.
 
     Neither input is mutated."""
     merged: Dict[str, Any] = dict(canonical)
     conflicts: List[str] = []
     for key, lval in legacy.items():
-        if key == PROMOTED_GLOBALS_KEY:
-            continue
         if key not in merged:
             merged[key] = lval
             continue
@@ -404,7 +398,6 @@ def merge_config_files(canonical: Dict[str, Any], legacy: Dict[str, Any], *,
             conflicts.append(str(key))
             if legacy_wins:
                 merged[key] = lval
-    _rebuild_promotion_record(merged, canonical, legacy)
     return merged, conflicts
 
 
@@ -459,21 +452,6 @@ def _repo_value_is_unset(key: Any, value: Any) -> bool:
     if key == "test_command":
         return value is None or not str(value).strip()
     return value is None and key not in _NULL_IS_A_VALUE_PER_REPO
-
-
-def _rebuild_promotion_record(merged: Dict[str, Any], canonical: Dict[str, Any],
-                              legacy: Dict[str, Any]) -> None:
-    marks: Dict[str, Any] = {}
-    for key in _PROMOTABLE:
-        if merged.get(key) is None:
-            continue
-        side = legacy if key in legacy and _same(legacy[key], merged[key]) else canonical
-        if is_promoted_global(side, key):
-            marks[key] = merged[key]
-    if marks:
-        merged[PROMOTED_GLOBALS_KEY] = marks
-    else:
-        merged.pop(PROMOTED_GLOBALS_KEY, None)
 
 
 def _changed_since(base: Dict[str, Any], now: Dict[str, Any]) -> Dict[str, Any]:
@@ -589,9 +567,9 @@ def _conflict_summary(conflicts: List[str]) -> str:
 
 def _conflict_sentence(conflicts: List[str]) -> str:
     if not conflicts:
-        return "No values conflicted."
-    return (f"{len(conflicts)} value(s) conflicted; the more recently modified file's "
-            f"value was kept for: {_conflict_summary(conflicts)}.")
+        return "No settings conflicted."
+    return (f"{len(conflicts)} setting(s) conflicted. The value from the more recently "
+            f"modified file was kept for: {_conflict_summary(conflicts)}.")
 
 
 def migrate_legacy_config(canonical: Optional[Path] = None, *,
@@ -624,23 +602,21 @@ def migrate_legacy_config(canonical: Optional[Path] = None, *,
         with config_lock(canonical):
             return _migrate_locked(canonical, legacy)
     except Exception as exc:  # fail open: a migration error never blocks a launch
-        _note_once(f"Warning: could not move settings from {legacy} to {canonical}, the "
-                   f"canonical Buddhi config location ({exc}). Settings are read from "
-                   f"{canonical}.")
+        _note_once(f"Warning: Could not move settings from {legacy} to {canonical} ({exc}). "
+                   f"Settings are read from {canonical}.")
         return "error"
 
 
 def _unreadable(legacy: Path, canonical: Path, reason: str) -> str:
-    _note_once(f"Warning: could not read the old config file {legacy} ({reason}). It was "
-               f"left untouched; settings are read from {canonical}, the canonical Buddhi "
-               f"config location.")
+    _note_once(f"Warning: Could not read the old config file {legacy} ({reason}). It was "
+               f"left unchanged. Settings are read from {canonical}.")
     return "unreadable"
 
 
 def _write_failed(legacy: Path, canonical: Path) -> str:
-    _note_once(f"Warning: could not move settings from {legacy} to {canonical}, the "
-               f"canonical Buddhi config location (the write failed). Both files were "
-               f"left as they are; settings are read from {canonical}.")
+    _note_once(f"Warning: Could not move settings from {legacy} to {canonical} because "
+               f"writing the file failed. Both files were left unchanged. Settings are "
+               f"read from {canonical}.")
     return "error"
 
 
@@ -686,9 +662,9 @@ def _migrate_locked(canonical: Path, legacy: Path) -> str:
     except OSError as exc:
         recorded = (_read_record(canonical) or {}).get("identity") == ident or (
             twin == "linked" and _write_record(canonical, ident, conflicts, legacy_data))
-        _note_once(f"Warning: settings from {legacy} were merged into {canonical}, the "
-                   f"canonical Buddhi config location, but the old file could not be "
-                   f"renamed ({exc.strerror or exc}). {_conflict_sentence(conflicts)} "
+        _note_once(f"Warning: Settings from {legacy} were merged into {canonical}, but the "
+                   f"old file could not be renamed ({exc.strerror or exc}). "
+                   f"{_conflict_sentence(conflicts)} "
                    + ("It will not be merged again unless it changes." if recorded
                       else "It will be merged again on the next run."))
         return "error"
@@ -715,9 +691,8 @@ def _migrate_locked(canonical: Path, legacy: Path) -> str:
     except OSError:
         pass
     verb = "were merged into" if conflicts else "are now in"
-    _note_once(f"Config moved: settings from {legacy} {verb} {canonical}, the canonical "
-               f"Buddhi config location. The old file is kept as {backup}. "
-               f"{_conflict_sentence(conflicts)}")
+    _note_once(f"Config moved: Settings from {legacy} {verb} {canonical}. The old file was "
+               f"kept as {backup}. {_conflict_sentence(conflicts)}")
     return "migrated"
 
 
@@ -739,10 +714,9 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
         return []
     canonical_data, _, why, cident = _read_config_file(canonical)
     if canonical_data is None or cident is None:
-        _note_once(f"Warning: could not move settings from {legacy} to {canonical}, the "
-                   f"canonical Buddhi config location ({canonical.name} could not be read: "
-                   f"{why}). Both files were left as they are; settings are read from "
-                   f"{canonical}.")
+        _note_once(f"Warning: Could not move settings from {legacy} to {canonical} because "
+                   f"{canonical.name} could not be read: {why}. Both files were left "
+                   f"unchanged. Settings are read from {canonical}.")
         return "error"
     # Newer modification time wins a conflict; a tie goes to the canonical file.
     canonical_mtime = before.setdefault("mtime", cident[3])
@@ -906,84 +880,30 @@ def label_gated_ci(cfg: Dict[str, Any], repo: Optional[str] = None) -> bool:
     :func:`active_reviewers` resolution order. The presence of a per-repo
     ``label_gated_ci`` key shadows the global flag even when malformed (a non-bool
     value falls to the default, never the global). ``repo=None`` reads the global
-    flag.
-
-    A top-level value the setup wizard PROMOTED (:func:`is_promoted_global`) is
-    skipped: it exists so that a global default is present for the per-repo choice
-    gates, and such a global is never inherited silently — a repo without its own
-    value resolves to the default, exactly as it did before the wizard wrote the
-    global. A top-level value set by hand keeps being inherited."""
+    flag."""
     entry = repo_entry(cfg, repo)
     if entry is not None and "label_gated_ci" in entry:
         v = entry.get("label_gated_ci")
-    elif is_promoted_global(cfg, "label_gated_ci"):
-        v = None
     else:
         v = cfg.get("label_gated_ci")
     return v if isinstance(v, bool) else DEFAULT_LABEL_GATED_CI
 
 
-# The setup wizard copies the bound repo's ``auto_merge`` / ``label_gated_ci`` to the
-# top level so that a global default EXISTS — per-repo choice gates arm on a global's
-# presence and then demand an explicit per-repo value. It records each value it
-# copied under this top-level key, and :func:`label_gated_ci` never lets a recorded
-# value fall through to a repo that has none of its own. The record binds to the
-# VALUE: a top-level value edited by hand afterwards no longer matches, so it is a
-# hand-set global again. (:func:`auto_merge` has no global tier at all, so a promoted
-# top-level ``auto_merge`` is inert here by design.)
-PROMOTED_GLOBALS_KEY = "promoted_global_defaults"
-
-
-def is_promoted_global(cfg: Dict[str, Any], key: str) -> bool:
-    """True when the top-level ``key`` still holds the value the setup wizard
-    promoted (recorded under :data:`PROMOTED_GLOBALS_KEY`)."""
-    marks = cfg.get(PROMOTED_GLOBALS_KEY)
-    if not isinstance(marks, dict) or key not in marks:
-        return False
-    value, promoted = cfg.get(key), marks[key]
-    return isinstance(value, bool) and isinstance(promoted, bool) and value == promoted
-
-
-def promote_global_defaults(cfg: Dict[str, Any], *, auto_merge: Optional[bool] = None,
-                            label_gated_ci: Optional[bool] = None) -> Dict[str, Any]:
-    """Return a copy of ``cfg`` carrying the top-level ``auto_merge`` and
-    ``label_gated_ci`` — each only when its value is not ``None`` — and recording
-    each value written under :data:`PROMOTED_GLOBALS_KEY`. A top-level value the
-    wizard did not write (a hand-set global) is left exactly as it is: it already
-    establishes the global, and repos keep inheriting it. Every other key is kept."""
+def establish_global_defaults(cfg: Dict[str, Any], *, auto_merge: Optional[bool] = None,
+                              label_gated_ci: Optional[bool] = None) -> Dict[str, Any]:
+    """Return a copy of ``cfg`` in which a top-level ``auto_merge`` /
+    ``label_gated_ci`` EXISTS for each setting the setup wizard asked (its
+    argument is not ``None``): per-repo choice gates arm on a global's presence and
+    then demand an explicit per-repo value. The value written is always ``False``
+    — the fail-safe — never the bound repo's own answer, so nothing a repo did not
+    choose for itself can be inherited (the bound repo keeps its answer under
+    ``repos[<repo>]``). A top-level value already present, set by hand, is left as
+    it is: the global exists, and repos keep inheriting it. Every other key is
+    kept."""
     out = dict(cfg)
-    current = out.get(PROMOTED_GLOBALS_KEY)
-    marks = dict(current) if isinstance(current, dict) else {}
-    written = False
-    for key, value in (("auto_merge", auto_merge), ("label_gated_ci", label_gated_ci)):
-        if value is None:
-            continue
-        if out.get(key) is not None and not is_promoted_global(out, key):
-            continue
-        out[key] = marks[key] = bool(value)
-        written = True
-    if written:
-        out[PROMOTED_GLOBALS_KEY] = marks
-    return out
-
-
-def drop_stale_promotions(cfg: Dict[str, Any]) -> Dict[str, Any]:
-    """Return ``cfg`` without the :data:`PROMOTED_GLOBALS_KEY` records that no longer
-    describe it — the top-level value was removed or edited by hand since setup
-    wrote it. Such a record already has no effect; dropping it at the next write
-    keeps a later hand edit back to the promoted value a hand-set global. Every
-    config write passes through here."""
-    marks = cfg.get(PROMOTED_GLOBALS_KEY)
-    if not isinstance(marks, dict):
-        return cfg
-    kept = {k: v for k, v in marks.items() if is_promoted_global(cfg, k)}
-    if len(kept) == len(marks):
-        return cfg
-    out = dict(cfg)
-    if kept:
-        out[PROMOTED_GLOBALS_KEY] = kept
-    else:
-        out.pop(PROMOTED_GLOBALS_KEY, None)
+    for key, asked in (("auto_merge", auto_merge), ("label_gated_ci", label_gated_ci)):
+        if asked is not None and out.get(key) is None:
+            out[key] = False
     return out
 
 
