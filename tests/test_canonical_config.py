@@ -65,6 +65,7 @@ def home(monkeypatch, tmp_path):
     monkeypatch.delenv("BUDDHI_CONFIG", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     monkeypatch.setattr(config, "_reported", set())
+    monkeypatch.setattr(config, "_deferred", set())
     return h
 
 
@@ -552,6 +553,85 @@ def test_earlier_release_writes_on_both_sides_of_the_rename_are_all_kept(home, m
     assert not _legacy(home).exists() and len(_backups(home)) == 2
 
 
+def _catch_up_fails(home, monkeypatch, failure):
+    """Migrate while an earlier release rewrites the legacy file just before the
+    rename (adding ``old/a``), and the catch-up write of that newer write fails."""
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=time.time_ns() - 10**9)
+    _put(_legacy(home), {"repos": {"leg/one": {"auto_merge": False}}})
+    real_rename, real_write = os.rename, wizard.write_config
+    writes = []
+
+    def racing(src, dst, *a, **k):
+        if str(src) == str(_legacy(home)) and ".migrated-" in str(dst):
+            _atomic_legacy_write(home, {"repos": {"leg/one": {"auto_merge": False},
+                                                  "old/a": {"auto_merge": True}}})
+        return real_rename(src, dst, *a, **k)
+
+    def second_write_fails(cfg, path):
+        writes.append(1)
+        if len(writes) == 2:  # the catch-up merge
+            if failure == "refused":
+                return False
+            raise KeyboardInterrupt
+        return real_write(cfg, path)
+
+    monkeypatch.setattr(config.os, "rename", racing)
+    monkeypatch.setattr(wizard, "write_config", second_write_fails)
+    if failure == "refused":
+        assert config.migrate_legacy_config() == "error"
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            config.migrate_legacy_config()
+    monkeypatch.setattr(config.os, "rename", real_rename)
+    monkeypatch.setattr(wizard, "write_config", real_write)
+    assert not _legacy(home).exists() and len(_backups(home)) == 1
+    assert "old/a" not in _load(_canonical(home))["repos"]
+    assert "old/a" in _load(_backups(home)[0])["repos"]
+
+
+@pytest.mark.parametrize("failure", ["refused", "interrupted"])
+def test_a_failed_catch_up_after_the_rename_is_retried_from_the_backup(home, monkeypatch,
+                                                                       capsys, failure):
+    """The legacy name is already gone when the catch-up merge fails, so the record
+    naming the backup is what brings the newer write over on the next resolve."""
+    _catch_up_fails(home, monkeypatch, failure)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    assert _load(record)["backup"] == _backups(home)[0].name
+    capsys.readouterr()
+    assert config.migrate_legacy_config() == "migrated"
+    cfg = _load(_canonical(home))
+    assert {"leg/one", "old/a"} <= set(cfg["repos"]) and cfg["plan"] == "pro"
+    assert f"kept as {_backups(home)[0]}" in capsys.readouterr().err
+    assert not record.exists() and len(_backups(home)) == 1
+    assert config.migrate_legacy_config() == "absent"
+
+
+def test_a_retried_catch_up_never_reads_or_overwrites_a_fresh_legacy_file(home, monkeypatch):
+    """A legacy file an earlier release creates after the failed catch-up is left to
+    its own migration: both its settings and the backup's reach the canonical file,
+    and the first backup is never overwritten."""
+    _catch_up_fails(home, monkeypatch, "refused")
+    first = _backups(home)[0]
+    first_bytes = first.read_bytes()
+    _atomic_legacy_write(home, {"repos": {"old/b": {"auto_merge": True}}})
+    config.config_path()
+    cfg = _load(_canonical(home))
+    assert {"leg/one", "old/a", "old/b"} <= set(cfg["repos"])
+    assert not _legacy(home).exists() and len(_backups(home)) == 2
+    assert first.read_bytes() == first_bytes
+
+
+def test_a_record_naming_a_backup_outside_the_legacy_folder_is_ignored(home, tmp_path):
+    """Only a ``.migrated-`` name beside the legacy file is ever caught up from."""
+    _put(_canonical(home), {"plan": "pro"})
+    stray = _put(tmp_path / "config.yaml.migrated-x", {"plan": "max-20x"})
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    _put(record, {"identity": [0, 0, 0, 0], "conflicts": [], "legacy": {},
+                  "backup": str(stray)})
+    assert config.migrate_legacy_config() == "absent"
+    assert _load(_canonical(home)) == {"plan": "pro"} and not record.exists()
+
+
 def test_a_run_stopped_after_the_write_reports_its_conflicts_on_the_next_run(home, monkeypatch,
                                                                              capsys):
     t = time.time_ns()
@@ -737,6 +817,22 @@ def test_a_blank_test_command_never_overrides_a_real_one(home, capsys, where):
         _put(_legacy(home), {"test_command": "make test"}, mtime_ns=t - 10**9)
     else:
         _put(_canonical(home), {"repos": {REPO: {"test_command": ""}}}, mtime_ns=t)
+        _put(_legacy(home), {"repos": {REPO: {"test_command": "make test"}}},
+             mtime_ns=t - 10**9)
+    config.config_path()
+    assert config.test_command(_load(_canonical(home)), REPO) == "make test"
+    assert "No settings conflicted" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("falsy", [False, 0, [], {}])
+@pytest.mark.parametrize("where", ["top-level", "per-repo"])
+def test_a_falsy_test_command_never_overrides_a_real_one(home, capsys, where, falsy):
+    t = time.time_ns()
+    if where == "top-level":
+        _put(_canonical(home), {"test_command": falsy}, mtime_ns=t)
+        _put(_legacy(home), {"test_command": "make test"}, mtime_ns=t - 10**9)
+    else:
+        _put(_canonical(home), {"repos": {REPO: {"test_command": falsy}}}, mtime_ns=t)
         _put(_legacy(home), {"repos": {REPO: {"test_command": "make test"}}},
              mtime_ns=t - 10**9)
     config.config_path()
@@ -1124,10 +1220,102 @@ def test_a_held_lock_is_waited_on_then_failed_open(home, tmp_path, capsys):
     try:
         _wait_for(held)
         start = time.monotonic()
-        with config.config_lock(p, timeout=0.3):
+        with config.config_lock(p, timeout=0.3) as may_write:
             waited = time.monotonic() - start
+        assert may_write is False
         assert 0.25 <= waited < 2.5
         assert "has held the config lock" in capsys.readouterr().err
+    finally:
+        holder.kill()
+        holder.wait()
+
+
+def _hold_lock(p, tmp_path):
+    """A separate process holding ``p``'s config lock for 30 s, started and held."""
+    held = tmp_path / "held"
+    holder = subprocess.Popen([sys.executable, "-c", _HOLD_LOCK, str(p) + ".lock",
+                               str(held), "30"])
+    try:
+        _wait_for(held)
+    except BaseException:
+        holder.kill()
+        holder.wait()
+        raise
+    return holder
+
+
+def test_a_writer_that_gives_up_on_the_lock_writes_nothing(home, tmp_path, monkeypatch, capsys):
+    """The holder may be mid read-modify-write: a write made without the lock would
+    be overwritten by its stale snapshot, so every writer refuses instead."""
+    p = _put(_canonical(home), {"plan": "pro"})
+    before = p.read_bytes()
+    monkeypatch.setattr(config, "LOCK_TIMEOUT_S", 0.3)
+    holder = _hold_lock(p, tmp_path)
+    try:
+        assert config.set_repo_keys(REPO, {"auto_merge": True}, p) is False
+        assert wizard.write_config({"plan": "max-5x"}, p) is False
+        assert wizard._write_global_default(FLEET, {"copilot": True}, p,
+                                            auto_merge=False) is False
+        # One bounded wait per hold: the writers inside it refuse without waiting again.
+        start = time.monotonic()
+        with config.config_lock(p) as may_write:
+            waited = time.monotonic() - start
+            assert may_write is False
+            assert config.set_repo_keys(REPO, {"auto_merge": True}, p) is False
+            assert wizard.write_config({"plan": "max-5x"}, p) is False
+        assert time.monotonic() - start < waited + config.LOCK_TIMEOUT_S
+        assert p.read_bytes() == before
+        assert sorted(q.name for q in p.parent.iterdir()) == ["config.yaml", "config.yaml.lock"]
+        assert capsys.readouterr().err.count("has held the config lock") == 4
+    finally:
+        holder.kill()
+        holder.wait()
+    # Once the holder is gone the next write takes the lock and lands.
+    assert config.set_repo_keys(REPO, {"auto_merge": True}, p) is True
+    assert _load(p) == {"plan": "pro", "repos": {REPO: {"auto_merge": True}}}
+
+
+def test_a_migration_that_gives_up_on_the_lock_is_deferred(home, tmp_path, monkeypatch, capsys):
+    """The migration never runs without the lock. This process reads the canonical
+    file as it is and does not wait again on its later resolves (every
+    ``load_config()`` resolves the path); the next process migrates."""
+    _put(_legacy(home), LEGACY, mtime_ns=time.time_ns() - 10**9)
+    canonical = _put(_canonical(home), {"known_repos": [REPO]})
+    monkeypatch.setattr(config, "LOCK_TIMEOUT_S", 0.3)
+    holder = _hold_lock(canonical, tmp_path)
+    try:
+        before = _tree(home / ".config")
+        assert config.migrate_legacy_config() == "deferred"
+        start = time.monotonic()
+        for _ in range(3):
+            assert config.config_path() == canonical
+        assert config.load_config() == {"known_repos": [REPO]}
+        assert config.migrate_legacy_config() == "deferred"
+        assert time.monotonic() - start < config.LOCK_TIMEOUT_S
+        assert _tree(home / ".config") == before
+        err = capsys.readouterr().err
+        assert err.count("has held the config lock") == 1
+        assert "Config moved" not in err and "Could not" not in err
+    finally:
+        holder.kill()
+        holder.wait()
+    monkeypatch.setattr(config, "_deferred", set())  # a fresh process
+    assert config.migrate_legacy_config() == "migrated"
+    assert _load(canonical) == {"known_repos": [REPO], **LEGACY}
+    assert not _legacy(home).exists() and len(_backups(home)) == 1
+
+
+@pytest.mark.parametrize("argv", [None, ["--repo", REPO]], ids=["full", "confirm"])
+def test_setup_reports_a_failed_write_while_another_process_holds_the_lock(
+        home, tmp_path, monkeypatch, argv):
+    _stub_wizard(monkeypatch)
+    p = _put(_canonical(home), {"plan": "pro"})
+    before = p.read_bytes()
+    monkeypatch.setattr(config, "LOCK_TIMEOUT_S", 0.3)
+    holder = _hold_lock(p, tmp_path)
+    try:
+        assert _run_wizard(argv) == 1
+        assert p.read_bytes() == before
     finally:
         holder.kill()
         holder.wait()
@@ -1390,6 +1578,21 @@ def test_later_per_repo_confirm_leaves_the_established_globals(home, monkeypatch
     assert cfg["repos"]["zeta/app"]["label_gated_ci"] is True
 
 
+def test_later_per_repo_confirm_arms_missing_choice_globals(home, monkeypatch):
+    """A migrated reviewer fleet keeps its values while confirmation adds only
+    the fail-closed global choice gates."""
+    _stub_wizard(monkeypatch)
+    _put(_canonical(home), {"active_reviewers": ["claude"],
+                            "auto_on_open": {"claude": True}})
+    assert _run_wizard(["--repo", "zeta/app"], auto_merge_on=True, lgc_on=True) == 0
+    cfg = _load(_canonical(home))
+    assert cfg["active_reviewers"] == ["claude"]
+    assert cfg["auto_on_open"] == {"claude": True}
+    assert cfg["auto_merge"] is False and cfg["label_gated_ci"] is False
+    assert cfg["repos"]["zeta/app"]["auto_merge"] is True
+    assert cfg["repos"]["zeta/app"]["label_gated_ci"] is True
+
+
 @pytest.mark.parametrize("argv", [None, ["--repo", REPO]], ids=["full", "confirm"])
 def test_setup_leaves_a_hand_set_global_label_gated_ci_alone(home, monkeypatch, argv):
     """A user who set a top-level label_gated_ci by hand keeps it — value and
@@ -1486,11 +1689,11 @@ def test_full_wizard_run_re_reads_the_file_under_the_lock(home, monkeypatch):
 
     @contextlib.contextmanager
     def lock_then_write(path, **kw):
-        with real_lock(path, **kw):
+        with real_lock(path, **kw) as may_write:
             if not state["injected"]:
                 state["injected"] = True
                 config.set_repo_keys("zeta/app", {"active_reviewers": ["claude"]}, Path(path))
-            yield
+            yield may_write
 
     monkeypatch.setattr(config, "config_lock", lock_then_write)
     assert _run_wizard() == 0

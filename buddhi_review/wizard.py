@@ -805,8 +805,13 @@ def merge_preserving(existing: Dict[str, Any], new: Dict[str, Any]) -> Dict[str,
 def write_config(cfg: Dict[str, Any], path: Path) -> bool:
     """Atomically write ``cfg`` to ``path`` (temp file + ``os.replace``) at 0600,
     under the config lock (:func:`buddhi_review.config.config_lock`, re-entrant, so
-    a caller that already holds it for its read-modify-write simply continues)."""
-    with config.config_lock(path):
+    a caller that already holds it for its read-modify-write simply continues).
+    Returns ``False``, writing nothing, when another process kept the lock past its
+    timeout: that holder may be mid read-modify-write and would overwrite this
+    write with its stale snapshot."""
+    with config.config_lock(path) as may_write:
+        if not may_write:
+            return False
         return _write_config_unlocked(cfg, path)
 
 
@@ -3018,6 +3023,15 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
         if ok and set_gd:
             ok = _write_global_default(reviewers, auto_on_open, cfg_path,
                                        auto_merge=am, label_gated_ci=lgc) and ok
+        elif ok:
+            # A migrated global reviewer fleet can predate these choice gates.
+            # Confirming any repo asks both choices, so arm only the missing
+            # fail-closed globals without replacing that established fleet.
+            current = config.load_config(cfg_path) if cfg_path.exists() else {}
+            defaults = config.establish_global_defaults(
+                current, auto_merge=am, label_gated_ci=lgc)
+            if defaults != current:
+                ok = write_config(defaults, cfg_path) and ok
     if not ok:
         _row("bad", f"Could not write {cfg_path} — check the path's permissions",
              pal, stream)
