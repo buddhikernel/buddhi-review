@@ -939,8 +939,93 @@ def test_unreadable_legacy_is_left_untouched_and_reported_once(home, kind, capsy
     assert out == ""
     warn = [ln for ln in err.splitlines() if "Could not read the old config file" in ln]
     assert len(warn) == 1 and str(legacy) in warn[0]
+    reason = {"invalid-yaml": "not valid YAML", "not-a-mapping": "not a YAML mapping",
+              "permission": "unreadable", "fifo": "not a regular file"}[kind]
+    assert warn[0] == (f"Warning: Could not read the old config file {legacy} ({reason}). "
+                       f"It was left unchanged. Settings are read from {_canonical(home)}.")
     if kind == "permission":
         os.chmod(legacy, 0o600)
+
+
+def test_a_legacy_folder_that_cannot_be_searched_reports_the_approved_reason(home, capsys):
+    """The lstat of the legacy path itself fails (its folder lacks the search bit):
+    the user sees the approved word ``unreadable``, never an OS error string."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    _put(_legacy(home), LEGACY)
+    folder = _legacy(home).parent
+    os.chmod(folder, 0o000)
+    try:
+        assert config.config_path() == _canonical(home)
+    finally:
+        os.chmod(folder, 0o700)
+    assert capsys.readouterr().err.strip() == (
+        f"Warning: Could not read the old config file {_legacy(home)} (unreadable). "
+        f"It was left unchanged. Settings are read from {_canonical(home)}.")
+    assert _load(_legacy(home)) == LEGACY
+
+
+def test_an_error_while_reading_reports_the_approved_reason(home, monkeypatch, capsys):
+    """The file opens but the read itself fails (an I/O error on a failing disk):
+    the user still sees the approved word ``unreadable``."""
+    _put(_legacy(home), LEGACY)
+    real_fdopen = os.fdopen
+
+    class Failing:
+        def __init__(self, f):
+            self._f = f
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            self._f.close()
+        def read(self):
+            raise OSError(5, "Input/output error")
+
+    with monkeypatch.context() as m:
+        m.setattr(config.os, "fdopen", lambda fd, *a, **k: Failing(real_fdopen(fd, *a, **k)))
+        assert config.config_path() == _canonical(home)
+    assert capsys.readouterr().err.strip() == (
+        f"Warning: Could not read the old config file {_legacy(home)} (unreadable). "
+        f"It was left unchanged. Settings are read from {_canonical(home)}.")
+
+
+def test_a_canonical_file_that_cannot_be_read_reports_the_approved_reason(home, capsys):
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 000 file")
+    _put(_canonical(home), {"plan": "pro"})
+    _put(_legacy(home), LEGACY)
+    os.chmod(_canonical(home), 0o000)
+    try:
+        assert config.config_path() == _canonical(home)
+    finally:
+        os.chmod(_canonical(home), 0o600)
+    assert capsys.readouterr().err.strip() == (
+        f"Warning: Could not move settings from {_legacy(home)} to {_canonical(home)} because "
+        f"config.yaml could not be read: unreadable. Both files were left unchanged. "
+        f"Settings are read from {_canonical(home)}.")
+    assert _load(_legacy(home)) == LEGACY and _load(_canonical(home)) == {"plan": "pro"}
+
+
+def test_a_copied_legacy_file_is_recorded_so_a_refused_rename_never_re_merges_it(home):
+    """No canonical file yet, so the legacy file is byte-copied; its rename is then
+    refused (a read-only legacy folder). The user deletes a repo from the canonical
+    file. The next run must NOT merge the same legacy bytes again and bring it back."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    _put(_legacy(home), LEGACY)
+    folder = _legacy(home).parent
+    os.chmod(folder, 0o500)
+    try:
+        config.config_path()
+        assert _load(_canonical(home)) == LEGACY
+        cfg = _load(_canonical(home))
+        del cfg["repos"][REPO]
+        _put(_canonical(home), cfg)
+        config.config_path()
+        assert REPO not in _load(_canonical(home))["repos"]
+        assert _legacy(home).exists()
+    finally:
+        os.chmod(folder, 0o700)
 
 
 def test_unreadable_canonical_leaves_both_files_and_fails_open(home, capsys):
