@@ -286,7 +286,9 @@ def _read_config_file(path: Path) -> Tuple[Optional[Dict[str, Any]], bytes, Opti
                                            Optional[Tuple[int, int, int, int]]]:
     """Read ``path`` as a YAML mapping for the migration: ``(data, raw, None,
     identity)`` on success (an empty document is ``{}``), else ``(None, b"",
-    reason, None)``. ``identity`` (device, inode, size, mtime) is taken from the
+    reason, None)``. ``reason`` is always one of the approved user-facing words:
+    ``PyYAML is not installed``, ``not a regular file``, ``not valid YAML``,
+    ``not a YAML mapping`` or ``unreadable`` (any ``OSError``). ``identity`` (device, inode, size, mtime) is taken from the
     open file, so it describes exactly the bytes read. Opened non-blocking and
     checked to be a regular file BEFORE reading, so a FIFO at the path can never
     hang the resolver."""
@@ -295,7 +297,7 @@ def _read_config_file(path: Path) -> Tuple[Optional[Dict[str, Any]], bytes, Opti
     try:
         fd: Optional[int] = os.open(str(path), os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except OSError as exc:
-        return None, b"", exc.strerror or str(exc), None
+        return None, b"", "unreadable", None
     try:
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
@@ -304,7 +306,7 @@ def _read_config_file(path: Path) -> Tuple[Optional[Dict[str, Any]], bytes, Opti
             fd = None
             raw = fh.read()
     except OSError as exc:
-        return None, b"", exc.strerror or str(exc), None
+        return None, b"", "unreadable", None
     finally:
         if fd is not None:
             os.close(fd)
@@ -589,7 +591,7 @@ def migrate_legacy_config(canonical: Optional[Path] = None, *,
             if not _lexists(legacy):
                 return "absent"
         except OSError as exc:
-            return _unreadable(legacy, canonical, exc.strerror or str(exc))
+            return _unreadable(legacy, canonical, "unreadable")
         if _twin(legacy, canonical) == "same":
             return "absent"  # one directory entry: there is nothing to move
         # An unreadable legacy file is reported without taking the lock or creating
