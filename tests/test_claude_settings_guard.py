@@ -2938,3 +2938,314 @@ def test_a_cd_that_never_leaves_the_checkout_is_not_a_cd_home(tmp_path, monkeypa
     (checkout / "tools").mkdir(parents=True)
     monkeypatch.setenv("HOME", str(tmp_path))
     assert guard.named_paths(command, str(checkout)).unsafe is None
+
+
+# ── a script a hook names, however it names it ───────────────────────────────────
+
+# Every way a hook's shell can spell ``tools/...``: the six project-directory
+# spellings, the same for ``PWD``, and a bare relative path.
+_SPELLINGS = (
+    '"$CLAUDE_PROJECT_DIR"/', '"${CLAUDE_PROJECT_DIR}"/', "${CLAUDE_PROJECT_DIR}/",
+    "$CLAUDE_PROJECT_DIR/", '"$CLAUDE_PROJECT_DIR/', "./",
+    '"$PWD"/', '"${PWD}"/', "${PWD}/", "$PWD/", '"$PWD/', "",
+)
+
+
+def _spell(spelling, path):
+    """``path`` (relative to the checkout) in one of :data:`_SPELLINGS`."""
+    return spelling + path + ('"' if spelling.endswith(('_DIR/', 'PWD/')) and spelling[0] == '"' else "")
+
+
+# The script directory every family's cells load from, and the sibling module each
+# family's script loads (the file a PR changes).
+_TOOLS = {
+    "tools/run": "import helper\n",
+    "tools/x.py": "import helper\n", "tools/helper.py": "x = 1\n",
+    "tools/x.js": "require('./helper')\n", "tools/helper.js": "module.exports = 1\n",
+    "tools/x.rb": "require_relative 'helper'\n", "tools/helper.rb": "X = 1\n",
+    "tools/x.pl": "use FindBin; use lib $FindBin::Bin; require 'helper.pl';\n",
+    "tools/helper.pl": "1;\n",
+}
+_SIBLING = {"python3": "tools/helper.py", "node": "tools/helper.js", "ruby": "tools/helper.rb",
+            "perl": "tools/helper.pl", '"$PY"': "tools/helper.py"}
+
+
+@pytest.fixture(scope="module")
+def _tools_repo(tmp_path_factory):
+    return make_pr_repo(tmp_path_factory.mktemp("tools"), _TOOLS, {})
+
+
+def _live(repo, command):
+    checker = guard._Checker(str(repo.wt), guard._Base(str(repo.wt), repo.base))
+    return checker.unchanged("hooks", command_hook("SessionStart", command))[0]
+
+
+def _assert_sibling_holds(repo, command, sibling):
+    """The hook is live while the script's directory is base's, and held back once
+    the PR changes a module beside the script."""
+    path = repo.wt / sibling
+    before = path.read_bytes()
+    assert _live(repo, command), f"held back with nothing changed: {command}"
+    try:
+        path.write_bytes(before + b"\n# the pull request's code\n")
+        assert not _live(repo, command), f"live after {sibling} changed: {command}"
+    finally:
+        path.write_bytes(before)
+
+
+@pytest.mark.parametrize("command", [
+    "node -e \"require('$CLAUDE_PROJECT_DIR/tools/x.js')\"",
+    "node -e \"require('${CLAUDE_PROJECT_DIR}/tools/x.js')\"",
+    "node -e \"require('$PWD/tools/x.js')\"",
+    "node -p \"require('$CLAUDE_PROJECT_DIR/tools/x.js')\"",
+])
+def test_a_script_node_code_loads_by_the_project_directory_names_its_directory(tmp_path, command):
+    """The shell expands the path in ``node -e`` code before node runs, so
+    ``require('$CLAUDE_PROJECT_DIR/tools/x.js')`` loads ``tools/x.js`` exactly as
+    ``require('./tools/x.js')`` does — and ``x.js`` loads its sibling."""
+    repo = _hook_repo(tmp_path, command, {"tools/x.js": "require('./helper.js');\n",
+                                         "tools/helper.js": "1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "tools/helper.js", touch(repo.markers, "pr") + "\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("command", [
+    'python3 -uW ignore "$CLAUDE_PROJECT_DIR"/tools/run',
+    'python3 -bX dev "$CLAUDE_PROJECT_DIR"/tools/run',
+    'python3 -Wd "$CLAUDE_PROJECT_DIR"/tools/run',
+])
+def test_a_python_script_after_a_cluster_ending_in_an_option_names_its_directory(tmp_path, command):
+    """``-uW ignore`` is ``-u`` then ``-W ignore``: ``ignore`` is ``-W``'s argument
+    and ``tools/run`` the script, which imports from its own directory."""
+    repo = _hook_repo(tmp_path, command, {"tools/run": "import helper\n", "tools/helper.py": "x = 1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "tools/helper.py", "x = 2\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("command", [
+    "ruby -e \"require './tools/x.rb'\"",
+    "ruby -e \"load '$CLAUDE_PROJECT_DIR/tools/x.rb'\"",
+])
+def test_a_script_ruby_code_loads_names_its_directory(tmp_path, command):
+    repo = _hook_repo(tmp_path, command, {"tools/x.rb": "require_relative 'helper'\n",
+                                         "tools/helper.rb": "X = 1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "tools/helper.rb", "X = 2\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+# (interpreter, options before the script): every option that takes an argument,
+# alone and closing a Python cluster, and the options that look like one but take
+# none in that family.
+_AFTER_OPTIONS = [
+    ("python3", "-W ignore"), ("python3", "-X dev"), ("python3", "-uW ignore"),
+    ("python3", "-bX dev"), ("python3", "-Wd"), ("python3", '-W"$MODE"'), ("python3", "-I"),
+    ("node", "-r dotenv/config"), ("node", "--require dotenv/config"),
+    ("node", "--import dotenv/config"), ("node", "--loader ts-node/esm"),
+    ("node", "--experimental-loader ts-node/esm"), ("node", "-C dev"),
+    ("node", "--conditions dev"),
+    ("ruby", "-I vendor"), ("ruby", "-r json"), ("ruby", "-C /"), ("ruby", "-X /"), ("ruby", "-W"),
+    ("perl", "-I vendor"), ("perl", "-W"), ("perl", "-X"), ("perl", "-C"),
+    ('"$PY"', "-W ignore"), ('"$PY"', "-X dev"), ('"$PY"', "-uW ignore"), ('"$PY"', "-bX dev"),
+    ('"$PY"', "-Wd"), ('"$PY"', "-I"), ('"$PY"', "-I vendor"), ('"$PY"', "-r dotenv/config"),
+    ('"$PY"', "-W"), ('"$PY"', "-X"), ('"$PY"', "-C"),
+]
+
+
+@pytest.mark.parametrize("spelling", _SPELLINGS, ids=lambda s: s or "bare")
+@pytest.mark.parametrize("interp,options", _AFTER_OPTIONS, ids=lambda v: v)
+def test_a_script_after_any_option_names_its_directory(_tools_repo, interp, options, spelling):
+    """The script after any option cluster — an option's argument skipped, a flag
+    not mistaken for one — imports from its directory, however its path is spelled
+    (``tools/run`` has no suffix, so only its position says it is the script)."""
+    command = f"{interp} {options} {_spell(spelling, 'tools/run')}"
+    _assert_sibling_holds(_tools_repo, command, _SIBLING[interp])
+
+
+# (interpreter and option, code before the path, code after it, suffix): every
+# inline-code option and loader, the option alone, ending a cluster, and with the
+# code glued to it (``-e'…'``, marked by a trailing ``|``).
+_INLINE = [
+    ("node -e", 'require("', '")', ".js"), ("node --eval", 'require("', '")', ".js"),
+    ("node -p", 'require("', '")', ".js"), ("node --print", 'require("', '")', ".js"),
+    ("node -pe", 'require("', '")', ".js"),
+    ("ruby -e", 'require "', '"', ".rb"), ("ruby -e", 'require_relative "', '"', ".rb"),
+    ("ruby -e", 'load "', '"', ".rb"), ("ruby -we", 'require "', '"', ".rb"),
+    ("ruby -we", 'require_relative "', '"', ".rb"), ("ruby -we", 'load "', '"', ".rb"),
+    ("ruby -e|", 'require "', '"', ".rb"), ("ruby -e|", 'require_relative "', '"', ".rb"),
+    ("ruby -e|", 'load "', '"', ".rb"),
+    ("perl -e", 'do "', '"', ".pl"), ("perl -e", 'require "', '"', ".pl"),
+    ("perl -E", 'do "', '"', ".pl"), ("perl -E", 'require "', '"', ".pl"),
+    ("perl -we", 'do "', '"', ".pl"), ("perl -we", 'require "', '"', ".pl"),
+    ("perl -e|", 'do "', '"', ".pl"), ("perl -e|", 'require "', '"', ".pl"),
+    ("python3 -c", 'exec(open("', '").read())', ".py"), ("python3 -uc", 'exec(open("', '").read())', ".py"),
+    ("python3 -c|", 'exec(open("', '").read())', ".py"),
+    ('"$RUN" -e', 'require("', '")', ".js"), ('"$RUN" -c', 'exec(open("', '").read())', ".py"),
+    ('"$RUN" -E', 'do "', '"', ".pl"), ('"$RUN" -we', 'require_relative "', '"', ".rb"),
+]
+_INLINE_SIBLING = {".js": "tools/helper.js", ".rb": "tools/helper.rb", ".pl": "tools/helper.pl",
+                   ".py": "tools/helper.py"}
+
+
+@pytest.mark.parametrize("spelling", _SPELLINGS, ids=lambda s: s or "bare")
+@pytest.mark.parametrize("module", ["x{}", "x"], ids=["suffix", "no-suffix"])
+@pytest.mark.parametrize("option,before,after,suffix", _INLINE,
+                         ids=[f"{o} {b}" for o, b, _, _ in _INLINE])
+def test_a_script_inline_code_loads_names_its_directory(_tools_repo, option, before, after, suffix,
+                                                        module, spelling):
+    """A file inline code hands a loader is code, with or without a suffix, and its
+    directory is a dependency, however the hook's shell spells its path."""
+    path = "tools/" + module.format(suffix)
+    code = f"'{before}'{_spell(spelling, path)}'{after}'"
+    command = f"{option[:-1]}{code}" if option.endswith("|") else f"{option} {code}"
+    _assert_sibling_holds(_tools_repo, command, _INLINE_SIBLING[suffix])
+
+
+@pytest.mark.parametrize("option", ["python3 -c", "python3 -uc", "python3 -c|"])
+@pytest.mark.parametrize("code", ["import tools.x", "from tools import x", "from tools.x import y"])
+def test_a_package_python_code_imports_by_name_is_walked_whatever_the_option(_tools_repo, option, code):
+    command = f"{option[:-1]}'{code}'" if option.endswith("|") else f"{option} '{code}'"
+    _assert_sibling_holds(_tools_repo, command, "tools/helper.py")
+
+
+@pytest.mark.parametrize("command,sibling", [
+    ("node -e \"require(process.env.CLAUDE_PROJECT_DIR + '/tools/x')\"", "tools/helper.js"),
+    ("node -e \"require(process.cwd() + '/tools/x.js')\"", "tools/helper.js"),
+    ("ruby -e \"require \\\"#{ENV['CLAUDE_PROJECT_DIR']}/tools/x\\\"\"", "tools/helper.rb"),
+    ("perl -e 'do $ENV{CLAUDE_PROJECT_DIR} . \"/tools/x.pl\"'", "tools/helper.pl"),
+    ("python3 -c \"import os; exec(open(os.environ['CLAUDE_PROJECT_DIR'] + '/tools/x.py').read())\"",
+     "tools/helper.py"),
+    ("python3 -c \"import os; exec(open(f'{os.getcwd()}/tools/x.py').read())\"", "tools/helper.py"),
+])
+def test_a_script_code_joins_onto_the_checkout_path_names_its_directory(_tools_repo, command, sibling):
+    """Code that builds the path itself — the project directory from its
+    environment, the working directory — joined with a literal ``/tools/x``: the
+    literal names the checkout's ``tools/x``."""
+    _assert_sibling_holds(_tools_repo, command, sibling)
+
+
+def test_an_isolated_python_program_still_has_its_code_read(tmp_path):
+    """``-I`` is a flag to Python, not an option taking the next word: the ``-c``
+    after it still starts code, and a file that code runs, changed by the PR, holds
+    the hook back."""
+    command = "python3 -I -c \"exec(open(r'tools/x.py').read())\""
+    repo = _hook_repo(tmp_path, command, {"tools/x.py": "x = 1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "tools/x.py", "x = 2\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_rollback_merges_the_held_keys_into_a_racing_writers_object(tmp_path, monkeypatch, capfd):
+    """Another writer lands one JSON object between the scrub's write and its
+    read-back: the spawn is refused, and the put-back keeps that writer's keys and
+    puts back the held ones it did not re-state — at the file's own mode."""
+    repo, rel = _hostile_untracked_local(tmp_path)
+    path = repo.wt / rel
+    original = json.loads(path.read_bytes())
+    theirs = {"permissions": {"allow": ["Bash(npm test)"]}}
+    real = guard._Dir.write
+    raced = []
+
+    def racing(self, name, data, mode, token, full=False):
+        if name == "settings.local.json" and not raced:
+            raced.append(data)
+            data = json.dumps(theirs).encode()
+        return real(self, name, data, mode, token, full=full)
+
+    monkeypatch.setattr(guard._Dir, "write", racing)
+    with pytest.raises(guard.SettingsGuardRefusal, match="did not read back as written"):
+        _spawn(str(repo.wt))
+    monkeypatch.setattr(guard._Dir, "write", real)
+    assert raced, "the scrub never wrote the file"
+    merged = {**theirs, "env": original["env"], "hooks": original["hooks"]}
+    assert path.read_bytes() == guard._dump(merged)
+    assert _mode(path) == 0o600
+    assert _saved_bytes() == []
+    assert "kept the edit made to this file while settings were held back, and put back" \
+        in capfd.readouterr().err
+    assert markers_present(repo.markers) == []
+
+
+_FIFO_CHILD = """
+import os, shutil, sys
+from buddhi_review import claude_settings_guard as guard
+with guard.window(sys.argv[1]):
+    shutil.rmtree(os.path.join(sys.argv[1], ".claude"))
+    os.mkfifo(os.path.join(sys.argv[1], ".claude"))
+"""
+
+
+def test_a_claude_dir_swapped_for_a_fifo_mid_spawn_never_blocks_the_put_back(tmp_path):
+    """A run that leaves a FIFO where ``.claude/`` was: the put-back never opens it
+    as a directory (which would wait for a writer forever) — it finishes, and says
+    ``.claude`` was replaced."""
+    repo, _ = _hostile_tracked(tmp_path)
+    r = subprocess.run([sys.executable, "-c", _FIFO_CHILD, str(repo.wt)], env=_child_env(),
+                       capture_output=True, text=True, timeout=20, stdin=subprocess.DEVNULL)
+    assert r.returncode == 0, r.stderr
+    assert ".claude was replaced while settings were held back" in r.stderr
+
+
+@pytest.mark.parametrize("command", ["cd sub && sh ./tools/.*", "cd sub && cat tools/.?"])
+def test_a_dot_glob_read_after_a_cd_may_climb_to_the_checkout_root(tmp_path, command):
+    """``.*`` / ``.?`` can match ``..``: after ``cd sub``, ``./tools/.*`` may be read
+    from the root as well as from ``sub``, and ``tools/..`` is the root itself."""
+    repo = _hook_repo(tmp_path, command, {"sub/a.txt": "a\n"}, head={"README.md": "changed\n"})
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_code_glued_to_its_option_and_starting_with_an_expansion_is_read(_tools_repo):
+    _assert_sibling_holds(_tools_repo, 'ruby -e"$PRELUDE"\'; load "./tools/x.rb"\'', "tools/helper.rb")
+
+
+def test_a_module_named_through_a_variable_reaches_into_its_directory(_tools_repo):
+    _assert_sibling_holds(_tools_repo, "node -e \"require('./tools/$NAME')\"", "tools/helper.js")
+
+
+def test_a_module_a_loader_finds_at_the_checkout_root_holds_the_hook_back(tmp_path):
+    """``require_relative 'helper'`` loads ``helper.rb`` from the checkout root,
+    whose every module the PR controls; a module no root file provides
+    (``require('fs')``) names nothing."""
+    repo = _hook_repo(tmp_path, "ruby -e \"require_relative 'helper'\"", {"helper.rb": "X = 1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == []
+    (tmp_path / "fs").mkdir()
+    repo = _hook_repo(tmp_path / "fs", "node -e \"require('fs')\"", {"helper.rb": "X = 1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+
+
+def test_a_variable_interpreter_given_I_may_still_import_from_the_root(tmp_path):
+    """``-I`` isolates only Python: run as ``"$PY" -Ic``, the program may still
+    import from the checkout root, so a module the PR adds there holds it back."""
+    repo = _hook_repo(tmp_path, "\"$PY\" -Ic 'import json'", {}, {"README.md": "changed\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "json.py", "x = 1\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("command", ["node -e \"require('/usr/lib/node_modules/x')\"",
+                                     "python3 -c \"print(open('/etc/hosts').read())\""])
+def test_an_absolute_path_in_code_that_the_checkout_lacks_names_nothing(tmp_path, command):
+    repo = _hook_repo(tmp_path, command, {"tools/x.py": "x = 1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+
+
+_DECIDE_CHILD = """
+import sys
+from buddhi_review import claude_settings_guard as guard
+hook = {"SessionStart": [{"hooks": [{"type": "command", "command": sys.argv[3]}]}]}
+print(guard._Checker(sys.argv[1], guard._Base(sys.argv[1], sys.argv[2])).unchanged("hooks", hook))
+"""
+
+
+def test_a_fifo_at_a_path_a_hook_names_is_held_back_without_waiting(tmp_path):
+    """A run can leave a FIFO where a hook names a file: reading it for a ``#!``
+    line must not wait for a writer. The check finishes, and holds the hook back."""
+    repo = _hook_repo(tmp_path, "cat tools/pipe", {"tools/x.txt": "x\n"})
+    os.mkfifo(repo.wt / "tools/pipe")
+    r = subprocess.run([sys.executable, "-c", _DECIDE_CHILD, str(repo.wt), repo.base, "cat tools/pipe"],
+                       env=_child_env(), capture_output=True, text=True, timeout=20,
+                       stdin=subprocess.DEVNULL)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.startswith("(False, ") and "tools/pipe" in r.stdout

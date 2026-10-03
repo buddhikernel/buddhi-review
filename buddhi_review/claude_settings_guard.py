@@ -25,12 +25,14 @@ bytes, the same file mode, the same git index flags — after a normal exit, an
 exception, a SIGTERM (the spawn's child is killed with it), a SIGKILL or a reboot:
 the original is recorded first in a durable, owner-only journal
 (:func:`state_dir`), which is replayed before the next spawn in that checkout and
-at loop entry (:func:`recover`). When the spawn changed a file meanwhile, the
-change is kept. If git holds the original (a tracked file with no local edit),
-an edited file gets back the held keys it did not re-state, and a deletion
-stands. If only the journal holds it (an untracked file, a local edit), nothing
-is merged into the checkout: the original is saved, owner-only, beside the
-journal, and named.
+at loop entry (:func:`recover`). When the spawn changed a file meanwhile, an
+edit that is still one JSON object gets back the held keys it did not re-state,
+whoever holds the original — git (a tracked file with no local edit) or only the
+journal (an untracked file, a local edit). A deletion, a replacement or an edit
+that is not one JSON object keeps the spawn's change, and when only the journal
+holds the original, it is saved, owner-only, beside the journal, and named. An
+original that is not one JSON object wins over the edit, and the dropped edit is
+announced.
 
 Each spawn also passes :data:`CLAUDE_ARGS`, so Claude Code loads no LOCAL
 settings file at all — including the one it would otherwise read from the
@@ -574,8 +576,17 @@ _CODE_OPTIONS = {
 }
 _CODE_OPTIONS["?"] = frozenset().union(*_CODE_OPTIONS.values())
 _PYTHON = re.compile(r"python[0-9.]*|pypy[0-9.]*")
-# A cluster of Python's no-argument flags, optionally ending in -c / -m (``-uc``).
-_PYTHON_FLAGS = re.compile(r"-([BbdEhiIOPqsSuvx]*)([cm]?)")
+# A cluster of Python's no-argument flags, optionally ending in an option that takes
+# an argument: ``-c`` / ``-m`` / ``-W`` / ``-X``, its argument glued on (``-Wd``,
+# ``-c'import x'``) or the next word (``-uW ignore``, ``-uc 'import x'``).
+_PYTHON_FLAGS = re.compile(r"-([BbdEhiIOPqsSuvx]*)(?:([cmWX])(.*))?", re.S)
+# A cluster of switches ending in an inline-code option, the code glued on or the
+# next word (``ruby -we 'x'``, ``perl -ne'x'``, ``node -pe 'x'``).
+_CODE_CLUSTERS = {
+    "ruby": re.compile(r"-[acdlnpsSvwy]*e(.*)", re.S),
+    "perl": re.compile(r"-[aclnpsStTuUvwWX0-9]*[eE](.*)", re.S),
+    "node": re.compile(r"-pe()"),
+}
 # What a script path ends with: an operand of an interpreter, a module it preloads
 # or a file its code names, of this shape, is run — its directory is a dependency.
 _CODE_SUFFIXES = (".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", ".tsx", ".jsx",
@@ -584,8 +595,24 @@ _CODE_SUFFIXES = (".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", "
 _PY_MODULE_SUFFIXES = (".py", ".pyc", ".pyo", ".pyw", ".so", ".pyd")
 _PY_IMPORT = re.compile(r"(?:^|[\s;:])(?:import\s+([\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*)"
                         r"|from\s+([\w.]+)\s+import)")
-_ARG_OPTIONS = frozenset({"-W", "-X", "-r", "--require", "--import", "--loader",
-                          "--experimental-loader", "-C", "--conditions", "-I", "-M"})
+# Options that take the next word as their argument, by interpreter family
+# (Python's come from :data:`_PYTHON_FLAGS`; its ``-I`` is a flag, as are Ruby's
+# ``-W`` and Perl's ``-W`` / ``-X`` / ``-C``, and Perl's ``-M`` takes its module
+# glued on: ``perl -M strict`` is an error).
+_ARG_OPTIONS = {
+    "python": frozenset(),
+    "node": frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader",
+                       "-C", "--conditions"}),
+    "ruby": frozenset({"-I", "-r", "-C", "-X"}),
+    "perl": frozenset({"-I"}),
+}
+_ARG_OPTIONS["?"] = frozenset().union(*_ARG_OPTIONS.values())
+# A string literal handed to a loader — Node's ``require``, Ruby's ``require`` /
+# ``require_relative`` / ``load``, Perl's ``do`` / ``require``, Python's
+# ``exec(open(…))`` — alone or joined onto an expression (``require(dir + '/x')``).
+# It names code, whether or not it has a suffix.
+_LOADER = re.compile(r"(?:\b(?:require_relative|require|load|do)\s*\(?|\bexec\s*\(\s*open\s*\()"
+                     r"\s*(?:[^;()\n]*?[+.]\s*)??[rRbBuUfF]{0,2}(?=['\"`])")
 # A string literal in interpreter code (``'x'``, ``"x"``, ``r'x'``, ``f"x"``, `` `x` ``).
 _CODE_LITERAL = re.compile(r"""(['"`])((?:\\.|(?!\1).)*)\1""", re.S)
 _BRACE_EXPANSION = re.compile(r"\{[^{}]*(?:,|\.\.)[^{}]*\}")
@@ -953,6 +980,20 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
         else:
             st.cwd.enter(None)
 
+    def inline(word: List[tuple], module: bool) -> None:
+        """An interpreter's inline code (``-c`` / ``-e`` …), or Python's ``-m`` module."""
+        family = _family(st.interp)
+        _scan_code(_text(word), named, checkout, depth, st.cwd, scripts=family in ("node", "?"))
+        if family in ("python", "?") and not st.isolated:
+            # ``-c`` / ``-m``: the checkout root is first on the program's path.
+            named.imports_root = True
+            code = _text(word)
+            named.root_imports.update({code.split(".", 1)[0]} if module else _python_imports(code))
+        # A code option this guard mistook (``perl -p x.pl``): the word may be the
+        # script, so it is read as one too.
+        for place, bare in st.cwd.places(word):
+            _scan_whole(place, named, checkout, True, bare)
+
     def command_ended() -> None:
         if st.command in _CD_COMMANDS and not st.cd_operand:
             cd_to(None)
@@ -1049,21 +1090,14 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
             elif st.cd_operands or text is None or not text.startswith("-") or _STACK_ARG.fullmatch(text):
                 st.cd_operand = operand = True
         elif st.arg_next:
-            st.arg_next = False
+            # Under an interpreter named by a variable, the option may be one that
+            # takes no argument (Python's ``-I``, Ruby's ``-W``): this word may be the
+            # script.
+            st.arg_next, script = False, st.arg_script
         elif st.code_next:
-            family, module = _family(st.interp), st.code_next == "-m"
+            module = st.code_next == "-m"
             st.code_next = False
-            _scan_code(_text(word), named, checkout, depth, st.cwd, scripts=family in ("node", "?"))
-            if family in ("python", "?") and not st.isolated:
-                # ``-c`` / ``-m``: the checkout root is first on the program's path.
-                named.imports_root = True
-                code = _text(word)
-                named.root_imports.update(
-                    {code.split(".", 1)[0]} if module else _python_imports(code))
-            # A code option this guard mistook (``perl -p x.pl``): the word may be
-            # the script, so it is read as one too.
-            for place, bare in st.cwd.places(word):
-                _scan_whole(place, named, checkout, True, bare)
+            inline(word, module)
             continue
         elif text is not None and _SCRIPT_DIR_INTERPRETERS.fullmatch(name):
             st.script_next = True           # ``timeout 30 python3 x.py``, ``env -i node x.js``
@@ -1071,16 +1105,26 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
         elif text == "run" and st.last in _RUNNERS:
             st.script_next = True           # ``uv run x.py``
             st.interp = "?"
-        elif st.script_next and text is not None and text.startswith("-"):
+        elif st.script_next and _lead(word, len(word)).startswith("-"):
             family = _family(st.interp)
-            flags = _PYTHON_FLAGS.fullmatch(text) if family == "python" else None
-            if flags and ("I" in flags.group(1) or "P" in flags.group(1)):
+            lead = _lead(word, len(word))   # the option, before any expansion glued to it
+            flags = _PYTHON_FLAGS.fullmatch(lead) if family in ("python", "?") else None
+            if family == "python" and flags and ("I" in flags.group(1) or "P" in flags.group(1)):
                 st.isolated = True          # ``-I`` / ``-P``: the root is not on the path
-            if text in _CODE_OPTIONS[family] or (flags and flags.group(2)):
+            code = _code_option(lead, family, flags)
+            if code is not None:
                 st.script_next = False
-                st.code_next = "-m" if (flags and flags.group(2) == "m") or text == "-m" else "-c"
-            elif text in _ARG_OPTIONS and not flags:  # Python's -I is a flag, not ruby's -I DIR
-                st.arg_next = True
+                module, glued = code
+                if text is None and glued is None:
+                    glued = len(lead)       # ``-e"$X…"``: code glued on, starting with an expansion
+                if glued is None:
+                    st.code_next = "-m" if module else "-c"
+                else:
+                    inline(word[glued:], module)  # ``-c'import x'``, ``-we'require "x"'``
+                    continue
+            elif text is not None and (text in _ARG_OPTIONS[family] or (
+                    flags and flags.group(2) in ("W", "X") and not flags.group(3))):
+                st.arg_next, st.arg_script = True, family == "?"
         elif st.script_next:
             script, st.script_next = True, False
         if script is False and (st.interp or st.scripts) and _script_shaped(word):
@@ -1134,6 +1178,7 @@ class _Command:
         self.command = ""
         self.last = ""
         self.script_next = self.code_next = self.arg_next = self.pattern_next = False
+        self.arg_script = False  # the option's argument may be the script
         self.redirect_next = False
         self.cd_operand = self.cd_operands = False  # an operand seen; ``--`` seen
         self.interp = ""        # the interpreter this simple command runs, if any
@@ -1279,6 +1324,22 @@ def _family(interp: str) -> str:
     return interp if interp in ("ruby", "perl") else "node"
 
 
+def _code_option(text: str, family: str, flags) -> Optional[Tuple[bool, Optional[int]]]:
+    """Whether an interpreter option word starts inline code (``-c``, ``-e`` …) or
+    Python's ``-m``, alone or ending a cluster: ``(module, glued)``, where ``glued``
+    is where code glued to the option starts (``-c'x'``), or None when the code is
+    the next word. None when the word is not a code option."""
+    if text in _CODE_OPTIONS[family]:
+        return text == "-m", None
+    if flags and flags.group(2) in ("c", "m"):
+        return flags.group(2) == "m", (len(text) - len(flags.group(3))) if flags.group(3) else None
+    for name, cluster in _CODE_CLUSTERS.items():
+        m = cluster.fullmatch(text) if family in (name, "?") else None
+        if m:
+            return False, m.start(1) if m.group(1) else None
+    return None
+
+
 def _python_imports(code: str) -> Set[str]:
     """The top-level module names Python code imports by name."""
     names = set()
@@ -1301,16 +1362,50 @@ def _scan_code(code: str, named: _Named, checkout: Optional[str], depth: int,
     files (``open('tools/x.py')``), and one may be a whole command line a shell
     will run (``os.system('sh tools/x.sh')``), so each is read both ways. The
     rest is not shell and is not read as such. ``$`` expansions in a literal are
-    the shell's, done before the interpreter runs. With ``scripts`` (JavaScript,
-    whose ``require('./x.js')`` loads x.js's own siblings), a script-shaped literal
-    is a script."""
+    the shell's, done before the interpreter runs. A literal a loader is handed
+    (:data:`_LOADER`) is code whose directory is a dependency, with or without a
+    suffix; with ``scripts`` (JavaScript, whose ``require('./x.js')`` loads x.js's
+    own siblings), so is any script-shaped literal. A literal starting with ``/``
+    may be joined onto the checkout's own path by the code, so it is read as a
+    checkout path too."""
+    loaded = {m.end() for m in _LOADER.finditer(code)}
     for m in _CODE_LITERAL.finditer(code):
         body = m.group(2)
         if not body:
             continue
+        shaped = body.endswith(_CODE_SUFFIXES)
+        # A loader's file without a suffix is a module (``require('./x')`` loads x.js).
+        script = (shaped or "module") if m.start() in loaded else scripts and shaped
         if not ("$" in body or "`" in body or "~" in body):
-            _scan_literal(body, named, checkout, scripts and body.endswith(_CODE_SUFFIXES))
-        _scan_command(body, named, checkout, depth + 1, strict=False, cwd=cwd, scripts=scripts)
+            _scan_literal(body, named, checkout, script)
+            for tail in {body, body.rsplit("}", 1)[-1]}:
+                if tail.startswith("/"):
+                    # ``process.env.CLAUDE_PROJECT_DIR + '/x.js'``, ``f"{root}/x.py"``:
+                    # code may join the checkout's own path onto it, so it is a
+                    # checkout path too, where one exists.
+                    _scan_relative(_literal(tail.lstrip("/")), named, bare=True, script=script)
+        elif script:
+            # ``require('$CLAUDE_PROJECT_DIR/x.js')``: the shell expanded the path
+            # before the interpreter ran, so it resolves as the shell's word would.
+            _scan_word(_code_path(body), named, checkout, script)
+        if script != "module":  # a module's path is not a command line
+            _scan_command(body, named, checkout, depth + 1, strict=False, cwd=cwd, scripts=scripts)
+
+
+def _code_path(text: str) -> List[tuple]:
+    """A path in interpreter code, its shell expansions kept whole: literal
+    characters, which no shell globs, and ``$…`` / backtick items."""
+    items: List[tuple] = []
+    i = 0
+    while i < len(text):
+        if text[i] in "$`":
+            j = _expansion_end(text, i)
+            items.append(("x", text[i:j]))
+            i = j
+        else:
+            items.append(("c", text[i], False))
+            i += 1
+    return items
 
 
 def _is_assignment(word: List[tuple]) -> bool:
@@ -1325,7 +1420,7 @@ def _classify(word: List[tuple]) -> List[tuple]:
     return [_classify_expansion(it[1]) if it[0] == "x" else it for it in word]
 
 
-def _scan_whole(word: List[tuple], named: _Named, checkout: Optional[str], script: bool,
+def _scan_whole(word: List[tuple], named: _Named, checkout: Optional[str], script: object,
                 if_present: bool = False) -> None:
     """Best effort: a quoted word as one path."""
     try:
@@ -1338,7 +1433,7 @@ def _scan_whole(word: List[tuple], named: _Named, checkout: Optional[str], scrip
 
 
 def _scan_word(word: List[tuple], named: _Named, checkout: Optional[str],
-               script: bool = False, if_present: bool = False) -> None:
+               script: object = False, if_present: bool = False) -> None:
     items = _classify(word)
     active = "".join(it[1] if it[0] == "c" and it[2] else "\0" for it in items)
     brace = _BRACE_EXPANSION.search(active)
@@ -1372,7 +1467,7 @@ def _scan_word(word: List[tuple], named: _Named, checkout: Optional[str],
 
 
 def _scan_piece(piece: List[tuple], named: _Named, checkout: Optional[str],
-                script: bool = False, if_present: bool = False) -> None:
+                script: object = False, if_present: bool = False) -> None:
     """One path-shaped piece of a word. ``if_present``: the piece is read from the
     checkout root only because a ``cd`` may not have left it, so a relative name
     counts only where it exists there (``./x`` is ``x``) — though the root itself,
@@ -1439,7 +1534,7 @@ def _scan_piece(piece: List[tuple], named: _Named, checkout: Optional[str],
     _scan_relative(piece, named, bare=True, script=script)
 
 
-def _scan_literal(text: str, named: _Named, checkout: Optional[str], script: bool = False) -> None:
+def _scan_literal(text: str, named: _Named, checkout: Optional[str], script: object = False) -> None:
     """A path taken literally, with no shell reading it (an ``env`` value): ``~``
     and ``$X`` are just characters of a relative name."""
     if text.startswith("/"):
@@ -1450,7 +1545,7 @@ def _scan_literal(text: str, named: _Named, checkout: Optional[str], script: boo
         _scan_relative(_literal(text), named, bare=True, script=script)
 
 
-def _scan_absolute(text: str, named: _Named, checkout: Optional[str], script: bool) -> None:
+def _scan_absolute(text: str, named: _Named, checkout: Optional[str], script: object) -> None:
     if not checkout or not os.path.isabs(text):
         return
     below = _below_checkout(text, checkout)
@@ -1562,10 +1657,13 @@ def _scan_relative(items: List[tuple], named: _Named, *, bare: bool, script: obj
             else "it names a checkout path built from a variable")
         return
     rel = "/".join(kept)
-    if bare:
-        (named.bare_trees if dynamic else named.bare).add(rel)
-    else:
-        (named.trees if dynamic else named.paths).add(rel)
+    if script != "module" or dynamic:
+        # A module a loader names need not exist as written (``require('./x')``
+        # loads ``x.js``): its directory, below, is what it depends on.
+        if bare:
+            (named.bare_trees if dynamic else named.bare).add(rel)
+        else:
+            (named.trees if dynamic else named.paths).add(rel)
     if (script == "command" or not script) and not dynamic:
         # Anything named may be run directly, wherever it stands (``timeout 30
         # ./check.py``): an interpreter its shebang names imports from its directory.
@@ -1575,7 +1673,8 @@ def _scan_relative(items: List[tuple], named: _Named, *, bare: bool, script: obj
         if depth > 1:
             (named.bare_trees if bare else named.trees).add("/".join(parent))
         elif bare:
-            named.bare_root_scripts.add(rel)
+            named.bare_root_scripts.update(
+                [rel] + [rel + s for s in _CODE_SUFFIXES] if script == "module" else [rel])
         else:
             named.unsafe = named.unsafe or "its interpreter imports from the checkout root"
 
@@ -1752,7 +1851,9 @@ class _Checker:
         """Whether the file at ``rel`` starts with a ``#!`` naming an interpreter that
         imports from the script's directory (through ``env`` or ``env -S`` too)."""
         try:
-            fd = os.open(os.path.join(self.checkout, rel), os.O_RDONLY | _NOFOLLOW)
+            # Never waits for a writer: a FIFO a run left at a named path is not run.
+            fd = os.open(os.path.join(self.checkout, rel),
+                         os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
         except OSError:
             return False
         try:
