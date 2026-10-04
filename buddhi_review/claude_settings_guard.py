@@ -953,19 +953,24 @@ def _command_strings(value, path: tuple) -> Iterator[Tuple[tuple, str]]:
     """Every string in ``value`` except those in positions Claude Code never runs:
     permission rules (``permissions.allow|deny|ask[]``, ``permissions.defaultMode``)
     are patterns it matches and ``permissions.additionalDirectories`` lists
-    directories it may read; a hook's ``matcher`` / ``type`` / ``prompt`` are a
-    regex, an enum and text for the model. Every other string — including in keys
-    a future release adds — is treated as something that may run."""
+    directories it may read; a hook's ``matcher`` / ``type`` are a regex and an
+    enum, and a ``type: "prompt"`` hook's ``prompt`` is text for a model without
+    tools. An agent hook's prompt is scanned because its subagent can act on paths
+    it names. Every other string — including in keys a future release adds — is
+    treated as something that may run."""
     if isinstance(value, str):
         top = path[:1]
         if top == ("permissions",) and len(path) >= 2 and path[1] in (
                 "allow", "deny", "ask", "defaultMode", "additionalDirectories"):
             return  # patterns it matches, and directories it may read: nothing runs
-        if top == ("hooks",) and path and path[-1] in ("matcher", "type", "prompt"):
-            return  # a regex, an enum, and a prompt hook's text for the model
+        if top == ("hooks",) and path and path[-1] in ("matcher", "type"):
+            return  # a regex and an enum
         yield path, value
     elif isinstance(value, dict):
         for k, v in value.items():
+            if (path[:1] == ("hooks",) and k == "prompt"
+                    and value.get("type") == "prompt"):
+                continue  # a single-turn model without tools cannot open named paths
             yield from _command_strings(v, path + (k,))
     elif isinstance(value, list):
         for v in value:
@@ -989,7 +994,9 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
     (an ``env`` value such as ``NODE_OPTIONS=--require ./x.js``). An
     interpreter's script named by a variable is what this command line assigned
     it, or unsafe (:func:`script_words`); ``positional`` is set when the command
-    is a shell's ``-c`` code that runs one of its operands as a script."""
+    is a shell's ``-c`` code that runs one of its operands as a script. A Python-
+    or Node-family interpreter whose program comes from stdin is unsafe because
+    the command does not expose that program's imports to this scanner."""
     if depth > _MAX_NESTING:
         raise _Unparseable("nested too deeply")
     try:
@@ -1155,6 +1162,11 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
             # No script: the program comes from stdin (``python3 - <<EOF``,
             # ``python3 <<< '…'``), with the checkout root first on its path.
             named.imports_root = True
+        if st.script_next and _family(st.interp) in ("python", "node"):
+            # A heredoc's body is shell syntax to the splitter, and a redirected
+            # file's contents are not part of the command at all. In either case
+            # the program may import PR-controlled code that is otherwise unseen.
+            unsafe("its interpreter reads a program from stdin")
 
     for word in words:
         if not word:  # ``""``: an empty argument names nothing

@@ -351,6 +351,22 @@ def test_a_prompt_hook_and_additional_directories_are_not_commands():
     assert guard.named_paths(perms, key="permissions").unsafe is None
 
 
+def test_an_agent_hook_prompt_names_checkout_paths(tmp_path):
+    """Unlike a single-turn prompt hook, an agent hook has tools and can act on a
+    repository path its prompt tells it to run."""
+    hooks = {"Stop": [{"hooks": [{
+        "type": "agent", "prompt": "Run python3 tools/check.py and report the result."
+    }]}]}
+    repo = make_pr_repo(tmp_path, {
+        SETTINGS: {"hooks": hooks},
+        "tools/check.py": "print('base')\n",
+    }, {"docs/guide.md": "x\n"})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    assert _hooks(_spawn(str(repo.wt))) == ["Stop"]
+    write(repo.wt, "tools/check.py", "print('pull request')\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
 def test_a_path_holding_a_nul_is_unsafe_not_a_crash():
     assert guard.named_paths("cat ~\x00/notes").unsafe
     assert guard.named_paths("cat ~\ud800/notes").unsafe
@@ -1970,17 +1986,28 @@ _JSON_HOOK = ("python3 -c \"import json,sys; p=json.load(sys.stdin)['tool_input'
 
 @pytest.mark.parametrize("command", [
     _JSON_HOOK,
-    "python3 - <<'PY'\nimport json\nPY",
-    "python3 <<< 'import json'",
     "python3 -m json.tool",
 ])
 def test_a_module_the_pr_adds_at_the_root_holds_back_a_python_program_run_there(tmp_path, command):
-    """``-c``, ``-m`` and a program on stdin put the checkout root first on Python's
-    path: a ``json.py`` the PR adds there replaces the standard library's."""
+    """``-c`` and ``-m`` put the checkout root first on Python's path: a ``json.py``
+    the PR adds there replaces the standard library's."""
     repo = _hook_repo(tmp_path, command, {}, {"README.md": "changed\n"})
     assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
     write(repo.wt, "json.py", "x = 1\n")
     assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("command", [
+    "python3 - <<'PY'\nimport tools.helper\nPY",
+    "python3 < tools/x.py",
+    "cat tools/x.py | python3",
+    "node < tools/x.js",
+    "cat tools/x.js | node",
+])
+def test_an_interpreter_program_read_from_stdin_is_unsafe(command):
+    """The command does not reveal a redirected program's imports, and a heredoc
+    body is not reliably distinguishable from shell syntax, so neither may run."""
+    assert guard.named_paths(command).unsafe == "its interpreter reads a program from stdin"
 
 
 def test_a_package_python_code_imports_by_name_is_walked(tmp_path):
