@@ -365,6 +365,160 @@ def _base_remote(
     return "origin"
 
 
+# ── The trusted base commit for the .claude settings guard ────────────────────────
+_PR_URL_RE = re.compile(r"^(.*)/pull/\d+/?$")
+_REF_NAME_RE = re.compile(r"[A-Za-z0-9._/+-]+")
+_SHA_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+class _Unresolved(Exception):
+    pass
+
+
+class PullRequestBase:
+    """The commit whose ``.claude`` settings a PR's ``claude`` spawns may trust:
+    the merge-base of ``HEAD`` and ``refs/remotes/<remote>/<base>``, where
+    ``<base>`` is the PR's ``baseRefName`` and ``<remote>`` is the configured
+    remote whose URL names the PR's repository (see :meth:`_remote`).
+
+    The run-loop entry installs one with
+    :func:`buddhi_review.claude_settings_guard.install_base_resolver`. It is called
+    with a checkout path and returns a full sha, or ``None`` with
+    :attr:`last_error` saying why.
+
+    * The repository is ``repo`` (``--repo``), else the PR's own URL minus its
+      ``/pull/<n>`` tail. ``gh pr view`` has no base-repository field, and
+      ``headRepository`` names the fork on a cross-repo PR, so neither is used.
+    * Every ref is fully qualified. A PR branch named ``origin/main`` creates
+      ``refs/heads/origin/main``, which git prefers for the short name
+      ``origin/main`` — that would make the PR its own "base". There is no
+      fallback to a local branch or a guessed ``origin``.
+    * Fetching just the base branch is best-effort: when the fetch fails (offline,
+      say) but the remote-tracking ref already exists, the merge-base is computed
+      from it. Only an unresolved merge-base is a failure.
+    * A success is cached for the run. A failure is retried on a bounded schedule
+      (after 30 s, 60 s, 120 s, then every 300 s), so a ``gh`` blip never darkens
+      a whole run and a dead ``gh`` never costs a stall on every spawn."""
+
+    RETRY_DELAYS = (30.0, 60.0, 120.0, 300.0)
+
+    def __init__(
+        self,
+        pr,
+        repo: Optional[str],
+        *,
+        run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.pr = str(pr)
+        self.repo = repo or ""
+        self._run = run
+        self._clock = clock
+        self._resolved: dict = {}
+        self._failures = 0
+        self._next_try = 0.0
+        self.last_error: Optional[str] = None
+
+    def __call__(self, checkout: str) -> Optional[str]:
+        if checkout in self._resolved:
+            return self._resolved[checkout]
+        now = self._clock()
+        if self._failures and now < self._next_try:
+            return None
+        try:
+            sha = self._resolve(checkout)
+        except _Unresolved as exc:
+            self.last_error = str(exc)
+            delays = self.RETRY_DELAYS
+            self._next_try = now + delays[min(self._failures, len(delays) - 1)]
+            self._failures += 1
+            return None
+        self._resolved[checkout] = sha
+        self._failures = 0
+        self.last_error = None
+        return sha
+
+    def _output(self, argv: List[str], checkout: str, what: str) -> str:
+        try:
+            r = self._run(argv, cwd=checkout)
+        except (subprocess.SubprocessError, OSError) as exc:
+            raise _Unresolved(f"{what} could not run ({exc})")
+        if getattr(r, "returncode", 1) != 0:
+            lines = (getattr(r, "stderr", "") or "").strip().splitlines()
+            raise _Unresolved(f"{what} failed" + (f": {lines[0][:200]}" if lines else ""))
+        return getattr(r, "stdout", "") or ""
+
+    def _remote(self, repo: str, pr_host: Optional[str], checkout: str) -> str:
+        """The remote whose URL names ``repo``'s owner/repo (and its host, when
+        ``repo`` names one). One such remote is used whatever its host — an SSH
+        host alias such as ``github-work`` included. Among several, those on the
+        PR's own host are preferred, never a same-named mirror on another host; and
+        when several match on no single host, nothing is guessed."""
+        target, host = _owner_repo(repo), _host(repo)
+        listing = self._output(["git", "remote", "-v"], checkout, "git remote")
+        matches = []
+        for line in listing.splitlines():
+            parts = line.split()
+            if (len(parts) >= 3 and parts[2] == "(fetch)" and target
+                    and _owner_repo(parts[1]) == target
+                    and (not host or _host(parts[1]) == host)):
+                matches.append((parts[0], _host(parts[1])))
+        if len(matches) == 1:
+            return matches[0][0]
+        on_pr_host = [name for name, h in matches if pr_host and h == pr_host]
+        if on_pr_host:
+            return on_pr_host[0]  # the same repository on the same host: any will do
+        if matches and len({h for _, h in matches}) == 1:
+            return matches[0][0]
+        raise _Unresolved(f"no configured git remote points at {repo}" if not matches
+                          else f"several git remotes on different hosts point at {repo}")
+
+    def _resolve(self, checkout: str) -> str:
+        argv = ["gh", "pr", "view", self.pr, "--json", "baseRefName,url"]
+        if self.repo:
+            argv += ["-R", self.repo]
+        try:
+            data = json.loads(self._output(argv, checkout, "gh pr view"))
+        except ValueError:
+            raise _Unresolved("gh pr view did not return JSON")
+        if not isinstance(data, dict):
+            raise _Unresolved("gh pr view did not return a PR")
+        base = data.get("baseRefName")
+        if (not isinstance(base, str) or not _REF_NAME_RE.fullmatch(base)
+                or base.startswith("-") or ".." in base):
+            raise _Unresolved("the PR names no usable base branch")
+        m = _PR_URL_RE.match(str(data.get("url") or ""))
+        from_url = m.group(1) if m else ""
+        repo = self.repo or from_url
+        if not repo:
+            raise _Unresolved("cannot tell which repository the PR belongs to")
+        remote = self._remote(repo, _host(from_url), checkout)
+        if not _REF_NAME_RE.fullmatch(remote) or remote.startswith("-"):
+            raise _Unresolved(f"no usable git remote points at {repo}")
+        tracking = f"refs/remotes/{remote}/{base}"
+        try:  # best-effort: an existing remote-tracking ref still resolves offline
+            self._run(["env", "GIT_TERMINAL_PROMPT=0",  # never wait on a credential prompt
+                       "git", "fetch", "--no-tags", "--quiet", remote,
+                       f"+refs/heads/{base}:{tracking}"], cwd=checkout)
+        except (subprocess.SubprocessError, OSError):
+            pass
+        # ``show-ref --verify`` takes the ref name EXACTLY: ``rev-parse`` would fall
+        # back to ``refs/heads/refs/remotes/<remote>/<base>`` — a branch the PR itself
+        # can create — when the tracking ref does not exist.
+        try:
+            tip = self._output(["git", "show-ref", "--verify", "--hash", tracking],
+                               checkout, "git show-ref").strip()
+        except _Unresolved:
+            raise _Unresolved(f"{tracking} does not exist")
+        if not _SHA_RE.fullmatch(tip):
+            raise _Unresolved(f"{tracking} does not exist")
+        sha = self._output(["git", "merge-base", "HEAD", tip], checkout,
+                           "git merge-base").strip()
+        if not _SHA_RE.fullmatch(sha):
+            raise _Unresolved("git merge-base returned no commit")
+        return sha
+
+
 def _branch_is_behind_base(
     base_branch: str,
     *,

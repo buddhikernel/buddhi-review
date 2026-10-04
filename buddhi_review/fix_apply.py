@@ -56,7 +56,7 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, Dict, FrozenSet, Optional, Sequence, TextIO, Tuple
 
-from buddhi_review import lang_syntax, unicode_repair
+from buddhi_review import claude_settings_guard, lang_syntax, unicode_repair
 from buddhi_review.classify import extract_json_object as _extract_json_object
 from buddhi_review.transparency import _colour_enabled
 
@@ -2475,20 +2475,25 @@ def default_fixer_runner(
     """The agentic ``claude -p`` fixer subprocess. MCP-isolated with
     ``--strict-mcp-config``; ``bypassPermissions`` because the run is detached
     and non-interactive (file edits roll back via the snapshot). On macOS the
-    argv is write-confined to the worktree (see ``maybe_sandbox``)."""
+    argv is write-confined to the worktree (see ``maybe_sandbox``). The PR's
+    committed ``.claude`` settings cannot run code in it
+    (:func:`buddhi_review.claude_settings_guard.window`); a checkout whose
+    settings cannot be made safe raises an ``OSError`` instead of spawning, which
+    :func:`apply_fix` escalates without a retry."""
     argv = maybe_sandbox(
         [
-            "claude", "--model", model, "--effort", effort,
+            "claude", "--model", model, "--effort", effort, *claude_settings_guard.CLAUDE_ARGS,
             "--permission-mode", "bypassPermissions",
             "--no-session-persistence", "--strict-mcp-config",
             "-p", prompt,
         ],
         cwd,
     )
-    proc = subprocess.run(
-        argv, capture_output=True, text=True, timeout=timeout, cwd=cwd,
-        stdin=subprocess.DEVNULL,
-    )
+    with claude_settings_guard.window(cwd):
+        proc = subprocess.run(
+            argv, capture_output=True, text=True, timeout=timeout, cwd=cwd,
+            stdin=subprocess.DEVNULL,
+        )
     return proc.returncode, proc.stdout or ""
 
 

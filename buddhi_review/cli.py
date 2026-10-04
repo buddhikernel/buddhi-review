@@ -38,7 +38,10 @@ import shlex
 import sys
 from typing import Callable, List, Optional, TextIO
 
-from buddhi_review import __version__, gh_ingest, model_call, round_driver, update_banner, upsell
+from buddhi_review import (
+    __version__, claude_settings_guard, gh_ingest, merge, model_call, round_driver,
+    update_banner, upsell,
+)
 from buddhi_review.actuators import default_fix_dispatch
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.backends import launch_review_loop, select_command_backend
@@ -166,6 +169,12 @@ def _run_loop(args: argparse.Namespace) -> int:
     print(f"plan: {plan(cfg)} · reviewers: {', '.join(active_reviewers(cfg, args.repo))} · channel: {notifier_channel(cfg)}")
 
     cwd = args.cwd or os.getcwd()
+    # The PR's committed .claude settings never run code in a claude spawn: each
+    # spawn keeps only display settings plus what the PR's base commit already
+    # held (resolved lazily, on the first spawn that needs it). Settings an
+    # interrupted earlier run left held back in this checkout are put back first.
+    claude_settings_guard.install_base_resolver(merge.PullRequestBase(args.pr, args.repo))
+    claude_settings_guard.recover(cwd)
     # Launch preflight gates (console). (1) Refuse the repo's PRIMARY
     # checkout while it sits on the PR branch — fixers must run in a dedicated
     # worktree so an uncommitted edit can never strand on the default branch.
@@ -204,14 +213,16 @@ def _run_loop(args: argparse.Namespace) -> int:
         # criteria ("running inside the repository … consult the docs") hold even
         # when review-pr is launched detached with --cwd from another checkout.
         classify_runner=model_call.text_runner("classifier", plan=plan_name, cwd=cwd),
+        # Every model call below runs in the checkout too, never in whatever
+        # directory launched the loop (another PR's worktree, say).
         clean_llm=lambda prompt: model_call.run_model_json(
-            prompt, role="clean-review-detector", plan=plan_name),
+            prompt, role="clean-review-detector", plan=plan_name, cwd=cwd),
         quota_llm=lambda prompt: model_call.run_model_json(
-            prompt, role="quota-detector", plan=plan_name),
+            prompt, role="quota-detector", plan=plan_name, cwd=cwd),
         fix_dispatch=default_fix_dispatch(
             cwd=cwd,
             plan=plan_name,
-            verify_runner=model_call.text_runner("fix-verify", plan=plan_name),
+            verify_runner=model_call.text_runner("fix-verify", plan=plan_name, cwd=cwd),
             verify_mode=args.verify_fixes,
             # A PR_DESCRIPTION comment rewrites the PR body in place (on by
             # default); the rewriter model is cwd-pinned like the classifier.
