@@ -22,9 +22,11 @@ PACKAGE_ROOT = str(Path(buddhi_review.__file__).resolve().parent.parent)
 SETTINGS = ".claude/settings.json"
 LOCAL_SETTINGS = ".claude/settings.local.json"
 OFFLINE_GIT = {  # a real `git fetch` over https fails in milliseconds, offline
-    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_COUNT": "2",
     "GIT_CONFIG_KEY_0": "protocol.https.allow",
     "GIT_CONFIG_VALUE_0": "never",
+    "GIT_CONFIG_KEY_1": "protocol.ssh.allow",
+    "GIT_CONFIG_VALUE_1": "never",
 }
 PR_VIEW = {"baseRefName": "main", "url": "https://github.com/o/r/pull/7"}
 

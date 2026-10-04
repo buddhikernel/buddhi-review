@@ -455,8 +455,11 @@ class _Dir:
             os.close(fd)
 
     def sync(self, full: bool = False) -> None:
-        with contextlib.suppress(OSError):
+        try:
             _fsync(self.fd, full)
+        except OSError:
+            if full:
+                raise
 
 
 def _fsync(fd: int, full: bool) -> None:
@@ -566,8 +569,9 @@ _RUNNERS = frozenset({"uv", "poetry", "pipenv", "pdm", "rye", "hatch", "bun", "d
 # directory is a dependency, not only the script.
 _SCRIPT_DIR_INTERPRETERS = re.compile(
     r"(python[0-9.]*|pypy[0-9.]*|node|nodejs|bun|deno|tsx|ts-node|ruby|perl|php[0-9.]*"
-    r"|sh|bash[0-9.]*|zsh[0-9.]*|dash|ksh[0-9]*|mksh|ash|yash|fish)")
+    r"|lua[0-9.]*|luajit[0-9.]*|sh|bash[0-9.]*|zsh[0-9.]*|dash|ksh[0-9]*|mksh|ash|yash|fish)")
 _SHELL = re.compile(r"sh|bash[0-9.]*|zsh[0-9.]*|dash|ksh[0-9]*|mksh|ash|yash|fish")
+_LUA = re.compile(r"lua[0-9.]*|luajit[0-9.]*")
 # PHP's default ``include_path`` starts with ``.``, the working directory: an
 # ``include 'x.php'`` in an unchanged script finds a file the PR adds at the
 # checkout root before the script's own sibling. Whatever it runs, it imports
@@ -1531,6 +1535,11 @@ def _family(interp: str) -> str:
         return "shell"
     if _PHP.fullmatch(interp):
         return "php"
+    if _LUA.fullmatch(interp):
+        # Lua is recognised as an interpreter but parsed as an unknown family:
+        # use the union of known option forms and retain the conservative Node
+        # import check rather than guessing which files a Lua runtime may load.
+        return "?"
     return interp if interp in ("ruby", "perl") else "node"
 
 
@@ -2086,6 +2095,8 @@ class _Checker:
                 # link's, ``sys.path[0]`` takes its target's.
                 real = self._resolved(rel) if not bare or exists(rel) else ""
                 interp = self._shebang_imports(real) if real else ""
+                if interp == "?":
+                    return False, "its shebang interpreter cannot be identified"
                 if _family(interp) == "php":
                     return False, "its interpreter imports from the checkout root"
                 if interp:
@@ -2176,7 +2187,8 @@ class _Checker:
         or ``env -S`` too), when it imports from the script's directory; ``sh`` for
         an executable file with no ``#!`` line, whose exec fails with ``ENOEXEC`` so
         the hook's shell reads it as a script (a binary loading ``$ORIGIN``
-        libraries depends on its directory too); ``""`` otherwise."""
+        libraries depends on its directory too); ``?`` when an ``env`` shebang
+        cannot identify its utility safely; ``""`` otherwise."""
         try:
             # Never waits for a writer: a FIFO a run left at a named path is not run.
             fd = os.open(os.path.join(self.checkout, rel),
@@ -2193,10 +2205,49 @@ class _Checker:
         if not head.startswith(b"#!"):
             return "sh" if mode & 0o111 else ""
         words = os.fsdecode(head[2:].split(b"\n", 1)[0]).split()
-        names = [w.rsplit("/", 1)[-1] for w in words if not w.startswith("-")]
-        if names and names[0] == "env":
-            names = names[1:]
-        return names[0] if names and _SCRIPT_DIR_INTERPRETERS.fullmatch(names[0]) else ""
+        if not words:
+            return ""
+        name = words[0].rsplit("/", 1)[-1]
+        if name != "env":
+            return name if _SCRIPT_DIR_INTERPRETERS.fullmatch(name) else ""
+
+        # ``env -S`` reparses the rest of a shebang into words.  At this point
+        # they are already split, so -S itself consumes no additional item here.
+        # Other env options may consume an item before NAME=value assignments and
+        # the utility.  An unknown/incomplete option leaves the utility ambiguous.
+        i = 1
+        flags = frozenset({"-0", "-i", "-v", "--debug", "--ignore-environment",
+                           "--list-signal-handling", "--null"})
+        args = frozenset({"-C", "-P", "-u", "--chdir", "--unset"})
+        while i < len(words):
+            word = words[i]
+            if word == "--":
+                i += 1
+                break
+            if word in flags:
+                i += 1
+                continue
+            if word in args:
+                if i + 1 >= len(words):
+                    return "?"
+                i += 2
+                continue
+            if word in ("-S", "--split-string"):
+                i += 1
+                continue
+            if (word.startswith(("--chdir=", "--split-string=", "--unset="))
+                    or (word.startswith(("-C", "-P", "-u")) and len(word) > 2)):
+                i += 1
+                continue
+            if word.startswith("-"):
+                return "?"
+            break
+        while i < len(words) and "=" in words[i]:
+            i += 1
+        if i >= len(words):
+            return "?"
+        name = words[i].rsplit("/", 1)[-1]
+        return name if _SCRIPT_DIR_INTERPRETERS.fullmatch(name) else ""
 
     def _resolved(self, rel: str) -> str:
         """The file the kernel runs for ``rel``: ``rel`` itself, or — when it is a

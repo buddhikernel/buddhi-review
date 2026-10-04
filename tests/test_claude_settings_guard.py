@@ -1461,6 +1461,23 @@ def test_a_journal_that_cannot_be_written_refuses_the_spawn(tmp_path, monkeypatc
     assert stub.spawns == [] and repo.settings_bytes() == before and repo.status() == ""
 
 
+def test_directory_sync_failure_is_fatal_only_for_durable_writes(tmp_path, monkeypatch):
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    calls = []
+
+    def fail(fd, full):
+        calls.append(full)
+        raise OSError("directory sync failed")
+
+    monkeypatch.setattr(guard, "_fsync", fail)
+    with guard._Dir.open(str(directory)) as opened:
+        opened.sync()
+        with pytest.raises(OSError, match="directory sync failed"):
+            opened.sync(full=True)
+    assert calls == [False, True]
+
+
 def test_a_scrub_that_does_not_read_back_refuses_the_spawn(tmp_path, monkeypatch):
     repo, rel = _hostile_tracked(tmp_path)
     before, flags = repo.settings_bytes(), repo.flags()
@@ -2751,6 +2768,33 @@ def test_a_bare_shebang_names_no_interpreter_and_refuses_nothing(tmp_path):
     assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
 
 
+@pytest.mark.parametrize("shebang", [
+    "#!/usr/bin/env -S FOO=bar node",
+    "#!/usr/bin/env -S -i -u OLD FOO=bar node",
+], ids=["assignment", "options-and-assignment"])
+def test_env_shebang_options_and_assignments_keep_node_import_checks(tmp_path, shebang):
+    """Options and assignments before env's utility must not hide that Node will
+    resolve packages through the checkout root."""
+    script = ".claude/hooks/fmt.js"
+    repo = _hook_repo(tmp_path, f'"$CLAUDE_PROJECT_DIR"/{script}',
+                      {script: shebang + "\nrequire('helper')\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "node_modules/helper/index.js", "module.exports = 1\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("shebang", [
+    "#!/usr/bin/env -S FOO=bar",
+    "#!/usr/bin/env -u",
+    "#!/usr/bin/env --unknown node",
+], ids=["assignments-only", "missing-option-argument", "unknown-option"])
+def test_an_ambiguous_env_shebang_fails_closed(tmp_path, shebang, capfd):
+    repo = _hook_repo(tmp_path, '"$CLAUDE_PROJECT_DIR"/tools/run',
+                      {"tools/run": shebang + "\necho run\n"})
+    assert _hooks(_spawn(str(repo.wt))) == []
+    assert "shebang interpreter cannot be identified" in capfd.readouterr().err
+
+
 def test_a_named_directory_the_pr_added_is_held_back_without_refusing(tmp_path):
     repo = _hook_repo(tmp_path, "ls tools/ >/dev/null", {}, head={"tools/new.sh": "true\n"})
     assert _hooks(_spawn(str(repo.wt))) == []
@@ -2993,6 +3037,7 @@ _TOOLS = {
     "tools/x.rb": "require_relative 'helper'\n", "tools/helper.rb": "X = 1\n",
     "tools/x.pl": "use FindBin; use lib $FindBin::Bin; require 'helper.pl';\n",
     "tools/helper.pl": "1;\n",
+    "tools/x.lua": "dofile('tools/helper.lua')\n", "tools/helper.lua": "return 1\n",
 }
 _SIBLING = {"python3": "tools/helper.py", "node": "tools/helper.js", "ruby": "tools/helper.rb",
             "perl": "tools/helper.pl", '"$PY"': "tools/helper.py"}
@@ -3017,6 +3062,24 @@ def _assert_sibling_holds(repo, command, sibling):
     try:
         path.write_bytes(before + b"\n# the pull request's code\n")
         assert not _live(repo, command), f"live after {sibling} changed: {command}"
+    finally:
+        path.write_bytes(before)
+
+
+@pytest.mark.parametrize("interp", ["lua", "lua5.4", "luajit"])
+def test_an_unclassified_interpreter_script_names_its_directory(_tools_repo, interp):
+    """A recognised interpreter whose option grammar is not modelled still makes
+    a script-shaped operand's directory a dependency."""
+    _assert_sibling_holds(_tools_repo, f"{interp} tools/x.lua", "tools/helper.lua")
+
+
+def test_an_ordinary_command_reading_lua_does_not_name_its_directory(_tools_repo):
+    """A code suffix alone does not turn a known command's data operand into a script."""
+    path = _tools_repo.wt / "tools/helper.lua"
+    before = path.read_bytes()
+    try:
+        path.write_bytes(before + b"\n-- the pull request's code\n")
+        assert _live(_tools_repo, "cat tools/x.lua")
     finally:
         path.write_bytes(before)
 
@@ -3579,7 +3642,8 @@ def _commit(repo, files, message="the PR's package"):
 @pytest.mark.parametrize("value,key,node", [
     ("node x.js", None, True), ("bun x.ts", None, True), ("deno run x.ts", None, True),
     ("tsx x.ts", None, True), ("ts-node x.ts", None, True),
-    ('"$RUN" x.js', None, True), ("uv run x", None, True),       # an interpreter of unknown family
+    ('"$RUN" x.js', None, True), ("uv run x", None, True), ("lua x.lua", None, True),
+    # An interpreter of unknown family keeps the conservative Node package check.
     ("python3 x.py", None, False), ("ruby x.rb", None, False), ("perl x.pl", None, False),
     ("sh x.sh", None, False),
     ({"NODE_OPTIONS": "--require pkg"}, "env", True), ({"NODE_ENV": "production"}, "env", False),
