@@ -25,6 +25,7 @@ from buddhi_review.loop import Comment, CommentResult
 from settings_guard_support import (
     LOCAL_SETTINGS,
     OFFLINE_GIT,
+    PR_VIEW,
     ROOT_LOCAL_SETTINGS,
     SETTINGS,
     ClaudeStub,
@@ -323,7 +324,7 @@ def test_resolver_matches_the_remote_on_the_prs_own_host(monkeypatch, tmp_path):
     git(repo.primary, "remote", "add", "a-mirror", "https://gitea.example.net/o/r.git")
     git(repo.primary, "update-ref", "refs/remotes/a-mirror/main", repo.head)
     assert git(repo.wt, "remote", "-v").splitlines()[0].startswith("a-mirror")
-    stub = ClaudeStub(real_run=subprocess.run)
+    stub = ClaudeStub(real_run=subprocess.run, pr_view={**PR_VIEW, "baseRefOid": repo.base})
     for k, v in OFFLINE_GIT.items():
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(subprocess, "run", stub)
@@ -351,7 +352,7 @@ def test_resolver_caches_asks_the_pr_repo_and_fetches_only_the_base(monkeypatch,
     monkeypatch.setattr(subprocess, "run", stub)
     resolver = merge.PullRequestBase("7", "o/r")
     assert resolver(str(repo.wt)) == repo.base and resolver(str(repo.wt)) == repo.base
-    assert stub.gh_calls == [["gh", "pr", "view", "7", "--json", "baseRefName,url", "-R", "o/r"]]
+    assert stub.gh_calls == [["gh", "pr", "view", "7", "--json", "baseRefName,baseRefOid,url", "-R", "o/r"]]
     assert len(stub.fetches) == 1
     assert stub.fetches[0].args[-2:] == ["origin", "+refs/heads/main:refs/remotes/origin/main"]
 
@@ -374,7 +375,7 @@ def test_resolver_takes_the_repo_from_the_pr_url_when_none_is_given(monkeypatch,
         monkeypatch.setenv(k, v)
     monkeypatch.setattr(subprocess, "run", stub)
     assert merge.PullRequestBase("7", None)(str(repo.wt)) == repo.base
-    assert stub.gh_calls[-1] == ["gh", "pr", "view", "7", "--json", "baseRefName,url"]
+    assert stub.gh_calls[-1] == ["gh", "pr", "view", "7", "--json", "baseRefName,baseRefOid,url"]
 
 
 def test_resolver_fails_closed_without_a_matching_remote_and_backs_off(monkeypatch, tmp_path):
@@ -423,6 +424,66 @@ def test_resolver_returns_where_the_pr_branched_not_the_base_tip(monkeypatch, tm
     monkeypatch.setattr(subprocess, "run", stub)
     found = merge.PullRequestBase("7", "o/r")(str(repo.wt))
     assert tip != repo.base and found == repo.base
+
+
+def _offline_stub(monkeypatch, **kwargs) -> ClaudeStub:
+    stub = ClaudeStub(real_run=subprocess.run, **kwargs)
+    for k, v in OFFLINE_GIT.items():
+        monkeypatch.setenv(k, v)
+    monkeypatch.setattr(subprocess, "run", stub)
+    return stub
+
+
+def test_a_failed_fetch_never_trusts_a_stale_tracking_ref(monkeypatch, tmp_path):
+    """The base removed a hook after the cached ``refs/remotes/origin/main`` was
+    taken; the PR branched after the removal and restores it. Offline, the stale
+    ref would make the old base — hook and all — the PR's merge-base, so the
+    restored hook would look base-identical. The resolver refuses, and the hook
+    is stripped."""
+    markers = tmp_path / "markers"
+    with_hook = {"model": "sonnet", "hooks": command_hook("SessionStart", touch(markers, "restored"))}
+    repo = make_pr_repo(tmp_path, {SETTINGS: with_hook}, {})
+    write(repo.primary, SETTINGS, {"model": "sonnet"})
+    git(repo.primary, "commit", "-qam", "base removes the hook")
+    current = git(repo.primary, "rev-parse", "HEAD").strip()
+    git(repo.wt, "reset", "-q", "--hard", current)
+    write(repo.wt, SETTINGS, with_hook)
+    git(repo.wt, "commit", "-qam", "pr restores the hook")
+    assert git(repo.wt, "rev-parse", "refs/remotes/origin/main").strip() == repo.base
+    stub = _offline_stub(monkeypatch, pr_view={**PR_VIEW, "baseRefOid": current})
+    resolver = merge.PullRequestBase("7", "o/r")
+    assert resolver(str(repo.wt)) is None
+    assert stub.fetches and stub.fetches[0].returncode != 0
+    assert resolver.last_error == "could not fetch main, and refs/remotes/origin/main is stale"
+    claude_settings_guard.install_base_resolver(resolver)
+    with claude_settings_guard.window(str(repo.wt)):
+        stub(["claude", "-p", "x"], cwd=str(repo.wt), text=True)
+    assert "hooks" not in (stub.spawns[-1].settings[SETTINGS] or {})
+    assert markers_present(repo.markers) == []
+
+
+def test_a_failed_fetch_needs_the_prs_base_commit(monkeypatch, tmp_path):
+    """Without a ``baseRefOid`` from ``gh`` nothing vouches for the cached ref."""
+    repo = make_pr_repo(tmp_path, {}, {})
+    _offline_stub(monkeypatch, pr_view={**PR_VIEW, "baseRefOid": None})
+    resolver = merge.PullRequestBase("7", "o/r")
+    assert resolver(str(repo.wt)) is None
+    assert resolver.last_error == "could not fetch main, and the PR names no base commit"
+
+
+def test_a_successful_fetch_is_trusted_without_the_prs_base_commit(monkeypatch, tmp_path):
+    """A fetch that succeeds has just written the tracking ref, so the base may
+    have moved past ``baseRefOid`` and the ref still resolves."""
+    repo = make_pr_repo(tmp_path, {}, {})
+    stub = ClaudeStub(real_run=subprocess.run, pr_view={**PR_VIEW, "baseRefOid": "f" * 40})
+
+    def run(argv, *args, **kwargs):
+        if "fetch" in argv:
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        return stub(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    assert merge.PullRequestBase("7", "o/r")(str(repo.wt)) == repo.base
 
 
 # ── A16: a hook naming the checkout root is stripped, even on an empty PR ─────────

@@ -16,9 +16,10 @@ file keeps a top-level key only when
   release adds is held back until someone proves it inert; or
 * its parsed JSON value equals the value the PR's BASE commit holds for the same
   key of the same file, AND every checkout file or directory the value names is
-  byte-identical to base (:func:`named_paths`). A value that names the checkout
-  root, climbs out of it, changes into a directory nobody can know in advance,
-  or cannot be parsed, names more than can be checked, so it is held back.
+  byte-identical to base, execute bit included (:func:`named_paths`). A value
+  that names the checkout root, climbs out of it, changes into a directory
+  nobody can know in advance, or cannot be parsed, names more than can be
+  checked, so it is held back.
 
 Everything else is held back for the spawn and put back afterwards — the same
 bytes, the same file mode, the same git index flags — after a normal exit, an
@@ -56,6 +57,7 @@ only :data:`INERT_KEYS` survive.
 """
 from __future__ import annotations
 
+import ast
 import base64
 import contextlib
 import hashlib
@@ -614,20 +616,38 @@ _CODE_SUFFIXES = (".py", ".pyw", ".js", ".mjs", ".cjs", ".ts", ".mts", ".cts", "
 _PY_MODULE_SUFFIXES = (".py", ".pyc", ".pyo", ".pyw", ".so", ".pyd")
 _PY_IMPORT = re.compile(r"(?:^|[\s;:'\"(])(?:import\s+([\w.]+(?:\s+as\s+\w+)?(?:\s*,\s*[\w.]+(?:\s+as\s+\w+)?)*)"
                         r"|from\s+([\w.]+)\s+import)")
+# A backslash ending a line: Python joins the next line onto it.
+_PY_CONTINUATION = re.compile(r"\\(?:\r\n|\r|\n)")
+# How many string literals deep :func:`_ast_imports` reads a literal as code.
+_AST_STRING_DEPTH = 4
 # A call that imports (or runs) a module by a name it is handed at run time:
 # ``importlib.import_module('tools.x')``, ``__import__('tools.x')``,
 # ``runpy.run_module('tools.x')``, ``pkgutil.resolve_name('tools.x:f')`` …
 _PY_DYNAMIC_IMPORT = re.compile(r"\b(?:__import__|import_module|run_module|resolve_name|find_spec)\s*\(")
+# The same helpers named anywhere, called or not (``load = importlib.import_module``,
+# ``getattr(importlib, 'import_module')``); what follows one that is called, or
+# renamed; and what precedes one a plain ``from … import`` brings in under its own
+# name (``from importlib import reload, import_module``).
+_PY_DYNAMIC_NAME = re.compile(r"\b(?:__import__|import_module|run_module|resolve_name|find_spec)\b")
+_PY_CALLED = re.compile(r"\s*\(")
+_PY_RENAMED = re.compile(r"\s+as\b")
+_PY_FROM_IMPORT_HEAD = re.compile(r"(?:^|[\s;:'\"(])from\s+[\w.]+\s+import\s*(?:\([\w\s,]*|[\w \t,]*)\Z")
 # A plain Python string literal (``'x'``, ``r"x"``, ``f'x'``), its prefix and its text.
 _PY_LITERAL = re.compile(r"""([rRuUbBfF]{0,2})(['"])((?:\\.|(?!\2).)*)\2""", re.S)
+# Options of a Node-family runtime whose argument is a module it loads before the
+# program — on its command line or in ``NODE_OPTIONS`` (Bun's ``--preload`` too):
+# resolved as ``require()`` resolves a path, with or without a suffix
+# (``--require ./tools/setup`` loads ``tools/setup`` itself), so that argument is a
+# module whatever its name looks like, and its directory is a dependency.
+_NODE_PRELOADS = frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader",
+                            "--preload"})
 # Options that take the next word as their argument, by interpreter family
 # (Python's come from :data:`_PYTHON_FLAGS`; its ``-I`` is a flag, as are Ruby's
 # ``-W`` and Perl's ``-W`` / ``-X`` / ``-C``, and Perl's ``-M`` takes its module
 # glued on: ``perl -M strict`` is an error).
 _ARG_OPTIONS = {
     "python": frozenset(),
-    "node": frozenset({"-r", "--require", "--import", "--loader", "--experimental-loader",
-                       "-C", "--conditions"}),
+    "node": _NODE_PRELOADS | {"-C", "--conditions"},
     "ruby": frozenset({"-I", "-r", "-C", "-X"}),
     "perl": frozenset({"-I"}),
 }
@@ -638,6 +658,11 @@ _ARG_OPTIONS["shell"] = frozenset({"--rcfile", "--init-file", "-C", "--init-comm
 _SCRIPT_ARGS = frozenset({"-f", "-F", "--rcfile", "--init-file"})
 # Builtins that read a shell script into the running shell (``. ./env.sh``).
 _SOURCE_COMMANDS = frozenset({".", "source"})
+# Variables naming a file a starting shell reads as a script — ``BASH_ENV`` for
+# every non-interactive bash, ``ENV`` for an interactive POSIX shell — whatever
+# its name: set in ``env`` or by a hook's assignment, the file is a script whose
+# directory it may source from (``. "$(dirname "$BASH_SOURCE")/lib.sh"``).
+_SCRIPT_ENV = frozenset({"BASH_ENV", "ENV"})
 # Commands after which a variable may hold a value this guard cannot read: they
 # set one themselves (``read S``, ``declare -n``), or run code that
 # may (a sourced script, ``eval``) — so no later script named by a variable resolves.
@@ -938,10 +963,13 @@ def named_paths(value, checkout: Optional[str] = None, *, key: Optional[str] = N
                     named.unsafe = named.unsafe or "it names the checkout root"
                 if path[1] == "NODE_OPTIONS":
                     named.node = True  # ``--require pkg``: resolved from the working directory
+                loader = path[1] in _SCRIPT_ENV  # ``BASH_ENV=tools/env``: a script, suffix or not
                 for element in {s, *s.split(":")}:
                     if element:
-                        _scan_literal(element, named, checkout)
-                _scan_command(s, named, checkout, 0, strict=True, commands=False, scripts=True)
+                        _scan_literal(element, named, checkout, loader and element == s)
+                _scan_command(s, named, checkout, 0, strict=True, commands=False,
+                              scripts="all" if loader else True,
+                              node_options=path[1] == "NODE_OPTIONS")
             else:
                 _scan_command(s, named, checkout, 0, strict=True)
     except _Unparseable as exc:
@@ -983,8 +1011,8 @@ def _command_strings(value, path: tuple) -> Iterator[Tuple[tuple, str]]:
 
 def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: int,
                   *, strict: bool, commands: bool = True, globs: bool = True,
-                  cwd: Optional["_Cwd"] = None, scripts: bool = False,
-                  positional: Optional[List[bool]] = None) -> None:
+                  cwd: Optional["_Cwd"] = None, scripts: object = False,
+                  positional: Optional[List[bool]] = None, node_options: bool = False) -> None:
     """Scan a shell command's words. With ``commands``, each simple command is
     followed the way a shell reads it: the word in command position (after
     assignments, prefixes like ``env`` and reserved words like ``then``), the
@@ -995,7 +1023,13 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
     may have left the shell (:class:`_Cwd`). ``cwd`` is that, inherited from the
     command a nested one is part of. With ``scripts``, every script-shaped word
     (:data:`_CODE_SUFFIXES`) is taken as a script whose directory it imports from
-    (an ``env`` value such as ``NODE_OPTIONS=--require ./x.js``). An
+    (an ``env`` value such as ``NODE_OPTIONS=--require ./x.js``); with
+    ``scripts="all"``, every word is, whatever its suffix (a :data:`_SCRIPT_ENV`
+    value such as ``BASH_ENV=tools/env``). With ``node_options``, the words are
+    Node's own options (a ``NODE_OPTIONS`` value, from ``env`` or a hook's
+    ``NODE_OPTIONS=…`` word): the module a preload option names
+    (:data:`_NODE_PRELOADS`) is one, suffix or not, as it is on ``node``'s command
+    line. An
     interpreter's script named by a variable is what this command line assigned
     it, or unsafe (:func:`script_words`); ``positional`` is set when the command
     is a shell's ``-c`` code that runs one of its operands as a script. A Python-
@@ -1147,7 +1181,9 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
             if module:
                 named.root_imports.add(code.split(".", 1)[0])
             else:
-                names, why = _python_imports(code)
+                # An unknown interpreter's code may not be Python at all (``lua -e``),
+                # so only a known Python's unparseable code is held back for it.
+                names, why = _python_imports(code, strict=family == "python")
                 named.root_imports.update(names)
                 if why:
                     unsafe(why)
@@ -1248,7 +1284,15 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
             continue  # ``[ -f x ]``, ``{ …; }``: shell syntax, not a glob of the root
         if _is_assignment(word) and (st.at_start or st.command in _EXPORTS):
             bind(word)
+        options = _assigned(word, "NODE_OPTIONS")
+        if options:
+            # ``NODE_OPTIONS='--require ./tools/setup' node x.js``, ``export
+            # NODE_OPTIONS=…``: Node's own options, read as an ``env`` value's are,
+            # wherever the word sets them.
+            _scan_command(_text(options), named, checkout, depth + 1, strict=False,
+                          commands=False, cwd=st.cwd, scripts=True, node_options=True)
         script: object = False
+        preload: Optional[int] = None  # where a module glued to its preload option starts
         operand = False  # the operand of a ``cd``, which takes effect after it is read
         shell_code = False  # a shell's ``-c`` command line, not a script it runs
         if st.at_start:
@@ -1298,6 +1342,14 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
         elif text == "run" and st.last in _RUNNERS:
             st.script_next = True           # ``uv run x.py``
             st.interp = "?"
+        elif node_options and (text in _NODE_PRELOADS or _preload_at(word) is not None):
+            # ``NODE_OPTIONS=--require ./tools/setup``: the module is resolved from
+            # the working directory too (``--require pkg``).
+            named.node = True
+            if text in _NODE_PRELOADS:
+                st.arg_next, st.arg_script = True, "module"
+            else:
+                script, preload = "module", _preload_at(word)
         elif st.script_next and (_lead(word, len(word)).startswith("-") or (
                 _lead(word, len(word)).startswith("+") and _family(st.interp) == "shell")):
             family = _family(st.interp)
@@ -1306,6 +1358,8 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
             if family == "python" and flags and ("I" in flags.group(1) or "P" in flags.group(1)):
                 st.isolated = True          # ``-I`` / ``-P``: the root is not on the path
             code = _code_option(lead, family, flags)
+            if code is None and family in ("node", "?"):
+                preload = _preload_at(word)
             if code is not None:
                 st.script_next = False
                 module, glued = code
@@ -1316,22 +1370,32 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
                 else:
                     inline(word[glued:], module)  # ``-c'import x'``, ``-we'require "x"'``
                     continue
+            elif preload is not None:
+                script = "module"           # ``--require=./tools/setup``, Bun's ``-r./tools/setup``
             elif text is not None and (text in _ARG_OPTIONS[family] or (
                     flags and flags.group(2) in ("W", "X") and not flags.group(3)) or (
                     family == "shell" and _SHELL_ARG_CLUSTER.fullmatch(text))):
-                st.arg_next, st.arg_script = True, family == "?" or text in _SCRIPT_ARGS
+                # A Node preload's argument is a module, suffix or not; under an
+                # interpreter named by a variable, the argument may be the script.
+                st.arg_next, st.arg_script = True, (
+                    "module" if family == "node" and text in _NODE_PRELOADS
+                    else family == "?" or text in _SCRIPT_ARGS)
         elif st.script_next:
             script, st.script_next = True, False
         elif st.operand_scripts and not shell_code:
             script = st.operand_seen = True  # ``sh -c 'sh "$0"' ./tools/x.sh``
         if st.interp and _family(st.interp) in ("node", "?"):
             named.node = True  # it resolves package names above its code (:meth:`_Checker._node_lookups`)
-        if script is False and not shell_code and (st.interp or st.scripts) and _script_shaped(word):
+        if script is False and not shell_code and (st.interp or st.scripts) and (
+                st.scripts == "all" or _script_shaped(word)):
             # Any script-shaped operand of an interpreter may be what it runs or
             # preloads, whatever this guard makes of its options (``ruby -W x.rb``,
             # ``node -r ./preload.js x.js``).
             script = True
-        targets = script_words(word) if script is True and st.interp else [word]
+        loaded = word[preload:] if preload else word  # a module glued on: just the module
+        if script == "module" and _script_shaped(loaded):
+            script = True  # ``-r ./tools/x.js``: named with its suffix, the file itself is a script
+        targets = script_words(loaded) if script in (True, "module") and st.interp else [loaded]
         if script is True and any("".join(it[1] for it in t if it[0] == "c").endswith(".php")
                                   for t in targets):
             unsafe("its interpreter imports from the checkout root")  # ``"$PHP" x.php``
@@ -1561,7 +1625,30 @@ def _code_option(text: str, family: str, flags) -> Optional[Tuple[bool, Optional
     return None
 
 
-def _python_imports(code: str) -> Tuple[Set[str], Optional[str]]:
+def _preload_at(word: List[tuple]) -> Optional[int]:
+    """Where the module glued to a Node preload option (:data:`_NODE_PRELOADS`)
+    starts in ``word`` — after the ``=`` (``--require=./tools/setup``,
+    ``--import="$CLAUDE_PROJECT_DIR"/x``) or right after a short ``-r``, which Bun
+    takes glued on (``-r./tools/setup``) — or None when ``word`` is not one."""
+    lead = _lead(word, len(word))
+    name, eq, _ = lead.partition("=")
+    if eq and name in _NODE_PRELOADS:
+        return len(name) + 1 if len(word) > len(name) + 1 else None
+    if lead.startswith("-r") and len(word) > 2:
+        return 2
+    return None
+
+
+def _assigned(word: List[tuple], name: str) -> Optional[List[tuple]]:
+    """The value ``word`` gives the variable ``name`` (``NAME=v``, ``NAME+=v``),
+    wherever it stands — a prefix, ``export``'s or ``env``'s operand — or None."""
+    for i, it in enumerate(word):
+        if it[0] == "c" and it[1] == "=":
+            return word[i + 1:] if _chars(word[:i]) in (name, name + "+") else None
+    return None
+
+
+def _python_imports(code: str, strict: bool = True) -> Tuple[Set[str], Optional[str]]:
     """The top-level module names Python code imports by name — in an ``import``
     statement (in an ``exec``'d string too), or handed to a call that imports one
     at run time (:data:`_PY_DYNAMIC_IMPORT`) — and why the code cannot be checked,
@@ -1570,13 +1657,37 @@ def _python_imports(code: str) -> Tuple[Set[str], Optional[str]]:
     any module under the root, so the code is not checked. Every literal in the
     call is taken as a name too (``import_module('.x', 'tools')``,
     ``__import__('tools', fromlist=['x'])``): reading one too many walks a
-    directory more, never one fewer."""
-    names = set()
+    directory more, never one fewer. A helper named anywhere but in a call —
+    handed on under another name (``load = importlib.import_module``, ``from
+    importlib import import_module as load``, ``getattr(importlib,
+    'import_module')``) — imports by calls this guard cannot see, so the code is
+    not checked either; only a plain ``from … import`` keeps the helper's own
+    name, whose calls are read.
+
+    ``import`` statements are read twice and the names united: by Python's own
+    parser (:func:`_ast_imports`), which sees through what a pattern cannot —
+    ``from \\<newline>tools.lint import x``, ``from tools . lint import x`` — and
+    by :data:`_PY_IMPORT` over the raw text with its line continuations joined,
+    which also finds a statement in a string the parser does not take for code.
+    Code the parser rejects cannot have its imports known, so with ``strict`` (a
+    known Python interpreter) it is not checked."""
+    names, parsed = _ast_imports(code)
+    if parsed is None and strict:
+        return names, "its Python code cannot be parsed"
+    # Line continuations joined, so a call or a rename split across lines reads
+    # the same to every pattern below.
+    code = _PY_CONTINUATION.sub(" ", code)
     for m in _PY_IMPORT.finditer(code):
         for module in (m.group(1) or m.group(2)).split(","):
             head = module.split()[0].split(".", 1)[0] if module.strip() else ""
             if head:
                 names.add(head)
+    for m in _PY_DYNAMIC_NAME.finditer(code):
+        if _PY_CALLED.match(code, m.end()):
+            continue  # a call: its arguments are read below
+        if _PY_FROM_IMPORT_HEAD.search(code, 0, m.start()) and not _PY_RENAMED.match(code, m.end()):
+            continue  # ``from importlib import import_module``: called under its own name
+        return names, "it imports a module by a name this guard cannot read"
     for m in _PY_DYNAMIC_IMPORT.finditer(code):
         args = _call_arguments(code, m.end())
         first = _PY_LITERAL.match(args or "", len(args or "") - len((args or "").lstrip()))
@@ -1594,6 +1705,28 @@ def _python_imports(code: str) -> Tuple[Set[str], Optional[str]]:
             return names, "it imports a module by a name this guard cannot read"
         names |= heads
     return names, None
+
+
+def _ast_imports(code, depth: int = 0) -> Tuple[Set[str], Optional[ast.AST]]:
+    """The top-level module names Python's parser finds in ``import`` statements of
+    ``code`` — and of every string or bytes literal in it that parses as Python
+    too, a few levels deep (``exec('from tools import x')``) — and the parsed
+    tree, or None when ``code`` does not parse. A relative import (``from . import
+    x``) is not counted: run by ``-c`` it has no package to be relative to."""
+    names: Set[str] = set()
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, TypeError, RecursionError, MemoryError):
+        return names, None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".", 1)[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            names.add(node.module.split(".", 1)[0])
+        elif (depth < _AST_STRING_DEPTH and isinstance(node, ast.Constant)
+              and isinstance(node.value, (str, bytes)) and node.value):
+            names |= _ast_imports(node.value, depth + 1)[0]
+    return names, tree
 
 
 def _call_arguments(code: str, start: int) -> Optional[str]:
@@ -1716,6 +1849,9 @@ def _scan_word(word: List[tuple], named: _Named, checkout: Optional[str],
             # ``X+=v`` appends to X's current value, which may be empty.
             if _NAME_RE.fullmatch(name) and _names_cwd(name, ([_opaque(name)] + value) if append else value):
                 named.unsafe = named.unsafe or "it names the checkout root"
+            if name in _SCRIPT_ENV and value:
+                # ``BASH_ENV=tools/env bash x.sh``: a script the shell sources, suffix or not.
+                _scan_piece(value, named, checkout, True, if_present)
             break
     pieces: List[List[tuple]] = [[]]
     for it in items:
@@ -1762,8 +1898,10 @@ def _scan_piece(piece: List[tuple], named: _Named, checkout: Optional[str],
         home = os.environ.get("HOME")
         if rest is not None and home and (not rest or rest.startswith("/")):
             _scan_absolute(home + rest, named, checkout, script)
+        elif rest is None and home:
+            _scan_home_dynamic(home, piece[1:], named, checkout, script)
         return
-    if first[0] == "opaque" or (first is _HOME and _chars(piece[1:]) is None):
+    if first[0] == "opaque":
         if any(_chars(c) == ".." for c in _components(piece[1:])):
             raise _Unparseable("it climbs out of a directory a variable names")
         return  # "$CLAUDE_FILE_PATHS", $1 …: not a checkout path this guard can name
@@ -1809,6 +1947,32 @@ def _scan_piece(piece: List[tuple], named: _Named, checkout: Optional[str],
         _scan_relative(piece, named, bare=False, script=script)
         return
     _scan_relative(piece, named, bare=True, script=script)
+
+
+def _scan_home_dynamic(home: str, rest: List[tuple], named: _Named, checkout: Optional[str],
+                       script: object) -> None:
+    """``$HOME/work/repo/tools/$SCRIPT``: a home path with another expansion in it.
+    The literal directory before the first expansion is resolved — below the
+    checkout, the path is read as the checkout path it is (``tools/`` reached into
+    by a variable); a directory the checkout is in, the variable may name the
+    checkout or anything in it, so it is unsafe; anywhere else, it is outside."""
+    first = next(i for i, it in enumerate(rest) if it[0] != "c")
+    lead = "".join(it[1] for it in rest[:first])
+    cut = lead.rfind("/")
+    if cut >= 0:
+        directory, tail = home + lead[:cut], rest[cut:]
+    else:
+        # ``$HOME$X``, ``${HOME}x$Y``: glued onto home's own last component.
+        directory, tail = os.path.dirname(home), _literal("/" + os.path.basename(home)) + rest
+    if not checkout or not os.path.isabs(directory):
+        return
+    below = _below_checkout(directory, checkout)
+    if below is not None:
+        _scan_relative(_literal(below) + tail, named, bare=False, script=script)
+    elif directory == "/" or _below_checkout(checkout, directory) is not None:
+        named.unsafe = named.unsafe or "a variable names a directory the checkout is in"
+    elif any(_chars(c) == ".." for c in _components(tail)):
+        raise _Unparseable("it climbs out of a directory a variable names")
 
 
 def _scan_literal(text: str, named: _Named, checkout: Optional[str], script: object = False) -> None:
@@ -2044,6 +2208,17 @@ class _Base:
 _REGULAR_MODES = ("100644", "100755")
 
 
+def _same_mode(st_mode: int, base_mode: str) -> bool:
+    """Whether a file on disk is exactly as executable as base records it. A PR
+    can flip a base file from ``100644`` to ``100755`` without changing a byte,
+    and a base-equal ``./tools/check`` or ``run-parts ./tools`` then runs it. Base
+    ``100755`` means owner-executable, as git itself reads a file's mode; base
+    ``100644`` means no execute bit at all, which is how git checks one out."""
+    if base_mode == "100755":
+        return bool(st_mode & stat.S_IXUSR)
+    return not st_mode & 0o111
+
+
 def _is_cache(path: str) -> bool:
     parts = path.split("/")
     return (parts[-1] == ".DS_Store"
@@ -2057,7 +2232,7 @@ def _in_git_dir(rel: str) -> bool:
 
 class _Checker:
     """Decides whether every path a base-equal value names is byte-identical to
-    base. Every failure to decide — a missing path, a git error, a walk that is
+    base, execute bit included. Every failure to decide — a missing path, a git error, a walk that is
     too big — answers "not identical"."""
 
     def __init__(self, checkout: str, base: _Base):
@@ -2161,14 +2336,24 @@ class _Checker:
         ``name``). The code is in, or run from, a directory the value names — a
         script's, a ``cd``'s, the root — so each ``node_modules`` and
         ``package.json`` beside one of the named paths' ancestors must be base's, or
-        absent both here and at base. A directory a tree already covers is skipped
-        (unless a ``..`` in it may lead elsewhere). The first that differs, or None."""
+        absent both here and at base. Node reads its code, and the directory it
+        runs in, at the REAL path, so the ancestors of where each named path's
+        symlinks lead count too (``hooks`` → ``tools/nested`` climbs through
+        ``tools/``). A directory a tree already covers is skipped (unless a ``..``
+        in it may lead elsewhere). The first that differs, or None."""
         dirs = {""}
+        real_trees = []
         for rel in exact + trees:
-            # As written (a ``..`` the kernel resolves, through a symlink too) and by name.
-            for parts in {tuple(rel.split("/")), tuple(os.path.normpath(rel).split("/"))}:
+            # As written (a ``..`` the kernel resolves, through a symlink too), by
+            # name, and where it really is.
+            real = self._real(rel)
+            if rel in trees:
+                real_trees.append(real)
+            for parts in {tuple(rel.split("/")), tuple(os.path.normpath(rel).split("/")),
+                          tuple(real.split("/"))}:
                 dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
-        covered = tuple(t + "/" for t in trees)
+        # A tree's walk compared the directory it really is, whole.
+        covered = tuple(t + "/" for t in trees + [r for r in real_trees if r])
         top = self.base.top()
         for d in sorted(dirs):
             if d and ".." not in d.split("/") and (d + "/").startswith(covered):
@@ -2181,6 +2366,20 @@ class _Checker:
                 elif (name in top) if not d else (self.base.entry(rel) is not None):
                     return rel  # base has it; the checkout does not
         return None
+
+    def _real(self, rel: str) -> str:
+        """Where ``rel`` really is in the checkout — every symlink along it
+        resolved, as Node resolves a module's path and its working directory —
+        relative to the checkout's own real path. A path the walk verified only
+        follows base's relative links, which stay inside; one that leaves it anyway
+        raises ValueError, so the value is held back."""
+        root = os.path.realpath(self.checkout)
+        real = os.path.realpath(os.path.join(self.checkout, rel))
+        if real == root:
+            return ""
+        if not real.startswith(root.rstrip(os.sep) + os.sep):
+            raise ValueError(f"{rel} really lies outside the checkout")
+        return real[len(root.rstrip(os.sep)) + 1:].replace(os.sep, "/")
 
     def _shebang_imports(self, rel: str) -> str:
         """The interpreter the file at ``rel`` names in a ``#!`` line (through ``env``
@@ -2325,7 +2524,7 @@ class _Checker:
                 return be is not None and be.kind == "tree" and self._same_dir(cur, hops, linked)
             if stat.S_ISREG(st.st_mode):  # a glob "under" a file matches nothing but itself
                 same = (be is not None and be.kind == "blob" and be.mode in _REGULAR_MODES
-                        and st.st_size <= _MAX_WALK_BYTES
+                        and _same_mode(st.st_mode, be.mode) and st.st_size <= _MAX_WALK_BYTES
                         and self.base.blob_id(_read(os.path.join(self.checkout, cur))) == be.sha)
                 if same and via_link and linked is not None:
                     linked.add(cur)
@@ -2351,9 +2550,9 @@ class _Checker:
     def _same_dir(self, rel: str, hops: int, linked: Optional[Set[str]] = None) -> bool:
         """A directory is unchanged when its COMPLETE on-disk file list — untracked
         and ignored files included, since a spawn can create one — and every
-        file's bytes equal base, and every symlink in it is base's identical
-        symlink to something itself unchanged (a file one resolves to is added to
-        ``linked``)."""
+        file's bytes and execute bit equal base, and every symlink in it is base's
+        identical symlink to something itself unchanged (a file one resolves to is
+        added to ``linked``)."""
         below = rel + "/" if rel else ""
         want = {p: e for p, e in self.base.listing(rel).items()
                 if p.startswith(below) and e.kind != "tree"}
@@ -2375,7 +2574,7 @@ class _Checker:
         for path, (kind, detail) in sorted(have.items()):
             be = want[path]
             if kind == "file":
-                if be.mode not in _REGULAR_MODES:
+                if be.mode not in _REGULAR_MODES or not _same_mode(detail, be.mode):
                     return False
                 if self.base.blob_id(_read(os.path.join(self.checkout, path))) != be.sha:
                     return False
@@ -2411,7 +2610,7 @@ class _Checker:
                     stack.append(path)
                     continue
                 if stat.S_ISREG(st.st_mode):
-                    found[path] = ("file", st.st_size)
+                    found[path] = ("file", st.st_mode)
                     total += st.st_size
                 elif stat.S_ISLNK(st.st_mode):
                     found[path] = ("link", None)

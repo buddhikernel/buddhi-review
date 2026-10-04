@@ -393,9 +393,11 @@ class PullRequestBase:
       ``refs/heads/origin/main``, which git prefers for the short name
       ``origin/main`` — that would make the PR its own "base". There is no
       fallback to a local branch or a guessed ``origin``.
-    * Fetching just the base branch is best-effort: when the fetch fails (offline,
-      say) but the remote-tracking ref already exists, the merge-base is computed
-      from it. Only an unresolved merge-base is a failure.
+    * Just the base branch is fetched. When the fetch fails (offline, say), the
+      existing remote-tracking ref is used only if it is exactly the PR's
+      ``baseRefOid``: a stale ref may predate a hook the base has since removed,
+      and a PR restoring that hook would then look base-identical. Any other
+      failed fetch is a failure.
     * A success is cached for the run. A failure is retried on a bounded schedule
       (after 30 s, 60 s, 120 s, then every 300 s), so a ``gh`` blip never darkens
       a whole run and a dead ``gh`` never costs a stall on every spawn."""
@@ -474,7 +476,7 @@ class PullRequestBase:
                           else f"several git remotes on different hosts point at {repo}")
 
     def _resolve(self, checkout: str) -> str:
-        argv = ["gh", "pr", "view", self.pr, "--json", "baseRefName,url"]
+        argv = ["gh", "pr", "view", self.pr, "--json", "baseRefName,baseRefOid,url"]
         if self.repo:
             argv += ["-R", self.repo]
         try:
@@ -496,12 +498,13 @@ class PullRequestBase:
         if not _REF_NAME_RE.fullmatch(remote) or remote.startswith("-"):
             raise _Unresolved(f"no usable git remote points at {repo}")
         tracking = f"refs/remotes/{remote}/{base}"
-        try:  # best-effort: an existing remote-tracking ref still resolves offline
-            self._run(["env", "GIT_TERMINAL_PROMPT=0",  # never wait on a credential prompt
-                       "git", "fetch", "--no-tags", "--quiet", remote,
-                       f"+refs/heads/{base}:{tracking}"], cwd=checkout)
+        try:
+            fetched = self._run(["env", "GIT_TERMINAL_PROMPT=0",  # never wait on a credential prompt
+                                 "git", "fetch", "--no-tags", "--quiet", remote,
+                                 f"+refs/heads/{base}:{tracking}"], cwd=checkout)
+            fetch_ok = getattr(fetched, "returncode", 1) == 0
         except (subprocess.SubprocessError, OSError):
-            pass
+            fetch_ok = False
         # ``show-ref --verify`` takes the ref name EXACTLY: ``rev-parse`` would fall
         # back to ``refs/heads/refs/remotes/<remote>/<base>`` — a branch the PR itself
         # can create — when the tracking ref does not exist.
@@ -512,6 +515,14 @@ class PullRequestBase:
             raise _Unresolved(f"{tracking} does not exist")
         if not _SHA_RE.fullmatch(tip):
             raise _Unresolved(f"{tracking} does not exist")
+        if not fetch_ok:
+            # An unfetched ref is trusted only when GitHub vouches for it: a stale one
+            # may predate a hook the base removed, which the PR could then restore.
+            current = data.get("baseRefOid")
+            if not isinstance(current, str) or not _SHA_RE.fullmatch(current):
+                raise _Unresolved(f"could not fetch {base}, and the PR names no base commit")
+            if tip != current:
+                raise _Unresolved(f"could not fetch {base}, and {tracking} is stale")
         sha = self._output(["git", "merge-base", "HEAD", tip], checkout,
                            "git merge-base").strip()
         if not _SHA_RE.fullmatch(sha):

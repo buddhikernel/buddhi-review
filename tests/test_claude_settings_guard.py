@@ -123,8 +123,8 @@ def test_every_spelling_of_a_checkout_path_names_that_file(command):
     ("sh <<< ./x.sh", "x.sh"),                                  # a here-string
     ("source <(cat ./x.sh)", "x.sh"),                           # process substitution
     ("A=./hooks/x.sh; sh $A", "hooks/x.sh"),                    # indirection through a variable
-    ("export BASH_ENV=./x.sh", "x.sh"),
-    ("NODE_OPTIONS='--require ./x.js' node y", "x.js"),
+    ("export BASH_ENV=./hooks/x.sh", "hooks/x.sh"),
+    ("NODE_OPTIONS='--require ./tools/x.js' node y", "tools/x.js"),
     ("node -r./tools/x.js y", "tools/x.js"),                                # a value glued to a short option
     ("perl -I./lib tools/lint.pl", "lib"),
     ("pytest -c./tools/pytest.ini", "tools/pytest.ini"),
@@ -174,6 +174,8 @@ def test_round_two_shell_forms_name_their_file(command, path):
     ("sh ./tools/*/../../x.sh", "climbs back out"),              # .. after a glob
     ("sh ./tools/{..,x}/x.sh", "cannot follow"),                # .. inside a brace expansion
     ("python3 ./check.py", "imports from the checkout root"),   # sys.path[0] is the root
+    # A preload at the root loads its siblings from there, however NODE_OPTIONS is set.
+    ("NODE_OPTIONS='--require ./x.js' node y", "imports from the checkout root"),
 ])
 def test_round_two_forms_that_reach_unknowable_places_are_unsafe(command, why):
     assert why in (guard.named_paths(command).unsafe or "")
@@ -208,6 +210,23 @@ def test_home_relative_paths_that_reach_the_checkout_are_named(tmp_path, monkeyp
     alias = tmp_path / "alias-to-tools"
     os.symlink(checkout / "tools", alias)
     assert guard.named_paths(f"python3 {alias}/check.py", str(checkout)).paths == {"tools/check.py"}
+
+
+def test_a_home_path_with_another_expansion_names_the_checkout_directory_it_reaches(
+        tmp_path, monkeypatch):
+    """``$HOME/work/wt/tools/$SCRIPT`` reaches into ``tools/`` as
+    ``$CLAUDE_PROJECT_DIR/tools/$SCRIPT`` does; a variable right under a directory
+    the checkout is in may name the checkout itself."""
+    checkout = tmp_path / "home" / "work" / "wt"
+    (checkout / "tools").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    for command in ('python3 "$HOME/work/wt/tools/$SCRIPT"', "python3 $HOME/work/wt/tools/$SCRIPT",
+                    'python3 "${HOME}/work/wt/tools/x$N.py"'):
+        named = guard.named_paths(command, str(checkout))
+        assert named.unsafe is None and "tools" in named.trees and "tools" in named.script_dirs, command
+    for command in ('python3 "$HOME/work/$REPO/tools/x.py"', 'python3 "$HOME/$X"', 'python3 "$HOME$X"'):
+        assert "the checkout is in" in (guard.named_paths(command, str(checkout)).unsafe or ""), command
+    assert guard.named_paths('python3 "$HOME/.local/bin/$X"', str(checkout)).unsafe is None
 
 
 def test_a_module_added_next_to_a_python_hook_is_caught(tmp_path):
@@ -372,9 +391,9 @@ def test_a_path_holding_a_nul_is_unsafe_not_a_crash():
     assert guard.named_paths("cat ~\ud800/notes").unsafe
 
 
-def _hook_repo(tmp_path, command, files, head=None):
+def _hook_repo(tmp_path, command, files, head=None, executable=()):
     base = {SETTINGS: {"hooks": command_hook("SessionStart", command)}, **files}
-    repo = make_pr_repo(tmp_path, base, head or {"docs/guide.md": "x\n"})
+    repo = make_pr_repo(tmp_path, base, head or {"docs/guide.md": "x\n"}, executable=executable)
     guard.install_base_resolver(lambda checkout: repo.base)
     return repo
 
@@ -383,8 +402,8 @@ def test_a_script_run_by_its_shebang_names_its_directory(tmp_path):
     """The documented hook ``"$CLAUDE_PROJECT_DIR"/.claude/hooks/check.py``, run by
     its ``#!/usr/bin/env python3`` line: a module the PR adds beside it would
     replace the standard library's, so the hook is held back."""
-    repo = _hook_repo(tmp_path, S, {".claude/hooks/check.py": "#!/usr/bin/env python3\nimport json\n"})
-    os.chmod(repo.wt / ".claude/hooks/check.py", 0o755)
+    repo = _hook_repo(tmp_path, S, {".claude/hooks/check.py": "#!/usr/bin/env python3\nimport json\n"},
+                      executable=[".claude/hooks/check.py"])
     assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
     write(repo.wt, ".claude/hooks/json.py", "x = 1\n")
     assert _hooks(_spawn(str(repo.wt))) == []
@@ -414,6 +433,41 @@ def test_an_untracked_bytecode_cache_does_not_strip_a_python_hook(tmp_path):
     git(repo.wt, "add", "-f", ".claude/hooks/__pycache__/helper.cpython-311.pyc")
     git(repo.wt, "commit", "-qm", "commit a cache")
     assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("base_mode,pr_mode", [(0o644, 0o755), (0o755, 0o644)],
+                         ids=["made-executable", "made-plain"])
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "on-disk"])
+def test_a_named_file_whose_execute_bit_changed_is_not_base(tmp_path, base_mode, pr_mode, committed):
+    """``./tools/check`` holds base's own bytes, but its mode is not base's: a PR
+    that only flips ``100644`` to ``100755`` changes no byte, yet the hook now runs
+    a file it could not run at base. The hook is held back, whichever way the bit
+    moved, whether the PR commits the mode or it is only set on disk."""
+    executable = ["tools/check"] if base_mode == 0o755 else []
+    repo = _hook_repo(tmp_path, "./tools/check",
+                      {"tools/check": touch(tmp_path / "markers", "check") + "\n"},
+                      executable=executable)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    os.chmod(repo.wt / "tools/check", pr_mode)
+    if committed:
+        git(repo.wt, "commit", "-qam", "flip the execute bit")
+    assert _hooks(_spawn(str(repo.wt))) == []
+    assert markers_present(repo.markers) == []
+
+
+@pytest.mark.parametrize("committed", [True, False], ids=["committed", "on-disk"])
+def test_a_directory_hook_is_stripped_when_a_file_there_becomes_executable(tmp_path, committed):
+    """``run-parts``-style: a hook over ``hooks.d/`` runs what is executable there.
+    A base file whose bytes stay base's but whose mode turns ``100755`` changes
+    the directory, so the hook is held back."""
+    repo = _dir_hook_repo(tmp_path)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    os.chmod(repo.wt / "hooks.d/a.sh", 0o755)
+    if committed:
+        git(repo.wt, "commit", "-qam", "make a.sh executable")
+    view = _spawn(str(repo.wt))
+    assert _hooks(view) == [] and view[SETTINGS]["model"] == "sonnet"
+    assert markers_present(repo.markers) == []
 
 
 def test_a_named_file_the_base_branch_lacks_is_never_trusted(tmp_path):
@@ -3219,6 +3273,86 @@ def test_a_script_glued_to_an_option_by_a_separator_names_its_directory(_tools_r
     _assert_sibling_holds(_tools_repo, command, "tools/helper.js")
 
 
+@pytest.mark.parametrize("command", [
+    "node --require ./tools/run -e 0",
+    "node -r ./tools/run -e 0",
+    "node --require tools/run -e 0",
+    'node --require "$CLAUDE_PROJECT_DIR"/tools/run -e 0',
+    "node --require=./tools/run -e 0",
+    'node --require="$CLAUDE_PROJECT_DIR"/tools/run -e 0',
+    "node --import ./tools/run -e 0",
+    "node --import=./tools/run -e 0",
+    "node --loader ./tools/run -e 0",
+    "node --experimental-loader=./tools/run -e 0",
+    "bun --preload ./tools/run -e 0",
+    "bun --preload=./tools/run -e 0",
+    "bun -r./tools/run -e 0",
+    # The same options in a ``NODE_OPTIONS`` the hook's own command line sets.
+    "NODE_OPTIONS='--require ./tools/run' node -e 0",
+    "NODE_OPTIONS='--require ./tools/x.js' node -e 0",
+    "NODE_OPTIONS=--require=./tools/run node -e 0",
+    "export NODE_OPTIONS='-r ./tools/run'; node -e 0",
+    "env NODE_OPTIONS='--import ./tools/run' node -e 0",
+])
+def test_a_module_a_node_preload_option_names_is_one_whatever_its_suffix(_tools_repo, command):
+    """``require()`` loads ``tools/run`` itself, suffix or not, so the module a
+    preload option names imports from its directory as any script does: by the
+    option's meaning, not by the shape of its argument, the PR changing
+    ``tools/helper.js`` holds the hook back."""
+    _assert_sibling_holds(_tools_repo, command, "tools/helper.js")
+
+
+def _live_env(repo, env):
+    checker = guard._Checker(str(repo.wt), guard._Base(str(repo.wt), repo.base))
+    return checker.unchanged("env", env)[0]
+
+
+@pytest.mark.parametrize("value", [
+    "--require ./tools/run", "-r ./tools/run", "--require tools/run", '--require "./tools/run"',
+    "--require=./tools/run", "--import ./tools/run", "--import=./tools/run",
+    "--loader=./tools/run", "--max-old-space-size=4096 --require ./tools/run",
+])
+def test_a_module_env_node_options_preloads_names_its_directory_whatever_its_suffix(_tools_repo, value):
+    """``env.NODE_OPTIONS`` is read by the option's meaning too: the module
+    ``--require ./tools/run`` loads has no suffix, yet its sibling is a dependency."""
+    env = {"NODE_OPTIONS": value}
+    path = _tools_repo.wt / "tools/helper.js"
+    before = path.read_bytes()
+    assert _live_env(_tools_repo, env), f"held back with nothing changed: {value}"
+    try:
+        path.write_bytes(before + b"\n// the pull request's code\n")
+        assert not _live_env(_tools_repo, env), f"live after tools/helper.js changed: {value}"
+    finally:
+        path.write_bytes(before)
+
+
+@pytest.mark.parametrize("command,node", [
+    ("NODE_OPTIONS='--require pkg' npm test", True),       # resolved from the working directory
+    ("export NODE_OPTIONS=--import=pkg; npm test", True),
+    ("NODE_OPTIONS=--max-old-space-size=4096 npm test", False),  # loads nothing
+])
+def test_a_preload_in_a_hook_s_node_options_resolves_packages(command, node):
+    assert guard.named_paths(command).node is node
+
+
+@pytest.mark.parametrize("command", [
+    "node -r ./tools/run -e 0", "node --require=./tools/run -e 0",
+    "NODE_OPTIONS='--require ./tools/run' node -e 0",
+])
+def test_a_node_preload_s_module_names_its_directory_not_only_itself(command):
+    """The module is resolved as ``require()`` resolves it (``tools/run``,
+    ``tools/run.js`` …): its directory is what it depends on."""
+    named = guard.named_paths(command)
+    assert named.unsafe is None
+    assert "tools" in (named.trees | named.bare_trees) and "tools" in named.script_dirs
+
+
+def test_a_node_preload_named_by_a_variable_this_command_did_not_set_is_unsafe():
+    """A preload is code the runtime runs, as its script is: one a variable names
+    may be any file under the checkout."""
+    assert "variable" in (guard.named_paths('node -r "$PRELOAD" -e 0').unsafe or "")
+
+
 # Shell and PHP scripts that load a sibling by their own location, and the same run
 # by a ``#!`` line or, with none, by the hook's shell (an executable file).
 _SHELL_TOOLS = {
@@ -3235,10 +3369,8 @@ _SHELL_TOOLS = {
 
 @pytest.fixture(scope="module")
 def _shell_repo(tmp_path_factory):
-    repo = make_pr_repo(tmp_path_factory.mktemp("shell"), _SHELL_TOOLS, {})
-    for rel in ("tools/shebang-sh", "tools/shebang-bash", "tools/no-shebang", "tools/shebang-php"):
-        os.chmod(repo.wt / rel, 0o755)
-    return repo
+    return make_pr_repo(tmp_path_factory.mktemp("shell"), _SHELL_TOOLS, {}, executable=(
+        "tools/shebang-sh", "tools/shebang-bash", "tools/no-shebang", "tools/shebang-php"))
 
 
 @pytest.mark.parametrize("command", [
@@ -3277,10 +3409,41 @@ def test_a_shell_script_names_its_directory(_shell_repo, command):
 
 @pytest.mark.parametrize("command", [
     "sh ./check.sh", "bash check.sh", '. "$CLAUDE_PROJECT_DIR"/check.sh', "source ./check.sh",
+    "export BASH_ENV=./check.sh; bash -c true",   # a startup file the shell sources
 ])
 def test_a_shell_script_at_the_root_is_held_back(_shell_repo, command):
     """Its directory is the checkout root, which a PR always changes."""
     assert not _live(_shell_repo, command)
+
+
+@pytest.mark.parametrize("name", sorted(guard._SCRIPT_ENV))
+@pytest.mark.parametrize("value", ["tools/check", "./tools/check", "$CLAUDE_PROJECT_DIR/tools/check"])
+def test_a_startup_file_an_env_value_names_is_a_script_whatever_its_suffix(_shell_repo, name, value):
+    """``BASH_ENV=tools/check`` (no suffix): the shell sources it, and it sources a
+    sibling, so the PR changing the sibling holds the ``env`` key back."""
+    checker = guard._Checker(str(_shell_repo.wt), guard._Base(str(_shell_repo.wt), _shell_repo.base))
+    path = _shell_repo.wt / "tools/lib.sh"
+    before = path.read_bytes()
+    assert checker.unchanged("env", {name: value})[0]
+    try:
+        path.write_bytes(before + b"\n# the pull request's code\n")
+        assert not checker.unchanged("env", {name: value})[0]
+    finally:
+        path.write_bytes(before)
+
+
+@pytest.mark.parametrize("command", [
+    "BASH_ENV=tools/check bash -c true",
+    'export BASH_ENV="$CLAUDE_PROJECT_DIR"/tools/check; bash -c true',
+    "env ENV=./tools/check sh -i -c true",
+])
+def test_a_startup_file_a_hook_assigns_is_a_script_whatever_its_suffix(_shell_repo, command):
+    _assert_sibling_holds(_shell_repo, command, "tools/lib.sh")
+
+
+def test_a_variable_no_shell_starts_from_does_not_name_a_script_directory():
+    named = guard.named_paths({"NODE_ENV": "tools/check"}, key="env")
+    assert named.bare == {"tools/check"} and not named.script_dirs
 
 
 @pytest.mark.parametrize("command", [
@@ -3459,6 +3622,7 @@ def test_a_package_python_code_imports_by_name_is_walked_whatever_the_option(_to
     "import runpy; runpy.run_module('tools.x')",
     "import pkgutil; pkgutil.resolve_name('tools.x:y')",
     "exec('import tools.x')",
+    "from importlib import reload, import_module; import_module('tools.x')",
 ])
 def test_a_package_python_code_imports_at_run_time_is_walked(_tools_repo, code):
     """A module named to a call that imports it at run time is walked like one an
@@ -3467,11 +3631,57 @@ def test_a_package_python_code_imports_at_run_time_is_walked(_tools_repo, code):
 
 
 @pytest.mark.parametrize("code", [
+    "from \\\ntools.x import y",          # a line continuation between ``from`` and the module
+    "import os, \\\n tools.x",             # … inside an ``import`` list
+    "from tools . x import y",            # spaces around the dot
+    "exec('from \\\\\\ntools.x import y')",  # a continuation inside an exec'd string
+])
+def test_python_imports_a_pattern_cannot_see_are_read(code):
+    """Python's own parser reads the module an ``import`` names however the
+    statement is laid out, so the guard walks the package a hook really loads."""
+    assert "tools" in guard._python_imports(code)[0]
+
+
+def test_a_package_imported_across_a_line_continuation_is_walked(tmp_path):
+    repo = _hook_repo(tmp_path, "python3 -c 'from \\\ntools.lint import main; main()'",
+                      {"tools/__init__.py": "", "tools/lint.py": "def main(): pass\n"},
+                      {"README.md": "changed\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    write(repo.wt, "tools/lint.py", "def main(): print(1)\n")
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+@pytest.mark.parametrize("code", ["from $MOD import x", "import tools.x +"])
+def test_python_code_the_parser_rejects_is_held_back(_tools_repo, code):
+    """Code whose imports cannot be known — a shell fills it in, or this Python
+    cannot parse it — may import anything under the root."""
+    named = guard.named_paths(f'python3 -c "{code}"')
+    assert named.unsafe == "its Python code cannot be parsed"
+    assert not _live(_tools_repo, f'python3 -c "{code}"')
+
+
+def test_an_unknown_interpreters_non_python_code_is_not_held_back_for_parsing():
+    assert guard._python_imports("print(1) end", strict=False)[1] is None
+
+
+@pytest.mark.parametrize("code", [
+    "from importlib import (\n    reload,\n    import_module,\n)\nimport_module('tools.x')",
+    "import importlib; importlib.import_module\\\n('tools.x')",  # a continuation before ``(``
+])
+def test_a_dynamic_import_helper_called_by_its_own_name_is_read(code):
+    assert guard._python_imports(code) == ({"importlib", "tools"}, None)
+
+
+@pytest.mark.parametrize("code", [
     "import importlib, sys; importlib.import_module(sys.argv[1])",   # a name read at run time
     "import importlib; importlib.import_module('tools.' + 'x')",     # a name built by the code
     "import importlib; p = 'tools'; importlib.import_module(f'{p}.x')",
     "import importlib; importlib.import_module('.x', package=__name__)",  # relative to an unknown package
     "__import__('$MOD')",                                             # a name the shell fills in
+    "import importlib; load = importlib.import_module; load('tools.x')",  # a helper renamed
+    "from importlib import import_module as load; load('tools.x')",
+    "import importlib; getattr(importlib, 'import_module')('tools.x')",
+    "load = __import__; load('tools.x')",
 ])
 def test_python_code_importing_a_name_it_does_not_spell_out_is_held_back(_tools_repo, code):
     named = guard.named_paths(f'python3 -c "{code}"')
@@ -3732,3 +3942,42 @@ def test_a_node_hook_in_a_checkout_below_the_repository_top_is_held_back(tmp_pat
     live, why = checker.unchanged("hooks", command_hook("SessionStart", f"node {_FMT}"))
     assert not live and "above the checkout" in why
     assert checker.unchanged("hooks", command_hook("SessionStart", f"python3 {S}")) == (True, "")
+
+
+@pytest.mark.parametrize("command", [
+    "node ./hooks/check.js", "node hooks/check.js", 'node "$CLAUDE_PROJECT_DIR"/hooks/check.js',
+    "./hooks/check.js",                                         # run by its #!/usr/bin/env node line
+    "cd \"$CLAUDE_PROJECT_DIR\"/hooks && node -e \"require('fmt')\"",
+])
+@pytest.mark.parametrize("added", [
+    {"tools/node_modules/fmt/index.js": _PR_PACKAGE},
+    {"tools/package.json": json.dumps({"name": "fmt", "exports": "./evil.js"}), "tools/evil.js": _PR_PACKAGE},
+], ids=["node_modules", "package-json-self-reference"])
+def test_a_package_is_resolved_above_where_a_directory_symlink_really_leads(tmp_path, command, added):
+    """``hooks`` is base's own symlink to ``tools/nested``, unchanged. Node reads
+    the script — and the directory a ``cd`` leaves it in — at its real path, so
+    ``require('fmt')`` climbs through ``tools/``, not through the directory that
+    holds the ``hooks`` link: a ``node_modules`` or ``package.json`` the PR adds
+    there holds the hook back."""
+    files = {"tools/nested/check.js": "#!/usr/bin/env node\nrequire('fmt')\n", "tools/keep.txt": "x\n"}
+    repo = _hook_repo(tmp_path, command, files)
+    os.chmod(repo.primary / "tools/nested/check.js", 0o755)
+    _relink(repo, "hooks", "tools/nested", in_base=True)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    _commit(repo, added)
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_package_lookup_that_really_leads_out_of_the_checkout_is_held_back(tmp_path, monkeypatch):
+    """Should a named directory, once verified, really sit outside the checkout,
+    the packages above it cannot be compared with base: the hook is held back."""
+    repo = _hook_repo(tmp_path, "node ./hooks/check.js", {"hooks/check.js": "require('fmt')\n"})
+    checker = guard._Checker(str(repo.wt), guard._Base(str(repo.wt), repo.base))
+    hook = command_hook("SessionStart", "node ./hooks/check.js")
+    assert checker.unchanged("hooks", hook) == (True, "")
+    real = os.path.realpath
+    outside = str(tmp_path / "elsewhere" / "hooks")
+    monkeypatch.setattr(guard.os.path, "realpath",
+                        lambda p, **kw: outside if p.endswith("/hooks") else real(p, **kw))
+    live, why = checker.unchanged("hooks", hook)
+    assert not live and "outside the checkout" in why

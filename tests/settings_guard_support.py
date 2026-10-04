@@ -96,8 +96,9 @@ class PrRepo:
 
 def make_pr_repo(tmp_path: Path, base_files: Dict[str, object],
                  head_files: Optional[Dict[str, object]] = None, *,
-                 removed=(), branch: str = "feature") -> PrRepo:
-    """Base commit on ``main`` holding ``base_files``; the PR branch (checked out in
+                 removed=(), executable=(), branch: str = "feature") -> PrRepo:
+    """Base commit on ``main`` holding ``base_files`` (``executable`` ones committed
+    as ``100755``); the PR branch (checked out in
     a linked worktree) writes ``head_files`` and deletes ``removed`` in ONE commit
     — an empty commit when it changes nothing. ``origin`` points at GitHub, and
     ``refs/remotes/origin/main`` is the base commit, made with ``update-ref``."""
@@ -113,6 +114,8 @@ def make_pr_repo(tmp_path: Path, base_files: Dict[str, object],
     git(primary, "config", "core.hooksPath", os.devnull)
     for rel, content in {"README.md": "base\n", **base_files}.items():
         write(primary, rel, content)
+    for rel in executable:
+        os.chmod(primary / rel, 0o755)
     git(primary, "add", "-A")
     git(primary, "commit", "-qm", "base")
     base = git(primary, "rev-parse", "HEAD").strip()
@@ -202,7 +205,9 @@ class ClaudeStub:
     """Stands in for ``subprocess.run``: records every ``claude`` spawn (the cwd it
     was given, the directory it would really run in, the settings it would load),
     answers ``gh pr view`` from ``pr_view``, and passes everything else — every
-    git call — to the real ``subprocess.run``."""
+    git call — to the real ``subprocess.run``. Unless ``pr_view`` sets
+    ``baseRefOid``, GitHub's base tip is the checkout's own
+    ``refs/remotes/origin/<baseRefName>``: the cached ref is current."""
     real_run: Callable
     pr_view: Dict = field(default_factory=lambda: dict(PR_VIEW))
     claude_stdout: str = "{}"
@@ -233,7 +238,15 @@ class ClaudeStub:
         if names[0] == "gh":
             self.gh_calls.append(argv)
             if argv[1:3] == ["pr", "view"]:
-                return subprocess.CompletedProcess(argv, 0, json.dumps(self.pr_view), "")
+                view = dict(self.pr_view)
+                if "baseRefOid" not in view:
+                    ref = f"refs/remotes/origin/{view.get('baseRefName')}"
+                    r = self.real_run(["git", "rev-parse", "--verify", "-q", ref],
+                                      cwd=kwargs.get("cwd"), capture_output=True, text=True,
+                                      stdin=subprocess.DEVNULL)
+                    if r.returncode == 0:
+                        view["baseRefOid"] = r.stdout.strip()
+                return subprocess.CompletedProcess(argv, 0, json.dumps(view), "")
             return subprocess.CompletedProcess(argv, 1, "", "gh: not stubbed")
         result = self.real_run(argv, *args, **kwargs)
         if "git" in names and "fetch" in argv:
