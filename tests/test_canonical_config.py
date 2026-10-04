@@ -15,6 +15,7 @@ Also here: the setup wizard's promotion of the bound repo's ``auto_merge`` /
 ``label_gated_ci`` resolves exactly as it did before the promotion existed.
 """
 import contextlib
+import errno
 import io
 import json
 import os
@@ -604,6 +605,112 @@ def test_a_failed_catch_up_after_the_rename_is_retried_from_the_backup(home, mon
     assert f"kept as {_backups(home)[0]}" in capsys.readouterr().err
     assert not record.exists() and len(_backups(home)) == 1
     assert config.migrate_legacy_config() == "absent"
+
+
+@pytest.mark.parametrize("failure", ["refused", "interrupted"])
+@pytest.mark.parametrize("canonical", ["untouched", "edited"])
+@pytest.mark.parametrize("start", ["merged", "copied"])
+def test_a_retried_catch_up_judges_a_changed_setting_against_the_file_the_user_left(
+        home, monkeypatch, failure, canonical, start):
+    """An earlier release changes an EXISTING setting after the legacy file was read
+    and before the migration writes the canonical file, and the catch-up of that
+    write fails. The retry judges the conflict against the canonical file as the user
+    left it — so the newer legacy value wins — never against the migration's own
+    write: neither a merge (``merged``) nor a byte copy made because there was no
+    canonical file yet (``copied``). Once the user edits the canonical file after the
+    migration, that edit is the newer one, and the canonical value stays."""
+    t = time.time_ns()
+    if start == "merged":
+        _put(_canonical(home), {"plan": "pro"}, mtime_ns=t - 2 * 10**9)
+    _put(_legacy(home), {"repos": {"leg/one": {"auto_merge": False}}}, mtime_ns=t - 3 * 10**9)
+    real_copy, real_write = config._write_bytes_atomic, wizard.write_config
+    raced = []
+
+    def old_release_writes(path):
+        if not raced and Path(path) == _canonical(home):  # the migration's first write
+            raced.append(1)
+            _atomic_legacy_write(home, {"repos": {"leg/one": {"auto_merge": True}}})
+            os.utime(_legacy(home), ns=(t - 10**9, t - 10**9))  # after C0, before this write
+
+    def copy(path, raw):
+        old_release_writes(path)
+        return real_copy(path, raw)
+
+    def write(cfg, path):
+        if raced:  # the catch-up merge
+            if failure == "refused":
+                return False
+            raise KeyboardInterrupt
+        old_release_writes(path)
+        return real_write(cfg, path)
+
+    monkeypatch.setattr(config, "_write_bytes_atomic", copy)
+    monkeypatch.setattr(wizard, "write_config", write)
+    if failure == "refused":
+        assert config.migrate_legacy_config() == "error"
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            config.migrate_legacy_config()
+    monkeypatch.setattr(config, "_write_bytes_atomic", real_copy)
+    monkeypatch.setattr(wizard, "write_config", real_write)
+    assert raced and len(_backups(home)) == 1
+    assert config.repo_entry(_load(_canonical(home)), "leg/one") == {"auto_merge": False}
+    if canonical == "edited":
+        # The user edits the canonical file directly (its path named, so this write
+        # does not itself resolve the config and run the retry).
+        assert config.set_repo_keys("other/repo", {"auto_merge": True}, _canonical(home)) is True
+    assert config.migrate_legacy_config() == "migrated"
+    want = canonical == "untouched"
+    assert config.repo_entry(_load(_canonical(home)), "leg/one") == {"auto_merge": want}
+    assert not _canonical(home).with_name("config.yaml.legacy-merged").exists()
+
+
+@pytest.mark.parametrize("failure", ["stat", "read"])
+def test_an_unreadable_backup_keeps_the_record_until_the_catch_up_can_run(home, monkeypatch,
+                                                                          capsys, failure):
+    """A backup that cannot be stat'ed or read is not "nothing to catch up": the
+    newer write an earlier release renamed into it would be lost if the record were
+    dropped. Both the catch-up after the rename and the retry from the record keep
+    the record, and the write arrives once the backup can be read."""
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=time.time_ns() - 10**9)
+    _put(_legacy(home), {"repos": {"leg/one": {"auto_merge": False}}})
+    real_rename, real_stat, real_read = os.rename, os.stat, config._read_config_file
+
+    def racing(src, dst, *a, **k):
+        if str(src) == str(_legacy(home)) and ".migrated-" in str(dst):
+            _atomic_legacy_write(home, {"repos": {"leg/one": {"auto_merge": False},
+                                                  "old/a": {"auto_merge": True}}})
+        return real_rename(src, dst, *a, **k)
+
+    def stat_fails(path, *a, **k):
+        if ".migrated-" in str(path):
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_stat(path, *a, **k)
+
+    def read_fails(path):
+        if ".migrated-" in str(path):
+            return None, b"", "unreadable", None
+        return real_read(path)
+
+    monkeypatch.setattr(config.os, "rename", racing)
+    if failure == "stat":
+        monkeypatch.setattr(config.os, "stat", stat_fails)
+    else:
+        monkeypatch.setattr(config, "_read_config_file", read_fails)
+    assert config.migrate_legacy_config() == "unreadable"
+    monkeypatch.setattr(config.os, "rename", real_rename)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    backup = _backups(home)[0]
+    assert _load(record)["backup"] == backup.name
+    assert f"Could not read the old config file {backup} (unreadable)" in capsys.readouterr().err
+    assert config.migrate_legacy_config() == "unreadable"  # the retry keeps it too
+    assert _load(record)["backup"] == backup.name
+    assert "old/a" not in _load(_canonical(home))["repos"]
+    monkeypatch.setattr(config.os, "stat", real_stat)
+    monkeypatch.setattr(config, "_read_config_file", real_read)
+    assert config.migrate_legacy_config() == "migrated"
+    assert {"leg/one", "old/a"} <= set(_load(_canonical(home))["repos"])
+    assert not record.exists()
 
 
 def test_a_retried_catch_up_never_reads_or_overwrites_a_fresh_legacy_file(home, monkeypatch):
@@ -1758,6 +1865,30 @@ def test_a_setup_with_no_bound_repo_writes_no_top_level_choice_keys(home, monkey
     assert "repo" not in cfg and "repos" not in cfg
     assert "auto_merge" not in cfg and "label_gated_ci" not in cfg
     assert cfg["active_reviewers"] == FLEET
+
+
+def test_a_lock_file_that_cannot_be_opened_refuses_writes(home, monkeypatch, capsys):
+    """A failed open does not prove there is no holder (the lock file's permissions
+    can change while another process keeps its flock), so every writer refuses and
+    the open failure is reported in its own words, not as a timeout."""
+    p = _put(_canonical(home), {"plan": "pro"})
+    before = p.read_bytes()
+    real_open = os.open
+
+    def refuse_lock_open(path, *a, **kw):
+        if str(path).endswith(".lock"):
+            raise PermissionError(errno.EACCES, "Permission denied", str(path))
+        return real_open(path, *a, **kw)
+
+    monkeypatch.setattr(config.os, "open", refuse_lock_open)
+    with config.config_lock(p) as may_write:
+        assert may_write is False
+    assert config.set_repo_keys(REPO, {"auto_merge": True}, p) is False
+    assert wizard.write_config({"plan": "max-5x"}, p) is False
+    assert p.read_bytes() == before
+    err = capsys.readouterr().err
+    assert err.count("Could not open the config lock file") == 3
+    assert "has held the config lock" not in err
 
 
 def test_an_interrupt_while_waiting_for_the_lock_leaks_no_fd(home, tmp_path, monkeypatch):
