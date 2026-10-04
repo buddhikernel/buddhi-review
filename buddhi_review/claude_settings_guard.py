@@ -850,6 +850,7 @@ class _Named:
     commands: Set[Tuple[str, bool]] = field(default_factory=set)  # (path, bare) run directly: its shebang decides
     imports_root: bool = False                          # a Python program run with the root first on its path
     root_imports: Set[str] = field(default_factory=set)  # top-level names that program imports
+    node: bool = False                                  # a Node-family program (or one of unknown family) runs
     unsafe: Optional[str] = None                       # names the root, escapes it, or is unparseable
 
 
@@ -869,7 +870,12 @@ def named_paths(value, checkout: Optional[str] = None, *, key: Optional[str] = N
     variable inside a path names the directory before it; a script an
     interpreter may run also names the script's directory, which it imports from,
     and a Python program run from the root (``-c``, ``-m``, stdin) depends on the
-    modules there. A ``cd`` only adds places a relative word is read from.
+    modules there. A Node-family program (``node``, ``bun``, ``deno``, ``tsx``,
+    ``ts-node``, or an interpreter of unknown family) also resolves a package name
+    (``require('prettier')`` in its script, its ``-e`` code, ``-r``,
+    ``NODE_OPTIONS``) through ``node_modules/`` and ``package.json`` in every
+    directory above its code: :attr:`_Named.node` records that it runs, for the
+    check. A ``cd`` only adds places a relative word is read from.
     The checkout root itself (a bare project-dir spelling, ``.``, ``./``, a
     root-level glob, an empty search-path element), a path that climbs out of the
     checkout, and anything the splitter cannot follow make the value unsafe
@@ -886,6 +892,8 @@ def named_paths(value, checkout: Optional[str] = None, *, key: Optional[str] = N
                 # too, element by element, as the process that inherits it will.
                 if _names_cwd(path[1], s):
                     named.unsafe = named.unsafe or "it names the checkout root"
+                if path[1] == "NODE_OPTIONS":
+                    named.node = True  # ``--require pkg``: resolved from the working directory
                 for element in {s, *s.split(":")}:
                     if element:
                         _scan_literal(element, named, checkout)
@@ -1127,6 +1135,8 @@ def _scan_command(command: str, named: _Named, checkout: Optional[str], depth: i
                 st.arg_next, st.arg_script = True, family == "?"
         elif st.script_next:
             script, st.script_next = True, False
+        if st.interp and _family(st.interp) in ("node", "?"):
+            named.node = True  # it resolves package names above its code (:meth:`_Checker._node_lookups`)
         if script is False and (st.interp or st.scripts) and _script_shaped(word):
             # Any script-shaped operand of an interpreter may be what it runs or
             # preloads, whatever this guard makes of its options (``ruby -W x.rb``,
@@ -1805,14 +1815,17 @@ class _Checker:
                                    f"{changed} differs from the base branch")
             exact = named.paths | {r for r in named.bare if exists(r)}
             trees = named.trees | {r for r in named.bare_trees if exists(r)}
+            node = named.node
             for rel, bare in named.commands:
                 # A script run directly: an interpreter named by its shebang imports
                 # from the script's directory, exactly as ``python3 x.py`` would.
-                if (not bare or exists(rel)) and self._shebang_imports(rel):
+                interp = self._shebang_imports(rel) if not bare or exists(rel) else ""
+                if interp:
                     parent = rel.rsplit("/", 1)[0] if "/" in rel else ""
                     if not parent:
                         return False, "its interpreter imports from the checkout root"
                     trees.add(parent)
+                    node = node or _family(interp) == "node"
             # The repository's own .git is not checkout content a PR can change —
             # unless the path climbs back out of it (``.git/../x.sh``).
             exact = sorted(r for r in exact if not _in_git_dir(r))
@@ -1823,6 +1836,14 @@ class _Checker:
             for rel in trees:
                 if not self._same(rel, 0):
                     return False, f"it reaches into {rel}/, which differs from the base branch"
+            if node:
+                if self.base.prefix():
+                    return False, ("its Node program resolves packages through directories "
+                                   "above the checkout, which this guard cannot compare")
+                changed = self._node_lookups(exact, trees)
+                if changed:
+                    return False, (f"its Node program resolves packages through {changed}, "
+                                   f"which differs from the base branch")
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
             return False, f"its files could not be compared with the base branch ({exc})"
         return True, ""
@@ -1847,28 +1868,58 @@ class _Checker:
                 return entry
         return None
 
-    def _shebang_imports(self, rel: str) -> bool:
-        """Whether the file at ``rel`` starts with a ``#!`` naming an interpreter that
-        imports from the script's directory (through ``env`` or ``env -S`` too)."""
+    def _node_lookups(self, exact: List[str], trees: List[str]) -> Optional[str]:
+        """Where a Node-family program resolves a package name its code requires
+        (``require('prettier')``, ``-r pkg``, ``import 'pkg'``): ``node_modules/`` in
+        every directory from the code's own up to the checkout root, and the nearest
+        ``package.json`` (its ``imports``, and its ``exports`` under its own
+        ``name``). The code is in, or run from, a directory the value names — a
+        script's, a ``cd``'s, the root — so each ``node_modules`` and
+        ``package.json`` beside one of the named paths' ancestors must be base's, or
+        absent both here and at base. A directory a tree already covers is skipped
+        (unless a ``..`` in it may lead elsewhere). The first that differs, or None."""
+        dirs = {""}
+        for rel in exact + trees:
+            # As written (a ``..`` the kernel resolves, through a symlink too) and by name.
+            for parts in {tuple(rel.split("/")), tuple(os.path.normpath(rel).split("/"))}:
+                dirs.update("/".join(parts[:i]) for i in range(1, len(parts)))
+        covered = tuple(t + "/" for t in trees)
+        top = self.base.top()
+        for d in sorted(dirs):
+            if d and ".." not in d.split("/") and (d + "/").startswith(covered):
+                continue
+            for name in ("node_modules", "package.json"):
+                rel = f"{d}/{name}" if d else name
+                if os.path.lexists(os.path.join(self.checkout, rel)):
+                    if not self._same(rel, 0):
+                        return rel
+                elif (name in top) if not d else (self.base.entry(rel) is not None):
+                    return rel  # base has it; the checkout does not
+        return None
+
+    def _shebang_imports(self, rel: str) -> str:
+        """The interpreter the file at ``rel`` names in a ``#!`` line (through ``env``
+        or ``env -S`` too), when it imports from the script's directory; ``""``
+        otherwise."""
         try:
             # Never waits for a writer: a FIFO a run left at a named path is not run.
             fd = os.open(os.path.join(self.checkout, rel),
                          os.O_RDONLY | _NOFOLLOW | getattr(os, "O_NONBLOCK", 0))
         except OSError:
-            return False
+            return ""
         try:
             if not stat.S_ISREG(os.fstat(fd).st_mode):
-                return False  # a directory (``'docs/'`` in -c code) is walked, not run
+                return ""  # a directory (``'docs/'`` in -c code) is walked, not run
             head = os.read(fd, 256)
         finally:
             os.close(fd)
         if not head.startswith(b"#!"):
-            return False
+            return ""
         words = os.fsdecode(head[2:].split(b"\n", 1)[0]).split()
         names = [w.rsplit("/", 1)[-1] for w in words if not w.startswith("-")]
         if names and names[0] == "env":
             names = names[1:]
-        return bool(names) and bool(_SCRIPT_DIR_INTERPRETERS.fullmatch(names[0]))
+        return names[0] if names and _SCRIPT_DIR_INTERPRETERS.fullmatch(names[0]) else ""
 
     def _same(self, rel: str, hops: int) -> bool:
         return self._walk([], [p for p in rel.split("/") if p not in ("", ".")], hops)

@@ -3249,3 +3249,110 @@ def test_a_fifo_at_a_path_a_hook_names_is_held_back_without_waiting(tmp_path):
                        stdin=subprocess.DEVNULL)
     assert r.returncode == 0, r.stderr
     assert r.stdout.startswith("(False, ") and "tools/pipe" in r.stdout
+
+
+# ── a Node program resolves a package name above its code ───────────────────────
+
+_FMT = '"$CLAUDE_PROJECT_DIR"/.claude/hooks/fmt.js'
+_PR_PACKAGE = "module.exports = 1  // the pull request's code\n"
+
+
+def _commit(repo, files, message="the PR's package"):
+    for rel, content in files.items():
+        write(repo.wt, rel, content)
+    git(repo.wt, "add", "-A")
+    git(repo.wt, "commit", "-qm", message)
+
+
+@pytest.mark.parametrize("value,key,node", [
+    ("node x.js", None, True), ("bun x.ts", None, True), ("deno run x.ts", None, True),
+    ("tsx x.ts", None, True), ("ts-node x.ts", None, True),
+    ('"$RUN" x.js', None, True), ("uv run x", None, True),       # an interpreter of unknown family
+    ("python3 x.py", None, False), ("ruby x.rb", None, False), ("perl x.pl", None, False),
+    ("sh x.sh", None, False),
+    ({"NODE_OPTIONS": "--require pkg"}, "env", True), ({"NODE_ENV": "production"}, "env", False),
+])
+def test_a_value_that_may_run_a_node_program_says_so(value, key, node):
+    assert guard.named_paths(value, key=key).node is node
+
+
+@pytest.mark.parametrize("command", [
+    f"node {_FMT}", f"bun {_FMT}", f"tsx {_FMT}", f'"$NODE" {_FMT}',
+    _FMT,                                                        # run by its #!/usr/bin/env node line
+])
+@pytest.mark.parametrize("added", [
+    {"node_modules/prettier/index.js": _PR_PACKAGE},
+    {".claude/node_modules/prettier/index.js": _PR_PACKAGE},
+    {"package.json": json.dumps({"name": "prettier", "exports": "./evil.js"}), "evil.js": _PR_PACKAGE},
+], ids=["root-node_modules", "claude-node_modules", "package-json-self-reference"])
+def test_a_package_a_node_script_requires_is_resolved_above_its_directory(tmp_path, command, added):
+    """``fmt.js`` requires ``prettier`` by name. Node finds it in ``node_modules/``
+    in any directory above the script, or through the nearest ``package.json`` that
+    names itself ``prettier``: a PR that adds either, leaving the hook and the
+    script's directory as base has them, holds the hook back."""
+    repo = _hook_repo(tmp_path, command,
+                      {".claude/hooks/fmt.js": "#!/usr/bin/env node\nrequire('prettier')\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    _commit(repo, added)
+    assert _hooks(_spawn(str(repo.wt))) == []
+    assert markers_present(repo.markers) == []
+
+
+@pytest.mark.parametrize("command,added", [
+    ("node -e \"require('prettier')\"", "node_modules/prettier/index.js"),
+    ("node -p \"require('prettier')\"", "node_modules/prettier/index.js"),
+    (f"node -r prettier {_FMT}", "node_modules/prettier/index.js"),
+    ("node --import prettier -e 1", "node_modules/prettier/index.js"),
+    ("cd \"$CLAUDE_PROJECT_DIR\"/.claude/hooks && node -e \"require('prettier')\"",
+     ".claude/node_modules/prettier/index.js"),
+])
+def test_a_package_node_code_or_a_preload_names_is_resolved_from_where_it_runs(tmp_path, command, added):
+    """Inline code and a preload resolve a package name from the working directory
+    upward — the checkout root, or where a ``cd`` left the shell."""
+    repo = _hook_repo(tmp_path, command, {".claude/hooks/fmt.js": "1\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    _commit(repo, {added: _PR_PACKAGE})
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_package_node_options_preloads_is_resolved_from_the_checkout_root(tmp_path):
+    """``NODE_OPTIONS=--require prettier`` names a package, not a path: a
+    ``node_modules/prettier`` a run leaves in the checkout, which base does not
+    have, holds the env back."""
+    base = {SETTINGS: {"env": {"NODE_OPTIONS": "--require prettier"}}}
+    repo = make_pr_repo(tmp_path, base, {"docs/guide.md": "x\n"})
+    guard.install_base_resolver(lambda checkout: repo.base)
+    assert "env" in _spawn(str(repo.wt))[SETTINGS]
+    write(repo.wt, "node_modules/prettier/index.js", _PR_PACKAGE)
+    assert "env" not in _spawn(str(repo.wt))[SETTINGS]
+
+
+def test_a_node_hook_stays_live_while_the_packages_are_base_s(tmp_path):
+    """Base's own ``package.json`` and committed ``node_modules`` keep a Node hook
+    live; a PR's ``imports`` map in that ``package.json`` holds it back."""
+    files = {".claude/hooks/fmt.js": "require('prettier')\n", "package.json": '{"name": "app"}\n',
+             "node_modules/prettier/index.js": "module.exports = 1\n"}
+    repo = _hook_repo(tmp_path, f"node {_FMT}", files)
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+    _commit(repo, {"package.json": '{"name": "app", "imports": {"#fmt": "./evil.js"}}\n',
+                   "evil.js": _PR_PACKAGE})
+    assert _hooks(_spawn(str(repo.wt))) == []
+
+
+def test_a_python_hook_is_not_held_back_by_a_node_package(tmp_path):
+    repo = _hook_repo(tmp_path, f"python3 {S}", {".claude/hooks/check.py": "import json\n"},
+                      {"node_modules/prettier/index.js": _PR_PACKAGE, "package.json": "{}\n"})
+    assert _hooks(_spawn(str(repo.wt))) == ["SessionStart"]
+
+
+def test_a_node_hook_in_a_checkout_below_the_repository_top_is_held_back(tmp_path):
+    """From a checkout below the repository's top, Node climbs on into the
+    repository's own directories, which the PR controls too and this guard cannot
+    compare. A Python hook there is unaffected."""
+    repo = make_pr_repo(tmp_path, {"app/.claude/hooks/fmt.js": "require('prettier')\n",
+                                   "app/.claude/hooks/check.py": "import json\n"}, {})
+    app = str(repo.wt / "app")
+    checker = guard._Checker(app, guard._Base(app, repo.base))
+    live, why = checker.unchanged("hooks", command_hook("SessionStart", f"node {_FMT}"))
+    assert not live and "above the checkout" in why
+    assert checker.unchanged("hooks", command_hook("SessionStart", f"python3 {S}")) == (True, "")
