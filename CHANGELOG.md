@@ -21,6 +21,13 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.9.2](https://github.com/buddhikernel/buddhi-review/compare/v0.9.1...v0.9.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* **round-driver:** a fix left uncommitted by a stopped test run or a rejected commit hook is never merged on an earlier review ([#115](https://github.com/buddhikernel/buddhi-review/issues/115)) ([4a41273](https://github.com/buddhikernel/buddhi-review/commit/4a41273779aeb7b8b822eb0a844b60e2f16b00c3))
+
 ## [0.9.1](https://github.com/buddhikernel/buddhi-review/compare/v0.9.0...v0.9.1) (2026-09-27)
 
 
