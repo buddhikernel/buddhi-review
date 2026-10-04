@@ -2876,8 +2876,9 @@ def _write_global_default(reviewers: Sequence[str], auto_on_open: Dict[str, bool
     (:func:`buddhi_review.config.has_global_default`). For each of ``auto_merge`` /
     ``label_gated_ci`` that was asked (not ``None``) a top-level key is established
     too — always ``False``, never the repo's own answer
-    (:func:`buddhi_review.config.establish_global_defaults`) — so a global exists
-    for the per-repo choice gates. One locked read-modify-write."""
+    (:func:`buddhi_review.config.establish_global_defaults`) — for a separately
+    installed backend's per-repo choice check. This package does not read the
+    top-level ``auto_merge``. One locked read-modify-write."""
     with config.config_lock(path):
         existing = config.load_config(path) if path.exists() else {}
         cfg = dict(existing)
@@ -3024,17 +3025,18 @@ def confirm_repo_interactive(repo: Optional[str], cwd: Optional[str], *,
             ok = _write_global_default(reviewers, auto_on_open, cfg_path,
                                        auto_merge=am, label_gated_ci=lgc) and ok
         elif ok:
-            # A migrated global reviewer fleet can predate these choice gates.
-            # Confirming any repo asks both choices, so arm only the missing
-            # fail-closed globals without replacing that established fleet.
+            # A global reviewer fleet set before these keys existed (for example,
+            # one migrated from the legacy file) has no top-level auto_merge /
+            # label_gated_ci. Confirming any repo asks both choices, so add only the
+            # missing keys, always False, without replacing that fleet.
             current = config.load_config(cfg_path) if cfg_path.exists() else {}
             defaults = config.establish_global_defaults(
                 current, auto_merge=am, label_gated_ci=lgc)
             if defaults != current:
                 ok = write_config(defaults, cfg_path) and ok
     if not ok:
-        _row("bad", f"Could not write {cfg_path} — check the path's permissions",
-             pal, stream)
+        _row("bad", f"Could not write {cfg_path} — check the path's permissions, or "
+                    f"whether another process holds the config lock", pal, stream)
         return 1
 
     # Read everything back through the F1 readers so the summary reflects what
@@ -3142,7 +3144,8 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
             current = config.load_config(cfg_path) if cfg_path.exists() else {}
             # For each auto-merge / label-gated-CI question the bound repo was asked
             # (not None), a top-level key is established too — always False, never
-            # the repo's answer — so a global exists for the per-repo choice gates.
+            # the repo's answer — for a separately installed backend's per-repo
+            # choice check. This package does not read the top-level auto_merge.
             merged = config.establish_global_defaults(
                 merge_preserving(current, new_cfg),
                 auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
@@ -3172,7 +3175,8 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
             step_pro_trial(repo, pal=pal, stream=stream, input_fn=input_fn)
             _offer_first_review(repo, pal=pal, stream=stream, input_fn=input_fn)
             return 0
-        _row("bad", f"Could not write {cfg_path} — check the path's permissions", pal, stream)
+        _row("bad", f"Could not write {cfg_path} — check the path's permissions, or "
+                    f"whether another process holds the config lock", pal, stream)
         return 1
     except KeyboardInterrupt:
         print(f"\n{pal.RED}Setup aborted.{pal.RESET}", file=stream)

@@ -19,7 +19,7 @@ _PAID_KEYS = (
 _FREE_KEYS = {"plan", "active_reviewers", "auto_on_open", "notifications", "repo", "cwd",
               "repos",
               # Established (always False) at the top level once the bound repo was
-              # asked, so a global exists for the per-repo choice gates
+              # asked, for a separately installed backend's per-repo choice check
               # (tests/test_canonical_config.py).
               "auto_merge", "label_gated_ci"}
 

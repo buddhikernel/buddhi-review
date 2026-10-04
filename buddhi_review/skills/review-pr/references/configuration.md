@@ -17,6 +17,11 @@ The config surface is small:
 | `notifications` | string channel (always `console`) | `console` |
 | `repo` / `cwd` | string | unset (inferred at runtime from the cwd's git remote) |
 
+Setup also writes a top-level `auto_merge: false` and `label_gated_ci: false`, which a
+separately installed backend uses. A top-level `auto_merge` has no effect on this
+package: auto-merge is set per repo, with `/review-pr setup`. A top-level
+`label_gated_ci` is the fallback for repos with no value of their own.
+
 ## Plan profiles (model selection)
 
 Model resolution is driven by the plan profile: the `Policy` object in

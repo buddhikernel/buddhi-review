@@ -1275,6 +1275,37 @@ def test_a_writer_that_gives_up_on_the_lock_writes_nothing(home, tmp_path, monke
     assert _load(p) == {"plan": "pro", "repos": {REPO: {"auto_merge": True}}}
 
 
+@pytest.mark.parametrize("argv", [None, ["--repo", REPO]], ids=["full", "confirm"])
+def test_setup_that_gives_up_on_the_lock_says_so(home, tmp_path, monkeypatch, capsys, argv):
+    """Setup cannot save while another process holds the config lock past the
+    timeout. Its failure line names the lock as a possible cause, and the lock line
+    says the config was not changed."""
+    _stub_wizard(monkeypatch)
+    p = _put(_canonical(home), {"plan": "pro"})
+    before = p.read_bytes()
+    monkeypatch.setattr(config, "LOCK_TIMEOUT_S", 0.3)
+    holder = _hold_lock(p, tmp_path)
+    try:
+        out = io.StringIO()
+        rc = wizard.run(argv=argv, run=_fake_run, which=lambda x: None,
+                        single_select=_answers(auto_merge_on=True, lgc_on=False),
+                        multi_select=lambda *a, **k: set(), getpass_fn=lambda *a: "",
+                        spawn_command=lambda *a, **k: {"spawned": False},
+                        input_fn=lambda *a: "", stream=out)
+    finally:
+        holder.kill()
+        holder.wait()
+    assert rc == 1
+    assert (f"Could not write {p} — check the path's permissions, or whether another "
+            f"process holds the config lock") in out.getvalue()
+    # (The full line at the default 10 s is pinned by the stuck-holder test.)
+    err = capsys.readouterr().err
+    assert f"Warning: Another process has held the config lock {p}.lock for more than " in err
+    assert ("The config was not changed. Run the command again once that process has "
+            "finished.") in err
+    assert p.read_bytes() == before
+
+
 def test_a_migration_that_gives_up_on_the_lock_is_deferred(home, tmp_path, monkeypatch, capsys):
     """The migration never runs without the lock. This process reads the canonical
     file as it is and does not wait again on its later resolves (every
@@ -1529,8 +1560,9 @@ def _run_wizard(argv=None, *, auto_merge_on=False, lgc_on=True):
 
 @pytest.mark.parametrize("am,lgc", [(False, True), (True, False), (True, True)])
 def test_full_wizard_run_writes_the_two_globals_to_the_canonical_file(home, monkeypatch, am, lgc):
-    """The top-level keys EXIST after a full setup (so the per-repo choice gates
-    arm) and always hold False, whatever the bound repo answered."""
+    """The top-level keys EXIST after a full setup (for a separately installed
+    backend's per-repo choice check) and always hold False, whatever the bound repo
+    answered."""
     _stub_wizard(monkeypatch)
     assert _run_wizard(auto_merge_on=am, lgc_on=lgc) == 0
     cfg = _load(_canonical(home))
@@ -1579,8 +1611,8 @@ def test_later_per_repo_confirm_leaves_the_established_globals(home, monkeypatch
 
 
 def test_later_per_repo_confirm_arms_missing_choice_globals(home, monkeypatch):
-    """A migrated reviewer fleet keeps its values while confirmation adds only
-    the fail-closed global choice gates."""
+    """A migrated reviewer fleet keeps its values while confirmation adds only the
+    missing top-level choice keys, always False."""
     _stub_wizard(monkeypatch)
     _put(_canonical(home), {"active_reviewers": ["claude"],
                             "auto_on_open": {"claude": True}})
@@ -1658,7 +1690,10 @@ def test_a_stuck_lock_holder_is_waited_on_for_ten_seconds_by_default(home, tmp_p
             raise AssertionError("config_lock did not give up within 25 s on a stuck holder")
         assert waiter.returncode == 0, err
         assert 9.5 <= float(out.strip()) <= 20
-        assert "for more than 10 seconds" in err
+        assert err.strip() == (
+            f"Warning: Another process has held the config lock {p}.lock for more than "
+            f"10 seconds. The config was not changed. Run the command again once that "
+            f"process has finished.")
     finally:
         holder.kill()
         holder.wait()

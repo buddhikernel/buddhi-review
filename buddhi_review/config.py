@@ -1,8 +1,12 @@
 """Config — ``~/.config/buddhi/config.yaml``.
 
 Keys: ``plan``, ``active_reviewers``, ``auto_on_open``, ``label_gated_ci``,
-``repos``, ``notifications`` (always ``console``), ``repo``, ``cwd``. The notifier
-writes to the console. :func:`set_repo_keys` is the per-repo writer (deep-merge
+``auto_merge``, ``repos``, ``notifications`` (always ``console``), ``repo``, ``cwd``.
+Setup writes the top-level ``auto_merge`` and ``label_gated_ci`` as ``false`` for a
+separately installed backend, which asks for an explicit per-repo choice whenever
+they are present. This package never reads the top-level ``auto_merge``, and reads
+the top-level ``label_gated_ci`` only as the fallback for a repo with no value of
+its own. The notifier writes to the console. :func:`set_repo_keys` is the per-repo writer (deep-merge
 into ``repos[<repo>]``, atomic, sibling-preserving).
 
 The file lives at the canonical Buddhi config location. A settings file left at
@@ -165,7 +169,8 @@ def _flock_acquire(lock_file: Path, timeout: float) -> Tuple[Optional[int], bool
                     break
             if time.monotonic() >= deadline:
                 print(f"Warning: Another process has held the config lock {lock_file} for "
-                      f"more than {int(timeout)} seconds. Continuing without the lock.",
+                      f"more than {int(timeout)} seconds. The config was not changed. Run "
+                      f"the command again once that process has finished.",
                       file=sys.stderr)
                 may_write = False
                 break
@@ -1008,8 +1013,11 @@ def establish_global_defaults(cfg: Dict[str, Any], *, auto_merge: Optional[bool]
                               label_gated_ci: Optional[bool] = None) -> Dict[str, Any]:
     """Return a copy of ``cfg`` in which a top-level ``auto_merge`` /
     ``label_gated_ci`` EXISTS for each setting the setup wizard asked (its
-    argument is not ``None``): per-repo choice gates arm on a global's presence and
-    then demand an explicit per-repo value. The value written is always ``False``
+    argument is not ``None``). This package does not act on them: a separately
+    installed backend checks that they are present and then asks for an explicit
+    per-repo choice. Here, :func:`auto_merge` never reads the top-level key, and
+    :func:`label_gated_ci` reads it only as its fallback, where ``False`` is the same
+    as the built-in default. The value written is always ``False``
     — the fail-safe — never the bound repo's own answer, so nothing a repo did not
     choose for itself can be inherited (the bound repo keeps its answer under
     ``repos[<repo>]``). A top-level value already present, set by hand, is left as
@@ -1027,8 +1035,10 @@ def auto_merge(cfg: Dict[str, Any], repo: Optional[str] = None) -> bool:
     ``repo``. A CONFIRMED repo's per-repo ``auto_merge`` (a ``repos[<repo>]`` entry
     with a **bool** value) enables it; otherwise OFF (fail-closed). Unlike
     :func:`label_gated_ci` there is deliberately NO global-default tier — the merge
-    is opt-in PER REPO (the wizard's ``step_repo_auto_merge`` is the only writer),
-    so this consults ONLY ``repos[<repo>]`` and never a top-level key. A non-bool
+    is opt-in PER REPO (the wizard's ``step_repo_auto_merge`` is the only writer of
+    the per-repo value), so this consults ONLY ``repos[<repo>]``. Setup also writes a
+    top-level ``auto_merge: false`` for a separately installed backend; this function
+    ignores it, so editing it changes nothing here. A non-bool
     per-repo value falls to OFF, never on. ``repo=None`` → OFF. The per-run
     ``--auto-merge`` / ``--no-auto-merge`` flag, when explicitly set, always wins
     over this (resolved at the CLI: flag > this config value > off)."""
