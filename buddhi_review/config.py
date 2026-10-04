@@ -129,6 +129,11 @@ def config_path() -> Path:
 
 LOCK_TIMEOUT_S = 10.0
 _LOCK_POLL_S = 0.02
+# The only ``flock`` errors that mean "this file system has no inter-process lock",
+# so there is no holder to race and writers go on. Every other error fails closed.
+_FLOCK_UNSUPPORTED_ERRNOS = frozenset(
+    getattr(errno, name) for name in ("ENOTSUP", "EOPNOTSUPP", "ENOSYS")
+    if hasattr(errno, name))
 _lock_guard = threading.Lock()
 # lock-file path -> [in-process RLock, re-entry depth, flock fd or None, may write]
 _lock_state: Dict[str, List[Any]] = {}
@@ -146,13 +151,15 @@ def _flock_acquire(lock_file: Path, timeout: float) -> Tuple[Optional[int], bool
 
     * ``(fd, True)`` — the lock is held.
     * ``(None, True)`` — no inter-process lock exists here at all: no ``fcntl``
-      (non-POSIX), or a file system that refuses ``flock``. There is no holder to
-      race, so writers behave as they did before the lock existed.
+      (non-POSIX), or a file system that reports ``flock`` as unsupported (ENOTSUP,
+      EOPNOTSUPP, ENOSYS). There is no holder to race, so writers behave as they
+      did before the lock existed.
     * ``(None, False)`` — the lock could not be taken, so writers modify nothing.
-      Two causes, each with its own stderr line: another process kept the lock past
+      Three causes, each with its own stderr line: another process kept the lock past
       the timeout (a stuck process must never hang a launch, so the caller goes on,
-      but a live holder may be mid read-modify-write); or the lock file could not be
-      opened or created. A failed open does NOT prove there is no holder — the lock
+      but a live holder may be mid read-modify-write); the lock file could not be
+      opened or created; or ``flock`` failed for any other reason (e.g. ENOLCK), which
+      proves nothing about holders. ``EINTR`` is retried within the same deadline. A failed open does NOT prove there is no holder — the lock
       file's permissions can change while another process still holds its ``flock``,
       and the directory can still allow the atomic replace that would clobber the
       holder's update — so it refuses rather than guesses."""
@@ -175,7 +182,19 @@ def _flock_acquire(lock_file: Path, timeout: float) -> Tuple[Optional[int], bool
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return fd, True
             except OSError as exc:
-                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                if exc.errno in _FLOCK_UNSUPPORTED_ERRNOS:
+                    break  # this file system has no flock at all: no holder to race
+                if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES,
+                                     errno.EINTR):
+                    # Any other failure (ENOLCK: lock resources exhausted, ...) did
+                    # not take the lock, and does not prove nobody holds it, so it
+                    # fails closed like a timeout. EINTR falls through to the
+                    # deadline check below, so an interruption can never extend or
+                    # bypass the bounded wait.
+                    print(f"Warning: Could not take the config lock {lock_file} ({exc}). "
+                          f"The config was not changed. Run the command again.",
+                          file=sys.stderr)
+                    may_write = False
                     break
             if time.monotonic() >= deadline:
                 print(f"Warning: Another process has held the config lock {lock_file} for "
@@ -259,6 +278,8 @@ def config_lock(path: Path, *, timeout: Optional[float] = None) -> Iterator[bool
 # merged only after the rename. Until that catch-up merge lands the record stays,
 # so when it fails or the run stops, a later resolve — which no longer finds the
 # legacy name — still sees the record and merges the newer write from the backup.
+# The legacy name is therefore retired only once that record is written; until
+# then it stays, and the move is reported and retried like a refused rename.
 # It reads only the backup: a legacy file created since is never read for it or
 # overwritten, and is migrated on its own afterwards.
 #
@@ -561,28 +582,34 @@ def _backup_name(legacy: Path) -> Path:
 def _write_bytes_atomic(path: Path, raw: bytes) -> bool:
     """Write ``raw`` to ``path`` atomically (temp file + ``os.replace``) at 0600."""
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
-        try:
-            if hasattr(os, "fchmod"):
-                os.fchmod(fd, 0o600)
-            with os.fdopen(fd, "wb") as fh:
-                fd = None
-                fh.write(raw)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(tmp, str(path))
-        except BaseException:
-            if fd is not None:
-                os.close(fd)
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
+        _replace_with_bytes(path, raw)
         return True
     except OSError:
         return False
+
+
+def _replace_with_bytes(path: Path, raw: bytes) -> None:
+    """:func:`_write_bytes_atomic`, raising the ``OSError`` instead. A failure
+    leaves the file at ``path`` as it was."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=path.name, suffix=".tmp")
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "wb") as fh:
+            fd = None
+            fh.write(raw)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, str(path))
+    except BaseException:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # The merge record — see the section comment above.
@@ -621,7 +648,11 @@ def _read_record(canonical: Path) -> Optional[Dict[str, Any]]:
 
 def _write_record(canonical: Path, ident: Tuple[int, ...], conflicts: List[str],
                   merged_legacy: Dict[str, Any], before: Dict[str, Optional[int]],
-                  backup: Optional[str] = None) -> bool:
+                  backup: Optional[str] = None) -> None:
+    """Raises ``OSError`` when the record cannot be written; any record already
+    there is then left as it was. The record written right after a merge is best
+    effort (its callers ignore the error); the one naming the backup is not — the
+    legacy name is retired only once it is written."""
     body: Dict[str, Any] = {"identity": list(ident), "conflicts": list(conflicts),
                             "legacy": merged_legacy}
     if backup is not None:
@@ -632,8 +663,8 @@ def _write_record(canonical: Path, ident: Tuple[int, ...], conflicts: List[str],
     if written is not None:
         body["canonical_before"] = before["mtime"]
         body["canonical_written"] = list(written)
-    return _write_bytes_atomic(_record_path(canonical),
-                               yaml.safe_dump(body, sort_keys=False).encode("utf-8"))
+    _replace_with_bytes(_record_path(canonical),
+                        yaml.safe_dump(body, sort_keys=False).encode("utf-8"))
 
 
 def _drop_record(canonical: Path) -> None:
@@ -836,11 +867,14 @@ def _migrate_locked(canonical: Path, legacy: Path) -> str:
         conflicts = merged
     # The canonical file holds the settings: retire the legacy name. The record names
     # the backup first, so a newer write the rename carries into it is retried by a
-    # later resolve until the catch-up below has merged it. (Best effort, like every
-    # record write: if it cannot be written the move still goes ahead.)
+    # later resolve until the catch-up below has merged it. Only that record leads a
+    # resolve to the backup once the legacy name is gone, so when it cannot be
+    # written the name is NOT retired: the legacy file keeps any newer write, the
+    # record already there (and its baseline) is left as it was, and a later resolve
+    # tries again — reported exactly as a refused rename.
     backup = _backup_name(legacy)
-    _write_record(canonical, ident, conflicts, legacy_data, before, backup=backup.name)
     try:
+        _write_record(canonical, ident, conflicts, legacy_data, before, backup=backup.name)
         os.rename(str(legacy), str(backup))
     except OSError as exc:
         recorded = (_read_record(canonical) or {}).get("identity") == ident
@@ -882,7 +916,8 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
         before.setdefault("mtime", None)
         if not _write_bytes_atomic(canonical, raw):
             return _write_failed(legacy, canonical)
-        _write_record(canonical, ident, [], legacy_data, before)
+        with contextlib.suppress(OSError):  # best effort, like the record below
+            _write_record(canonical, ident, [], legacy_data, before)
         return []
     canonical_data, _, why, cident = _read_config_file(canonical)
     if canonical_data is None or cident is None:
@@ -902,8 +937,10 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
         if not write_config(merged, canonical):
             return _write_failed(legacy, canonical)
     # Recorded only once the canonical file holds the merge: a record must never
-    # vouch for a write that did not land.
-    _write_record(canonical, ident, conflicts, legacy_data, before)
+    # vouch for a write that did not land. Best effort: without it the legacy name
+    # stays until a record naming the backup can be written (see _migrate_locked).
+    with contextlib.suppress(OSError):
+        _write_record(canonical, ident, conflicts, legacy_data, before)
     return conflicts
 
 

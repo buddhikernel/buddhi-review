@@ -728,6 +728,77 @@ def test_a_retried_catch_up_never_reads_or_overwrites_a_fresh_legacy_file(home, 
     assert first.read_bytes() == first_bytes
 
 
+def test_the_legacy_name_is_kept_while_the_record_naming_the_backup_cannot_be_written(
+        home, monkeypatch, capsys):
+    """The record naming the backup cannot be written, and at that moment an earlier
+    release rewrites the legacy file (changing ``leg/one`` and adding ``old/a``) with a
+    timestamp after the canonical file as the user left it but before the
+    migration's own write. Renamed anyway, the legacy file would carry that write
+    into a backup that no later resolve could find once the catch-up failed. So the
+    name stays, the merge's record (and the baseline it holds) survives, and the next
+    resolve merges what changed — judged against that baseline — and finishes."""
+    t = time.time_ns()
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=t - 2 * 10**9)
+    _put(_legacy(home), {"repos": {"leg/one": {"auto_merge": False}}}, mtime_ns=t - 3 * 10**9)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    real_replace, real_write = os.replace, wizard.write_config
+    writes = []
+
+    def backup_record_fails(src, dst, *a, **k):
+        if str(dst) == str(record) and b"backup:" in Path(src).read_bytes():
+            _atomic_legacy_write(home, {"repos": {"leg/one": {"auto_merge": True},
+                                                  "old/a": {"auto_merge": True}}})
+            os.utime(_legacy(home), ns=(t - 10**9, t - 10**9))
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(dst))
+        return real_replace(src, dst, *a, **k)
+
+    def catch_up_refused(cfg, path):
+        writes.append(1)
+        return len(writes) == 1 and real_write(cfg, path)
+
+    monkeypatch.setattr(config.os, "replace", backup_record_fails)
+    monkeypatch.setattr(wizard, "write_config", catch_up_refused)
+    assert config.migrate_legacy_config() == "error"
+    monkeypatch.setattr(config.os, "replace", real_replace)
+    monkeypatch.setattr(wizard, "write_config", real_write)
+    assert _legacy(home).exists() and _backups(home) == []
+    assert "old/a" in _load(_legacy(home))["repos"]
+    kept = _load(record)
+    assert "backup" not in kept and kept["canonical_before"] == t - 2 * 10**9
+    assert capsys.readouterr().err.strip() == (
+        f"Warning: Settings from {_legacy(home)} were merged into {_canonical(home)}, but the "
+        f"old file could not be renamed ({os.strerror(errno.ENOSPC)}). No settings "
+        f"conflicted. It will not be merged again unless it changes.")
+    assert config.migrate_legacy_config() == "migrated"
+    cfg = _load(_canonical(home))
+    assert cfg["plan"] == "pro" and {"leg/one", "old/a"} <= set(cfg["repos"])
+    assert config.repo_entry(cfg, "leg/one") == {"auto_merge": True}
+    assert not _legacy(home).exists() and len(_backups(home)) == 1
+    assert not record.exists()
+
+
+def test_a_record_that_cannot_be_written_at_all_keeps_the_legacy_name(home, capsys):
+    """No record can be written (a folder sits at its path): the settings still reach
+    the canonical file, but the legacy name is not retired without a record that
+    would lead a later resolve to the backup. Once a record can be written, the
+    move completes."""
+    _put(_legacy(home), LEGACY)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    record.mkdir(parents=True)
+    assert config.migrate_legacy_config() == "error"
+    assert _load(_canonical(home)) == LEGACY
+    assert _legacy(home).exists() and _backups(home) == []
+    err = capsys.readouterr().err.strip()
+    assert err.startswith(f"Warning: Settings from {_legacy(home)} were merged into "
+                          f"{_canonical(home)}, but the old file could not be renamed (")
+    assert err.endswith("). No settings conflicted. It will be merged again on the next run.")
+    record.rmdir()
+    assert config.migrate_legacy_config() == "migrated"
+    assert _load(_canonical(home)) == LEGACY
+    assert not _legacy(home).exists() and len(_backups(home)) == 1
+    assert not record.exists()
+
+
 def test_a_record_naming_a_backup_outside_the_legacy_folder_is_ignored(home, tmp_path):
     """Only a ``.migrated-`` name beside the legacy file is ever caught up from."""
     _put(_canonical(home), {"plan": "pro"})
@@ -1889,6 +1960,57 @@ def test_a_lock_file_that_cannot_be_opened_refuses_writes(home, monkeypatch, cap
     err = capsys.readouterr().err
     assert err.count("Could not open the config lock file") == 3
     assert "has held the config lock" not in err
+
+
+def _flock_failing_with(monkeypatch, code, times=None):
+    """Make ``fcntl.flock`` raise ``OSError(code)`` (``times`` times, else always)."""
+    calls = {"n": 0}
+
+    def flaky(fd, op):
+        calls["n"] += 1
+        if times is None or calls["n"] <= times:
+            raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(config.fcntl, "flock", flaky)
+    return calls
+
+
+def test_an_unexpected_flock_error_refuses_writes(home, monkeypatch, capsys):
+    """ENOLCK (lock resources exhausted) takes no lock and proves no absence of a
+    holder, so writers refuse instead of overwriting another process's update."""
+    p = _put(_canonical(home), {"plan": "pro"})
+    before = p.read_bytes()
+    _flock_failing_with(monkeypatch, errno.ENOLCK)
+    with config.config_lock(p) as may_write:
+        assert may_write is False
+    assert config.set_repo_keys(REPO, {"auto_merge": True}, p) is False
+    assert wizard.write_config({"plan": "max-5x"}, p) is False
+    assert p.read_bytes() == before
+    assert "Could not take the config lock" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("name", ["ENOTSUP", "EOPNOTSUPP", "ENOSYS"])
+def test_a_file_system_without_flock_still_lets_writers_go_on(home, monkeypatch, name):
+    p = _put(_canonical(home), {"plan": "pro"})
+    _flock_failing_with(monkeypatch, getattr(errno, name))
+    with config.config_lock(p) as may_write:
+        assert may_write is True
+
+
+def test_an_eintr_is_retried_within_the_deadline(home, monkeypatch):
+    p = _put(_canonical(home), {"plan": "pro"})
+    calls = _flock_failing_with(monkeypatch, errno.EINTR, times=2)
+    with config.config_lock(p, timeout=5) as may_write:
+        assert may_write is True
+        assert calls["n"] == 3  # two interrupted attempts, then the one that took it
+
+
+def test_an_endless_eintr_cannot_outlast_the_deadline(home, monkeypatch, capsys):
+    p = _put(_canonical(home), {"plan": "pro"})
+    _flock_failing_with(monkeypatch, errno.EINTR)
+    with config.config_lock(p, timeout=0.2) as may_write:
+        assert may_write is False
+    assert "has held the config lock" in capsys.readouterr().err
 
 
 def test_an_interrupt_while_waiting_for_the_lock_leaks_no_fd(home, tmp_path, monkeypatch):
