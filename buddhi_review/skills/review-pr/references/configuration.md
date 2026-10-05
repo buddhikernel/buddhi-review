@@ -1,6 +1,6 @@
 # Configuration & tuning
 
-All configuration below lives in `~/.config/review-loop/config.yaml`, written by
+All configuration below lives in `~/.config/buddhi/config.yaml`, written by
 `/review-pr setup`. Until that file exists the loop runs on defaults and prints a
 short config-unset note to its log rather than asking you to onboard. The skills
 run a first-run gate before launching: if the config is absent they ask once
@@ -16,6 +16,11 @@ The config surface is small:
 | `repos` | map `{owner/repo: {…}}` of per-repo `active_reviewers` / `auto_on_open` overrides | unset (the top-level keys apply to every repo) |
 | `notifications` | string channel (always `console`) | `console` |
 | `repo` / `cwd` | string | unset (inferred at runtime from the cwd's git remote) |
+
+Setup also writes a top-level `auto_merge: false` and `label_gated_ci: false`, which a
+separately installed backend uses. A top-level `auto_merge` has no effect on this
+package: auto-merge is set per repo, with `/review-pr setup`. A top-level
+`label_gated_ci` is the fallback for repos with no value of their own.
 
 ## Plan profiles (model selection)
 
@@ -49,7 +54,7 @@ gracefully with no failed round-trips.
 
 ## Reviewer fleet
 
-`active_reviewers` in `~/.config/review-loop/config.yaml` sets the starting
+`active_reviewers` in `~/.config/buddhi/config.yaml` sets the starting
 universe of reviewers. Defaults to `[copilot, gemini, codex, claude]` when no
 config exists. See [`reviewer-setup.md`](reviewer-setup.md).
 

@@ -53,7 +53,7 @@ to land (merge) on the base branch.
 - **Reviewers trigger based on the fleet confirmed for THIS repo** (per-repo, because
   the vendor GitHub Apps + the claude workflow are installed per repo; set via the
   Step 1.1 terminal setup wizard or `/review-pr setup`, stored under `repos:` in
-  `~/.config/review-loop/config.yaml`), falling back to your global default, then the
+  `~/.config/buddhi/config.yaml`), falling back to your global default, then the
   built-in Copilot/Gemini/Codex/Claude set. If a reviewer is not responding, confirm
   reviewers for this repo (Step 1.1) or run `/review-pr setup`. Do not assume any
   specific reviewer is auto-triggered.
@@ -99,12 +99,12 @@ no config runs the loop with defaults and emits config-unset warnings instead of
 the user to onboard:
 
 ```bash
-test -s ~/.config/review-loop/config.yaml && echo configured || echo unconfigured
+{ test -s ~/.config/review-loop/config.yaml || test -s ~/.config/buddhi/config.yaml; } && echo configured || echo unconfigured
 ```
 
 - **`configured`** — proceed silently to Step 1.
 - **`unconfigured`** — ask with **AskUserQuestion** (a sanctioned gate; ask ONCE):
-  - Question: *"No buddhi config found (`~/.config/review-loop/config.yaml`). Set it up before launching?"*
+  - Question: *"No buddhi config found (`~/.config/buddhi/config.yaml`). Set it up before launching?"*
   - Options:
     1. **Run setup now** *(recommended)* — open the interactive wizard in a **fresh
        terminal window** (your agent session stays alive — the wizard is a raw-mode TTY
