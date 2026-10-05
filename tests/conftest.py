@@ -1,4 +1,5 @@
-"""Suite-wide hermeticity shims: the PR-intent seam + the on-disk config.
+"""Suite-wide hermeticity shims: the PR-intent seam, the on-disk config, and the
+``.claude`` settings guard's containment (see ``_contained_settings_guard``).
 
 The fix-verify pass can consult the PR's own title + body via ``gh pr view`` to
 catch a fix that undoes deliberate work. Pin every test to the network-free empty
@@ -16,9 +17,11 @@ per-test tmp path (a file that does not exist → the empty-config default) and
 clear ``BUDDHI_TEST_COMMAND``; a test that wants a config writes to
 ``tmp_path``/its own path and sets the env itself.
 """
+import sys
+
 import pytest
 
-from buddhi_review import fix_apply, gh_ingest, polish_state
+from buddhi_review import claude_settings_guard, fix_apply, gh_ingest, polish_state
 
 
 def _log_line(stdout):
@@ -54,6 +57,27 @@ def _hermetic_config(monkeypatch, tmp_path):
     # A round driver whose gh fake reports the PR's head stamps polish verdicts
     # against it; keep those stamps in the test's own directory.
     monkeypatch.setenv(polish_state.STATE_DIR_ENV, str(tmp_path / "polish-state"))
+
+
+@pytest.fixture(autouse=True)
+def _contained_settings_guard(monkeypatch, tmp_path):
+    """Keep the ``.claude`` settings guard off the contributor's own checkout.
+
+    Its journal and lock live under this test's tmp dir, and a falsy ``cwd`` (a
+    model call given none inherits the process's working directory, which is the
+    checkout the suite runs from and may hold the contributor's own
+    ``.claude/settings.local.json``) resolves to a per-test path instead. Both are
+    environment variables the guard reads at call time, so the containment
+    survives ``importlib.reload`` of the guard and of any module importing it. A
+    test pinning the falsy-cwd contract deletes the fallback itself.
+
+    ``_run_loop`` installs a process-wide base resolver; it is removed after every
+    test, so a later test never resolves through an earlier test's ``gh`` stub or
+    the real ``gh``."""
+    monkeypatch.setenv(claude_settings_guard.STATE_DIR_ENV, str(tmp_path / "settings-guard-state"))
+    monkeypatch.setenv(claude_settings_guard.FALLBACK_CWD_ENV, str(tmp_path / "settings-guard-cwd"))
+    yield
+    sys.modules["buddhi_review.claude_settings_guard"].uninstall_base_resolver()
 
 
 @pytest.fixture(autouse=True)

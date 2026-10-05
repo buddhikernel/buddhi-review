@@ -31,6 +31,7 @@ Understanding the trust boundary helps you scope a report:
   fixers inside a dedicated worktree, and on macOS wraps each fixer with
   `sandbox-exec` so a fixer cannot write to the primary checkout (fail-open if
   `sandbox-exec` is absent).
+- **It keeps a pull request's Claude settings from running code.** Before each `claude` run in your checkout, `.claude/settings.json` and `.claude/settings.local.json` keep only display settings, plus values that are unchanged from the PR's base branch and name only files that are also unchanged. Everything else is held back while `claude` runs and put back afterwards; if a run is interrupted, a journal in `~/.cache/buddhi/settings-guard/` puts it back on the next run. `claude` is started with `--setting-sources user,project`, so no local settings file is read. To find the base branch, the package runs `gh pr view` and fetches that one branch into your remote-tracking ref. The check follows only the paths a setting names, so a base-branch hook that runs code without naming it (for example `npm test`) can still run code the pull request changed.
 - **It installs a PreToolUse hook.** Each bundled skill registers a git-guardrail
   hook that blocks history-rewriting git (rebase / merge / reset --hard /
   cherry-pick / force-push) while a review is in flight. It activates only when the
