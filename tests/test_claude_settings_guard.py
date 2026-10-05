@@ -1490,8 +1490,12 @@ def test_the_allowlist_is_exactly_the_audited_set():
 def test_the_journal_lives_in_the_durable_cache_dir_by_default(tmp_path, monkeypatch):
     import tempfile
     monkeypatch.delenv(guard.STATE_DIR_ENV)
-    monkeypatch.setenv("HOME", str(tmp_path))
-    assert guard.state_dir() == str(tmp_path / ".cache" / "buddhi" / "settings-guard")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    # The system temp dir, which a reboot or a reaper empties, set apart from HOME
+    # (a test's HOME is itself under the temp dir on Linux).
+    monkeypatch.setenv("TMPDIR", str(tmp_path / "systmp"))
+    monkeypatch.setattr(tempfile, "tempdir", None)
+    assert guard.state_dir() == str(tmp_path / "home" / ".cache" / "buddhi" / "settings-guard")
     assert not guard.state_dir().startswith(tempfile.gettempdir())
 
 
@@ -1814,7 +1818,7 @@ def test_the_containment_survives_a_reload_of_the_guard(tmp_path):
     "cd sub; cd -; sh scripts/check.sh",
     "cd missing; sh scripts/check.sh",               # a cd that fails
     "cd sub || true; sh scripts/check.sh",
-    "cd /tmp; sh scripts/check.sh",
+    "cd /usr; sh scripts/check.sh",                  # outside the checkout, never above it
     "cd sub >/dev/null && sh scripts/check.sh",      # a redirect is not where cd goes
     "cd sub 2>/dev/null && sh scripts/check.sh",
     "cd sub && true; cd - >/dev/null && sh scripts/check.sh",
@@ -1854,7 +1858,7 @@ def test_a_cd_above_the_checkout_is_unsafe(tmp_path):
     checkout.mkdir()
     assert guard.named_paths(f"cd {tmp_path} && sh wt/x.sh", str(checkout)).unsafe
     assert guard.named_paths("cd / && sh x.sh", str(checkout)).unsafe
-    assert guard.named_paths("cd /tmp && sh x.sh", str(checkout)).unsafe is None
+    assert guard.named_paths("cd /usr && sh x.sh", str(checkout)).unsafe is None  # beside it, not above
 
 
 def test_cd_reads_dotdot_by_name_so_the_named_directory_is_walked(tmp_path):
@@ -3046,7 +3050,7 @@ def test_a_python_flag_cluster_ending_in_c_is_code():
 
 
 @pytest.mark.parametrize("command", [
-    "cd /tmp && ./x.sh",          # cd outside the checkout, then a file there
+    "cd /usr && ./x.sh",          # cd outside the checkout, then a file there
     "pushd tools && popd && ./x.sh",
 ])
 def test_a_relative_word_after_a_cd_counts_at_the_root_only_where_it_exists(tmp_path, command):
