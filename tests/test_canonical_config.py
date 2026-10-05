@@ -24,6 +24,7 @@ import site
 import stat
 import subprocess
 import sys
+import threading
 import time
 import types
 from pathlib import Path
@@ -614,6 +615,32 @@ def test_a_failed_catch_up_after_the_rename_is_retried_from_the_backup(home, mon
     assert config.migrate_legacy_config() == "absent"
 
 
+def test_an_unreadable_recovery_record_is_kept_for_the_next_catch_up(
+        home, monkeypatch, capsys):
+    """The legacy name is already gone, so an unreadable recovery record must not
+    be mistaken for an absent record and deleted: it is the only pointer to the
+    backup whose later write still needs to be merged."""
+    _catch_up_fails(home, monkeypatch, "refused")
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    backup = _backups(home)[0]
+    real_read = config._read_config_file
+
+    def record_read_fails(path):
+        if Path(path) == record:
+            return None, b"", "unreadable", None
+        return real_read(path)
+
+    monkeypatch.setattr(config, "_read_config_file", record_read_fails)
+    capsys.readouterr()
+    assert config.migrate_legacy_config() == "unreadable"
+    assert record.exists()
+    assert f"Could not read the old config file {record} (unreadable)" in capsys.readouterr().err
+    monkeypatch.setattr(config, "_read_config_file", real_read)
+    assert config.migrate_legacy_config() == "migrated"
+    assert "old/a" in _load(_canonical(home))["repos"]
+    assert backup.exists() and not record.exists()
+
+
 @pytest.mark.parametrize("failure", ["refused", "interrupted"])
 @pytest.mark.parametrize("canonical", ["untouched", "edited"])
 @pytest.mark.parametrize("start", ["merged", "copied"])
@@ -817,25 +844,77 @@ def test_the_legacy_name_is_kept_while_the_record_naming_the_backup_cannot_be_wr
 
 
 def test_a_record_that_cannot_be_written_at_all_keeps_the_legacy_name(home, capsys):
-    """No record can be written (a folder sits at its path): the settings still reach
-    the canonical file, but the legacy name is not retired without a record that
-    would lead a later resolve to the backup. Once a record can be written, the
-    move completes."""
+    """No record can be written (a folder sits at its path), so neither config is
+    changed. Once a record can be written, the move completes."""
     _put(_legacy(home), LEGACY)
     record = _canonical(home).with_name("config.yaml.legacy-merged")
     record.mkdir(parents=True)
     assert config.migrate_legacy_config() == "error"
-    assert _load(_canonical(home)) == LEGACY
+    assert not _canonical(home).exists()
     assert _legacy(home).exists() and _backups(home) == []
-    err = capsys.readouterr().err.strip()
-    assert err.startswith(f"Warning: Settings from {_legacy(home)} were merged into "
-                          f"{_canonical(home)}, but the old file could not be renamed (")
-    assert err.endswith("). No settings conflicted. It will be merged again on the next run.")
+    assert "writing the file failed" in capsys.readouterr().err
     record.rmdir()
     assert config.migrate_legacy_config() == "migrated"
     assert _load(_canonical(home)) == LEGACY
     assert not _legacy(home).exists() and len(_backups(home)) == 1
     assert not record.exists()
+
+
+def test_an_interruption_after_the_canonical_replace_retries_a_late_legacy_edit(
+        home, monkeypatch):
+    """A legacy write after the migration read but before its canonical replace is
+    recovered even if execution stops after that replace and before completion is
+    recorded. The migration's newer mtime must not defeat the late legacy value."""
+    t = time.time_ns()
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=t - 3 * 10**9)
+    _put(_legacy(home), {"plan": "max-20x"}, mtime_ns=t - 2 * 10**9)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    real_replace = os.replace
+
+    def replace_then_stop(src, dst, *args, **kwargs):
+        if str(dst) == str(_canonical(home)):
+            _atomic_legacy_write(home, {"plan": "max-5x"})
+            os.utime(_legacy(home), ns=(t - 10**9, t - 10**9))
+            real_replace(src, dst, *args, **kwargs)
+            raise KeyboardInterrupt
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(config.os, "replace", replace_then_stop)
+    with pytest.raises(KeyboardInterrupt):
+        config.migrate_legacy_config()
+    monkeypatch.setattr(config.os, "replace", real_replace)
+    assert _load(record)["state"] == "pending"
+    assert _load(_canonical(home))["plan"] == "max-20x"
+    assert config.migrate_legacy_config() == "migrated"
+    assert _load(_canonical(home))["plan"] == "max-5x"
+    assert not record.exists()
+
+
+def test_a_failed_pending_record_write_cannot_lose_a_late_legacy_edit(
+        home, monkeypatch):
+    """The recovery baseline must exist before the canonical replacement. If its
+    write fails while an earlier release edits the legacy file, the canonical file
+    stays untouched and the next run imports that edit."""
+    t = time.time_ns()
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=t - 2 * 10**9)
+    _put(_legacy(home), {"plan": "max-20x"}, mtime_ns=t - 3 * 10**9)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    real_replace = os.replace
+
+    def record_fails(src, dst, *args, **kwargs):
+        if str(dst) == str(record):
+            _atomic_legacy_write(home, {"plan": "max-5x"})
+            os.utime(_legacy(home), ns=(t - 10**9, t - 10**9))
+            raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(dst))
+        return real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(config.os, "replace", record_fails)
+    assert config.migrate_legacy_config() == "error"
+    monkeypatch.setattr(config.os, "replace", real_replace)
+    assert _load(_canonical(home)) == {"plan": "pro"}
+    assert _load(_legacy(home)) == {"plan": "max-5x"}
+    assert config.migrate_legacy_config() == "migrated"
+    assert _load(_canonical(home))["plan"] == "max-5x"
 
 
 def test_a_record_naming_a_backup_outside_the_legacy_folder_is_ignored(home, tmp_path):
@@ -1289,9 +1368,12 @@ def test_one_and_true_are_different_settings(home, newer, capsys):
     config.config_path()
     cfg = _load(_canonical(home))
     winner = legacy if newer == "legacy" else canonical
-    for repo in ("o/r", "other/repo"):
-        assert config.label_gated_ci(cfg, repo) is config.label_gated_ci(winner, repo)
-    assert "2 setting(s) conflicted" in capsys.readouterr().err
+    # The per-repo value is a real conflict: ``1`` is not ``true``.
+    assert config.label_gated_ci(cfg, "o/r") is config.label_gated_ci(winner, "o/r")
+    # A top-level ``1`` is a value the reader treats as unset, so it never replaces
+    # the valid global ``true`` even from the newer file.
+    assert config.label_gated_ci(cfg, "other/repo") is True
+    assert "1 setting(s) conflicted" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("side", ["legacy", "canonical"])
@@ -1371,6 +1453,26 @@ def test_a_plan_the_readers_treat_as_unset_never_overrides_a_real_one(monkeypatc
                                                           legacy_wins=legacy_wins)
             assert merged == {"plan": "pro"} and conflicts == []
             assert config.plan(merged) == plan_profile.active_plan(merged) == "pro"
+
+
+@pytest.mark.parametrize("key, good, bad", [
+    ("active_reviewers", ["copilot"], "copilot"),
+    ("auto_on_open", {"claude": True}, ["claude"]),
+    ("label_gated_ci", True, "no"),
+])
+def test_a_malformed_reader_setting_never_overrides_a_valid_one(key, good, bad):
+    """``active_reviewers()`` reads only a list, ``auto_on_open()`` only a mapping and
+    ``label_gated_ci()`` only a real bool, so a malformed value of the same key in the
+    newer file yields to the valid value on the other side instead of replacing it."""
+    for legacy_wins in (True, False):
+        for canonical, legacy in (({key: good}, {key: bad}), ({key: bad}, {key: good})):
+            merged, conflicts = config.merge_config_files(canonical, legacy,
+                                                          legacy_wins=legacy_wins)
+            assert _same_setting(merged[key], good) and conflicts == []
+
+
+def _same_setting(a, b):
+    return type(a) is type(b) and a == b
 
 
 # ── Unreadable legacy file → fail open ──────────────────────────────────────────
@@ -1562,6 +1664,36 @@ def test_lock_is_reentrant_within_a_thread(home, capsys):
     assert _load(p)["repos"][REPO]["auto_merge"] is True
 
 
+def test_timeout_covers_another_thread_holding_the_in_process_lock(home, capsys):
+    p = _canonical(home)
+    held = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        with config.config_lock(p, timeout=1) as may_write:
+            assert may_write is True
+            held.set()
+            assert release.wait(2)
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert held.wait(1)
+    try:
+        start = time.monotonic()
+        with config.config_lock(p, timeout=0.05) as may_write:
+            waited = time.monotonic() - start
+        assert may_write is False
+        assert 0.03 <= waited < 0.15
+        assert holder.is_alive()
+        assert "Another thread has held the config lock" in capsys.readouterr().err
+    finally:
+        release.set()
+        holder.join(2)
+    assert not holder.is_alive()
+    with config.config_lock(p, timeout=0.05) as may_write:
+        assert may_write is True
+
+
 _HOLD_LOCK = r"""
 import fcntl, os, sys, time
 fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
@@ -1742,19 +1874,27 @@ for i in range(int(n)):
 def _race(h, tmp_path, script, argv_per_child):
     go = tmp_path / "go"
     procs, readies = [], []
-    for i, argv in enumerate(argv_per_child):
-        ready = tmp_path / f"ready{i}"
-        readies.append(ready)
-        procs.append(subprocess.Popen([sys.executable, "-c", script, str(ready), str(go), *argv],
-                                      env=_env(h), cwd=str(h), stdout=subprocess.PIPE,
-                                      stderr=subprocess.PIPE, text=True))
-    for ready in readies:
-        _wait_for(ready)
-    go.touch()
-    results = [p.communicate(timeout=60) for p in procs]
-    for p, (out, err) in zip(procs, results):
-        assert p.returncode == 0, err
-    return results
+    try:
+        for i, argv in enumerate(argv_per_child):
+            ready = tmp_path / f"ready{i}"
+            readies.append(ready)
+            procs.append(subprocess.Popen(
+                [sys.executable, "-c", script, str(ready), str(go), *argv],
+                env=_env(h), cwd=str(h), stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True))
+        for ready in readies:
+            _wait_for(ready)
+        go.touch()
+        results = [p.communicate(timeout=60) for p in procs]
+        for p, (out, err) in zip(procs, results):
+            assert p.returncode == 0, err
+        return results
+    finally:
+        for p in procs:
+            if p.poll() is None:
+                p.kill()
+        for p in procs:
+            p.communicate()
 
 
 def test_two_concurrent_writers_lose_no_setting(home, tmp_path):
