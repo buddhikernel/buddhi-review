@@ -1493,8 +1493,10 @@ def test_the_journal_lives_in_the_durable_cache_dir_by_default(tmp_path, monkeyp
     monkeypatch.setenv("HOME", str(tmp_path / "home"))
     # The system temp dir, which a reboot or a reaper empties, set apart from HOME
     # (a test's HOME is itself under the temp dir on Linux).
+    (tmp_path / "systmp").mkdir()
     monkeypatch.setenv("TMPDIR", str(tmp_path / "systmp"))
     monkeypatch.setattr(tempfile, "tempdir", None)
+    assert tempfile.gettempdir() == str(tmp_path / "systmp")
     assert guard.state_dir() == str(tmp_path / "home" / ".cache" / "buddhi" / "settings-guard")
     assert not guard.state_dir().startswith(tempfile.gettempdir())
 
