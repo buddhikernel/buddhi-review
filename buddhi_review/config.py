@@ -137,6 +137,9 @@ _FLOCK_UNSUPPORTED_ERRNOS = frozenset(
 _lock_guard = threading.Lock()
 # lock-file path -> [in-process RLock, re-entry depth, flock fd or None, may write]
 _lock_state: Dict[str, List[Any]] = {}
+# Per thread: the lock-file paths whose in-process lock this thread was refused (another
+# thread kept it past the timeout), for as long as that refused hold is open.
+_refused = threading.local()
 
 
 def config_lock_path(path: Path) -> Path:
@@ -226,12 +229,21 @@ def config_lock(path: Path, *, timeout: Optional[float] = None) -> Iterator[bool
     the lock file could not be opened (each reported on stderr in its own words). A
     writer then writes nothing and reports failure; a read-only caller may carry on.
     The same deadline covers both lock layers. A re-entry yields the outermost
-    acquisition's answer without waiting again, so a caller that wraps several
-    writers in one hold needs no check of its own: each writer refuses on ``False``.
+    acquisition's answer without waiting again — also when another thread kept the
+    in-process lock past the timeout, so a nested writer never waits a second time
+    and never writes, once that thread is done, what its caller read while that thread
+    was mid-write. A caller that wraps several writers in one hold therefore needs no
+    check of its own: each writer refuses on ``False``.
 
     Always resolve ``path`` BEFORE entering: :func:`config_path` may run the
     migration, which takes this same lock."""
     key = os.path.abspath(str(config_lock_path(path)))
+    refused = getattr(_refused, "keys", None)
+    if refused is None:
+        refused = _refused.keys = set()
+    if key in refused:
+        yield False  # inside a hold of this thread that was refused: refuse at once
+        return
     with _lock_guard:
         state = _lock_state.setdefault(key, [threading.RLock(), 0, None, True])
     rlock = state[0]
@@ -242,7 +254,11 @@ def config_lock(path: Path, *, timeout: Optional[float] = None) -> Iterator[bool
               f"than {int(wait)} seconds. The config was not changed. Run the command "
               f"again once that thread has finished.",
               file=sys.stderr)
-        yield False
+        refused.add(key)
+        try:
+            yield False
+        finally:
+            refused.discard(key)
         return
     try:
         if state[1] == 0:
@@ -282,8 +298,12 @@ def config_lock(path: Path, *, timeout: Optional[float] = None) -> Iterator[bool
 # canonical file after that attempt establishes a new baseline. The completed
 # record stays until the legacy name is retired; it prevents the same bytes from
 # being merged repeatedly after a refused rename, while a later legacy edit merges
-# only what changed. A record whose legacy file was already retired (a run stopped
-# after the rename) is dropped, never used.
+# only what changed. The pending record of that later merge keeps the completed
+# record's legacy snapshot as its base, so when the merge fails or is interrupted
+# the retry still merges only what changed since that snapshot, never the whole
+# snapshot again over the edits made to the canonical file since. A record whose
+# legacy file was already retired (a run stopped after the rename) is dropped,
+# never used.
 #
 # Just before the rename the record also names the backup the legacy file is
 # retired to. A process of an earlier release (it takes no lock) may rewrite the
@@ -471,7 +491,9 @@ def merge_config_files(canonical: Dict[str, Any], legacy: Dict[str, Any], *,
       other side (a top-level ``None``, a ``plan`` that is not a non-empty string, a
       non-mapping ``repos``, a non-list ``known_repos`` or ``active_reviewers``, a
       non-mapping ``auto_on_open``, a non-bool ``label_gated_ci``, a non-mapping repo entry,
-      and a per-repo ``None`` for a key whose reader treats null as absent).
+      a per-repo ``None`` for a key whose reader treats null as absent, and a
+      per-repo ``active_reviewers`` / ``auto_on_open`` / ``auto_merge`` /
+      ``label_gated_ci`` of the wrong type for its reader).
     * A CONFLICT — the same key (a top-level value such as ``plan``,
       ``active_reviewers``, ``auto_on_open``, ``label_gated_ci`` or
       ``test_command``, or one key of one repo) with two different values — takes
@@ -560,10 +582,24 @@ def _repo_value_is_unset(key: Any, value: Any) -> bool:
     """A per-repo value its reader treats as absent: ``None`` (except for the keys
     whose readers let a present null shadow the global), and a blank
     ``test_command`` (blank, or falsy such as ``false`` / ``0`` / ``[]``, as
-    :func:`test_command` reads it)."""
+    :func:`test_command` reads it). A present, non-null value of the wrong type for
+    its reader is unset too — an ``active_reviewers`` that is not a list, an
+    ``auto_on_open`` that is not a mapping, an ``auto_merge`` / ``label_gated_ci``
+    that is not a bool — the same checks :func:`_holds_nothing` applies to the
+    top-level keys, so a malformed value in the newer file never replaces a valid
+    per-repo setting on the other side. A present null of a ``_NULL_IS_A_VALUE_PER_REPO``
+    key stays a value (it shadows the global default)."""
     if key == "test_command":
         return not (value and str(value).strip())
-    return value is None and key not in _NULL_IS_A_VALUE_PER_REPO
+    if value is None:
+        return key not in _NULL_IS_A_VALUE_PER_REPO
+    if key == "active_reviewers":
+        return not isinstance(value, list)
+    if key == "auto_on_open":
+        return not isinstance(value, dict)
+    if key in ("auto_merge", "label_gated_ci"):
+        return not isinstance(value, bool)
+    return False
 
 
 def _first_entries(repos: Dict[Any, Any]) -> Dict[str, Dict[str, Any]]:
@@ -703,6 +739,9 @@ def _read_record(canonical: Path) -> Any:
     pending_target = data.get("canonical_target")
     if not isinstance(pending_target, dict):
         pending_target = None
+    pending_base = data.get("legacy_base")
+    if not isinstance(pending_base, dict):
+        pending_base = None
     baseline = None
     if "canonical_before" in data and (mtime is None or type(mtime) is int):
         if state == "pending":
@@ -714,15 +753,19 @@ def _read_record(canonical: Path) -> Any:
             "legacy": merged_legacy, "backup": backup if isinstance(backup, str) else None,
             "baseline": baseline, "state": state,
             "pending_source": tuple(pending_source) if pending_source is not None else None,
-            "pending_target": pending_target}
+            "pending_target": pending_target,
+            "pending_base": pending_base if state == "pending" else None}
 
 
 def _write_record(canonical: Path, ident: Tuple[int, ...], conflicts: List[str],
                   merged_legacy: Dict[str, Any], before: Dict[str, Optional[int]],
                   backup: Optional[str] = None, *, state: str = "completed",
-                  target: Optional[Dict[str, Any]] = None) -> None:
-    """Write pending or completed recovery state atomically. Raises ``OSError``
-    when it cannot be written; any record already there is then left as it was."""
+                  target: Optional[Dict[str, Any]] = None,
+                  base: Optional[Dict[str, Any]] = None) -> None:
+    """Write pending or completed recovery state atomically. ``base`` — the legacy
+    snapshot a completed merge already brought in — is kept in a pending record, so
+    its retry merges only what changed since. Raises ``OSError`` when it cannot be
+    written; any record already there is then left as it was."""
     body: Dict[str, Any] = {"identity": list(ident), "conflicts": list(conflicts),
                             "legacy": merged_legacy, "state": state}
     if backup is not None:
@@ -733,6 +776,8 @@ def _write_record(canonical: Path, ident: Tuple[int, ...], conflicts: List[str],
             body["canonical_pending"] = list(source)
         if target is not None:
             body["canonical_target"] = target
+        if base is not None:
+            body["legacy_base"] = base
     # The baseline the merge was judged against, and the canonical file this run
     # left: a later resolve reuses the baseline only while the file is still that.
     written = (_stat_identity(canonical)
@@ -982,10 +1027,13 @@ def _migrate_locked(canonical: Path, legacy: Path) -> str:
             and record["identity"] == ident:
         conflicts = record["conflicts"]  # merged already, by a run that did not finish
     else:
-        # A pending record does not vouch for the canonical replacement: retry the
-        # whole snapshot even when the legacy file itself has not changed.
-        base = (record["legacy"] if record is not None
-                and record["state"] == "completed" else None)
+        # A pending record does not vouch for the canonical replacement: retry its
+        # whole change even when the legacy file itself has not changed — the whole
+        # snapshot, or, when it was a change on top of a completed merge, everything
+        # since the snapshot that merge brought in (kept in the record as its base).
+        base = None
+        if record is not None:
+            base = record["legacy"] if record["state"] == "completed" else record["pending_base"]
         merged = _merge_into_canonical(canonical, legacy, legacy_data, raw, ident, before, base)
         if isinstance(merged, str):
             return merged
@@ -1067,13 +1115,17 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
     if not _same(merged, canonical_data):
         # The pending record preserves the user's pre-migration timestamp before
         # replacing the canonical file. If the replacement or the completed-record
-        # write is interrupted, the next run retries against that same baseline.
+        # write is interrupted, the next run retries against that same baseline —
+        # and, for a change on top of a completed merge, from that merge's snapshot
+        # (``base``), so it never replays what that merge already brought in. A
+        # catch-up's record keeps that snapshot as its ``legacy`` instead.
         pending_ident, pending_conflicts, pending_legacy = (
             pending_record if pending_record is not None
             else (ident, conflicts, legacy_data))
         try:
             _write_record(canonical, pending_ident, pending_conflicts, pending_legacy,
-                          before, backup=backup, state="pending", target=merged)
+                          before, backup=backup, state="pending", target=merged,
+                          base=base if pending_record is None else None)
         except OSError:
             return _write_failed(legacy, canonical)
         # Deferred import: wizard imports config at module load (config is the

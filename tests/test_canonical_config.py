@@ -998,6 +998,58 @@ def test_a_refused_rename_merges_only_what_a_later_legacy_edit_changed(home):
         os.chmod(folder, 0o700)
 
 
+@pytest.mark.parametrize("failure", ["refused", "interrupted", "interrupted-after-the-write"])
+def test_a_later_legacy_edit_whose_merge_did_not_finish_is_retried_alone(home, monkeypatch,
+                                                                         failure):
+    """After a refused rename, a later legacy edit is merged as only what it changed.
+    When that merge's canonical write fails, or is interrupted before or after it
+    lands, the retry still merges only that change: the snapshot the first merge
+    brought in is never replayed over the user's own later canonical edits."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    t = time.time_ns()
+    _put(_legacy(home), LEGACY, mtime_ns=t - 3 * 10**9)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    folder = _legacy(home).parent
+    os.chmod(folder, 0o500)
+    try:
+        assert config.migrate_legacy_config() == "error"  # merged; the rename is refused
+        # The user changes the plan and turns this repo's auto-merge on in the canonical
+        # file, then adds only a test command to the (still present) legacy file, later.
+        cfg = _load(_canonical(home))
+        cfg["plan"] = "pro"
+        cfg["repos"][REPO]["auto_merge"] = True
+        _put(_canonical(home), cfg, mtime_ns=t - 2 * 10**9)
+        _legacy(home).write_text(yaml.safe_dump({**LEGACY, "test_command": "tox"}),
+                                 encoding="utf-8")
+        os.utime(_legacy(home), ns=(t - 10**9, t - 10**9))
+        real = wizard.write_config
+
+        def fails_once(cfg, path):
+            monkeypatch.setattr(wizard, "write_config", real)
+            if failure == "refused":
+                return False
+            if failure == "interrupted-after-the-write":
+                assert real(cfg, path) is True
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(wizard, "write_config", fails_once)
+        if failure == "refused":
+            assert config.migrate_legacy_config() == "error"
+        else:
+            with pytest.raises(KeyboardInterrupt):
+                config.migrate_legacy_config()
+        assert _load(record)["state"] == "pending"
+        assert config.migrate_legacy_config() == "error"  # retried; still not renamed
+    finally:
+        os.chmod(folder, 0o700)
+    assert config.migrate_legacy_config() == "migrated"
+    cfg = _load(_canonical(home))
+    assert cfg["test_command"] == "tox"
+    assert cfg["plan"] == "pro" and cfg["repos"][REPO]["auto_merge"] is True
+    assert not _legacy(home).exists() and not record.exists()
+
+
 def _edit_after_the_merge(home, monkeypatch, path, edited):
     """Migrate, while an earlier release rewrites the legacy file as ``edited``
     after it was merged: just before the rename, so the catch-up merges the edit
@@ -1357,9 +1409,10 @@ def test_a_canonical_path_linked_to_the_legacy_file_becomes_its_own_file(home, l
 
 
 @pytest.mark.parametrize("newer", ["legacy", "canonical"])
-def test_one_and_true_are_different_settings(home, newer, capsys):
-    """Readers accept only a real bool, so ``1`` is not ``true``: the two are a
-    conflict, and the result resolves as the file that wins resolved alone."""
+def test_one_is_not_true_so_it_never_overrides_a_real_bool(home, newer, capsys):
+    """Readers accept only a real bool, so ``1`` is not ``true``: it is a value the
+    reader treats as unset, at the top level and per repo alike, and never replaces
+    the valid ``true`` on the other side even from the newer file."""
     t = time.time_ns()
     canonical = {"label_gated_ci": True, "repos": {"o/r": {"label_gated_ci": True}}}
     legacy = {"label_gated_ci": 1, "repos": {"o/r": {"label_gated_ci": 1}}}
@@ -1367,13 +1420,9 @@ def test_one_and_true_are_different_settings(home, newer, capsys):
     _put(_legacy(home), legacy, mtime_ns=t if newer == "legacy" else t - 10**9)
     config.config_path()
     cfg = _load(_canonical(home))
-    winner = legacy if newer == "legacy" else canonical
-    # The per-repo value is a real conflict: ``1`` is not ``true``.
-    assert config.label_gated_ci(cfg, "o/r") is config.label_gated_ci(winner, "o/r")
-    # A top-level ``1`` is a value the reader treats as unset, so it never replaces
-    # the valid global ``true`` even from the newer file.
+    assert config.label_gated_ci(cfg, "o/r") is True
     assert config.label_gated_ci(cfg, "other/repo") is True
-    assert "1 setting(s) conflicted" in capsys.readouterr().err
+    assert "No settings conflicted" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("side", ["legacy", "canonical"])
@@ -1473,6 +1522,54 @@ def test_a_malformed_reader_setting_never_overrides_a_valid_one(key, good, bad):
 
 def _same_setting(a, b):
     return type(a) is type(b) and a == b
+
+
+@pytest.mark.parametrize("key, good, bad, read", [
+    ("active_reviewers", ["copilot"], "copilot",
+     lambda cfg: config.active_reviewers(cfg, "o/r")),
+    ("auto_on_open", {"claude": True}, ["claude"],
+     lambda cfg: config.auto_on_open(cfg, "claude", "o/r")),
+    ("auto_merge", True, "false", lambda cfg: config.auto_merge(cfg, "o/r")),
+    ("label_gated_ci", True, 1, lambda cfg: config.label_gated_ci(cfg, "o/r")),
+])
+def test_a_malformed_per_repo_setting_never_overrides_a_valid_one(key, good, bad, read):
+    """The per-repo readers apply the same type checks as the top-level ones, so a
+    malformed per-repo value in the newer file yields to the valid value on the other
+    side instead of replacing it (and resolving to the reader's default)."""
+    for legacy_wins in (True, False):
+        for canonical, legacy in (({"repos": {"o/r": {key: good}}}, {"repos": {"o/r": {key: bad}}}),
+                                  ({"repos": {"o/r": {key: bad}}}, {"repos": {"o/r": {key: good}}})):
+            merged, conflicts = config.merge_config_files(canonical, legacy,
+                                                          legacy_wins=legacy_wins)
+            assert _same_setting(merged["repos"]["o/r"][key], good) and conflicts == []
+            assert read(merged) == read({"repos": {"o/r": {key: good}}})
+
+
+@pytest.mark.parametrize("key, bad", [("active_reviewers", "copilot"), ("auto_on_open", ["x"]),
+                                      ("auto_merge", "false"), ("label_gated_ci", "no")])
+def test_a_malformed_per_repo_setting_survives_when_the_other_side_has_none(key, bad):
+    """With no valid value to defer to, the lone malformed value is kept as the file
+    held it (and two malformed values are not a conflict)."""
+    merged, conflicts = config.merge_config_files({"repos": {"o/r": {"k": 1}}},
+                                                  {"repos": {"o/r": {key: bad}}},
+                                                  legacy_wins=False)
+    assert merged["repos"]["o/r"] == {"k": 1, key: bad} and conflicts == []
+    merged, conflicts = config.merge_config_files({"repos": {"o/r": {key: bad}}},
+                                                  {"repos": {"o/r": {key: "other"}}},
+                                                  legacy_wins=True)
+    assert merged["repos"]["o/r"] == {key: bad} and conflicts == []
+
+
+def test_two_valid_but_different_per_repo_settings_still_conflict():
+    """The type check only demotes malformed values: two real, differing settings
+    keep resolving to the newer file's."""
+    canonical = {"repos": {"o/r": {"auto_merge": True, "active_reviewers": ["a"]}}}
+    legacy = {"repos": {"o/r": {"auto_merge": False, "active_reviewers": ["b"]}}}
+    merged, conflicts = config.merge_config_files(canonical, legacy, legacy_wins=True)
+    assert merged["repos"]["o/r"] == {"auto_merge": False, "active_reviewers": ["b"]}
+    assert sorted(conflicts) == ["repos.o/r.active_reviewers", "repos.o/r.auto_merge"]
+    merged, _ = config.merge_config_files(canonical, legacy, legacy_wins=False)
+    assert merged["repos"]["o/r"] == canonical["repos"]["o/r"]
 
 
 # ── Unreadable legacy file → fail open ──────────────────────────────────────────
@@ -1692,6 +1789,55 @@ def test_timeout_covers_another_thread_holding_the_in_process_lock(home, capsys)
     assert not holder.is_alive()
     with config.config_lock(p, timeout=0.05) as may_write:
         assert may_write is True
+
+
+def test_a_writer_nested_in_a_hold_another_thread_refused_refuses_at_once(home, monkeypatch,
+                                                                          capsys):
+    """A hold refused because another thread kept the in-process lock past the timeout
+    stays refused for every writer nested in it: none waits a second time, and none
+    writes, once that thread is done, a snapshot read while it was mid-write."""
+    p = _put(_canonical(home), {"plan": "max-5x"})
+    monkeypatch.setattr(config, "LOCK_TIMEOUT_S", 0.2)
+    held, release = threading.Event(), threading.Event()
+
+    def hold():  # another thread's read-modify-write, still running when the writers start
+        with config.config_lock(p, timeout=10) as may_write:
+            assert may_write is True
+            held.set()
+            assert release.wait(10)
+            assert wizard.write_config({"plan": "pro"}, p) is True
+
+    holder = threading.Thread(target=hold)
+    holder.start()
+    assert held.wait(5)
+    try:
+        start = time.monotonic()
+        with config.config_lock(p) as may_write:
+            waited = time.monotonic() - start
+            assert may_write is False
+            assert config.set_repo_keys(REPO, {"auto_merge": True}, p) is False
+            assert wizard.write_config({"plan": "max-20x"}, p) is False
+        assert time.monotonic() - start < waited + config.LOCK_TIMEOUT_S
+        real_load = config.load_config
+
+        def read_then_the_holder_finishes(path=None):
+            cfg = real_load(path)  # read while the holder is still mid-write
+            release.set()
+            holder.join(10)  # its update lands before the nested write below
+            return cfg
+
+        monkeypatch.setattr(config, "load_config", read_then_the_holder_finishes)
+        assert wizard._write_global_default(FLEET, {"copilot": True}, p) is False
+        monkeypatch.setattr(config, "load_config", real_load)
+    finally:
+        release.set()
+        holder.join(10)
+    assert not holder.is_alive()
+    assert _load(p) == {"plan": "pro"}
+    assert capsys.readouterr().err.count("Another thread has held the config lock") == 2
+    # The refusal ends with its hold: the next write takes the free lock and lands.
+    assert config.set_repo_keys(REPO, {"auto_merge": True}, p) is True
+    assert _load(p) == {"plan": "pro", "repos": {REPO: {"auto_merge": True}}}
 
 
 _HOLD_LOCK = r"""
