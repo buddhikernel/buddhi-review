@@ -21,6 +21,13 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.9.3](https://github.com/buddhikernel/buddhi-review/compare/v0.9.2...v0.9.3) (2026-10-05)
+
+
+### Bug Fixes
+
+* **security:** a pull request's Claude settings can no longer run code during a review ([#118](https://github.com/buddhikernel/buddhi-review/issues/118)) ([bc11b93](https://github.com/buddhikernel/buddhi-review/commit/bc11b93aed33d778dfc8965b108b894f19899d78))
+
 ## [0.9.2](https://github.com/buddhikernel/buddhi-review/compare/v0.9.1...v0.9.2) (2026-10-01)
 
 
