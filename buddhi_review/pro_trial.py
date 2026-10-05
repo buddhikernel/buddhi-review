@@ -5,6 +5,9 @@ This is the ONE sanctioned license-ACQUISITION module in the free tree
 offer routes here, and here ONLY. It ACQUIRES a trial the server-less, cardless,
 zero-paste way and then hands off to the installed Pro wheel:
 
+  0. **the release gate** — nothing below runs until a public route says the paid
+     package is published with a wheel this interpreter can install
+     (:class:`ReleaseCheck`; closed on any doubt);
   1. **open registration** — ``POST /users`` on the *unprotected* Keygen account
      (no token), with the buyer's email;
   2. **a user token** — ``POST /tokens`` (HTTP Basic, the email + a locally-generated
@@ -39,6 +42,7 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import platform
 import re
 import secrets
 import shlex
@@ -46,10 +50,12 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Callable, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from buddhi_review import netrc_writer
 
@@ -381,6 +387,209 @@ def _await_active(*, backends=None, is_active=None, attempts: int = 20,
     return False
 
 
+# ═════════════════════ Is the paid release published yet? ══════════════════════
+# The trial ends in a pip install from the private index, so it is offered only
+# once there is a published wheel this machine can install. A public route answers
+# that, with no credential and no request data:
+#
+#   200 {"status": "open", "wheels": ["<interpreter>-<abi>-<platform>", ...]}
+#   200 {"status": "closed"}
+#
+# It counts as OPEN only for that first shape — a 200 ``application/json`` object
+# whose ``wheels`` is a non-empty list of strings — AND when at least one listed tag
+# suits the interpreter the install runs, which pip can install into. Everything
+# else is closed: a timeout, a DNS or TLS failure, a redirect, any other status (the
+# edge's 429, a 5xx), a body that is not JSON or is too large, an unknown status, a
+# missing or empty wheel list, a tag that does not parse, an interpreter with no pip
+# or one PEP 668 marks externally managed. One request per setup run (a :class:`ReleaseCheck`
+# carries it from the wizard's early prefetch to the offer and into
+# :func:`start_trial`); no retry, no cache, and nothing about the answer is written.
+
+RELEASE_STATUS_URL = "https://api.buddhireview.com/release-status"
+# A cold answer takes about 2 s and the route can hold a queued request for about
+# 6 s more, so an 8 s wall-clock cap waits for every real answer.
+_RELEASE_TIMEOUT_S = 8.0
+_RELEASE_MAX_BYTES = 64 * 1024
+# The one seam every check reads the answer through: a callable returning the
+# route's JSON object (or None), or None for the HTTPS client below. The test suite
+# points it at a stub so no test ever calls the route.
+_release_fetch: Optional[Callable[[], Optional[dict]]] = None
+# The outcome tag :func:`start_trial` returns while the release is closed. It carries
+# no message: the wizard stays silent, as it does off a TTY or past the offer cap.
+RELEASE_CLOSED = "release_closed"
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the answer must come from the route itself, so any
+    3xx surfaces as an ``HTTPError`` and reads as closed."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _fetch_release_answer(url: Optional[str] = None,
+                          timeout: float = _RELEASE_TIMEOUT_S) -> Optional[dict]:
+    """One GET to the release route → the JSON object it answered, or None for
+    anything but a 200 ``application/json`` object within the size cap (a redirect,
+    any other status, another content type, an oversized or non-JSON body, a network
+    or TLS error). Never raises.
+
+    ``timeout`` is urllib's per-socket-operation timeout; it does not bound DNS
+    resolution or the whole read, so the hard wall-clock cap is
+    :class:`ReleaseCheck`'s. ``url`` is a test seam: the route is always
+    :data:`RELEASE_STATUS_URL`."""
+    opener = urllib.request.build_opener(
+        _RefuseRedirects, urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+    req = urllib.request.Request(url or RELEASE_STATUS_URL, method="GET",
+                                 headers={"Accept": "application/json",
+                                          "User-Agent": "buddhi-review-setup"})
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            if resp.status != 200 or resp.headers.get_content_type() != "application/json":
+                return None
+            raw = resp.read(_RELEASE_MAX_BYTES + 1)
+    except Exception:
+        return None
+    if len(raw) > _RELEASE_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+# Run BY the interpreter :func:`pip_install` runs (``sys.executable``): who it is, and
+# whether ``-m pip install`` can install into it at all — pip is importable there, and
+# it is not a PEP 668 externally-managed interpreter outside a virtual environment
+# (pip refuses those without an override this module never passes).
+_INSTALL_PROBE = (
+    "import importlib.util, os, platform, sys, sysconfig\n"
+    "managed = sys.prefix == sys.base_prefix and os.path.isfile(\n"
+    "    os.path.join(sysconfig.get_path('stdlib'), 'EXTERNALLY-MANAGED'))\n"
+    "print(sys.hexversion, sys.implementation.cache_tag, getattr(sys, 'abiflags', '') or '-',\n"
+    "      platform.machine() or '-', importlib.util.find_spec('pip') is not None and not managed)\n"
+)
+_INSTALL_PROBE_TIMEOUT_S = 5.0
+
+
+def _install_identity() -> List[str]:
+    """What :data:`_INSTALL_PROBE` prints when it runs in this very interpreter and
+    pip can install into it."""
+    return [str(sys.hexversion), str(sys.implementation.cache_tag),
+            getattr(sys, "abiflags", "") or "-", platform.machine() or "-", "True"]
+
+
+def _install_target_ok(*, timeout: float = _INSTALL_PROBE_TIMEOUT_S) -> bool:
+    """Whether ``sys.executable`` — the interpreter :func:`pip_install` runs — is this
+    running interpreter, so its wheel tags can be computed here, in process, AND can
+    ``pip install`` into its environment. Asked of that interpreter itself, once, so a
+    virtual environment's own path still counts as this interpreter. False on any
+    doubt: no interpreter path, a different interpreter (an override such as
+    ``PYTHONEXECUTABLE`` can point ``sys.executable`` elsewhere), no pip (a ``uv``
+    tool environment ships none), a PEP 668 externally-managed interpreter, or a
+    probe that fails or hangs."""
+    if not sys.executable:
+        return False
+    try:
+        proc = subprocess.run([sys.executable, "-c", _INSTALL_PROBE], capture_output=True,
+                              text=True, timeout=timeout)
+    except Exception:
+        return False
+    return proc.returncode == 0 and (proc.stdout or "").split() == _install_identity()
+
+
+def _interpreter_tags() -> frozenset:
+    """The wheel tags the install's interpreter accepts: computed in process, since
+    :func:`_install_target_ok` has confirmed ``sys.executable`` is this interpreter —
+    or none at all when it is not, or when pip could not install into it."""
+    if not _install_target_ok():
+        return frozenset()
+    from packaging import tags
+    return frozenset(tags.sys_tags())
+
+
+def _release_open(answer) -> bool:
+    """Whether a route answer offers a published wheel this interpreter can install:
+    ``status`` is exactly ``open``, ``wheels`` is a non-empty list of strings, every
+    entry parses as a wheel tag (compressed sets such as ``py2.py3-none-any``
+    expand), and at least one tag is one :func:`_interpreter_tags` accepts. A tag
+    that does not parse makes the whole answer closed."""
+    if not isinstance(answer, dict) or answer.get("status") != "open":
+        return False
+    wheels = answer.get("wheels")
+    if not (isinstance(wheels, list) and wheels and all(isinstance(w, str) for w in wheels)):
+        return False
+    try:
+        from packaging.tags import parse_tag
+        offered: set = set()
+        for wheel in wheels:
+            offered |= parse_tag(wheel)
+        supported = _interpreter_tags()
+    except Exception:
+        return False
+    return not offered.isdisjoint(supported)
+
+
+class ReleaseCheck:
+    """One setup run's answer to "is the paid release published, with a wheel for
+    this interpreter?" — at most ONE request, made on a background thread so the
+    wizard can ask early and use the answer at the end.
+
+    :meth:`start` sends the request (once). The answer counts only if it is complete
+    within the wall-clock cap counted from :meth:`start` (the background-thread
+    pattern of ``update_banner._bounded_fetch``: urllib's own timeout does not bound
+    DNS resolution or a trickling body). :meth:`is_open` waits for it, never past the
+    cap, then freezes the answer: one that lands after the cap is closed for the rest
+    of the run, whenever it is first read — and one that landed in time is used even
+    when it is read long after (the wizard asks at its start and reads at its end).
+    ``fetch`` and ``timeout`` are test seams."""
+
+    def __init__(self, *, fetch: Optional[Callable[[], Optional[dict]]] = None,
+                 timeout: float = _RELEASE_TIMEOUT_S):
+        self._fetch = fetch
+        self._timeout = timeout
+        self._thread: Optional[threading.Thread] = None
+        self._deadline = 0.0
+        self._result = [False]
+        self._finished: List[Optional[float]] = [None]
+        self._answer: Optional[bool] = None
+
+    def start(self) -> "ReleaseCheck":
+        if self._thread is not None or self._answer is not None:
+            return self
+        fetch = self._fetch or _release_fetch or _fetch_release_answer
+        result, finished = self._result, self._finished
+
+        def _worker() -> None:
+            try:
+                answer = _release_open(fetch())
+            except Exception:
+                answer = False
+            result[0] = answer
+            finished[0] = time.monotonic()
+
+        thread = threading.Thread(target=_worker, name="buddhi-release-check", daemon=True)
+        self._deadline = time.monotonic() + self._timeout
+        try:
+            thread.start()
+        except Exception:  # no thread to ask on: closed
+            self._answer = False
+            return self
+        self._thread = thread
+        return self
+
+    def is_open(self) -> bool:
+        if self._answer is None:
+            self.start()
+        if self._answer is None:
+            self._thread.join(max(0.0, self._deadline - time.monotonic()))
+            done = self._finished[0]
+            self._answer = (not self._thread.is_alive() and done is not None
+                            and done <= self._deadline and self._result[0] is True)
+        return self._answer
+
+
 # ═══════════════════════════════ Result type ═══════════════════════════════════
 
 class TrialOutcome:
@@ -472,12 +681,18 @@ def _finish_install(key: str, *, attrs=None, is_trial=True, backends=None, runne
                         f"already be active elsewhere. Contact {SUPPORT_EMAIL}.")
 
 
-def start_trial(email: str, *, transport=None, backends=None, runner=None,
-                netrc_path=None, is_active=None, sleep=None, attempts=20,
-                state_path=None) -> TrialOutcome:
+def start_trial(email: str, *, release: Optional[ReleaseCheck] = None, transport=None,
+                backends=None, runner=None, netrc_path=None, is_active=None, sleep=None,
+                attempts=20, state_path=None) -> TrialOutcome:
     """Run the full server-less trial acquisition for ``email``. Returns a
     :class:`TrialOutcome`; the wizard prints ``.message``. Fully seam-injectable so
     the path is unit-testable without network, pip, or a real backend.
+
+    Nothing happens unless the paid release is published with a wheel for this
+    interpreter: ``release`` is the setup run's :class:`ReleaseCheck` (a fresh one —
+    one request — when not given). While it is closed there is nothing to install, so
+    no account, license or pending credential is touched — the pending-credential
+    retry below included — and the outcome is :data:`RELEASE_CLOSED`, with no message.
 
     A registration that succeeds but fails before a license is minted (the token or
     license call errors — e.g. a transient network hiccup) saves its password as a
@@ -485,6 +700,8 @@ def start_trial(email: str, *, transport=None, backends=None, runner=None,
     the SAME email reuses it to mint a token directly, instead of re-registering —
     which the server would now refuse as already-taken, with no password on this
     end to answer it."""
+    if not (release or ReleaseCheck()).is_open():
+        return TrialOutcome(False, RELEASE_CLOSED, "")
     if not valid_email(email):
         return TrialOutcome(False, "bad_email", "That doesn't look like an email address.")
 
