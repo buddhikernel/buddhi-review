@@ -421,11 +421,14 @@ def _same(a: Any, b: Any) -> bool:
 
 
 def _holds_nothing(key: Any, value: Any) -> bool:
-    """A top-level value every reader treats as absent: ``None``, a ``repos`` block
-    that is not a mapping, a ``known_repos`` that is not a list. Such a value never
-    overrides a real setting on the other side of a merge."""
+    """A top-level value every reader treats as absent: ``None``, a ``plan`` that is
+    not a non-empty string, a ``repos`` block that is not a mapping, a
+    ``known_repos`` that is not a list. Such a value never overrides a real setting
+    on the other side of a merge."""
     if value is None:
         return True
+    if key == "plan":  # plan() and plan_profile.active_plan() fall back to the default
+        return not (isinstance(value, str) and value)
     if key == "test_command":  # test_command() treats a falsy or blank command as unset
         return not (value and str(value).strip())
     if key == "repos":
@@ -447,9 +450,9 @@ def merge_config_files(canonical: Dict[str, Any], legacy: Dict[str, Any], *,
       item the canonical list lacks.
     * Any other key held by one side only is kept; two equal values are one value
       (compared type-strictly); a value every reader treats as absent yields to the
-      other side (a top-level ``None``, a non-mapping ``repos``, a non-list
-      ``known_repos``, a non-mapping repo entry, and a per-repo ``None`` for a key
-      whose reader treats null as absent).
+      other side (a top-level ``None``, a ``plan`` that is not a non-empty string, a
+      non-mapping ``repos``, a non-list ``known_repos``, a non-mapping repo entry,
+      and a per-repo ``None`` for a key whose reader treats null as absent).
     * A CONFLICT — the same key (a top-level value such as ``plan``,
       ``active_reviewers``, ``auto_on_open``, ``label_gated_ci`` or
       ``test_command``, or one key of one repo) with two different values — takes
@@ -544,17 +547,41 @@ def _repo_value_is_unset(key: Any, value: Any) -> bool:
     return value is None and key not in _NULL_IS_A_VALUE_PER_REPO
 
 
+def _first_entries(repos: Dict[Any, Any]) -> Dict[str, Dict[str, Any]]:
+    """Each repo's entry as readers find it (:func:`repo_entry`): the FIRST mapping
+    whose key matches the repo case-insensitively, keyed by the normalised name."""
+    first: Dict[str, Dict[str, Any]] = {}
+    for rkey, rval in repos.items():
+        norm = norm_repo(rkey)
+        if norm is not None and isinstance(rval, dict):
+            first.setdefault(norm, rval)
+    return first
+
+
 def _changed_since(base: Dict[str, Any], now: Dict[str, Any]) -> Dict[str, Any]:
     """What an edit changed or added, going from ``base`` to ``now`` — per top-level
     key, and per repo per key under ``repos``. A removal is not a change to carry
-    over: the canonical file keeps what it has."""
+    over: the canonical file keeps what it has.
+
+    A repo is compared as readers find it in each file — its FIRST mapping entry,
+    matched case-insensitively — so an edit that only changes the case of a repo's
+    key changes nothing. A later entry for the same repo is never carried over: no
+    reader uses it, and alone in the change it would be merged into the entry
+    readers do use."""
     out: Dict[str, Any] = {}
     for key, value in now.items():
         old = base.get(key)
         if key == "repos" and isinstance(value, dict) and isinstance(old, dict):
+            was = _first_entries(old)
+            seen: set = set()
             repos: Dict[Any, Any] = {}
             for rkey, rval in value.items():
-                rold = old.get(rkey)
+                norm = norm_repo(rkey) if isinstance(rval, dict) else None
+                if norm is not None:
+                    if norm in seen:
+                        continue  # behind an earlier entry for the same repo
+                    seen.add(norm)
+                rold = was.get(norm) if norm is not None else old.get(rkey)
                 if isinstance(rval, dict) and isinstance(rold, dict):
                     diff = {k: v for k, v in rval.items() if k not in rold or not _same(rold[k], v)}
                     if diff:
@@ -675,9 +702,11 @@ def _drop_record(canonical: Path) -> None:
 
 
 def _pending_backup(legacy: Path, record: Optional[Dict[str, Any]]) -> Optional[Path]:
-    """The backup a record names, when it exists: the legacy file was retired to it
-    and a write that landed in it may not have been merged yet. Only a
-    ``.migrated-`` name beside ``legacy`` is accepted."""
+    """The backup a record names, unless it is known to be gone: the legacy file was
+    retired to it and a write that landed in it may not have been merged yet. Only
+    a ``.migrated-`` name beside ``legacy`` is accepted. A backup whose probe fails
+    (an I/O error, say) is returned too: that is no evidence it is gone, so
+    :func:`_catch_up` reports it as unreadable and the record is kept for a retry."""
     name = record.get("backup") if record is not None else None
     if not name or os.sep in name or (os.altsep and os.altsep in name) \
             or not name.startswith(f"{legacy.name}.migrated-"):
@@ -686,7 +715,19 @@ def _pending_backup(legacy: Path, record: Optional[Dict[str, Any]]) -> Optional[
     try:
         return path if _lexists(path) else None
     except OSError:
-        return None
+        return path
+
+
+def _restrict_backup(backup: Path) -> None:
+    """Make ``backup`` 0600, as the canonical file is: it holds the same settings.
+    Only a regular file with no other name is changed — never a symlink's target or
+    a hard link's other names."""
+    try:
+        st = os.lstat(str(backup))
+        if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:  # never a link's other name
+            os.chmod(str(backup), 0o600)
+    except OSError:
+        pass
 
 
 def _catch_up(canonical: Path, legacy: Path, backup: Path, ident: Tuple[int, ...],
@@ -825,6 +866,8 @@ def _migrate_locked(canonical: Path, legacy: Path) -> str:
     if pending is not None and record is not None:
         # An earlier run retired the legacy file to this backup but did not merge a
         # write that landed in it before the rename: merge it now, from the backup.
+        # That run may also have stopped before it made the backup 0600.
+        _restrict_backup(pending)
         more = _catch_up(canonical, legacy, pending, record["identity"], record["legacy"],
                          before)
         if isinstance(more, str):
@@ -884,6 +927,9 @@ def _migrate_locked(canonical: Path, legacy: Path) -> str:
                    + ("It will not be merged again unless it changes." if recorded
                       else "It will be merged again on the next run."))
         return "error"
+    # 0600 before the catch-up, so a catch-up that fails or is stopped never leaves
+    # the backup readable by others.
+    _restrict_backup(backup)
     # A process of an earlier release (it takes no lock) may have rewritten the legacy
     # file after it was read here, so the moved file holds that newer write.
     more = _catch_up(canonical, legacy, backup, ident, legacy_data, before)
@@ -892,12 +938,6 @@ def _migrate_locked(canonical: Path, legacy: Path) -> str:
     if more:
         conflicts = conflicts + [c for c in more if c not in conflicts]
     _drop_record(canonical)
-    try:
-        st = os.lstat(str(backup))
-        if stat.S_ISREG(st.st_mode) and st.st_nlink == 1:  # never a link's other name
-            os.chmod(str(backup), 0o600)
-    except OSError:
-        pass
     _report_moved(legacy, canonical, backup, conflicts)
     return "migrated"
 

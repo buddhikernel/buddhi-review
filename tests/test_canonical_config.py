@@ -380,6 +380,8 @@ def test_partial_canonical_known_repos_only_adopts_the_legacy_settings(home):
      {"plan": "pro", "active_reviewers": FLEET}),
     ({"known_repos": {"a/b": 1}}, {"known_repos": [REPO]}, {"known_repos": [REPO]}),
     ({"plan": "pro"}, {"plan": None}, {"plan": "pro"}),
+    ({"plan": "pro"}, {"plan": ""}, {"plan": "pro"}),
+    ({"plan": ""}, {"plan": "pro"}, {"plan": "pro"}),
 ])
 def test_a_null_or_malformed_side_never_overrides_a_real_setting(home, capsys, newer,
                                                                  canonical_side, legacy_side,
@@ -718,6 +720,38 @@ def test_an_unreadable_backup_keeps_the_record_until_the_catch_up_can_run(home, 
     assert not record.exists()
 
 
+def test_a_backup_that_cannot_be_probed_keeps_the_record_until_it_can(home, monkeypatch,
+                                                                      capsys):
+    """An I/O error while probing the backup a record names is no evidence it is
+    gone. The legacy name is already retired, so dropping the record would lose the
+    newer write the backup holds for good: the backup is reported, the record kept,
+    and the write arrives once the error clears."""
+    _catch_up_fails(home, monkeypatch, "refused")
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    backup = _backups(home)[0]
+    real_lstat, real_stat = os.lstat, os.stat
+
+    def io_error(real):
+        def probe(path, *a, **k):
+            if str(path) == str(backup):
+                raise OSError(errno.EIO, os.strerror(errno.EIO), str(path))
+            return real(path, *a, **k)
+        return probe
+
+    monkeypatch.setattr(config.os, "lstat", io_error(real_lstat))
+    monkeypatch.setattr(config.os, "stat", io_error(real_stat))
+    capsys.readouterr()
+    assert config.migrate_legacy_config() == "unreadable"
+    assert f"Could not read the old config file {backup} (unreadable)" in capsys.readouterr().err
+    monkeypatch.setattr(config.os, "lstat", real_lstat)
+    monkeypatch.setattr(config.os, "stat", real_stat)
+    assert _load(record)["backup"] == backup.name
+    assert "old/a" not in _load(_canonical(home))["repos"]
+    assert config.migrate_legacy_config() == "migrated"
+    assert {"leg/one", "old/a"} <= set(_load(_canonical(home))["repos"])
+    assert not record.exists()
+
+
 def test_a_retried_catch_up_never_reads_or_overwrites_a_fresh_legacy_file(home, monkeypatch):
     """A legacy file an earlier release creates after the failed catch-up is left to
     its own migration: both its settings and the backup's reach the canonical file,
@@ -885,6 +919,66 @@ def test_a_refused_rename_merges_only_what_a_later_legacy_edit_changed(home):
         os.chmod(folder, 0o700)
 
 
+def _edit_after_the_merge(home, monkeypatch, path, edited):
+    """Migrate, while an earlier release rewrites the legacy file as ``edited``
+    after it was merged: just before the rename, so the catch-up merges the edit
+    from the backup (``catch-up``); or after a refused rename, so the next resolve
+    merges it from the legacy file (``retry``). Both merge only what it changed."""
+    raw = yaml.safe_dump(edited, sort_keys=False)
+    if path == "catch-up":
+        real_rename = os.rename
+
+        def racing(src, dst, *a, **k):
+            if str(src) == str(_legacy(home)) and ".migrated-" in str(dst):
+                tmp = _legacy(home).with_name("earlier-release.tmp")
+                tmp.write_text(raw, encoding="utf-8")
+                os.replace(tmp, _legacy(home))
+            return real_rename(src, dst, *a, **k)
+
+        monkeypatch.setattr(config.os, "rename", racing)
+        assert config.migrate_legacy_config() == "migrated"
+        monkeypatch.setattr(config.os, "rename", real_rename)
+        assert _load(_backups(home)[0]) == edited
+        return
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    folder = _legacy(home).parent
+    os.chmod(folder, 0o500)
+    try:
+        assert config.migrate_legacy_config() == "error"  # the rename is refused
+        _legacy(home).write_text(raw, encoding="utf-8")
+        config.migrate_legacy_config()
+    finally:
+        os.chmod(folder, 0o700)
+    assert _load(_legacy(home)) == edited
+
+
+@pytest.mark.parametrize("path", ["catch-up", "retry"])
+def test_a_later_edit_of_a_shadowed_case_variant_is_never_promoted(home, monkeypatch, path):
+    """Readers use a repo's FIRST case-variant entry. An edit that changes only the
+    entry behind it changes nothing a reader of the legacy file sees, so it must not
+    reach the entry readers use in the canonical file either."""
+    t = time.time_ns()
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=t - 2 * 10**9)
+    _put(_legacy(home), {"repos": {"O/R": {"auto_merge": False}, "o/r": {"auto_merge": False}}},
+         mtime_ns=t - 10**9)
+    edited = {"repos": {"O/R": {"auto_merge": False}, "o/r": {"auto_merge": True}}}
+    _edit_after_the_merge(home, monkeypatch, path, edited)
+    assert config.auto_merge(_load(_canonical(home)), "o/r") is config.auto_merge(edited, "o/r") \
+        is False
+
+
+@pytest.mark.parametrize("path", ["catch-up", "retry"])
+def test_a_later_edit_that_only_changes_a_repos_case_replays_nothing(home, monkeypatch, path):
+    """An edit that only changes the case of a repo's key changes no setting, so the
+    unchanged legacy values are not merged again over the canonical file's own."""
+    t = time.time_ns()
+    _put(_canonical(home), {"repos": {"o/r": {"auto_merge": True}}}, mtime_ns=t - 10**9)
+    _put(_legacy(home), {"repos": {"o/r": {"auto_merge": False}}}, mtime_ns=t - 2 * 10**9)
+    _edit_after_the_merge(home, monkeypatch, path, {"repos": {"O/R": {"auto_merge": False}}})
+    assert _load(_canonical(home)) == {"repos": {"o/r": {"auto_merge": True}}}
+
+
 def test_the_record_is_not_trusted_once_the_canonical_file_is_gone(home):
     if os.geteuid() == 0:
         pytest.skip("root ignores directory permissions")
@@ -908,6 +1002,82 @@ def test_the_backup_of_a_hard_linked_legacy_file_keeps_the_other_links_mode(home
     config.config_path()
     assert stat.S_IMODE(os.stat(other).st_mode) == 0o644
     assert _load(_canonical(home)) == LEGACY
+
+
+@pytest.mark.parametrize("stop", ["after-the-rename", "catch-up-refused", "catch-up-interrupted"])
+def test_a_resumed_recovery_leaves_the_backup_0600(home, monkeypatch, stop):
+    """A world-readable legacy file whose move stops once it is renamed — right
+    after the rename, or in a failed catch-up of a newer write the rename carried
+    along — leaves the record naming the backup. A failed catch-up never leaves the
+    backup readable by others, and the resolve that finishes the recovery makes it
+    0600 before it drops the record."""
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=time.time_ns() - 10**9)
+    _put(_legacy(home), {"repos": {"leg/one": {"auto_merge": False}}})
+    os.chmod(_legacy(home), 0o644)
+    real_rename, real_write = os.rename, wizard.write_config
+    writes = []
+
+    def rename(src, dst, *a, **k):
+        if str(src) == str(_legacy(home)) and ".migrated-" in str(dst):
+            if stop != "after-the-rename":  # an earlier release writes just before it
+                _atomic_legacy_write(home, {"repos": {"leg/one": {"auto_merge": False},
+                                                      "old/a": {"auto_merge": True}}})
+                os.chmod(_legacy(home), 0o644)
+            real_rename(src, dst, *a, **k)
+            if stop == "after-the-rename":
+                raise KeyboardInterrupt
+            return None
+        return real_rename(src, dst, *a, **k)
+
+    def write(cfg, path):
+        writes.append(1)
+        if len(writes) == 2:  # the catch-up merge
+            if stop == "catch-up-refused":
+                return False
+            raise KeyboardInterrupt
+        return real_write(cfg, path)
+
+    monkeypatch.setattr(config.os, "rename", rename)
+    monkeypatch.setattr(wizard, "write_config", write)
+    if stop == "catch-up-refused":
+        assert config.migrate_legacy_config() == "error"
+    else:
+        with pytest.raises(KeyboardInterrupt):
+            config.migrate_legacy_config()
+    monkeypatch.setattr(config.os, "rename", real_rename)
+    monkeypatch.setattr(wizard, "write_config", real_write)
+    (backup,) = _backups(home)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    assert _load(record)["backup"] == backup.name
+    stopped_before_it = 0o644 if stop == "after-the-rename" else 0o600
+    assert stat.S_IMODE(os.stat(backup).st_mode) == stopped_before_it
+    config.migrate_legacy_config()
+    assert stat.S_IMODE(os.stat(backup).st_mode) == 0o600
+    assert not record.exists()
+    if stop != "after-the-rename":
+        assert "old/a" in _load(_canonical(home))["repos"]
+
+
+def test_a_resumed_recovery_keeps_a_hard_linked_files_other_names_mode(home, tmp_path,
+                                                                       monkeypatch):
+    other = _put(tmp_path / "dotfiles" / "review.yaml", LEGACY)
+    os.chmod(other, 0o644)
+    (home / ".config" / "review-loop").mkdir(parents=True)
+    os.link(other, _legacy(home))
+    real_rename = os.rename
+
+    def stopped_after_the_rename(src, dst, *a, **k):
+        real_rename(src, dst, *a, **k)
+        if str(src) == str(_legacy(home)):
+            raise KeyboardInterrupt
+
+    monkeypatch.setattr(config.os, "rename", stopped_after_the_rename)
+    with pytest.raises(KeyboardInterrupt):
+        config.migrate_legacy_config()
+    monkeypatch.setattr(config.os, "rename", real_rename)
+    config.migrate_legacy_config()
+    assert stat.S_IMODE(os.stat(other).st_mode) == 0o644
+    assert not _canonical(home).with_name("config.yaml.legacy-merged").exists()
 
 
 @pytest.mark.parametrize("shape", ["folder-link", "file-link"])
@@ -1186,6 +1356,21 @@ def test_merge_function_contract():
     assert merged["a"] == 2 and merged["repos"]["x/y"] == {"k": 2, "j": 5}
     # Neither input was mutated.
     assert canonical == {"a": 1, "repos": {"x/y": {"k": 1}}, "known_repos": ["p/q"]}
+
+
+@pytest.mark.parametrize("unset", ["", None, 5, []])
+def test_a_plan_the_readers_treat_as_unset_never_overrides_a_real_one(monkeypatch, unset):
+    """``plan()`` and ``plan_profile.active_plan()`` read a plan that is not a
+    non-empty string as the default plan, so in a merge it yields to a real plan on
+    the other side, even from the newer file, instead of changing the plan."""
+    monkeypatch.delenv("BUDDHI_LOOP_PLAN", raising=False)
+    for legacy_wins in (True, False):
+        for canonical, legacy in (({"plan": "pro"}, {"plan": unset}),
+                                  ({"plan": unset}, {"plan": "pro"})):
+            merged, conflicts = config.merge_config_files(canonical, legacy,
+                                                          legacy_wins=legacy_wins)
+            assert merged == {"plan": "pro"} and conflicts == []
+            assert config.plan(merged) == plan_profile.active_plan(merged) == "pro"
 
 
 # ── Unreadable legacy file → fail open ──────────────────────────────────────────
