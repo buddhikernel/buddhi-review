@@ -21,6 +21,13 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.9.4](https://github.com/buddhikernel/buddhi-review/compare/v0.9.3...v0.9.4) (2026-10-05)
+
+
+### Bug Fixes
+
+* **config:** PRO-57.a — one config file at ~/.config/buddhi/config.yaml, with the legacy file migrated into it ([#117](https://github.com/buddhikernel/buddhi-review/issues/117)) ([962c228](https://github.com/buddhikernel/buddhi-review/commit/962c228b9374d84376807be8c16290d4735f1f52))
+
 ## [0.9.3](https://github.com/buddhikernel/buddhi-review/compare/v0.9.2...v0.9.3) (2026-10-05)
 
 
