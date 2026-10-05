@@ -20,6 +20,7 @@ import io
 import json
 import os
 import re
+import site
 import stat
 import subprocess
 import sys
@@ -104,10 +105,14 @@ def _tree(d):
 
 def _env(h, **extra):
     """Subprocess env: sandbox HOME, this checkout first on the import path, and no
-    config override."""
+    config override. The child keeps THIS interpreter's user site-packages: Python
+    finds them through HOME, so a sandboxed HOME would hide every dependency
+    installed with ``pip install --user`` (as CI does when the system site-packages
+    are not writable) unless ``PYTHONUSERBASE`` pins where they are."""
     env = {k: v for k, v in os.environ.items()
            if k not in ("BUDDHI_CONFIG", "XDG_CONFIG_HOME", "CLAUDE_CONFIG_DIR",
                         "BUDDHI_TEST_COMMAND")}
+    env.setdefault("PYTHONUSERBASE", site.getuserbase())
     env["HOME"] = str(h)
     env["PYTHONPATH"] = str(ROOT) + (os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
     env["BUDDHI_NO_UPDATE_CHECK"] = "1"
