@@ -15,6 +15,7 @@ Also here: the setup wizard's promotion of the bound repo's ``auto_merge`` /
 ``label_gated_ci`` resolves exactly as it did before the promotion existed.
 """
 import contextlib
+import copy
 import errno
 import io
 import json
@@ -794,6 +795,28 @@ def test_a_retried_catch_up_never_reads_or_overwrites_a_fresh_legacy_file(home, 
     assert first.read_bytes() == first_bytes
 
 
+def test_an_unreadable_legacy_file_never_holds_up_a_pending_catch_up(home, monkeypatch,
+                                                                     capsys):
+    """The catch-up of a newer write in the backup failed, and an earlier release has
+    since left an invalid legacy file behind. That write is merged from the backup
+    first; only then is the unreadable legacy file reported, and left as it is."""
+    _catch_up_fails(home, monkeypatch, "refused")
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    (backup,) = _backups(home)
+    _put(_legacy(home), None, raw="plan: [unclosed\n")
+    legacy_bytes = _legacy(home).read_bytes()
+    capsys.readouterr()
+    assert config.migrate_legacy_config() == "unreadable"
+    assert {"leg/one", "old/a"} <= set(_load(_canonical(home))["repos"])
+    assert not record.exists()
+    err = capsys.readouterr().err
+    unreadable = (f"Warning: Could not read the old config file {_legacy(home)} (not valid "
+                  f"YAML). It was left unchanged. Settings are read from {_canonical(home)}.")
+    assert f"kept as {backup}" in err and unreadable in err
+    assert err.index("Config moved") < err.index(unreadable)
+    assert _legacy(home).read_bytes() == legacy_bytes and _backups(home) == [backup]
+
+
 def test_the_legacy_name_is_kept_while_the_record_naming_the_backup_cannot_be_written(
         home, monkeypatch, capsys):
     """The record naming the backup cannot be written, and at that moment an earlier
@@ -1110,6 +1133,156 @@ def test_a_later_edit_that_only_changes_a_repos_case_replays_nothing(home, monke
     assert _load(_canonical(home)) == {"repos": {"o/r": {"auto_merge": True}}}
 
 
+# What a later legacy edit removes, after the merge brought these settings in.
+_IMPORTED = {"plan": "max-5x", "test_command": "make test",
+             "repos": {REPO: {"active_reviewers": FLEET, "auto_merge": True},
+                       "gone/repo": {"auto_merge": True}}}
+_REMOVALS = ["top-level", "repo-key", "repo-entry", "repos-block"]
+
+
+def _without(what):
+    """``_IMPORTED`` after an edit that removes one thing: a top-level key, one key of
+    a repo's entry, a repo's whole entry, or the whole ``repos`` block."""
+    edited = copy.deepcopy(_IMPORTED)
+    if what == "top-level":
+        del edited["test_command"]
+    elif what == "repo-key":
+        del edited["repos"][REPO]["auto_merge"]
+    elif what == "repo-entry":
+        del edited["repos"]["gone/repo"]
+    else:
+        del edited["repos"]
+    return edited
+
+
+@pytest.mark.parametrize("what", _REMOVALS)
+@pytest.mark.parametrize("path", ["catch-up", "retry"])
+def test_a_setting_a_later_legacy_edit_removes_leaves_the_canonical_file_too(
+        home, monkeypatch, path, what):
+    """A setting an earlier release removes from the legacy file after it was merged
+    (say a repo's ``auto_merge: true``) must not survive in the canonical file, which
+    still holds exactly the value that merge brought in. A ``repos`` block left empty
+    goes with its entries."""
+    t = time.time_ns()
+    _put(_canonical(home), {"known_repos": [REPO]}, mtime_ns=t - 2 * 10**9)
+    _put(_legacy(home), _IMPORTED, mtime_ns=t - 10**9)
+    _edit_after_the_merge(home, monkeypatch, path, _without(what))
+    assert _load(_canonical(home)) == {"known_repos": [REPO], **_without(what)}
+
+
+@pytest.mark.parametrize("path", ["catch-up", "retry"])
+def test_a_legacy_file_emptied_after_the_merge_costs_the_canonical_file_nothing(
+        home, monkeypatch, path):
+    """A legacy file that holds no settings at all removes none: like a deleted legacy
+    file, and like an empty one on the first merge, it never costs the canonical file
+    a setting."""
+    t = time.time_ns()
+    _put(_canonical(home), {"known_repos": [REPO]}, mtime_ns=t - 2 * 10**9)
+    _put(_legacy(home), _IMPORTED, mtime_ns=t - 10**9)
+    _edit_after_the_merge(home, monkeypatch, path, {})
+    assert _load(_canonical(home)) == {"known_repos": [REPO], **_IMPORTED}
+
+
+@pytest.mark.parametrize("what", _REMOVALS)
+def test_a_later_legacy_removal_never_wipes_a_value_set_in_the_canonical_file_since(
+        home, what):
+    """The user changed the canonical file after the merge. A value set there since is
+    theirs, so the legacy edit's removal of the same setting leaves it, and a repo
+    entry they changed stays (its presence confirms the repo). Only what still holds
+    the merged value goes: here, the whole ``repos`` block's removal takes the
+    unchanged fleet out of the entry whose ``auto_merge`` the user turned off."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    t = time.time_ns()
+    _put(_canonical(home), {"known_repos": [REPO]}, mtime_ns=t - 3 * 10**9)
+    _put(_legacy(home), _IMPORTED, mtime_ns=t - 2 * 10**9)
+    folder = _legacy(home).parent
+    os.chmod(folder, 0o500)
+    try:
+        assert config.migrate_legacy_config() == "error"  # merged; the rename is refused
+        cfg = _load(_canonical(home))
+        cfg["test_command"] = "tox"
+        cfg["repos"][REPO]["auto_merge"] = False
+        cfg["repos"]["gone/repo"]["auto_merge"] = False
+        _put(_canonical(home), cfg, mtime_ns=t - 10**9)
+        _legacy(home).write_text(yaml.safe_dump(_without(what)), encoding="utf-8")
+        assert config.migrate_legacy_config() == "error"  # merged again; still not renamed
+    finally:
+        os.chmod(folder, 0o700)
+    if what == "repos-block":
+        cfg["repos"][REPO] = {"auto_merge": False}
+    assert _load(_canonical(home)) == cfg
+
+
+@pytest.mark.parametrize("failure", ["refused", "interrupted", "interrupted-after-the-write"])
+def test_a_removal_whose_merge_did_not_finish_is_retried(home, monkeypatch, failure):
+    """The merge that carries a later legacy edit's removal fails, or stops before or
+    after its canonical write lands. Its pending record names the merged result
+    WITHOUT the removed setting, and the retry still removes it."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    t = time.time_ns()
+    _put(_canonical(home), {"known_repos": [REPO]}, mtime_ns=t - 2 * 10**9)
+    _put(_legacy(home), _IMPORTED, mtime_ns=t - 10**9)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    folder = _legacy(home).parent
+    os.chmod(folder, 0o500)
+    try:
+        assert config.migrate_legacy_config() == "error"  # merged; the rename is refused
+        _legacy(home).write_text(yaml.safe_dump(_without("repo-key")), encoding="utf-8")
+        real = wizard.write_config
+
+        def fails_once(cfg, path):
+            monkeypatch.setattr(wizard, "write_config", real)
+            if failure == "refused":
+                return False
+            if failure == "interrupted-after-the-write":
+                assert real(cfg, path) is True
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(wizard, "write_config", fails_once)
+        if failure == "refused":
+            assert config.migrate_legacy_config() == "error"
+        else:
+            with pytest.raises(KeyboardInterrupt):
+                config.migrate_legacy_config()
+        pending = _load(record)
+        assert pending["state"] == "pending"
+        assert pending["canonical_target"]["repos"][REPO] == {"active_reviewers": FLEET}
+        assert config.migrate_legacy_config() == "error"  # retried; still not renamed
+    finally:
+        os.chmod(folder, 0o700)
+    assert config.migrate_legacy_config() == "migrated"
+    assert _load(_canonical(home)) == {"known_repos": [REPO], **_without("repo-key")}
+    assert not _legacy(home).exists() and not record.exists()
+
+
+def test_a_removal_follows_the_entries_readers_use_and_spares_what_changed_since():
+    """Repos are matched as readers find them (the FIRST mapping entry, any case). A
+    whole entry goes only while it is exactly the merged one; an entry the edit kept
+    but emptied stays, empty; a value changed since stays. What it is given is never
+    changed: it can be the canonical file's own data, read in."""
+    base = {"plan": "pro", "test_command": "make",
+            "repos": {"O/R": {"auto_merge": True, "test_command": "make"},
+                      "o/r": {"auto_merge": False},  # behind O/R: no reader uses it
+                      "gone/y": {"auto_merge": True},
+                      "emptied/z": {"auto_merge": True},
+                      "touched/x": {"auto_merge": True, "test_command": "make"}}}
+    now = {"repos": {"o/r": {"test_command": "make"},  # its auto_merge removed
+                     "emptied/z": {}}}                  # every key removed, the entry kept
+    canonical = {"plan": "pro", "test_command": "tox",
+                 "repos": {"o/R": {"auto_merge": True, "test_command": "make"},
+                           "Gone/Y": {"auto_merge": True},
+                           "emptied/z": {"auto_merge": True},
+                           "touched/x": {"auto_merge": False, "test_command": "make"}}}
+    as_read = copy.deepcopy(canonical)
+    assert config._carry_removals(canonical, base, now) == {
+        "test_command": "tox",
+        "repos": {"o/R": {"test_command": "make"}, "emptied/z": {},
+                  "touched/x": {"auto_merge": False}}}
+    assert canonical == as_read
+
+
 def test_the_record_is_not_trusted_once_the_canonical_file_is_gone(home):
     if os.geteuid() == 0:
         pytest.skip("root ignores directory permissions")
@@ -1209,6 +1382,61 @@ def test_a_resumed_recovery_keeps_a_hard_linked_files_other_names_mode(home, tmp
     config.migrate_legacy_config()
     assert stat.S_IMODE(os.stat(other).st_mode) == 0o644
     assert not _canonical(home).with_name("config.yaml.legacy-merged").exists()
+
+
+@pytest.mark.parametrize("stop", ["after-the-rename", "catch-up-refused"])
+def test_a_resumed_move_still_shows_the_one_time_notice(home, monkeypatch, capsys, stop):
+    """A run that retired the legacy file but stopped before it reported the move —
+    right after the rename, or in a failed catch-up of a newer write the rename
+    carried along — never showed the notice. The resolve that finishes the move
+    shows it, with the conflicts that run resolved plus any the catch-up adds, also
+    when the backup holds nothing new; it reports the move as done, and only once."""
+    t = time.time_ns()
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=t - 2 * 10**9)
+    _put(_legacy(home), {"plan": "max-20x", "repos": {"leg/one": {"auto_merge": False}}},
+         mtime_ns=t - 10**9)
+    real_rename, real_write = os.rename, wizard.write_config
+    writes = []
+
+    def rename(src, dst, *a, **k):
+        if str(src) == str(_legacy(home)) and ".migrated-" in str(dst):
+            if stop == "catch-up-refused":  # an earlier release writes just before it
+                _atomic_legacy_write(home, {"plan": "max-20x",
+                                            "repos": {"leg/one": {"auto_merge": False},
+                                                      "old/a": {"auto_merge": True}}})
+            real_rename(src, dst, *a, **k)
+            if stop == "after-the-rename":
+                raise KeyboardInterrupt
+            return None
+        return real_rename(src, dst, *a, **k)
+
+    def write(cfg, path):
+        writes.append(1)
+        return len(writes) == 1 and real_write(cfg, path)  # the catch-up's write is refused
+
+    monkeypatch.setattr(config.os, "rename", rename)
+    monkeypatch.setattr(wizard, "write_config", write)
+    if stop == "after-the-rename":
+        with pytest.raises(KeyboardInterrupt):
+            config.migrate_legacy_config()
+    else:
+        assert config.migrate_legacy_config() == "error"
+    monkeypatch.setattr(config.os, "rename", real_rename)
+    monkeypatch.setattr(wizard, "write_config", real_write)
+    (backup,) = _backups(home)
+    record = _canonical(home).with_name("config.yaml.legacy-merged")
+    assert _load(record)["backup"] == backup.name
+    assert "Config moved" not in capsys.readouterr().err
+    assert config.migrate_legacy_config() == "migrated"
+    assert capsys.readouterr().err.strip() == (
+        f"Config moved: Settings from {_legacy(home)} were merged into {_canonical(home)}. "
+        f"The old file was kept as {backup}. 1 setting(s) conflicted. The value from the "
+        f"more recently modified file was kept for: plan.")
+    assert not record.exists()
+    if stop == "catch-up-refused":
+        assert "old/a" in _load(_canonical(home))["repos"]
+    assert config.migrate_legacy_config() == "absent"
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("shape", ["folder-link", "file-link"])
@@ -2511,6 +2739,74 @@ def test_an_interrupt_while_waiting_for_the_lock_leaks_no_fd(home, tmp_path, mon
     finally:
         holder.kill()
         holder.wait()
+
+
+def _lock_fds(monkeypatch, lock_file):
+    """Every descriptor ``os.open`` hands out for ``lock_file`` from now on."""
+    opened = []
+    real_open = os.open
+
+    def spy(path, *a, **k):
+        fd = real_open(path, *a, **k)
+        if os.path.abspath(str(path)) == os.path.abspath(str(lock_file)):
+            opened.append(fd)
+        return fd
+
+    monkeypatch.setattr(config.os, "open", spy)
+    return opened
+
+
+def _still_open_on(fd, path):
+    """Whether ``fd`` is still an open descriptor of the file at ``path``. A closed
+    number that something else has reused since is not."""
+    try:
+        st = os.fstat(fd)
+    except OSError as exc:
+        assert exc.errno == errno.EBADF
+        return False
+    target = os.stat(path)
+    return (st.st_dev, st.st_ino) == (target.st_dev, target.st_ino)
+
+
+def test_releasing_the_lock_closes_its_file_descriptor(home, monkeypatch):
+    """A hold opens the lock file once, and the release closes it. Without the close
+    every read-modify-write leaks a descriptor, until a long-lived process runs out."""
+    p = _canonical(home)
+    lock = config.config_lock_path(p)
+    opened = _lock_fds(monkeypatch, lock)
+    with config.config_lock(p) as may_write:
+        assert may_write is True
+        with config.config_lock(p):  # a re-entry opens nothing, and closes nothing
+            pass
+        assert len(opened) == 1 and _still_open_on(opened[0], lock)
+    assert not _still_open_on(opened[0], lock)
+
+
+@pytest.mark.parametrize("outcome", ["timed-out", "unsupported", "failed"])
+def test_a_hold_without_the_flock_leaks_no_file_descriptor(home, monkeypatch, capsys, outcome):
+    """The lock file is opened before the ``flock`` is tried, so every way of coming
+    back without it — another holder past the timeout, a file system without
+    ``flock``, or any other ``flock`` error — closes that descriptor too."""
+    p = _canonical(home)
+    lock = config.config_lock_path(p)
+    lock.parent.mkdir(parents=True)
+    other = None
+    if outcome == "timed-out":
+        # Another holder: a flock conflicts across open files, even in one process.
+        other = os.open(str(lock), os.O_RDWR | os.O_CREAT, 0o600)
+        config.fcntl.flock(other, config.fcntl.LOCK_EX)
+    else:
+        _flock_failing_with(monkeypatch,
+                            errno.ENOTSUP if outcome == "unsupported" else errno.ENOLCK)
+    opened = _lock_fds(monkeypatch, lock)
+    try:
+        with config.config_lock(p, timeout=0.1) as may_write:
+            assert may_write is (outcome == "unsupported")
+        assert len(opened) == 1
+        assert not _still_open_on(opened[0], lock)
+    finally:
+        if other is not None:
+            os.close(other)
 
 
 # ── PRO-42 safety: an unconfirmed repo resolves exactly as before ───────────────

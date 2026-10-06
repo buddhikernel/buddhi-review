@@ -298,12 +298,13 @@ def config_lock(path: Path, *, timeout: Optional[float] = None) -> Iterator[bool
 # canonical file after that attempt establishes a new baseline. The completed
 # record stays until the legacy name is retired; it prevents the same bytes from
 # being merged repeatedly after a refused rename, while a later legacy edit merges
-# only what changed. The pending record of that later merge keeps the completed
-# record's legacy snapshot as its base, so when the merge fails or is interrupted
-# the retry still merges only what changed since that snapshot, never the whole
-# snapshot again over the edits made to the canonical file since. A record whose
-# legacy file was already retired (a run stopped after the rename) is dropped,
-# never used.
+# only what changed — what it removed included, wherever the canonical file still
+# holds the value merged before. The pending record of that later merge keeps the
+# completed record's legacy snapshot as its base, so when the merge fails or is
+# interrupted the retry still merges only what changed since that snapshot, never
+# the whole snapshot again over the edits made to the canonical file since. A
+# record whose legacy file was already retired (a run stopped after the rename) is
+# dropped, never used.
 #
 # Just before the rename the record also names the backup the legacy file is
 # retired to. A process of an earlier release (it takes no lock) may rewrite the
@@ -311,6 +312,9 @@ def config_lock(path: Path, *, timeout: Optional[float] = None) -> Iterator[bool
 # merged only after the rename. Until that catch-up merge lands the record stays,
 # so when it fails or the run stops, a later resolve — which no longer finds the
 # legacy name — still sees the record and merges the newer write from the backup.
+# That resolve also shows the one-time move notice the stopped run never showed. A
+# legacy file left since that cannot be read holds neither back: it is reported
+# after them.
 # The legacy name is therefore retired only once that record is written; until
 # then it stays, and the move is reported and retried like a refused rename.
 # It reads only the backup: a legacy file created since is never read for it or
@@ -615,8 +619,9 @@ def _first_entries(repos: Dict[Any, Any]) -> Dict[str, Dict[str, Any]]:
 
 def _changed_since(base: Dict[str, Any], now: Dict[str, Any]) -> Dict[str, Any]:
     """What an edit changed or added, going from ``base`` to ``now`` — per top-level
-    key, and per repo per key under ``repos``. A removal is not a change to carry
-    over: the canonical file keeps what it has.
+    key, and per repo per key under ``repos``. What the edit removed is not part of
+    this diff: :func:`_carry_removals` applies that, and only where the canonical
+    file still holds the removed value.
 
     A repo is compared as readers find it in each file — its FIRST mapping entry,
     matched case-insensitively — so an edit that only changes the case of a repo's
@@ -647,6 +652,72 @@ def _changed_since(base: Dict[str, Any], now: Dict[str, Any]) -> Dict[str, Any]:
                 out[key] = repos
         elif key not in base or not _same(old, value):
             out[key] = value
+    return out
+
+
+def _carry_removals(merged: Dict[str, Any], base: Dict[str, Any],
+                    now: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply to ``merged`` what an edit removed, going from ``base`` to ``now``: a
+    top-level key, a key of a repo's entry, a repo's whole entry, or the whole
+    ``repos`` block (each of its entries removed). A removal is carried over only
+    where ``merged`` still holds exactly the value ``base`` held (compared
+    type-strictly): a value set in the canonical file since that snapshot was merged
+    is the user's, and a removal never wipes it.
+
+    Repos are compared as readers find them (:func:`repo_entry`) — the FIRST mapping
+    entry, matched case-insensitively — in all three, so removing an entry no reader
+    uses removes nothing. A repo whose entry the edit removed loses its canonical
+    entry only while that entry is still exactly the one ``base`` held; once anything
+    in it has changed, the entry stays (its presence alone confirms the repo) and only
+    the keys still holding their ``base`` value go. An entry the edit kept but emptied
+    stays as an empty entry for the same reason: the repo is still confirmed in the
+    legacy file. A ``repos`` block the removals leave empty is dropped, since readers
+    treat the two alike. A legacy file that holds no settings at all removes nothing:
+    like a deleted legacy file, it never costs the canonical file a setting, just as
+    it never replaces an existing canonical file on the first merge.
+
+    Returns a new mapping and never changes ``merged`` or any mapping inside it: those
+    can be the very objects the canonical file was read into, and a change made there
+    would hide this one from the caller's check for anything to write."""
+    out = dict(merged)
+    if not now:
+        return out
+    for key, was in base.items():
+        if key == "repos" and isinstance(was, dict):
+            continue  # per repo, below
+        if key not in now and key in out and _same(out[key], was):
+            del out[key]
+    old_repos, repos = base.get("repos"), out.get("repos")
+    if not (isinstance(old_repos, dict) and isinstance(repos, dict)):
+        return out
+    new_repos = now.get("repos")
+    remaining = _first_entries(new_repos) if isinstance(new_repos, dict) else {}
+    used: Dict[str, Any] = {}  # each repo's key in the canonical block, as readers find it
+    for rkey, rval in repos.items():
+        norm = norm_repo(rkey)
+        if norm is not None and isinstance(rval, dict):
+            used.setdefault(norm, rkey)
+    kept = dict(repos)
+    changed = False
+    for norm, was in _first_entries(old_repos).items():
+        rkey = used.get(norm)
+        if rkey is None:
+            continue
+        entry, still = repos[rkey], remaining.get(norm)
+        if still is None and _same(entry, was):
+            del kept[rkey]
+            changed = True
+            continue
+        gone = {k for k, v in was.items()
+                if (still is None or k not in still) and k in entry and _same(entry[k], v)}
+        if gone:
+            kept[rkey] = {k: v for k, v in entry.items() if k not in gone}
+            changed = True
+    if changed:
+        if kept:
+            out["repos"] = kept
+        else:
+            del out["repos"]
     return out
 
 
@@ -911,14 +982,15 @@ def migrate_legacy_config(canonical: Optional[Path] = None, *,
             return "deferred"
         if legacy_present:
             # An unreadable legacy file is reported without taking the lock or
-            # creating anything; a readable one is read again under the lock before
-            # it is merged.
+            # creating anything, unless a merge record is waiting: the backup it names
+            # may hold a write not merged yet, so the locked run catches that up first
+            # and then reports this file. A readable one is read again under the lock
+            # before it is merged.
             data, _, why, _ = _read_config_file(legacy)
-            if data is None:
+            if data is None and not _record_exists(canonical):
                 if _lexists(legacy):
                     return _unreadable(legacy, canonical, why or "unreadable")
-                if not _record_exists(canonical):
-                    return "absent"  # a concurrent process moved it between the two looks
+                return "absent"  # a concurrent process moved it between the two looks
         with config_lock(canonical) as may_write:
             if not may_write:
                 # The holder may be mid read-modify-write of the canonical file: a
@@ -987,10 +1059,13 @@ def _migrate_locked(canonical: Path, legacy: Path) -> str:
         if isinstance(more, str):
             return more  # reported; the record still names the backup, so it is retried
         _drop_record(canonical)
+        # The run that wrote this record retired the legacy file but stopped before it
+        # reported the move, so report it now — also when the backup holds nothing new
+        # — with that run's conflicts and any the catch-up added.
+        moved = record["conflicts"] + [c for c in (more or []) if c not in record["conflicts"]]
         record = None
-        if more is not None:
-            _report_moved(legacy, canonical, pending, more)
-            caught_up = True
+        _report_moved(legacy, canonical, pending, moved)
+        caught_up = True
     done = "migrated" if caught_up else "absent"
     # Re-check under the lock: a concurrent process may have finished the move.
     if not _lexists(legacy):
@@ -1083,8 +1158,9 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
                                                          Dict[str, Any]]] = None) -> Any:
     """Bring the legacy settings into ``canonical``, then record the merge.
     ``base`` — the legacy settings an earlier, unfinished run already merged — limits
-    the merge to what changed since. Returns the conflict list, or a failure
-    outcome string after reporting it (nothing then moved)."""
+    the merge to what changed since, and what was removed since (where the canonical
+    file still holds the merged value, :func:`_carry_removals`). Returns the conflict
+    list, or a failure outcome string after reporting it (nothing then moved)."""
     if not _lexists(canonical):
         # Nothing to merge with: the canonical file becomes a byte-for-byte copy of
         # the legacy one, comments included (and an empty file stays empty).
@@ -1112,6 +1188,8 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
     legacy_wins = canonical_mtime is None or ident[3] > canonical_mtime
     incoming = _changed_since(base, legacy_data) if base is not None else legacy_data
     merged, conflicts = merge_config_files(canonical_data, incoming, legacy_wins=legacy_wins)
+    if base is not None:
+        merged = _carry_removals(merged, base, legacy_data)
     if not _same(merged, canonical_data):
         # The pending record preserves the user's pre-migration timestamp before
         # replacing the canonical file. If the replacement or the completed-record
