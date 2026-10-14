@@ -16,8 +16,9 @@ def test_free_role_table():
     assert plan_profile.effort_for("classifier") == "medium"
     for role in ("clean-review-detector", "quota-detector", "fix-verify", "fix-cosmetic"):
         assert plan_profile.effort_for(role) == "low"
-    assert plan_profile.model_for("fix-substantive", "max-5x") == "sonnet"
-    assert plan_profile.effort_for("fix-substantive") == "high"
+    # A real-flaw fix defaults to the latest Opus at medium (Pro maps it to Sonnet).
+    assert plan_profile.model_for("fix-substantive", "max-5x") == "opus"
+    assert plan_profile.effort_for("fix-substantive") == "medium"
 
 
 def test_unknown_role_falls_back():

@@ -6,16 +6,20 @@
 # map resolves opus → sonnet; nothing else differs between plans.
 #
 # Effort is PLAN-INDEPENDENT — sized to the role's job, identical across plans
-# (classifier=medium, detectors + fix-verify=low, fix-substantive=high), and
+# (classifier=medium, detectors + fix-verify=low, fix-substantive=medium), and
 # passed EXPLICITLY on `claude --effort` so a distributed skill behaves
 # identically on every machine instead of inheriting the host's settings.
+#
+# fix-substantive states the default for a real-flaw fix: the latest Opus at
+# medium effort. The per-comment fixer runs on the classifier's own pick, which
+# defaults to the same thing and goes above medium only on a named criterion.
 
 roles:
   classifier:            {model: sonnet, effort: medium}
   clean-review-detector: {model: haiku,  effort: low}
   quota-detector:        {model: haiku,  effort: low}
   fix-verify:            {model: haiku,  effort: low}
-  fix-substantive:       {model: sonnet, effort: high}
+  fix-substantive:       {model: opus,   effort: medium}
   fix-cosmetic:          {model: haiku,  effort: low}
   pr-description-rewriter: {model: sonnet, effort: low}
 

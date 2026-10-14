@@ -82,6 +82,16 @@ def _commented_line_from_hunk(diff_hunk: Optional[str]) -> Optional[int]:
     return (new_lineno - 1) if (new_lineno is not None and new_lineno > 0) else None
 
 
+def held_effort_line(comment: Comment, held: str) -> str:
+    """Print, and return, the one line that says a SUBSTANTIVE pick above medium
+    named no criterion and so runs at medium (:func:`buddhi_review.classify.hold_effort_to_evidence`)."""
+    where = f"{comment.path or '?'}:{_commented_line_from_hunk(comment.diff_hunk) or '?'}"
+    line = (f"  [effort] {where} — SUBSTANTIVE pick '{held}' names no criterion "
+            f"for spending more than medium; running at 'medium'.")
+    print(line, flush=True)
+    return line
+
+
 def build_pr_description_prompt(current_body: str, comment_text: str,
                                *, nonce: Optional[str] = None) -> str:
     """The PR-body rewriter prompt. Both the current body and the comment ride
@@ -250,6 +260,8 @@ def default_fix_dispatch(
                 comment, pr=pr, repo=repo, cwd=cwd,
                 gh_run=gh_run, rewrite_runner=rewrite_runner,
             )
+        if c.held_effort:
+            held_effort_line(comment, c.held_effort)
         return apply_fix(
             comment.text,
             cwd=cwd,

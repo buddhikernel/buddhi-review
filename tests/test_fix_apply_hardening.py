@@ -38,7 +38,9 @@ def test_effort_timeouts_single_source_medium_and_low_bumped():
     # The one table the fixer reads; medium bumped 300→600s so a substantive fix
     # on a large file is not abandoned to a too-short budget, and low bumped
     # 120→300s after real cosmetic haiku fixes tripped `>120s` repeatedly.
-    assert fix_apply.EFFORT_TIMEOUTS == {"low": 300, "medium": 600, "high": 900}
+    # xhigh and max get their own budgets above high.
+    assert fix_apply.EFFORT_TIMEOUTS == {"low": 300, "medium": 600, "high": 900,
+                                         "xhigh": 1200, "max": 1800}
 
 
 def test_apply_fix_nonzero_exit_retries_within_bound_then_escalates(repo):

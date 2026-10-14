@@ -1,8 +1,8 @@
 """The review-domain ``PolicyPack`` — the single policy contract the kernel reads.
 
 This pack tunes the kernel's seven decisions for PR review: the discard predicate
-(out-of-scope comments), the effort taxonomy (low/medium/high → haiku/sonnet/opus
-aliases, resolved to concrete models per the user's plan elsewhere), the judgment
+(out-of-scope comments), the effort taxonomy (low … max, with haiku/sonnet/opus
+aliases resolved to concrete models per the user's plan elsewhere), the judgment
 threshold (model-vs-human routing), the validity rule (a business question needs a
 payload), the ask phrasings, and the bounded interrupt budget that paces human
 escalations. Nothing domain-specific lives in the kernel; it all enters here.
@@ -12,6 +12,10 @@ single statement of *when* a review comment needs the project owner rather than 
 automatic fix. The classifier (:func:`buddhi_review.classify.build_prompt`) weaves
 it in as trusted instruction, so the "fix it / ask the owner" rule is authored in
 exactly one place.
+
+:data:`EFFORT_PHILOSOPHY` and :data:`EFFORT_CRITERIA` are the same kind of trusted
+text for the fixer's effort: a real-flaw fix runs at medium unless the classifier
+names one of the criteria (enforced in :func:`buddhi_review.classify.hold_effort_to_evidence`).
 """
 from __future__ import annotations
 
@@ -95,6 +99,44 @@ ESCALATION_CRITERIA = (
 )
 
 
+# ── Fix effort: spent on named evidence ─────────────────────────────────────────
+# A SUBSTANTIVE fix defaults to Opus at medium effort. Above medium the classifier
+# must name one of these criteria, or the fix runs at medium. There is no ceiling:
+# xhigh and max stay reachable. Trusted instruction text, woven in above the fence.
+EFFORT_PHILOSOPHY = (
+    "WHY MEDIUM: a fast fix that reviewers from other vendors then check, "
+    "iterated over a few quick rounds, beats one long attempt by a single "
+    "model — those reviewers make different mistakes from the fixer, so each "
+    "round catches what the last one missed, sooner and at lower cost. Spend "
+    "more effort only where you can name why."
+)
+EFFORT_CRITERIA = (
+    ("multi-module",
+     "the fix must change several modules or systems together."),
+    ("subtle-correctness",
+     "concurrency, security or state correctness where a plausible-looking "
+     "fix is easily wrong: a race, a check-then-act gap, or a bypass the "
+     "comment shows has several routes. A single missing case with a local "
+     "fix is medium, however severe its consequence."),
+    ("prior-attempt-failed",
+     "an earlier attempt at this same issue failed: the comment itself says a "
+     "fix did not hold (it was rejected, it broke a test, or the reviewer is "
+     "re-raising the issue)."),
+    ("deeply-non-obvious",
+     "concrete evidence in the comment or its diff hunk shows a misleading "
+     "symptom: the reported behaviour is separated from its cause by a "
+     "transformation, numerical boundary, grammar ambiguity, or performance "
+     "interaction, and the comment identifies why the obvious local correction "
+     "would be wrong. Naming an algorithmic, numerical, parsing, or performance "
+     "issue without that evidence is not enough."),
+)
+
+
+def effort_criteria_text() -> str:
+    """The criteria list exactly as the classifier reads it, one per line."""
+    return "".join(f"    {name} — {why}\n" for name, why in EFFORT_CRITERIA)
+
+
 def review_policy_pack(daily_interrupt_budget: int = 25) -> PolicyPack:
     """The concrete review pack.
 
@@ -113,10 +155,13 @@ def review_policy_pack(daily_interrupt_budget: int = 25) -> PolicyPack:
         name="buddhi-review",
         version="1",
         discard_predicates=(_out_of_scope,),
+        # The full effort vocabulary, with no ceiling below max. This spend
+        # decision is advisory: the fixer runs on the classifier's own pick.
         effort_taxonomy=EffortTaxonomy(
-            levels=("low", "medium", "high"),
-            ceiling="high",
-            model_by_effort={"low": "haiku", "medium": "sonnet", "high": "opus"},
+            levels=("low", "medium", "high", "xhigh", "max"),
+            ceiling="max",
+            model_by_effort={"low": "haiku", "medium": "sonnet", "high": "opus",
+                             "xhigh": "opus", "max": "opus"},
         ),
         convergence=ConvergenceHeuristics(),
         judgment=JudgmentPolicy(business_question_threshold=0.6),
