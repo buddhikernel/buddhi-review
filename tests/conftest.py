@@ -16,12 +16,18 @@ developer's real ``~/.config/buddhi/config.yaml`` and a machine with a global
 per-test tmp path (a file that does not exist → the empty-config default) and
 clear ``BUDDHI_TEST_COMMAND``; a test that wants a config writes to
 ``tmp_path``/its own path and sets the env itself.
+
+The setup wizard asks a public route whether the paid release is published before
+it offers the trial, and records each offer in a state file. Every test gets that
+answer stubbed CLOSED and the state file in its own tmp dir (see
+``_release_closed``), so no test calls the route or writes the real state file.
 """
 import sys
 
 import pytest
 
-from buddhi_review import claude_settings_guard, fix_apply, gh_ingest, polish_state
+from buddhi_review import (claude_settings_guard, fix_apply, gh_ingest, polish_state,
+                           pro_trial)
 
 
 def _log_line(stdout):
@@ -78,6 +84,22 @@ def _contained_settings_guard(monkeypatch, tmp_path):
     monkeypatch.setenv(claude_settings_guard.FALLBACK_CWD_ENV, str(tmp_path / "settings-guard-cwd"))
     yield
     sys.modules["buddhi_review.claude_settings_guard"].uninstall_base_resolver()
+
+
+@pytest.fixture(autouse=True)
+def _release_closed(monkeypatch, tmp_path):
+    """Stub the release check closed through its one seam
+    (``pro_trial._release_fetch``), so a full wizard run on a forced TTY never calls
+    the live route, and keep the trial offer's state file (``BUDDHI_TRIAL_STATE``) in
+    this test's directory. A test that needs "open" points the seam at its own answer;
+    the real HTTP client is tested against a local server
+    (tests/test_pro_release_gate.py)."""
+    monkeypatch.setattr(pro_trial, "_release_fetch", lambda: None)
+    monkeypatch.setenv("BUDDHI_TRIAL_STATE", str(tmp_path / "trial-state.json"))
+    # A test that opts into "open" gets open on any machine: the check that the
+    # interpreter can pip-install (a uv-made environment ships no pip) is answered
+    # yes here, and tested for real in tests/test_pro_release_gate.py.
+    monkeypatch.setattr(pro_trial, "_install_target_ok", lambda **k: True)
 
 
 @pytest.fixture(autouse=True)

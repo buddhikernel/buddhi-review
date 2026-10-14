@@ -9,6 +9,8 @@ through the F1 readers (:func:`config.active_reviewers` / :func:`config.auto_on_
 / :func:`config.label_gated_ci` / :func:`config.repo_entry`).
 """
 import io
+import os
+import threading
 import types
 
 import pytest
@@ -486,6 +488,96 @@ def test_set_repo_keys_none_removes_the_key_and_spares_siblings(tmp_path):
     assert "test_command" not in entry
     assert entry["auto_merge"] is True                       # sibling key untouched
     assert config.repo_test_command(cfg, "acme/widgets") == "cargo test"  # sibling repo
+
+
+# ── The config lock around the confirm's two writes ─────────────────────────────────
+
+def _probe_the_lock_after_the_repo_write(monkeypatch, cfg_path):
+    """Spy on set_repo_keys: right after the repo entry is written, another thread of
+    this process tries to take the config lock. Returns what that thread was told
+    (``may_write``), once per write."""
+    told = []
+    real = config.set_repo_keys
+
+    def spy(repo, keys, path=None):
+        ok = real(repo, keys, path)
+        answer = {}
+
+        def another_writer():
+            with config.config_lock(cfg_path, timeout=0.2) as may_write:
+                answer["may_write"] = may_write
+
+        thread = threading.Thread(target=another_writer)
+        thread.start()
+        thread.join(10)
+        told.append(answer.get("may_write"))
+        return ok
+
+    monkeypatch.setattr(config, "set_repo_keys", spy)
+    return told
+
+
+@pytest.mark.parametrize("second_write", ["promote", "establish"])
+def test_one_lock_hold_spans_the_repo_entry_and_the_global_write(tmp_path, monkeypatch, capsys,
+                                                                 second_write):
+    """The repo entry and the top-level keys the confirm writes after it land under ONE
+    hold of the config lock, so no other writer can take the lock between the two:
+    neither when the first setup promotes its fleet to the global default
+    (``promote``), nor when a later confirm only adds the missing top-level choice
+    keys to an established fleet (``establish``)."""
+    cfg_path = tmp_path / "config.yaml"
+    if second_write == "establish":
+        assert wizard.write_config({"active_reviewers": ["claude"]}, cfg_path)
+    told = _probe_the_lock_after_the_repo_write(monkeypatch, cfg_path)
+    rc, _ = _confirm(
+        cfg_path, reviewers={COPILOT},
+        ss_answers={"Auto-merge default for": 1, "Label-gated CI default for": 0,
+                    "Does Copilot auto-review": 0})
+    assert rc == 0
+    assert told == [False]  # the confirm still held the lock between its two writes
+    assert "Another thread has held the config lock" in capsys.readouterr().err
+    # Both writes landed.
+    cfg = _read(cfg_path)
+    assert config.repo_entry(cfg, REPO)["auto_merge"] is True
+    assert cfg["auto_merge"] is False and cfg["label_gated_ci"] is False
+    assert cfg["active_reviewers"] == (["copilot"] if second_write == "promote" else ["claude"])
+
+
+@pytest.mark.parametrize("start", ["existing", "absent"])
+def test_a_confirm_that_gives_up_on_the_lock_writes_nothing(tmp_path, monkeypatch, capsys,
+                                                            start):
+    """Another process holds the config lock past the timeout: the confirm writes
+    neither the repo entry nor any top-level key, says the write failed, and leaves
+    the config file byte-for-byte as it was (or still absent)."""
+    folder = tmp_path / "cfg"
+    folder.mkdir()
+    cfg_path = folder / "config.yaml"
+    before = None
+    if start == "existing":
+        assert wizard.write_config({"active_reviewers": ["claude"]}, cfg_path)
+        before = cfg_path.read_bytes()
+    # Another holder: a flock conflicts across open files, even in one process.
+    holder = os.open(str(config.config_lock_path(cfg_path)), os.O_RDWR | os.O_CREAT, 0o600)
+    config.fcntl.flock(holder, config.fcntl.LOCK_EX)
+    monkeypatch.setattr(config, "LOCK_TIMEOUT_S", 0.2)
+    try:
+        rc, out = _confirm(
+            cfg_path, reviewers={COPILOT},
+            ss_answers={"Auto-merge default for": 1, "Label-gated CI default for": 0,
+                        "Does Copilot auto-review": 0})
+    finally:
+        os.close(holder)
+    assert rc == 1
+    assert (f"Could not write {cfg_path} — check the path's permissions, or whether "
+            f"another process holds the config lock") in out
+    assert "Confirmed reviewers" not in out
+    assert "has held the config lock" in capsys.readouterr().err
+    if before is not None:
+        assert cfg_path.read_bytes() == before
+    else:
+        assert not cfg_path.exists()
+    assert sorted(p.name for p in folder.iterdir()) == sorted(
+        ["config.yaml.lock"] + (["config.yaml"] if before is not None else []))
 
 
 # ── Parity with the reference wizard's confirm_repo_interactive ─────────────────────

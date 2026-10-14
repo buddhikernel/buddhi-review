@@ -321,10 +321,18 @@ def test_step_done_has_no_coming_soon_teaser():
 
 
 def _pro_trial_stub(monkeypatch, *, allowed=True, active=False):
-    """Neuter pro_trial's side effects for step_pro_trial UI tests."""
-    calls = {"shown": 0, "declined": 0, "start": [], "convert": 0}
+    """Neuter pro_trial's side effects for step_pro_trial UI tests. The paid release
+    reads as published (with a wheel for this interpreter), so the offer can show;
+    ``calls["release"]`` counts the requests."""
+    from packaging import tags
+    calls = {"shown": 0, "declined": 0, "start": [], "convert": 0, "release": 0}
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     monkeypatch.setattr(wizard.pro_trial, "offer_allowed", lambda **k: allowed)
+
+    def _release():
+        calls["release"] += 1
+        return {"status": "open", "wheels": [str(next(iter(tags.sys_tags())))]}
+    monkeypatch.setattr(wizard.pro_trial, "_release_fetch", _release)
     monkeypatch.setattr(wizard.pro_trial, "record_offer_shown",
                         lambda **k: calls.__setitem__("shown", calls["shown"] + 1))
     monkeypatch.setattr(wizard.pro_trial, "record_declined",
@@ -351,6 +359,7 @@ def test_step_pro_trial_yes_starts_trial(monkeypatch):
     assert calls["shown"] == 1
     assert calls["start"] == ["me@example.com"]
     assert "14 days" in buf.getvalue()
+    assert calls["release"] == 1      # the offer asked the release route once
 
 
 def test_step_pro_trial_convert_gets_a_hidden_paste_reader(monkeypatch):
@@ -382,15 +391,17 @@ def test_step_pro_trial_skips_when_not_allowed(monkeypatch):
                           input_fn=lambda *a: "y")
     assert calls["shown"] == 0
     assert buf.getvalue() == ""       # nothing shown when the offer is not allowed
+    assert calls["release"] == 0      # …and the release route is never asked
 
 
 def test_step_pro_trial_skips_off_tty(monkeypatch):
-    _pro_trial_stub(monkeypatch, allowed=True)
+    calls = _pro_trial_stub(monkeypatch, allowed=True)
     monkeypatch.setattr(wizard, "_is_tty", lambda: False)
     buf = io.StringIO()
     wizard.step_pro_trial(None, pal=wizard._Palette(False), stream=buf,
                           input_fn=lambda *a: "y")
     assert buf.getvalue() == ""
+    assert calls["release"] == 0
 
 
 def test_claude_workflow_written_when_absent(monkeypatch, tmp_path):

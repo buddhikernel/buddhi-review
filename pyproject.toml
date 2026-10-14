@@ -49,6 +49,11 @@ classifiers = [
 dependencies = [
     "buddhikernel>=0.1",
     "PyYAML>=6.0",
+    # The trial offer matches the published wheels' tags against this interpreter's
+    # (packaging.tags). 24.0 is the first release that tags a free-threaded
+    # (--disable-gil) interpreter correctly; an older one would accept a wheel that
+    # pip then refuses to install.
+    "packaging>=24.0",
 ]
 
 [project.optional-dependencies]

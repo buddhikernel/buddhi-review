@@ -2813,7 +2813,8 @@ def _prompt_email(*, input_fn, stream, pal) -> Optional[str]:
 
 
 def step_pro_trial(_repo: Optional[str], *, pal, stream, input_fn=input,
-                   paste_input: Optional[Callable] = None) -> None:
+                   paste_input: Optional[Callable] = None,
+                   release: Optional["pro_trial.ReleaseCheck"] = None) -> None:
     """Step 7c — the first-run Pro trial offer (PRO-6, §E.9(a): the one sanctioned
     conversion moment). A single benefit-led line + a default-YES prompt, shown only
     on an interactive first run where Pro is not already active and the upsell
@@ -2822,12 +2823,22 @@ def step_pro_trial(_repo: Optional[str], *, pal, stream, input_fn=input,
     acquisition + install is delegated to the scoped :mod:`pro_trial` module; this
     function only asks and prints.
 
+    The offer is shown only once the paid release is published with a wheel for this
+    interpreter (``release``, the run's :class:`pro_trial.ReleaseCheck`, started early
+    by :func:`run`; one is made here when not given). Until then the step is silent,
+    like the off-TTY and capped paths, and the offer counters are left untouched. The
+    same answer gates ``start_trial`` — and with it the paid-key prompt that follows an
+    already-registered email.
+
     The Pro key is a live credential (it becomes the private-index password), so the
     convert path reads it through the same HIDDEN, wrapped-paste-safe reader the wizard
     uses for every other secret — never ``input_fn``, which echoes into the scrollback."""
     if not _is_tty():
         return
     if not pro_trial.offer_allowed(now=None):
+        return
+    release = release or pro_trial.ReleaseCheck()
+    if not release.is_open():
         return
     pro_trial.record_offer_shown()
     _row("step", _PRO_TRIAL_OFFER, pal, stream)
@@ -2838,7 +2849,9 @@ def step_pro_trial(_repo: Optional[str], *, pal, stream, input_fn=input,
     email = _prompt_email(input_fn=input_fn, stream=stream, pal=pal)
     if not email:
         return  # soft cancel — not a durable decline, so a later setup may re-offer
-    outcome = pro_trial.start_trial(email)
+    outcome = pro_trial.start_trial(email, release=release)
+    if outcome.status == pro_trial.RELEASE_CLOSED:
+        return
     _row("ok" if outcome.ok else "info", outcome.message, pal, stream)
     # An already-registered email means the buyer likely has (or wants) a paid key —
     # route them to the concierge-paste convert path rather than dead-ending.
@@ -3094,6 +3107,13 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
                 multi_select=multi_select, single_select=single_select, input_fn=input_fn)
 
         print(f"{pal.BOLD}buddhi-review setup{pal.RESET}", file=stream)
+        # The trial offer at the end waits on whether the paid release is published.
+        # Ask now, on a background thread, so the answer is in hand by the done panel
+        # instead of costing up to 8 s of silence after it — and only when the offer
+        # could be shown at all: off a TTY, or for a suppressed, declined, capped or
+        # already-Pro user, the route is never contacted.
+        release = (pro_trial.ReleaseCheck().start()
+                   if _is_tty() and pro_trial.offer_allowed(now=None) else None)
 
         doctor = step_doctor(run=run, which=which, pal=pal, stream=stream)
         plan = step_plan(doctor, pal=pal, stream=stream, single_select=single_select, input_fn=input_fn)
@@ -3172,7 +3192,7 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
                      auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
         if ok:
             step_done(cfg_path, pal=pal, stream=stream)
-            step_pro_trial(repo, pal=pal, stream=stream, input_fn=input_fn)
+            step_pro_trial(repo, pal=pal, stream=stream, input_fn=input_fn, release=release)
             _offer_first_review(repo, pal=pal, stream=stream, input_fn=input_fn)
             return 0
         _row("bad", f"Could not write {cfg_path} — check the path's permissions, or "

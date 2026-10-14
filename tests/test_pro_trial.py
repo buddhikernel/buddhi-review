@@ -82,11 +82,20 @@ class FakeProBackend:
         return True
 
 
+def _open_here():
+    """A release answer that is open, with a wheel tag this interpreter accepts."""
+    from packaging import tags
+    return {"status": "open", "wheels": [str(next(iter(tags.sys_tags())))]}
+
+
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch, tmp_path):
     monkeypatch.delenv("BUDDHI_NO_UPSELL", raising=False)
     monkeypatch.setenv("BUDDHI_NETRC", str(tmp_path / ".netrc"))
     monkeypatch.setenv("BUDDHI_TRIAL_STATE", str(tmp_path / "trial.json"))
+    # These tests drive the acquisition itself, so the release is published here; the
+    # closed answer and the gate around it are tests/test_pro_release_gate.py's.
+    monkeypatch.setattr(pro_trial, "_release_fetch", _open_here)
 
 
 # ── primitives ────────────────────────────────────────────────────────────────
