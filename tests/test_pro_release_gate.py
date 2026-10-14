@@ -333,6 +333,35 @@ def test_an_answer_that_lands_after_the_cap_never_reopens_the_check():
     assert check.is_open() is False
 
 
+def test_a_slow_interpreter_probe_does_not_close_an_in_time_answer(monkeypatch):
+    """The local install check runs alongside the request, outside its cap: an
+    ``open`` that lands in time stays open though the probe outlasts the cap."""
+    real = pro_trial._interpreter_tags
+
+    def slow_tags():
+        time.sleep(0.4)
+        return real()
+    monkeypatch.setattr(pro_trial, "_interpreter_tags", slow_tags)
+    started = time.monotonic()
+    assert pro_trial.ReleaseCheck(fetch=_counting(), timeout=0.1).is_open() is True
+    # Probe and request overlapped: the wait is the probe's, not the two summed.
+    assert time.monotonic() - started < 0.4 + 0.1 + 0.3
+
+
+def test_an_interpreter_probe_that_never_finishes_is_closed(monkeypatch):
+    release = threading.Event()
+
+    def hung_tags():
+        release.wait(5)
+        return frozenset(tags.sys_tags())
+    monkeypatch.setattr(pro_trial, "_interpreter_tags", hung_tags)
+    monkeypatch.setattr(pro_trial, "_LOCAL_CHECK_TIMEOUT_S", 0.2)
+    try:
+        assert pro_trial.ReleaseCheck(fetch=_counting(), timeout=0.1).is_open() is False
+    finally:
+        release.set()
+
+
 def test_a_fetch_that_raises_is_closed_quietly(monkeypatch):
     """Closed, and no thread traceback lands on the user's terminal mid-setup."""
     escaped = []

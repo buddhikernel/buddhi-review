@@ -1283,6 +1283,20 @@ def test_a_removal_follows_the_entries_readers_use_and_spares_what_changed_since
     assert canonical == as_read
 
 
+def test_a_malformed_repos_block_or_entry_removes_nothing():
+    """A ``repos`` block or repo entry the edit left present but not a mapping is
+    unset, as merge_config_files reads it — not a deletion. Only a repo whose entry
+    is genuinely absent loses its merged entry."""
+    base = {"repos": {"a/x": {"auto_merge": True}, "b/y": {"auto_merge": True}}}
+    canonical = copy.deepcopy(base)
+    for broken in ([], None, "oops"):
+        assert config._carry_removals(canonical, base, {"repos": broken}) == canonical
+    now = {"repos": {"a/x": ["not", "a", "mapping"]}}  # b/y genuinely removed
+    assert config._carry_removals(canonical, base, now) == {
+        "repos": {"a/x": {"auto_merge": True}}}
+    assert config._carry_removals(canonical, base, {"plan": "pro"}) == {}  # block removed
+
+
 def test_the_record_is_not_trusted_once_the_canonical_file_is_gone(home):
     if os.geteuid() == 0:
         pytest.skip("root ignores directory permissions")

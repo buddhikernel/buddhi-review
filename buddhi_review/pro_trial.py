@@ -471,6 +471,10 @@ _INSTALL_PROBE = (
     "      platform.machine() or '-', importlib.util.find_spec('pip') is not None and not managed)\n"
 )
 _INSTALL_PROBE_TIMEOUT_S = 5.0
+# How long :class:`ReleaseCheck` waits for the local half (the probe above plus the
+# in-process tag computation), counted from :meth:`ReleaseCheck.start`. It runs
+# alongside the request, never inside the route's cap, and fits within that cap.
+_LOCAL_CHECK_TIMEOUT_S = _INSTALL_PROBE_TIMEOUT_S + 2.0
 
 
 def _install_identity() -> List[str]:
@@ -509,12 +513,14 @@ def _interpreter_tags() -> frozenset:
     return frozenset(tags.sys_tags())
 
 
-def _release_open(answer) -> bool:
+def _release_open(answer, supported: Optional[frozenset] = None) -> bool:
     """Whether a route answer offers a published wheel this interpreter can install:
     ``status`` is exactly ``open``, ``wheels`` is a non-empty list of strings, every
     entry parses as a wheel tag (compressed sets such as ``py2.py3-none-any``
     expand), and at least one tag is one :func:`_interpreter_tags` accepts. A tag
-    that does not parse makes the whole answer closed."""
+    that does not parse makes the whole answer closed. ``supported`` is those tags
+    when the caller has already computed them (:class:`ReleaseCheck` does, alongside
+    the request)."""
     if not isinstance(answer, dict) or answer.get("status") != "open":
         return False
     wheels = answer.get("wheels")
@@ -525,7 +531,8 @@ def _release_open(answer) -> bool:
         offered: set = set()
         for wheel in wheels:
             offered |= parse_tag(wheel)
-        supported = _interpreter_tags()
+        if supported is None:
+            supported = _interpreter_tags()
     except Exception:
         return False
     return not offered.isdisjoint(supported)
@@ -543,15 +550,22 @@ class ReleaseCheck:
     cap, then freezes the answer: one that lands after the cap is closed for the rest
     of the run, whenever it is first read — and one that landed in time is used even
     when it is read long after (the wizard asks at its start and reads at its end).
-    ``fetch`` and ``timeout`` are test seams."""
+    The local half — whether this interpreter can install a listed wheel — runs on
+    its own thread from :meth:`start`, alongside the request and outside its cap, so
+    a slow interpreter probe can never turn an in-time ``open`` into closed. It has
+    its own bound (:data:`_LOCAL_CHECK_TIMEOUT_S`), and one that does not finish is
+    closed. ``fetch`` and ``timeout`` are test seams."""
 
     def __init__(self, *, fetch: Optional[Callable[[], Optional[dict]]] = None,
                  timeout: float = _RELEASE_TIMEOUT_S):
         self._fetch = fetch
         self._timeout = timeout
         self._thread: Optional[threading.Thread] = None
+        self._probe: Optional[threading.Thread] = None
         self._deadline = 0.0
-        self._result = [False]
+        self._local_deadline = 0.0
+        self._result: list = [None]
+        self._tags: List[Optional[frozenset]] = [None]
         self._finished: List[Optional[float]] = [None]
         self._answer: Optional[bool] = None
 
@@ -559,23 +573,34 @@ class ReleaseCheck:
         if self._thread is not None or self._answer is not None:
             return self
         fetch = self._fetch or _release_fetch or _fetch_release_answer
-        result, finished = self._result, self._finished
+        result, finished, tags = self._result, self._finished, self._tags
+
+        def _probe() -> None:
+            try:
+                tags[0] = _interpreter_tags()
+            except Exception:
+                tags[0] = frozenset()
 
         def _worker() -> None:
             try:
-                answer = _release_open(fetch())
+                answer = fetch()
             except Exception:
-                answer = False
+                answer = None
             result[0] = answer
             finished[0] = time.monotonic()
 
+        probe = threading.Thread(target=_probe, name="buddhi-release-probe", daemon=True)
         thread = threading.Thread(target=_worker, name="buddhi-release-check", daemon=True)
-        self._deadline = time.monotonic() + self._timeout
+        now = time.monotonic()
+        self._deadline = now + self._timeout
+        self._local_deadline = now + _LOCAL_CHECK_TIMEOUT_S
         try:
+            probe.start()
             thread.start()
         except Exception:  # no thread to ask on: closed
             self._answer = False
             return self
+        self._probe = probe
         self._thread = thread
         return self
 
@@ -585,8 +610,17 @@ class ReleaseCheck:
         if self._answer is None:
             self._thread.join(max(0.0, self._deadline - time.monotonic()))
             done = self._finished[0]
-            self._answer = (not self._thread.is_alive() and done is not None
-                            and done <= self._deadline and self._result[0] is True)
+            in_time = (not self._thread.is_alive() and done is not None
+                       and done <= self._deadline)
+            supported = None
+            if in_time:
+                self._probe.join(max(0.0, self._local_deadline - time.monotonic()))
+                supported = None if self._probe.is_alive() else self._tags[0]
+            try:
+                self._answer = (supported is not None
+                                and _release_open(self._result[0], supported))
+            except Exception:
+                self._answer = False
         return self._answer
 
 

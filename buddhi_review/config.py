@@ -671,7 +671,9 @@ def _carry_removals(merged: Dict[str, Any], base: Dict[str, Any],
     in it has changed, the entry stays (its presence alone confirms the repo) and only
     the keys still holding their ``base`` value go. An entry the edit kept but emptied
     stays as an empty entry for the same reason: the repo is still confirmed in the
-    legacy file. A ``repos`` block the removals leave empty is dropped, since readers
+    legacy file. A ``repos`` block or repo entry the edit left present but malformed
+    (not a mapping) is unset, as :func:`merge_config_files` reads it, and removes
+    nothing. A ``repos`` block the removals leave empty is dropped, since readers
     treat the two alike. A legacy file that holds no settings at all removes nothing:
     like a deleted legacy file, it never costs the canonical file a setting, just as
     it never replaces an existing canonical file on the first merge.
@@ -691,7 +693,14 @@ def _carry_removals(merged: Dict[str, Any], base: Dict[str, Any],
     if not (isinstance(old_repos, dict) and isinstance(repos, dict)):
         return out
     new_repos = now.get("repos")
+    if "repos" in now and not isinstance(new_repos, dict):
+        # A malformed ``repos`` (``repos: []``) is unset, as merge_config_files reads
+        # it — not a deletion of every repo's entry.
+        return out
     remaining = _first_entries(new_repos) if isinstance(new_repos, dict) else {}
+    # Repos whose legacy entry is still present but not a mapping: unset, not removed.
+    malformed = {norm_repo(k) for k, v in (new_repos or {}).items()
+                 if not isinstance(v, dict)} - set(remaining) - {None}
     used: Dict[str, Any] = {}  # each repo's key in the canonical block, as readers find it
     for rkey, rval in repos.items():
         norm = norm_repo(rkey)
@@ -701,7 +710,7 @@ def _carry_removals(merged: Dict[str, Any], base: Dict[str, Any],
     changed = False
     for norm, was in _first_entries(old_repos).items():
         rkey = used.get(norm)
-        if rkey is None:
+        if rkey is None or norm in malformed:
             continue
         entry, still = repos[rkey], remaining.get(norm)
         if still is None and _same(entry, was):
