@@ -119,9 +119,9 @@ EFFORT_CRITERIA = (
      "comment shows has several routes. A single missing case with a local "
      "fix is medium, however severe its consequence."),
     ("prior-attempt-failed",
-     "an earlier attempt at this same issue failed: the comment itself says a "
-     "fix did not hold (it was rejected, it broke a test, or the reviewer is "
-     "re-raising the issue)."),
+     "an earlier attempt at this same issue failed: a PRIOR ATTEMPT line shows "
+     "it, or the comment itself says a fix did not hold (it was rejected, it "
+     "broke a test, or the reviewer is re-raising the issue)."),
     ("deeply-non-obvious",
      "concrete evidence in the comment or its diff hunk shows a misleading "
      "symptom: the reported behaviour is separated from its cause by a "

@@ -16,7 +16,7 @@ seam here so wiring them in does not disturb the kernel core.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from buddhi.closure import (
     CONVERGED,
@@ -76,13 +76,14 @@ def process_comment(
     classify_runner: Callable[[str], str],
     budget: Budget,
     classify_retries: int = 1,
+    prior_attempt: Optional[str] = None,
 ) -> CommentResult:
     # path/diff_hunk (captured by ingest) give the classifier the "file or module
     # the comment touches" its escalation criteria tell it to consult; they ride
     # inside build_prompt's inert nonce fence (untrusted PR-payload content).
     classification = classify_comment(
         comment.text, runner=classify_runner, retries=classify_retries,
-        path=comment.path, diff_hunk=comment.diff_hunk,
+        path=comment.path, diff_hunk=comment.diff_hunk, prior_attempt=prior_attempt,
     )
     raw = raw_item_for(
         comment.id,
@@ -107,6 +108,7 @@ def process_comments(
     classify_runner: Callable[[str], str],
     max_rounds: int = 10,
     classify_retries: int = 1,
+    prior_attempts: Optional[Dict[str, str]] = None,
 ) -> List[CommentResult]:
     """Classify + decide every comment in one round. Returns one result per comment.
 
@@ -119,6 +121,7 @@ def process_comments(
         process_comment(
             c, adapter=adapter, classify_runner=classify_runner,
             budget=budget, classify_retries=classify_retries,
+            prior_attempt=(prior_attempts or {}).get(c.id),
         )
         for c in comments
     ]

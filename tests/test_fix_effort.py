@@ -237,9 +237,9 @@ _GUIDANCE = (
     "plausible-looking fix is easily wrong: a race, a check-then-act gap, or a bypass the "
     "comment shows has several routes. A single missing case with a local fix is medium, "
     "however severe its consequence.\n"
-    "    prior-attempt-failed — an earlier attempt at this same issue failed: the comment "
-    "itself says a fix did not hold (it was rejected, it broke a test, or the reviewer is "
-    "re-raising the issue).\n"
+    "    prior-attempt-failed — an earlier attempt at this same issue failed: a PRIOR "
+    "ATTEMPT line shows it, or the comment itself says a fix did not hold (it was "
+    "rejected, it broke a test, or the reviewer is re-raising the issue).\n"
     "    deeply-non-obvious — concrete evidence in the comment or its diff hunk shows a "
     "misleading symptom: the reported behaviour is separated from its cause by a "
     "transformation, numerical boundary, grammar ambiguity, or performance interaction, "
@@ -250,7 +250,8 @@ _GUIDANCE = (
     "at once or more than one criterion holds; max = a systemic redesign or a deeply "
     "non-obvious bug hunt.\n"
     '  "Needs careful analysis", "non-trivial", "complex", "security-relevant" or a severe '
-    "consequence alone is NOT a criterion — that is what medium is for. Do not assume an "
+    "consequence alone is NOT a criterion — that is what medium is for. A PRIOR ATTEMPT "
+    "line is the loop's own record of a failed attempt; without one, do not assume an "
     "earlier attempt failed unless the comment itself says so.\n"
     "For every other label, pick the model and effort that match the comment.\n"
     'effort_criterion is "none" unless a SUBSTANTIVE pick is above medium.\n'
@@ -280,6 +281,7 @@ def test_the_classifier_is_sent_the_guidance_above_the_fence():
     assert ('Reply with ONE JSON object: '
             '{"label","bot","model","effort","effort_criterion","severity","reason"}.') in prompt[:fence]
     assert prompt.index("please fix the null check") > fence
+    assert classify.PRIOR_ATTEMPT_LINE not in prompt     # no earlier attempt was passed
 
 
 def test_the_criteria_list_names_all_four_in_order():
@@ -388,9 +390,13 @@ def _probe(run):
     ('  --effort <level>  Effort (choices: "low", "medium", "high")\n', _THREE),
     ("  --effort <level>  Effort (low, medium, high, auto)\n", _THREE),
     ("  --effortless-mode   (on, off)\n  --effort <level>  Effort (low, medium, high)\n", _THREE),
-    ("  --effort <level>  Effort () (low, medium, high)\n", _THREE),
-    ("  --effort <level>  Effort (low, medium, high) (xhigh)\n",
-     frozenset({"low", "medium", "high", "xhigh"})),
+    ("  --effort <level>  Effort () ( ) (low, medium, high)\n", _THREE),
+    # Only the option's first list is read, and its text ends at a blank line.
+    ("  --effort <level>  Effort (low, medium, high) (xhigh)\n", _THREE),
+    ("  --effort <level>  Effort level (low, medium, high)\n\nCommands:\n"
+     "  doctor  Check health (max detail)\n", _THREE),
+    ("  --effort <level>  Effort level\n\nCommands:\n"
+     "  doctor  Check health (low, medium, high)\n", _ALL),
     # The option's own text ends at the next option: a later option's list is
     # never read as the effort list, and a "--" that starts no option is not one.
     ("  --effort <level>  Effort (low, medium, high)\n  --mode <m>  Mode (fast, xhigh, max)\n",

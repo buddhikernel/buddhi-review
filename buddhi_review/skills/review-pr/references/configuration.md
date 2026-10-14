@@ -177,7 +177,7 @@ The loop drives `claude` with a reasoning effort level (`low` … `max`), sized 
 role inside the skill (it does **not** inherit your global `~/.claude/settings.json`,
 so cost and behaviour are identical across machines). Older CLI builds may not
 accept the higher levels (`xhigh` / `max`); the loop probes `claude --help` once
-for the levels your CLI advertises and **degrades any unsupported level to `high`**
+for the levels your CLI advertises and **degrades either unsupported higher level to `high`**
 before the call (logged once). The probe fails open — a modern CLI keeps all five
 and behaves exactly as before. Automatic, nothing to set.
 
@@ -187,7 +187,7 @@ A real-flaw (`SUBSTANTIVE`) fix runs on the latest Opus at **medium** effort by
 default (Sonnet on the Pro plan). The classifier picks `high`, `xhigh` or `max`
 only when it can name one of four criteria: the fix must change several modules
 together; a subtle concurrency, security or state-correctness problem; an earlier
-attempt at the same issue failed, as the comment says; or a deeply non-obvious
+attempt at the same issue failed, as the comment or an earlier round shows; or a deeply non-obvious
 cause that the comment shows. A higher pick that names none runs at medium, and
 the run log says so. There is no ceiling: `xhigh` and `max` stay available.
 
@@ -196,8 +196,8 @@ quick rounds, beats one long attempt by a single model. Those reviewers make
 different mistakes from the fixer, so each round catches what the last one
 missed, sooner and at lower cost.
 
-Every other label (`COSMETIC` and the rest) runs on the model and effort the
-classifier picks, as before.
+A `COSMETIC` fix runs on the model and effort the classifier picks, as before; the
+other labels do not run the code fixer.
 
 ## Vendor trigger strings
 

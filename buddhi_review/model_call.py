@@ -116,11 +116,11 @@ def probe_supported_efforts(
     run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
 ) -> frozenset:
     """Parse ``claude --help`` for the effort levels the installed CLI advertises:
-    the parenthesised list in the ``--effort`` option's own text, which may wrap
-    onto the next line (``--effort <level>  …`` then ``(low, medium, high, xhigh,
-    max)``). The list is trusted only when it names low, medium and high; anything
-    else (no list, a ``(default: …)`` note, a failed or unreadable probe) gives the
-    full set, so a parse miss never downgrades a modern CLI."""
+    the first parenthesised list in the ``--effort`` option's own text, which may
+    wrap onto the next line (``--effort <level>  …`` then ``(low, medium, high,
+    xhigh, max)``). The list is trusted only when it names low, medium and high;
+    anything else (no list, a ``(default: …)`` note, a failed or unreadable probe)
+    gives the full set, so a parse miss never downgrades a modern CLI."""
     run = run or subprocess.run
     try:
         result = run(["claude", "--help"], capture_output=True, text=True, timeout=20,
@@ -128,10 +128,11 @@ def probe_supported_efforts(
     except (OSError, subprocess.SubprocessError, ValueError):
         return frozenset(EFFORTS)
     text = f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}"
-    # The --effort option's own text runs up to the next option line.
-    block = re.search(r"--effort\b(.*?)(?=\n\s*-{1,2}[A-Za-z]|\Z)", text,
+    # The --effort option's own text runs up to the next option line or blank line.
+    block = re.search(r"--effort\b(.*?)(?=\n\s*-{1,2}[A-Za-z]|\n\s*\n|\Z)", text,
                       re.DOTALL | re.IGNORECASE)
-    listed = " ".join(re.findall(r"\(([^)]*)\)", block.group(1))) if block else ""
+    groups = re.findall(r"\(([^)]*)\)", block.group(1)) if block else []
+    listed = next((g for g in groups if g.strip()), "")
     levels = set(re.findall(r"[a-z]+", listed.lower()))
     if not set(_SAFE_EFFORTS) <= levels:
         return frozenset(EFFORTS)

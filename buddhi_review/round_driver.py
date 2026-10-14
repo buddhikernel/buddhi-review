@@ -82,6 +82,7 @@ from buddhi_review import (
     commit_push, detectors, escalation_wait, gh_ingest, merge, polish_state,
 )
 from buddhi_review.actuators import ActionResult, FixDispatch, act_on_result
+from buddhi_review.actuators import _commented_line_from_hunk
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.classify import DISCARD_LABELS
 from buddhi_review.config import (
@@ -1165,6 +1166,7 @@ class RoundDriver:
         #   not credit that sign-off with reviewing the current head.
         self._restore_signal_stamps: Dict[str, Optional[str]] = {}
         self.actions: List[ActionResult] = []
+        self._failed_fixes: Dict[Tuple[str, str, int], str] = {}  # see _note_failed_fixes
 
         # ── F5 run-cumulative review tracking (the SAFETY gate + silent-reviewer
         # warning) ──────────────────────────────────────────────────────────────
@@ -2201,6 +2203,22 @@ class RoundDriver:
             self.done.add(bot)
             print(f"[round] → excluding {bot} from subsequent rounds this run "
                   f"(reviewed — no findings)")
+
+    def _attempt_key(self, c: Comment) -> Optional[Tuple[str, str, int]]:
+        """Same reviewer, file and anchored line (None without a line): how a re-raise is matched."""
+        line = _commented_line_from_hunk(c.diff_hunk)
+        return (c.source, c.path, line) if line else None
+
+    def _prior_attempts(self, comments: Sequence[Comment]) -> Dict[str, str]:
+        keys = {c.id: self._attempt_key(c) for c in comments}
+        return {cid: self._failed_fixes[k] for cid, k in keys.items() if k in self._failed_fixes}
+
+    def _note_failed_fixes(self, comments, actions: Sequence[ActionResult]) -> None:
+        """Remember each fix of this round that was rejected or handed back."""
+        for c, a in zip(comments, actions):
+            key = self._attempt_key(c)
+            if key and a.disposition == "fix" and a.final in ("rejected", "escalated"):
+                self._failed_fixes[key] = (a.detail or a.final)[:300]
 
     def _maybe_errored_comeback(self, comment: Comment, result: CommentResult) -> None:
         """An errored-excluded bot comes back ONLY on a comment carrying REVIEW
@@ -3975,7 +3993,7 @@ class RoundDriver:
 
             results = process_comments(
                 actionable, adapter=self.adapter, classify_runner=self.classify_runner,
-                max_rounds=self.max_rounds,
+                max_rounds=self.max_rounds, prior_attempts=self._prior_attempts(actionable),
             )
             # Second residue sample, after the summon, the poll and the (model-bound,
             # possibly slow) classification pass, and still ahead of every fixer of
@@ -3992,6 +4010,7 @@ class RoundDriver:
                 round_actions.append(
                     act_on_result(c, r, adapter=self.adapter, fix_dispatch=self.fix_dispatch))
             self.actions.extend(round_actions)
+            self._note_failed_fixes(actionable, round_actions)
             # What this round's fixers left on disk, read the moment the last one
             # returns — BEFORE the escalation wait and the commit step's test gate,
             # each of which can hand the tree to a human for many minutes: a failed
