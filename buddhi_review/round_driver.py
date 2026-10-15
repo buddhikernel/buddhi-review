@@ -2214,11 +2214,13 @@ class RoundDriver:
         return {cid: self._failed_fixes[k] for cid, k in keys.items() if k in self._failed_fixes}
 
     def _note_failed_fixes(self, comments, actions: Sequence[ActionResult]) -> None:
-        """Remember each fix of this round that was rejected or handed back."""
+        """Remember each fix of this round that was rejected or handed back; forget one that held."""
         for c, a in zip(comments, actions):
             key = self._attempt_key(c)
             if key and a.disposition == "fix" and a.final in ("rejected", "escalated"):
                 self._failed_fixes[key] = (a.detail or a.final)[:300]
+            elif key and a.disposition == "fix" and a.final == "fixed":
+                self._failed_fixes.pop(key, None)
 
     def _maybe_errored_comeback(self, comment: Comment, result: CommentResult) -> None:
         """An errored-excluded bot comes back ONLY on a comment carrying REVIEW

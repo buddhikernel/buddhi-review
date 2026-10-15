@@ -391,7 +391,9 @@ def _probe(run):
     ("  --effort <level>  Effort (low, medium, high, auto)\n", _THREE),
     ("  --effortless-mode   (on, off)\n  --effort <level>  Effort (low, medium, high)\n", _THREE),
     ("  --effort <level>  Effort () ( ) (low, medium, high)\n", _THREE),
-    # Only the option's first list is read, and its text ends at a blank line.
+    # The option's first list that names low, medium and high is read; its text ends at a
+    # blank line.
+    ("  --effort <level>  Effort (default: high) (low, medium, high)\n", _THREE),
     ("  --effort <level>  Effort (low, medium, high) (xhigh)\n", _THREE),
     ("  --effort <level>  Effort level (low, medium, high)\n\nCommands:\n"
      "  doctor  Check health (max detail)\n", _THREE),

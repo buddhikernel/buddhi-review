@@ -282,9 +282,9 @@ def classify_comment(
 
 
 PRIOR_ATTEMPT_LINE = (
-    "PRIOR ATTEMPT: earlier in this run, a fix for a comment by the same reviewer on "
-    "this same line did not hold (it was rejected or handed back); its reason is the "
-    "[earlier attempt] text in the fenced block below.\n"
+    "PRIOR ATTEMPT: earlier in this run, an attempted fix for a comment by the same "
+    "reviewer on the same file and line was rejected or handed back. What happened "
+    "appears as [earlier attempt] in the fenced block below.\n"
 )
 
 

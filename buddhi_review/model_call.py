@@ -116,11 +116,11 @@ def probe_supported_efforts(
     run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
 ) -> frozenset:
     """Parse ``claude --help`` for the effort levels the installed CLI advertises:
-    the first parenthesised list in the ``--effort`` option's own text, which may
-    wrap onto the next line (``--effort <level>  …`` then ``(low, medium, high,
-    xhigh, max)``). The list is trusted only when it names low, medium and high;
-    anything else (no list, a ``(default: …)`` note, a failed or unreadable probe)
-    gives the full set, so a parse miss never downgrades a modern CLI."""
+    the first parenthesised list in the ``--effort`` option's own text that names
+    low, medium and high; the text may wrap onto the next line (``--effort <level>  …``
+    then ``(low, medium, high, xhigh, max)``). Anything else (no such list, only a
+    ``(default: …)`` note, a failed or unreadable probe) gives the full set, so a
+    parse miss never downgrades a modern CLI."""
     run = run or subprocess.run
     try:
         result = run(["claude", "--help"], capture_output=True, text=True, timeout=20,
@@ -132,9 +132,9 @@ def probe_supported_efforts(
     block = re.search(r"--effort\b(.*?)(?=\n\s*-{1,2}[A-Za-z]|\n\s*\n|\Z)", text,
                       re.DOTALL | re.IGNORECASE)
     groups = re.findall(r"\(([^)]*)\)", block.group(1)) if block else []
-    listed = next((g for g in groups if g.strip()), "")
-    levels = set(re.findall(r"[a-z]+", listed.lower()))
-    if not set(_SAFE_EFFORTS) <= levels:
+    lists = (set(re.findall(r"[a-z]+", g.lower())) for g in groups)
+    levels = next((s for s in lists if set(_SAFE_EFFORTS) <= s), None)
+    if levels is None:
         return frozenset(EFFORTS)
     return frozenset(levels & set(EFFORTS))
 

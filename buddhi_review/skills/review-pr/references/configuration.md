@@ -187,7 +187,7 @@ A real-flaw (`SUBSTANTIVE`) fix runs on the latest Opus at **medium** effort by
 default (Sonnet on the Pro plan). The classifier picks `high`, `xhigh` or `max`
 only when it can name one of four criteria: the fix must change several modules
 together; a subtle concurrency, security or state-correctness problem; an earlier
-attempt at the same issue failed, as the comment or an earlier round shows; or a deeply non-obvious
+attempt at the same issue failed, as a PRIOR ATTEMPT line or the comment shows; or a deeply non-obvious
 cause that the comment shows. A higher pick that names none runs at medium, and
 the run log says so. There is no ceiling: `xhigh` and `max` stay available.
 
