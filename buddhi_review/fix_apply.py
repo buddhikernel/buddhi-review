@@ -56,7 +56,7 @@ import sys
 from dataclasses import dataclass
 from typing import Callable, Dict, FrozenSet, Optional, Sequence, TextIO, Tuple
 
-from buddhi_review import claude_settings_guard, lang_syntax, unicode_repair
+from buddhi_review import claude_settings_guard, lang_syntax, model_call, unicode_repair
 from buddhi_review.classify import extract_json_object as _extract_json_object
 from buddhi_review.transparency import _colour_enabled
 
@@ -92,7 +92,9 @@ TRIPWIRE_REGION_WINDOW = 60
 # retry then just repeats). `low` is 300s (was 120s): empirical haiku timeouts on
 # real cosmetic fixes tripped `>120s` repeatedly — mirrors the same raise in the
 # reference tree.
-EFFORT_TIMEOUTS: Dict[str, int] = {"low": 300, "medium": 600, "high": 900}
+EFFORT_TIMEOUTS: Dict[str, int] = {
+    "low": 300, "medium": 600, "high": 900, "xhigh": 1200, "max": 1800,
+}
 _GIT_TIMEOUT = 30
 
 # ---------------------------------------------------------------------------
@@ -2479,7 +2481,10 @@ def default_fixer_runner(
     committed ``.claude`` settings cannot run code in it
     (:func:`buddhi_review.claude_settings_guard.window`); a checkout whose
     settings cannot be made safe raises an ``OSError`` instead of spawning, which
-    :func:`apply_fix` escalates without a retry."""
+    :func:`apply_fix` escalates without a retry. An effort the installed CLI does
+    not offer is degraded to ``high`` here, at the ``--effort`` boundary
+    (:func:`buddhi_review.model_call.degrade_effort`)."""
+    effort = model_call.degrade_effort(effort)
     argv = maybe_sandbox(
         [
             "claude", "--model", model, "--effort", effort, *claude_settings_guard.CLAUDE_ARGS,

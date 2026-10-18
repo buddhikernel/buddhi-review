@@ -10,9 +10,11 @@ from buddhi_review.classify import (
 
 
 def test_json_first():
-    c = parse_classification('{"label":"SUBSTANTIVE","bot":"claude","model":"sonnet","effort":"high","reason":"npe"}')
+    # A SUBSTANTIVE effort above medium needs a named criterion
+    # (tests/test_fix_effort.py), so this parse check uses medium.
+    c = parse_classification('{"label":"SUBSTANTIVE","bot":"claude","model":"sonnet","effort":"medium","reason":"npe"}')
     assert c is not None
-    assert c.tuple4 == ("SUBSTANTIVE", "claude", "sonnet", "high")
+    assert c.tuple4 == ("SUBSTANTIVE", "claude", "sonnet", "medium")
     assert c.reason == "npe"
 
 

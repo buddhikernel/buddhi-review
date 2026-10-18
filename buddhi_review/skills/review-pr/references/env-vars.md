@@ -44,10 +44,8 @@ See [`configuration.md`](configuration.md) and [`reviewer-setup.md`](reviewer-se
 ## Effort levels & CLI portability
 
 The loop drives the `claude` CLI with an effort level (`low`, `medium`, `high`,
-`xhigh`, `max`). Older CLI builds may not accept the higher levels and would reject
-them at parse time. To stay portable the loop probes `claude --help` **once** at
-first use for the levels your installed CLI actually advertises, and **degrades any
-level it does not support down to `high`** before the call (logging the degrade
-once). An unknown / malformed level also lands on `high`. The probe **fails open**:
-if it cannot read the supported set, it assumes the full five, so a modern CLI
-behaves exactly as before. Nothing to configure.
+`xhigh`, `max`). Older CLI builds may not accept `xhigh` or `max`, so the loop probes
+`claude --help` once for the levels your CLI advertises and **degrades either
+unsupported higher level to `high`** before the call (logging the degrade once). The
+probe fails open: if it cannot read the supported set, it assumes all five, so a
+modern CLI behaves exactly as before. Nothing to configure.

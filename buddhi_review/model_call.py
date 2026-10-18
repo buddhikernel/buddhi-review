@@ -23,13 +23,14 @@ The agentic per-comment FIXER is NOT routed here — it lives in
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import time
 from typing import Callable, Dict, List, Optional, TextIO, Tuple
 
 from buddhi_review import claude_settings_guard, plan_profile
-from buddhi_review.classify import extract_json_object
+from buddhi_review.classify import EFFORTS, extract_json_object
 
 
 def _env_int(name: str, default: int, floor: int = 0) -> int:
@@ -98,6 +99,67 @@ def _make_default_spawn(cwd: Optional[str] = None) -> Spawn:
     return _spawn
 
 
+# ── Effort portability: degrade to the safe middle on an older CLI ─────────────
+# The effort vocabulary assumes the installed `claude` accepts all five levels.
+# An older CLI may not know `xhigh`/`max` and would reject them at parse time, so
+# before either reaches `--effort` the CLI's `--help` is probed ONCE for the levels
+# it advertises, and one it lacks is degraded to `high`. Every other value passes
+# through untouched and never triggers the probe. The probe fails open: help it
+# cannot read keeps the full set, so a modern CLI behaves exactly as before.
+_SAFE_EFFORTS = ("low", "medium", "high")
+_HIGHER_EFFORTS = ("xhigh", "max")
+_supported_efforts_cache: Optional[frozenset] = None
+_degrade_logged = False
+
+
+def probe_supported_efforts(
+    run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
+) -> frozenset:
+    """Parse ``claude --help`` for the effort levels the installed CLI advertises:
+    the first parenthesised list in the ``--effort`` option's own text that names
+    low, medium and high; the text may wrap onto the next line (``--effort <level>  …``
+    then ``(low, medium, high, xhigh, max)``). Anything else (no such list, only a
+    ``(default: …)`` note, a failed or unreadable probe) gives the full set, so a
+    parse miss never downgrades a modern CLI."""
+    run = run or subprocess.run
+    try:
+        result = run(["claude", "--help"], capture_output=True, text=True, timeout=20,
+                     stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return frozenset(EFFORTS)
+    text = f"{getattr(result, 'stdout', '') or ''}\n{getattr(result, 'stderr', '') or ''}"
+    # The --effort option's own text runs up to the next option line or blank line.
+    block = re.search(r"--effort\b(.*?)(?=\n\s*-{1,2}[A-Za-z]|\n\s*\n|\Z)", text,
+                      re.DOTALL | re.IGNORECASE)
+    groups = re.findall(r"\(([^)]*)\)", block.group(1)) if block else []
+    lists = (set(re.findall(r"[a-z]+", g.lower())) for g in groups)
+    levels = next((s for s in lists if set(_SAFE_EFFORTS) <= s), None)
+    if levels is None:
+        return frozenset(EFFORTS)
+    return frozenset(levels & set(EFFORTS))
+
+
+def degrade_effort(effort: str) -> str:
+    """The effort to pass on ``--effort``: ``xhigh``/``max`` (any case) unchanged
+    when the installed CLI advertises them and ``high`` when it does not; every
+    other value unchanged. The first degrade in a process is logged once."""
+    global _supported_efforts_cache, _degrade_logged
+    level = str(effort).strip().lower()
+    if level not in _HIGHER_EFFORTS:
+        return effort
+    if _supported_efforts_cache is None:
+        _supported_efforts_cache = probe_supported_efforts()
+    if level in _supported_efforts_cache:
+        return effort
+    if not _degrade_logged:
+        _degrade_logged = True
+        supported = ", ".join(e for e in EFFORTS if e in _supported_efforts_cache)
+        body = (f"  [effort] '{effort}' is not offered by the installed claude CLI "
+                f"(it offers: {supported}); running at 'high'.")
+        print(f"\033[2m{body}\033[0m" if _dim_enabled(sys.stdout) else body, flush=True)
+    return "high"
+
+
 # The module-level default spawn (cwd inherited from the process) — what the seam
 # tests and callers inject against. The classifier path swaps in a cwd-pinned
 # variant on demand (see ``run_model_text``).
@@ -151,7 +213,7 @@ def run_model_text(
     if cwd is not None and spawn is _default_spawn:
         spawn = _make_default_spawn(cwd)
     model = resolve_model(prompt, role=role, plan=plan)
-    effort = plan_profile.effort_for(role, plan)
+    effort = degrade_effort(plan_profile.effort_for(role, plan))
     argv, stdin_text = build_argv(prompt, model=model, effort=effort)
     try:
         proc = spawn(argv, stdin_text, timeout or TIMEOUT)

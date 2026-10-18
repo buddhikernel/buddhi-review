@@ -34,7 +34,7 @@ Each plan maps **roles** to a concrete model + context window:
 | Role | Default tier (max-5x) | Why |
 |---|---|---|
 | `classifier` | Sonnet / standard | Highest-frequency call; a bounded labelling task. Sonnet is reliable and far cheaper/faster than Opus here. |
-| `fix-substantive` | Sonnet / standard | Real-flaw fixes; never below Sonnet. |
+| `fix-substantive` | Opus / standard (Sonnet on Pro) | Real-flaw fixes, at medium effort unless the classifier names why a fix needs more (see [Fix effort](#fix-effort)). |
 | `fix-cosmetic` | Haiku / standard | Trivial mechanical edits. |
 | `clean-review-detector` | Haiku / standard | Binary CLEAN/NOT_CLEAN. |
 | `quota-detector` | Haiku / standard | Binary QUOTA/NOT_QUOTA. |
@@ -177,9 +177,27 @@ The loop drives `claude` with a reasoning effort level (`low` … `max`), sized 
 role inside the skill (it does **not** inherit your global `~/.claude/settings.json`,
 so cost and behaviour are identical across machines). Older CLI builds may not
 accept the higher levels (`xhigh` / `max`); the loop probes `claude --help` once
-for the levels your CLI advertises and **degrades any unsupported level to `high`**
+for the levels your CLI advertises and **degrades either unsupported higher level to `high`**
 before the call (logged once). The probe fails open — a modern CLI keeps all five
 and behaves exactly as before. Automatic, nothing to set.
+
+## Fix effort
+
+A real-flaw (`SUBSTANTIVE`) fix runs on the latest Opus at **medium** effort by
+default (Sonnet on the Pro plan). The classifier picks `high`, `xhigh` or `max`
+only when it can name one of four criteria: the fix must change several modules
+together; a subtle concurrency, security or state-correctness problem; an earlier
+attempt at the same issue failed, as a PRIOR ATTEMPT line or the comment shows; or a deeply non-obvious
+cause that the comment shows. A higher pick that names none runs at medium, and
+the run log says so. There is no ceiling: `xhigh` and `max` stay available.
+
+Why: a fast fix that reviewers from other vendors then check, iterated over a few
+quick rounds, beats one long attempt by a single model. Those reviewers make
+different mistakes from the fixer, so each round catches what the last one
+missed, sooner and at lower cost.
+
+A `COSMETIC` fix runs on the model and effort the classifier picks, as before; the
+other labels do not run the code fixer.
 
 ## Vendor trigger strings
 
