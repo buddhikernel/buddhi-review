@@ -280,8 +280,9 @@ def _open_pr(args: argparse.Namespace) -> int:
 
 def _setup(args: argparse.Namespace) -> int:
     from buddhi_review import wizard
-    argv = ["--repo", args.repo] if getattr(args, "repo", None) else None
-    return wizard.run(argv=argv)
+    argv: List[str] = ["--repo", args.repo] if getattr(args, "repo", None) else []
+    argv += [f"--{name}" for name in ("buy", "activate", "recover") if getattr(args, name, False)]
+    return wizard.run(argv=argv or None)
 
 
 def _status(args: argparse.Namespace) -> int:
@@ -691,7 +692,16 @@ def build_parser() -> argparse.ArgumentParser:
                     help="print only the JSON result, no guidance text")
 
     sp = sub.add_parser("setup", help="interactive onboarding wizard")
-    sp.add_argument("--repo", help="pre-bind this owner/repo (per-repo confirm mode)")
+    mode = sp.add_mutually_exclusive_group()
+    mode.add_argument("--repo", help="pre-bind this owner/repo (per-repo confirm mode)")
+    mode.add_argument("--buy", action="store_true",
+                      help="buy Buddhi Review Pro in your browser and set it up on this computer")
+    mode.add_argument("--activate", action="store_true",
+                      help="set up Buddhi Review Pro with a setup code from the website or "
+                           "from the person who bought your seat")
+    mode.add_argument("--recover", action="store_true",
+                      help="move your own Buddhi Review Pro seat to this computer, or change "
+                           "your recovery address")
 
     stp = sub.add_parser("status", help="print per-repo setup status as JSON (for the skill gate)")
     stp.add_argument("--repo", required=True, help="owner/repo to report on")
@@ -728,8 +738,8 @@ def build_parser() -> argparse.ArgumentParser:
 # separately-installed, active backend (which runs it), or answered with the notice
 # below — the normal free-only outcome, and equally what a plain typo gets.
 
-# The upgrade notice (approved verbatim 2026-07-12, gate H1; its link moved to
-# buddhireview.com/buy on 2026-09-25, WS11) printed when no installed
+# The upgrade notice (approved verbatim 2026-07-12, gate H1; its last line now points
+# at `setup --buy`, which buys from the tool itself) printed when no installed
 # backend claims the command. The free tree ships NO list of non-free command names,
 # so a command whose paid access has lapsed and one that never existed are
 # indistinguishable here; the wording is deliberately true for BOTH and asserts
@@ -740,7 +750,7 @@ def build_parser() -> argparse.ArgumentParser:
 _UNCLAIMED_COMMAND_NOTICE = (
     "The '{command}' command is not included in this free installation.\n"
     "If you have a Buddhi licence, renew or reactivate it and run the command again.\n"
-    "To get a licence: https://buddhireview.com/buy"
+    "To get a licence, run: buddhi-review setup --buy"
 )
 
 

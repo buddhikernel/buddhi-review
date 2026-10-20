@@ -1009,8 +1009,17 @@ def migrate_legacy_config(canonical: Optional[Path] = None, *,
                 return "deferred"
             return _migrate_locked(canonical, legacy)
     except Exception as exc:  # fail open: a migration error never blocks a launch
-        _note_once(f"Warning: Could not move settings from {legacy} to {canonical} ({exc}). "
-                   f"Settings are read from {canonical}.")
+        try:
+            retired = not _lexists(legacy)
+        except Exception:
+            retired = False
+        if retired:
+            # The old name is already gone (retired to its backup): nothing was "left".
+            _note_once(f"Warning: Could not finish moving settings from {legacy} to "
+                       f"{canonical} ({exc}). Settings are read from {canonical}.")
+        else:
+            _note_once(f"Warning: Could not move settings from {legacy} to {canonical} "
+                       f"({exc}). Settings are read from {canonical}.")
         return "error"
 
 
@@ -1031,6 +1040,28 @@ def _write_failed_after_merge(legacy: Path, canonical: Path) -> str:
     _note_once(f"Warning: Settings from {legacy} were merged into {canonical}, but the "
                f"recovery record could not be completed. The old file was left "
                f"unchanged and the merge will be retried.")
+    return "error"
+
+
+# The three lines above say the old file was left as it was. Once the legacy file
+# has been renamed to its backup, a catch-up merge (a write that landed in it during
+# the move) fails differently: the move itself is done, so these say what is true.
+
+def _catch_up_failed(legacy: Path, canonical: Path, backup: Path, reason: str, *,
+                     unreadable: bool = False) -> str:
+    fix = f" Fix {canonical} so it can be read." if unreadable else ""
+    _note_once(f"Warning: Settings from {legacy} are now in {canonical}, and the old file was "
+               f"kept as {backup}. A change made to the old file during the move could not be "
+               f"merged into {canonical} yet ({reason}). The next run tries again. Settings "
+               f"are read from {canonical}.{fix}")
+    return "error"
+
+
+def _catch_up_unrecorded(legacy: Path, canonical: Path, backup: Path) -> str:
+    _note_once(f"Warning: Settings from {legacy} are now in {canonical}, and the old file was "
+               f"kept as {backup}. A change made to the old file during the move was merged "
+               f"into {canonical}, but its record could not be saved, so the next run checks "
+               f"it again.")
     return "error"
 
 
@@ -1169,7 +1200,21 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
     ``base`` — the legacy settings an earlier, unfinished run already merged — limits
     the merge to what changed since, and what was removed since (where the canonical
     file still holds the merged value, :func:`_carry_removals`). Returns the conflict
-    list, or a failure outcome string after reporting it (nothing then moved)."""
+    list, or a failure outcome string after reporting it (nothing then moved; in a
+    catch-up after the rename — ``backup`` set — the move is done, and the failure line
+    says so)."""
+    retired = legacy.with_name(backup) if backup is not None else None
+
+    def _write_failed_here() -> str:
+        if retired is not None:
+            return _catch_up_failed(legacy, canonical, retired, "writing the file failed")
+        return _write_failed(legacy, canonical)
+
+    def _unrecorded_here() -> str:
+        if retired is not None:
+            return _catch_up_unrecorded(legacy, canonical, retired)
+        return _write_failed_after_merge(legacy, canonical)
+
     if not _lexists(canonical):
         # Nothing to merge with: the canonical file becomes a byte-for-byte copy of
         # the legacy one, comments included (and an empty file stays empty).
@@ -1178,16 +1223,20 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
             _write_record(canonical, ident, [], legacy_data, before, backup=backup,
                           state="pending", target=legacy_data)
         except OSError:
-            return _write_failed(legacy, canonical)
+            return _write_failed_here()
         if not _write_bytes_atomic(canonical, raw):
-            return _write_failed(legacy, canonical)
+            return _write_failed_here()
         try:
             _write_record(canonical, ident, [], legacy_data, before, backup=backup)
         except OSError:
-            return _write_failed_after_merge(legacy, canonical)
+            return _unrecorded_here()
         return []
     canonical_data, _, why, cident = _read_config_file(canonical)
     if canonical_data is None or cident is None:
+        if retired is not None:
+            return _catch_up_failed(legacy, canonical, retired,
+                                    f"{canonical.name} could not be read: {why}",
+                                    unreadable=True)
         _note_once(f"Warning: Could not move settings from {legacy} to {canonical} because "
                    f"{canonical.name} could not be read: {why}. Both files were left "
                    f"unchanged. Settings are read from {canonical}.")
@@ -1214,16 +1263,16 @@ def _merge_into_canonical(canonical: Path, legacy: Path, legacy_data: Dict[str, 
                           before, backup=backup, state="pending", target=merged,
                           base=base if pending_record is None else None)
         except OSError:
-            return _write_failed(legacy, canonical)
+            return _write_failed_here()
         # Deferred import: wizard imports config at module load (config is the
         # lower layer), exactly as set_repo_keys does.
         from buddhi_review.wizard import write_config
         if not write_config(merged, canonical):
-            return _write_failed(legacy, canonical)
+            return _write_failed_here()
     try:
         _write_record(canonical, ident, conflicts, legacy_data, before, backup=backup)
     except OSError:
-        return _write_failed_after_merge(legacy, canonical)
+        return _unrecorded_here()
     return conflicts
 
 

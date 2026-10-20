@@ -320,12 +320,13 @@ def test_step_done_has_no_coming_soon_teaser():
     assert "config written" in out
 
 
-def _pro_trial_stub(monkeypatch, *, allowed=True, active=False):
-    """Neuter pro_trial's side effects for step_pro_trial UI tests. The paid release
-    reads as published (with a wheel for this interpreter), so the offer can show;
-    ``calls["release"]`` counts the requests."""
+def _pro_trial_stub(monkeypatch, *, allowed=True):
+    """step_pro_trial UI tests: the offer's gating answers ``allowed``, the paid release
+    reads as published (with a wheel for this interpreter), and pro_trial.trial_step
+    records the terminal it was handed. ``calls["release"]`` counts the requests to
+    the release route."""
     from packaging import tags
-    calls = {"shown": 0, "declined": 0, "start": [], "convert": 0, "release": 0}
+    calls = {"release": 0, "ui": []}
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
     monkeypatch.setattr(wizard.pro_trial, "offer_allowed", lambda **k: allowed)
 
@@ -333,55 +334,131 @@ def _pro_trial_stub(monkeypatch, *, allowed=True, active=False):
         calls["release"] += 1
         return {"status": "open", "wheels": [str(next(iter(tags.sys_tags())))]}
     monkeypatch.setattr(wizard.pro_trial, "_release_fetch", _release)
-    monkeypatch.setattr(wizard.pro_trial, "record_offer_shown",
-                        lambda **k: calls.__setitem__("shown", calls["shown"] + 1))
-    monkeypatch.setattr(wizard.pro_trial, "record_declined",
-                        lambda **k: calls.__setitem__("declined", calls["declined"] + 1))
-
-    def _start(email, **k):
-        calls["start"].append(email)
-        return wizard.pro_trial.TrialOutcome(True, "active", "✓ Buddhi Pro is active")
-    monkeypatch.setattr(wizard.pro_trial, "start_trial", _start)
-    monkeypatch.setattr(wizard.pro_trial, "convert",
-                        lambda **k: (calls.__setitem__("convert", calls["convert"] + 1)
-                                     or wizard.pro_trial.TrialOutcome(True, "active", "ok")))
     return calls
 
 
-def test_step_pro_trial_yes_starts_trial(monkeypatch):
+def test_step_pro_trial_offers_the_trial_through_the_wizards_own_controls(monkeypatch):
+    """The step hands pro_trial the wizard's terminal: its rows, its yes/no control
+    and its hidden reader. A No is the durable decline."""
     calls = _pro_trial_stub(monkeypatch, allowed=True)
-    buf = io.StringIO()
-    # Radio selectors read via single_select; bridge Yes → default. Provide the email.
     monkeypatch.setattr(wizard, "single_select", _yn_bridge)
-    answers = iter(["y", "me@example.com"])   # 1) yes to the offer  2) the email
-    wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
-                          input_fn=lambda *a: next(answers))
-    assert calls["shown"] == 1
-    assert calls["start"] == ["me@example.com"]
-    assert "14 days" in buf.getvalue()
-    assert calls["release"] == 1      # the offer asked the release route once
+    monkeypatch.setattr(wizard.pro_trial, "record_declined",
+                        lambda **k: calls.__setitem__("declined", True))
+    monkeypatch.setattr(wizard.pro_trial, "record_offer_shown", lambda **k: False)
+    buf = io.StringIO()
+    asked = []
+    stopped = wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
+                                    input_fn=lambda prompt="": asked.append(prompt) or "n")
+    assert stopped is False
+    assert f"▸ {wizard._PRO_TRIAL_OFFER}" in buf.getvalue()
+    assert wizard._PRO_TRIAL_OFFER == ("Try Buddhi Review Pro — automation that carries a run "
+                                       "like this to the finish on its own.")
+    assert asked == ["Start or continue your free 14-day Pro trial?"]
+    assert calls["declined"] is True and calls["release"] == 1
 
 
-def test_step_pro_trial_convert_gets_a_hidden_paste_reader(monkeypatch):
-    """The Pro key becomes the private-index password (it lands in ~/.netrc), so the
-    convert path must read it through the wizard's HIDDEN reader — never ``input_fn``,
-    which echoes the credential into the terminal scrollback."""
+def test_step_pro_trial_reads_codes_through_the_hidden_reader(monkeypatch):
+    """Every code that must not reach the scrollback goes through the wizard's hidden,
+    wrapped-paste-safe reader, never ``input_fn``."""
     _pro_trial_stub(monkeypatch, allowed=True)
     seen = {}
-    monkeypatch.setattr(wizard.pro_trial, "start_trial", lambda email, **k:
-                        wizard.pro_trial.TrialOutcome(False, "email_registered", "taken"))
-    monkeypatch.setattr(wizard.pro_trial, "convert", lambda **k: seen.update(k)
-                        or wizard.pro_trial.TrialOutcome(True, "active", "ok"))
-    monkeypatch.setattr(wizard, "single_select", _yn_bridge)
-    buf = io.StringIO()
-    answers = iter(["y", "me@example.com", "y"])   # offer → email → "have a key to paste"
-    input_fn = lambda *a: next(answers)
-    wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
-                          input_fn=input_fn)
-    assert seen["paste_input"] is not input_fn and seen["paste_input"] is not input
-    # the y/N consent for a clipboard candidate is a plain visible prompt — that one is
-    # the wizard's own input_fn (it must never carry the key itself).
-    assert seen["confirm_input"] is input_fn
+
+    def trial_step(ui, **k):
+        seen["ui"] = ui
+        return False
+    monkeypatch.setattr(wizard.pro_trial, "trial_step", trial_step)
+    prefaces = []
+    monkeypatch.setattr(wizard, "_read_hidden_tty", lambda prompt, preface=True: (
+        prefaces.append(preface) or "HIDDEN-" + prompt.strip()))
+    wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=io.StringIO(),
+                          input_fn=lambda prompt="": pytest.fail("echoing reader used"))
+    assert seen["ui"].ask_hidden("Paste the recovery code: ") == "HIDDEN-Paste the recovery code:"
+    assert seen["ui"].interactive is True
+    # no line of the reader's own before an approved prompt
+    assert prefaces == [False]
+
+
+def test_the_acquisition_reader_never_falls_back_to_an_echoing_read(monkeypatch):
+    """When echo cannot be turned off, Python's getpass warns and reads with echo ON;
+    a setup or recovery code must never be read that way."""
+    import getpass
+    import warnings
+    echoed = []
+
+    def echoing_getpass(prompt=""):
+        warnings.warn("Can not control echo on the terminal.", getpass.GetPassWarning)
+        echoed.append(prompt)
+        return "CODE-TYPED-WITH-ECHO"
+    monkeypatch.setattr(getpass, "getpass", echoing_getpass)
+    assert wizard._never_echoing_getpass("Paste: ") == ""
+    assert echoed == []
+    monkeypatch.setattr(wizard, "_is_tty", lambda: False)        # no TTY reader either
+    ui = wizard._acquisition_ui(pal=wizard._Palette(False), stream=io.StringIO())
+    assert ui.ask_hidden("Paste your setup code (it stays hidden):") == ""
+    from buddhi_review import pro_trial
+    assert pro_trial._hidden_paste_input("Paste: ") == "" and echoed == []
+
+
+def _echoing_getpass(monkeypatch):
+    """Python's getpass when echo cannot be turned off: it warns, then reads with echo
+    ON. Returns the list of prompts it read that way."""
+    import getpass
+    import warnings
+    echoed = []
+
+    def echoing(prompt=""):
+        warnings.warn("Can not control echo on the terminal.", getpass.GetPassWarning)
+        echoed.append(prompt)
+        return "SECRET-TYPED-WITH-ECHO"
+    monkeypatch.setattr(getpass, "getpass", echoing)
+    monkeypatch.setattr(wizard, "_is_tty", lambda: False)    # no hidden TTY reader either
+    return echoed
+
+
+def _stop(*_a, **_k):
+    raise KeyboardInterrupt
+
+
+@pytest.mark.parametrize("route", ["--buy", "--activate", "--recover", "held work",
+                                   "--repo", "reviewers"])
+def test_no_secret_prompt_setup_runs_can_echo(monkeypatch, tmp_path, route):
+    """Every secret reader `run()` hands out — to the Pro setup paths, to the held-work
+    finisher, to the per-repo confirm and to the reviewer step (the Claude and GitHub
+    tokens) — refuses to read rather than read with echo on."""
+    echoed = _echoing_getpass(monkeypatch)
+    got = {}
+    if route.startswith("--") and route != "--repo":
+        entry = {"--buy": "run_buy", "--activate": "run_activate",
+                 "--recover": "run_recover"}[route]
+        monkeypatch.setattr(wizard.pro_trial, entry,
+                            lambda ui, **k: got.setdefault("read", ui.ask_hidden) and 0)
+        argv = [route]
+    elif route == "held work":
+        monkeypatch.setattr(wizard.pro_trial, "has_held_work", lambda **k: True)
+        monkeypatch.setattr(wizard.pro_trial, "finish_held_work",
+                            lambda ui, release=None: got.setdefault("read", ui.ask_hidden))
+        monkeypatch.setattr(wizard, "step_doctor", _stop)
+        argv = None
+    elif route == "--repo":
+        monkeypatch.setattr(wizard, "confirm_repo_interactive",
+                            lambda *a, **k: got.setdefault("read", k["getpass_fn"]) and 0)
+        argv = ["--repo", "acme/widgets"]
+    else:
+        monkeypatch.setattr(wizard.pro_trial, "has_held_work", lambda **k: False)
+        monkeypatch.setattr(wizard, "step_doctor", lambda **k: {})
+        monkeypatch.setattr(wizard, "step_plan", lambda *a, **k: "free")
+        monkeypatch.setattr(wizard, "step_repo", lambda *a, **k: (None, None))
+        monkeypatch.setattr(wizard, "step_budgets_locked", lambda **k: None)
+
+        def reviewers(*a, **k):
+            got["read"] = k["getpass_fn"]
+            raise KeyboardInterrupt
+        monkeypatch.setattr(wizard, "step_reviewers", reviewers)
+        argv = None
+    wizard.run(argv=argv, config_path=tmp_path / "c.yaml", stream=io.StringIO(),
+               input_fn=lambda *a: "")
+    assert got["read"]("Paste it: ") == ""
+    assert echoed == []
 
 
 def test_step_pro_trial_skips_when_not_allowed(monkeypatch):
@@ -389,7 +466,6 @@ def test_step_pro_trial_skips_when_not_allowed(monkeypatch):
     buf = io.StringIO()
     wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
                           input_fn=lambda *a: "y")
-    assert calls["shown"] == 0
     assert buf.getvalue() == ""       # nothing shown when the offer is not allowed
     assert calls["release"] == 0      # …and the release route is never asked
 
@@ -402,6 +478,37 @@ def test_step_pro_trial_skips_off_tty(monkeypatch):
                           input_fn=lambda *a: "y")
     assert buf.getvalue() == ""
     assert calls["release"] == 0
+
+
+def test_ctrl_c_in_the_trial_step_skips_the_review_question(monkeypatch, tmp_path):
+    monkeypatch.setattr(wizard, "step_pro_trial", lambda *a, **k: True)
+    monkeypatch.setattr(wizard, "_offer_first_review",
+                        lambda *a, **k: pytest.fail("asked to review a PR after Ctrl-C"))
+    rc, _out, _ = _drive(monkeypatch, tmp_path, workflow_present=True)
+    assert rc == 0
+
+
+@pytest.mark.parametrize("flag, entry", [("--buy", "run_buy"), ("--activate", "run_activate"),
+                                         ("--recover", "run_recover")])
+def test_a_pro_setup_flag_runs_only_its_path(monkeypatch, tmp_path, flag, entry):
+    ran = []
+    monkeypatch.setattr(wizard.pro_trial, entry, lambda ui, **k: ran.append(ui) or 7)
+    monkeypatch.setattr(wizard, "step_doctor", lambda **k: pytest.fail("wizard ran"))
+    rc = wizard.run(argv=[flag], config_path=tmp_path / "c.yaml", stream=io.StringIO(),
+                    input_fn=lambda *a: pytest.fail("prompted"))
+    assert rc == 7 and len(ran) == 1
+
+
+def test_a_plain_setup_finishes_held_work_before_the_wizard(monkeypatch, tmp_path):
+    order = []
+    monkeypatch.setattr(wizard.pro_trial, "has_held_work", lambda **k: True)
+    monkeypatch.setattr(wizard.pro_trial, "finish_held_work",
+                        lambda ui, release=None: order.append(("held", release is not None)))
+    monkeypatch.setattr(wizard, "step_doctor",
+                        lambda **k: order.append(("doctor", None)) or (_ for _ in ()).throw(
+                            KeyboardInterrupt()))
+    rc = wizard.run(argv=None, config_path=tmp_path / "c.yaml", stream=io.StringIO())
+    assert order == [("held", True), ("doctor", None)] and rc == 1
 
 
 def test_claude_workflow_written_when_absent(monkeypatch, tmp_path):

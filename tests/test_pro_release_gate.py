@@ -34,7 +34,7 @@ import pytest
 from packaging import tags
 
 from buddhi_review import pro_trial, wizard
-from conftest import _yn_bridge
+from conftest import FakeBridge, ScriptedUi, _yn_bridge
 
 _HERE = str(next(iter(tags.sys_tags())))          # a tag this interpreter accepts
 # The real "can sys.executable pip-install here" probe; the conftest answers it yes for
@@ -655,30 +655,29 @@ def _record_start(monkeypatch, calls):
     monkeypatch.setattr(pro_trial.ReleaseCheck, "start", start)
 
 
-def test_a_full_run_asks_once_early_and_start_trial_reuses_the_answer(
+def test_a_full_run_asks_once_early_and_the_trial_reuses_the_answer(
         monkeypatch, tmp_path, _tty):
     calls = []
     _record_start(monkeypatch, calls)
     fetch = _counting()
     monkeypatch.setattr(pro_trial, "_release_fetch", fetch)
-    keygen = []
-
-    def transport(method, url, auth, body):
-        keygen.append(url)
-        return 409, {"errors": [{"code": "EMAIL_TAKEN"}]}
-    monkeypatch.setattr(pro_trial, "_default_transport", transport)
+    bridge = FakeBridge({"POST /trial/code": [(202, {"status": "sent"})],
+                         "POST /trial": [(403, {"error": "code_invalid"})]})
+    monkeypatch.setattr(pro_trial, "_bridge_transport", bridge)
     out = _full_run(monkeypatch, tmp_path, calls=calls, answers={
-        "Start your free 14-day Pro trial": "y",
+        "Start or continue your free 14-day Pro trial": "y",
+        "Do you accept it": "y",
         "Email to set up your trial": "me@example.com",
-        "Already have a Pro key to paste": "n",
+        "Enter the 6-digit code": "123456",
+        "Send a new code": "n",
         "Review an open PR now": "n",
     })
     assert len(fetch.calls) == 1                      # one request for the whole run
     assert calls[0] == ("release-check", None)        # started before the first step
     assert [c for c in calls if c[0] == "release-check"] == [("release-check", None)]
     assert wizard._PRO_TRIAL_OFFER in out
-    assert keygen and keygen[0].endswith("/users")    # the open answer let it register
-    assert ("prompt", "Already have a Pro key to paste") in calls
+    assert bridge.count("POST /trial/code") == 1      # the open answer let it ask for a code
+    assert ("prompt", "Send a new code") in calls
 
 
 def test_a_full_run_while_closed_offers_nothing(monkeypatch, tmp_path, _tty):
@@ -713,25 +712,27 @@ class _Closed:
         return False
 
 
-@pytest.mark.parametrize("pending", [False, True], ids=["fresh", "pending-credential"])
-def test_start_trial_while_closed_mints_nothing(tmp_path, pending):
+@pytest.mark.parametrize("pending", [False, True], ids=["fresh", "older-release-state"])
+def test_start_trial_while_closed_asks_the_service_nothing(monkeypatch, tmp_path, pending):
     state = tmp_path / "trial.json"
     if pending:
         state.write_text(json.dumps({"pending_email": "me@example.com",
                                      "pending_password": "pw",
                                      "pending_user_id": "user-1"}), encoding="utf-8")
     before = state.read_bytes() if pending else None
-    keygen, installs = [], []
+    bridge = FakeBridge()
+    monkeypatch.setattr(pro_trial, "_bridge_transport", bridge)
+    installs = []
     netrc = tmp_path / ".netrc"
+    ui = ScriptedUi()
     outcome = pro_trial.start_trial(
-        "me@example.com", release=_Closed(), state_path=state, netrc_path=netrc,
-        transport=lambda *a: keygen.append(a) or (201, {}),
+        "me@example.com", release=_Closed(), ui=ui, state_path=state, netrc_path=netrc,
         runner=lambda cmd, env=None: installs.append(cmd))
     assert (outcome.ok, outcome.status, outcome.message) == (False, pro_trial.RELEASE_CLOSED, "")
-    assert keygen == [] and installs == []
+    assert bridge.calls == [] and installs == [] and ui.asked == [] and ui.lines == []
     assert not netrc.exists()
     if pending:
-        assert state.read_bytes() == before      # the pending credential is untouched
+        assert state.read_bytes() == before      # an older release's state is untouched
     else:
         assert not state.exists()
 
@@ -746,25 +747,29 @@ def test_start_trial_checks_the_release_before_anything_else():
 def test_start_trial_called_directly_asks_once(monkeypatch, tmp_path):
     fetch = _counting({"status": "closed"})
     monkeypatch.setattr(pro_trial, "_release_fetch", fetch)
+    bridge = FakeBridge()
+    monkeypatch.setattr(pro_trial, "_bridge_transport", bridge)
     outcome = pro_trial.start_trial("me@example.com", state_path=tmp_path / "s.json",
-                                    transport=lambda *a: pytest.fail("contacted keygen"))
+                                    ui=ScriptedUi())
     assert outcome.status == pro_trial.RELEASE_CLOSED
-    assert len(fetch.calls) == 1
+    assert len(fetch.calls) == 1 and bridge.calls == []
 
 
 def test_start_trial_reuses_the_run_answer(monkeypatch, tmp_path):
     fetch = _counting()
     monkeypatch.setattr(pro_trial, "_release_fetch", fetch)
+    bridge = FakeBridge({"POST /trial/code": [(422, {"error": "send_failed"})]})
+    monkeypatch.setattr(pro_trial, "_bridge_transport", bridge)
     check = pro_trial.ReleaseCheck().start()
     assert check.is_open() is True
     outcome = pro_trial.start_trial(
         "me@example.com", release=check, state_path=tmp_path / "s.json",
-        transport=lambda *a: (409, {"errors": [{"code": "EMAIL_TAKEN"}]}))
-    assert outcome.status == "email_registered"
-    assert len(fetch.calls) == 1
+        ui=ScriptedUi(yes={"Do you accept it?": [True]}))
+    assert outcome.status == "send_failed"
+    assert len(fetch.calls) == 1 and bridge.count("POST /trial/code") == 1
 
 
-# ── The paid-key prompt is behind the same gate (deliberately) ──────────────────
+# ── The trial's own requests are behind the same gate (deliberately) ─────────────
 
 class _OpenThenClosed:
     """Open for the offer, closed by the time start_trial asks: pins the guard INSIDE
@@ -778,37 +783,46 @@ class _OpenThenClosed:
         return self.asked == 1
 
 
-def test_the_paid_key_prompt_is_hidden_while_closed(monkeypatch, _tty):
-    """The paste prompt follows start_trial's "email already registered" outcome, so
-    the release guard at the top of start_trial hides it while closed: no account is
-    contacted, no paste is asked for, convert never runs, and nothing is printed."""
-    keygen = []
-    monkeypatch.setattr(pro_trial, "_default_transport",
-                        lambda *a: keygen.append(a) or (409, {"errors": [{"code": "TAKEN"}]}))
-    monkeypatch.setattr(pro_trial, "convert", lambda **k: pytest.fail("convert ran"))
+def test_the_trial_asks_nothing_more_once_closed(monkeypatch, _tty):
+    """The licence agreement and the code request follow start_trial's guard, so while
+    the release is closed nothing is asked of the service or the user after the email,
+    and nothing is printed after the offer."""
+    bridge = FakeBridge()
+    monkeypatch.setattr(pro_trial, "_bridge_transport", bridge)
     asked = []
 
     def input_fn(prompt=""):
         asked.append(prompt)
-        assert "Pro key" not in prompt
+        assert "Do you accept it" not in prompt and "6-digit" not in prompt
         return "me@example.com" if "Email" in prompt else "y"
     release = _OpenThenClosed()
     buf = io.StringIO()
     wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
                           input_fn=input_fn, release=release)
     assert release.asked == 2                    # the step, then start_trial
-    assert keygen == []
-    assert not any("Pro key" in p for p in asked)
+    assert bridge.calls == []
     # The offer line is all that was printed: no outcome row after it.
     lines = [ln for ln in buf.getvalue().splitlines() if ln.strip()]
-    assert len(lines) == 1 and "Try Buddhi Pro free for 14 days" in lines[0]
+    assert len(lines) == 1 and wizard._PRO_TRIAL_OFFER in lines[0]
 
 
-def test_the_paid_key_prompt_is_hidden_when_the_step_is_closed(monkeypatch, _tty):
-    monkeypatch.setattr(pro_trial, "convert", lambda **k: pytest.fail("convert ran"))
-    monkeypatch.setattr(pro_trial, "_default_transport",
-                        lambda *a: pytest.fail("contacted keygen"))
+def test_a_closed_step_asks_nothing_at_all(monkeypatch, _tty):
+    bridge = FakeBridge()
+    monkeypatch.setattr(pro_trial, "_bridge_transport", bridge)
     buf = io.StringIO()
     wizard.step_pro_trial("acme/widgets", pal=wizard._Palette(False), stream=buf,
                           input_fn=_never, release=_Closed())
-    assert buf.getvalue() == ""
+    assert buf.getvalue() == "" and bridge.calls == []
+
+
+# ── Three values the release check's bounds rest on ──────────────────────────────
+
+def test_the_local_check_fits_within_the_route_cap():
+    """The interpreter probe runs alongside the request and must finish within the
+    route's own cap, so the whole check stays within 8 s."""
+    assert pro_trial._LOCAL_CHECK_TIMEOUT_S <= pro_trial._RELEASE_TIMEOUT_S
+    assert pro_trial._RELEASE_TIMEOUT_S == 8.0
+
+
+def test_the_answer_size_cap_is_64_kib():
+    assert pro_trial._RELEASE_MAX_BYTES == 64 * 1024
