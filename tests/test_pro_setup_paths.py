@@ -758,6 +758,34 @@ def test_a_paused_recovery_whose_state_cannot_be_read_is_installed(monkeypatch):
     assert ui.lines[-1] == ("ok", _PAID_OK) and "install" not in _state()
 
 
+def test_a_paused_recovery_resumes_under_the_subscription_that_became_active(monkeypatch,
+                                                                             tmp_path):
+    _accepted()
+    _recover(monkeypatch, {"POST /recover/code": [(202, {"status": "sent"})],
+                           "POST /recover": [_complete(_ready("sub_1", "KEY-1"),
+                                                       _ready("sub_2", "KEY-2"))],
+                           "GET /seats": [(200, {"reasons": ["paused"]}),
+                                          (200, {"reasons": ["paused"]})]},
+             _choice_ui(_recover_ui()), runner=lambda *a, **k: pytest.fail("installed"))
+    assert "password KEY-1" in _netrc_text(tmp_path)
+    assert _state()["install"]["keys"] == {"sub_1": "KEY-1", "sub_2": "KEY-2"}
+    seen = []
+
+    def runner(*a, **k):
+        seen.append(_netrc_text(tmp_path))
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+    ui, _fake = _finish(monkeypatch, {"GET /seats": [(200, {"reasons": ["paused"]}),
+                                                     (200, {"reasons": []})]}, runner=runner)
+    assert ui.lines == [("ok", _PAID_OK)] and "install" not in _state()
+    assert seen and "password KEY-2" in seen[0] and "KEY-1" not in seen[0]
+
+
+def test_a_paused_recovery_keeps_the_saved_key_when_none_reads_active(monkeypatch, tmp_path):
+    _paused_recovery(monkeypatch)
+    ui, _fake = _finish(monkeypatch, {"GET /seats": [(503, {"error": "unavailable"})]})
+    assert ui.lines[-1] == ("ok", _PAID_OK) and "password KEY-1" in _netrc_text(tmp_path)
+
+
 def test_a_held_recovery_that_ends_paused_is_not_installed_in_the_same_run(monkeypatch):
     _accepted(recover=_held_recovery(accepted=True, replay_until=pro_trial._now() + 600))
     ui, _fake = _finish(monkeypatch, {"POST /recover": [_complete(_ready("sub_1", _KEY))],
@@ -1495,6 +1523,16 @@ def test_no_trial_is_offered_over_an_unfinished_paid_install(kind):
     pro_trial._write_state(None, {"install": {"kind": "trial", "buyer": True,
                                               "at": pro_trial._now()}})
     assert pro_trial.offer_allowed() is True
+
+
+@pytest.mark.parametrize("kind", ["buy", "activate", "recover"])
+def test_no_trial_is_offered_over_a_finished_paid_install_that_reads_inactive(kind):
+    """A paused or disputed subscription reads as inactive, yet its key is still the
+    one in ~/.netrc: a trial key must not replace it."""
+    pro_trial._write_state(None, {"last_install_kind": kind})
+    assert pro_trial.offer_allowed(backends=[]) is False
+    pro_trial._write_state(None, {"last_install_kind": "trial"})
+    assert pro_trial.offer_allowed(backends=[]) is True
 
 
 def test_a_long_retry_after_is_never_cut_short(monkeypatch):

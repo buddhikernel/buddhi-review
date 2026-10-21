@@ -1396,13 +1396,16 @@ def _install_tail(netrc: Path, *, kind: str, buyer: bool, last_offer: bool, back
 
 def _finish_install(key: str, *, kind: str = "trial", buyer: bool = True,
                     last_offer: bool = False, drop_hold: Optional[str] = None,
-                    install: bool = True, paused_subs: Sequence[str] = (), backends=None,
+                    install: bool = True, paused_subs: Sequence[str] = (),
+                    sub_keys: Optional[Dict[str, str]] = None, backends=None,
                     runner=None, netrc_path=None, is_active=None, sleep=None, attempts=20,
                     state_path: Optional[Path] = None) -> TrialOutcome:
     """Write ``key`` as the index credential, record the install as unfinished, then
     run :func:`_install_tail` (unless ``install`` is False: the key is saved for a
     later plain ``setup`` to finish, and the record notes it waits on ``paused_subs``
-    being paused, which that ``setup`` reads again before it installs). The held code named by ``drop_hold`` is dropped
+    being paused, which that ``setup`` reads again before it installs; ``sub_keys``
+    keeps each one's key, so that ``setup`` runs under whichever is active by then).
+    The held code named by ``drop_hold`` is dropped
     in the SAME state write that records the unfinished install, once the key is in
     ``~/.netrc`` — so a write that fails keeps the code, and some record always
     remains for a later ``setup`` to continue from."""
@@ -1414,25 +1417,31 @@ def _finish_install(key: str, *, kind: str = "trial", buyer: bool = True,
     state["install"] = {"kind": kind, "buyer": bool(buyer), "at": _now()}
     if not install:
         state["install"].update(deferred="paused", subscriptions=list(paused_subs))
+        if sub_keys:
+            state["install"]["keys"] = dict(sub_keys)
     if drop_hold:
         state.pop(drop_hold, None)
     _write_state(state_path, state)
     if action == "appended-unparsed":
-        if kind == "trial" and last_offer:
-            return TrialOutcome(False, "netrc_unparsed",
-                                f"{netrc} has an entry that could not be safely updated (it shares "
-                                "a line with another entry), so your new credential was appended "
-                                f"instead. Clean up {netrc} by hand. For help continuing trial "
-                                f"setup, email {SUPPORT_EMAIL}.")
-        return TrialOutcome(False, "netrc_unparsed",
-                            f"{netrc} has an entry that could not be safely updated (it shares a "
-                            "line with another entry) — your new credential was appended "
-                            f"instead. Please clean up {netrc} by hand, then re-run setup.")
+        return _netrc_unparsed(netrc, kind, last_offer)
     if not install:
         return TrialOutcome(False, "saved", "")
     return _install_tail(netrc, kind=kind, buyer=buyer, last_offer=last_offer,
                          backends=backends, runner=runner, is_active=is_active, sleep=sleep,
                          attempts=attempts, state_path=state_path)
+
+
+def _netrc_unparsed(netrc: Path, kind: str, last_offer: bool) -> TrialOutcome:
+    if kind == "trial" and last_offer:
+        return TrialOutcome(False, "netrc_unparsed",
+                            f"{netrc} has an entry that could not be safely updated (it shares "
+                            "a line with another entry), so your new credential was appended "
+                            f"instead. Clean up {netrc} by hand. For help continuing trial "
+                            f"setup, email {SUPPORT_EMAIL}.")
+    return TrialOutcome(False, "netrc_unparsed",
+                        f"{netrc} has an entry that could not be safely updated (it shares a "
+                        "line with another entry) — your new credential was appended "
+                        f"instead. Please clean up {netrc} by hand, then re-run setup.")
 
 
 def _show(ui: Ui, outcome: TrialOutcome) -> TrialOutcome:
@@ -2153,15 +2162,24 @@ _PAUSED_NOT_INSTALLED = ("Buddhi Review Pro is not installed yet, because none o
                          "to finish.")
 
 
-def _still_paused(record: dict) -> bool:
-    """Whether an install deferred because every moved subscription was paused should
-    stay deferred: every one of them still reads as paused. A subscription that cannot
-    be read is never taken as paused, so the install goes ahead as it would have."""
+def _still_paused(record: dict) -> Tuple[bool, Optional[str]]:
+    """For an install deferred because every moved subscription was paused: whether it
+    should stay deferred (every one of them still reads as paused), and the first one
+    now read as active, which the install then runs under (build rule 7). A
+    subscription that cannot be read is never taken as paused, so the install goes
+    ahead as it would have."""
     subs = record.get("subscriptions")
     if not isinstance(subs, list) or not subs:
-        return False
-    return all(isinstance(s, str) and _subscription_paused(s, _seat_admin_secret(s)) is True
-               for s in subs)
+        return False, None
+    every_paused = True
+    for sub in subs:
+        paused = (_subscription_paused(sub, _seat_admin_secret(sub))
+                  if isinstance(sub, str) else None)
+        if paused is False:
+            return False, sub
+        if paused is not True:
+            every_paused = False
+    return every_paused, None
 
 
 def _recovery_seats(ui: Ui, data: dict, subs: list, opts: dict) -> int:
@@ -2210,7 +2228,8 @@ def _recovery_seats(ui: Ui, data: dict, subs: list, opts: dict) -> int:
         outcome = _show(ui, _finish_install(
             chosen[1], kind="recover", buyer=True,
             install=not all(m[2] is True for m in moved),
-            paused_subs=[m[0] for m in moved], drop_hold="recover", **opts))
+            paused_subs=[m[0] for m in moved], sub_keys={m[0]: m[1] for m in moved},
+            drop_hold="recover", **opts))
     except KeyboardInterrupt:
         return 1    # the key is saved; the next plain setup finishes the install
     if outcome.status == "saved":
@@ -2537,14 +2556,29 @@ def _finish_unfinished_install(ui: Ui, record: dict, opts: dict) -> None:
     # A recovery whose every subscription was paused saved the key without installing:
     # while they still are, installing would only fail to activate (and drop this
     # record), so the record is kept for the setup the user was told to run.
-    if record.get("deferred") == "paused" and _still_paused(record):
-        ui.row("info", _PAUSED_NOT_INSTALLED)
-        return
+    active_sub = None
+    if record.get("deferred") == "paused":
+        paused, active_sub = _still_paused(record)
+        if paused:
+            ui.row("info", _PAUSED_NOT_INSTALLED)
+            return
     kind = record.get("kind") if record.get("kind") in ("trial",) + _PAID_KINDS else "buy"
     state = _read_state(opts.get("state_path"))
     from buddhi_review import upsell
     shown = state.get("shown_count") if isinstance(state.get("shown_count"), int) else 0
     netrc = Path(opts["netrc_path"]) if opts.get("netrc_path") else netrc_writer.default_path()
+    # The saved key is the first moved seat's; when another subscription is the one now
+    # active, its key replaces it in ~/.netrc so the install runs under that one.
+    keys = record.get("keys") if isinstance(record.get("keys"), dict) else {}
+    key = keys.get(active_sub) if active_sub else None
+    if isinstance(key, str) and key:
+        ok, action = write_index_credential(key, path=netrc)
+        if not ok:
+            ui.row("warn", _netrc_failed_line(netrc, kind, shown >= upsell._max_shows()))
+            return
+        if action == "appended-unparsed":
+            _show(ui, _netrc_unparsed(netrc, kind, shown >= upsell._max_shows()))
+            return
     _show(ui, _install_tail(netrc, kind=kind, buyer=bool(record.get("buyer", True)),
                             last_offer=shown >= upsell._max_shows(),
                             **{k: v for k, v in opts.items() if k != "netrc_path"}))
@@ -2612,6 +2646,10 @@ def offer_allowed(*, backends=None, now=None, state_path=None) -> bool:
     if state.get("declined") is True:
         return False
     if _paid_install_pending(state):     # a trial key would replace the paid one
+        return False
+    # ... and so would it over a paid install that finished: a paused or disputed
+    # subscription reads as inactive above while its key is still the one in ~/.netrc.
+    if state.get("last_install_kind") in _PAID_KINDS:
         return False
     now = now if now is not None else _now()
     started = _num(state.get("trial_active_since"))
