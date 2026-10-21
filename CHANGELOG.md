@@ -21,6 +21,20 @@ title: Changelog
 
 * **install:** the manual skill install copies files rather than linking them, so upgrading the package does not refresh `~/.claude/skills/`. README + GETTING_STARTED now tell you to re-run the `cp -R` block after every `pip install -U buddhi-review` — required to pick up this release's new skill text.
 
+## [0.10.0](https://github.com/buddhikernel/buddhi-review/compare/v0.9.3...v0.10.0) (2026-10-21)
+
+
+### Features
+
+* **classify:** a real-flaw fix defaults to Opus at medium effort, and the classifier is told when an earlier fix for the same finding failed ([#123](https://github.com/buddhikernel/buddhi-review/issues/123)) ([8fd3e15](https://github.com/buddhikernel/buddhi-review/commit/8fd3e15ac4645e9b14494a0daaabb95e1c1509ba))
+* **trial:** trials, setup --buy, --activate and --recover go through the Buddhi Review service, after the licence agreement ([#124](https://github.com/buddhikernel/buddhi-review/issues/124)) ([41b42de](https://github.com/buddhikernel/buddhi-review/commit/41b42dec9b6c5e7f64359d206ab43e7e59fd7675))
+
+
+### Bug Fixes
+
+* **config:** PRO-57.a — one config file at ~/.config/buddhi/config.yaml, with the legacy file migrated into it ([#117](https://github.com/buddhikernel/buddhi-review/issues/117)) ([962c228](https://github.com/buddhikernel/buddhi-review/commit/962c228b9374d84376807be8c16290d4735f1f52))
+* **trial:** PRO-49.b — offer the Pro trial only once the paid release is published ([#121](https://github.com/buddhikernel/buddhi-review/issues/121)) ([821c126](https://github.com/buddhikernel/buddhi-review/commit/821c126ea69bbf47a0a1b953576e7c282eff72f6))
+
 ## [0.9.3](https://github.com/buddhikernel/buddhi-review/compare/v0.9.2...v0.9.3) (2026-10-05)
 
 
