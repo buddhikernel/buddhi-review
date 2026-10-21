@@ -676,6 +676,23 @@ def test_not_activated_lines():
                             f"may already be active elsewhere. Contact {_SUPPORT}.")
 
 
+@pytest.mark.parametrize("kind", ["buy", "activate", "recover"])
+def test_a_paid_key_that_did_not_activate_still_blocks_the_trial_offer(kind):
+    """The paid key stays in ~/.netrc, so a trial key must never be offered over it."""
+    assert pro_trial.offer_allowed()
+    out = pro_trial._finish_install(_KEY, kind=kind, **_install_kw(is_active=lambda: False))
+    assert out.status == "not_activated"
+    state = _state()
+    assert "install" not in state and state["last_install_kind"] == kind
+    assert "trial_active_since" not in state
+    assert not pro_trial.offer_allowed()
+
+
+def test_a_trial_that_did_not_activate_records_no_install_kind():
+    pro_trial._finish_install(_KEY, kind="trial", **_install_kw(is_active=lambda: False))
+    assert "last_install_kind" not in _state()
+
+
 def test_a_key_is_never_printed_nor_world_readable(tmp_path, monkeypatch):
     netrc = tmp_path / ".netrc"
     lines = []

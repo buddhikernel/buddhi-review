@@ -1381,9 +1381,15 @@ def _install_tail(netrc: Path, *, kind: str, buyer: bool, last_offer: bool, back
     # Installed, but this computer did not activate: one calm line + a pointer. The
     # unfinished-install record is dropped, so a later plain ``setup`` does not re-run
     # pip and repeat this line on every run (the cause is often permanent: a trial
-    # already used here, or a key active elsewhere).
+    # already used here, or a key active elsewhere). A paid key still stays in
+    # ``~/.netrc``, so its kind is recorded: without it the trial offer would come back
+    # and a trial key would replace the paid one.
     state = _read_state(state_path)
-    if state.pop("install", None) is not None:
+    changed = state.pop("install", None) is not None
+    if kind in _PAID_KINDS and state.get("last_install_kind") != kind:
+        state["last_install_kind"] = kind
+        changed = True
+    if changed:
         _write_state(state_path, state)
     if kind == "trial":
         return TrialOutcome(False, "not_activated",
