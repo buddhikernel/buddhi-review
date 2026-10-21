@@ -2329,9 +2329,13 @@ def _recover_seats(ui: Ui, release: "ReleaseCheck", opts: dict) -> int:
                              "changed it): ", valid_recovery_address, _EMAIL_RETRY)
     if email is None:
         return 1
-    sent = _call_retrying("POST", "/recover/code", {"email": email})
+    # One attempt, as for /trial/code: every accepted request mails a new code that
+    # replaces the last one, so a retry after a lost answer would void the code the
+    # user is about to paste.
+    sent = _bridge_call("POST", "/recover/code", {"email": email})
     if sent.status != 202 or sent.data is None:
         ui.row("warn", _too_many(sent.retry_after) if sent.status == 429
+               else _codes_paused(sent.retry_after) if _sending_paused(sent)
                else _NOT_ANSWERING if _no_answer(sent) else _FAULT)
         return 1
     ui.row("info", "If this is the recovery address of a Buddhi Review Pro purchase, a recovery "
@@ -2366,15 +2370,23 @@ _ADDR_403 = ("That code is not valid. It may be mistyped, expired (codes last 30
 _ADDR_UNCHANGED = "Your recovery address was not changed."
 
 
+def _sending_paused(a: BridgeAnswer) -> bool:
+    return a.status == 503 and a.error == "sending_paused"
+
+
+def _codes_paused(seconds: Optional[float]) -> str:
+    return ("Codes cannot be sent right now. Try again in about "
+            f"{_time_phrase(seconds)} with `buddhi-review setup --recover`.")
+
+
 def _address_answer_line(a: BridgeAnswer, new: str) -> str:
     if a.status == 403:
         return _ADDR_403
     if a.status == 422 and a.error == "send_failed":
         return (f"We could not send to {new}. The codes for this change no longer work. Start "
                 "again with another address.")
-    if a.status == 503 and a.error == "sending_paused":
-        return ("Codes cannot be sent right now. Try again in about "
-                f"{_time_phrase(a.retry_after)} with `buddhi-review setup --recover`.")
+    if _sending_paused(a):
+        return _codes_paused(a.retry_after)
     if a.status == 429:
         return _too_many(a.retry_after)
     if _no_answer(a):
@@ -2392,7 +2404,9 @@ def _change_address(ui: Ui) -> int:
                        "digits and . _ % + - such as name@example.com.")
     if new is None:
         return 1
-    first = _call_retrying("POST", "/recover/address/code", {"email": current, "new_email": new})
+    # The two code-sending requests make one attempt each (see /recover/code above):
+    # a retry would mail a new code that voids the one already sent.
+    first = _bridge_call("POST", "/recover/address/code", {"email": current, "new_email": new})
     if first.status == 400 and first.error == "same_address":
         ui.row("info", "The new address is the same as the current one. Nothing was changed.")
         return 1
@@ -2413,9 +2427,9 @@ def _change_address(ui: Ui) -> int:
             ui.row("warn", _ADDR_403)
             return 1
         while True:  # step 2: the code to the new address (asked again on request)
-            second = _call_retrying("POST", "/recover/address/new-code",
-                                    {"email": current, "new_email": new,
-                                     "current_code": current_code})
+            second = _bridge_call("POST", "/recover/address/new-code",
+                                  {"email": current, "new_email": new,
+                                   "current_code": current_code})
             if second.status != 202 or second.data is None:
                 ui.row("warn", _address_answer_line(second, new))
                 return 1

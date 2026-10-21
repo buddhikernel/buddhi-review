@@ -1022,6 +1022,42 @@ def test_address_change_answers_that_end_it(monkeypatch, route, answer, line):
     assert rc == 1 and ui.lines[-1] == ("warn", line)
 
 
+def test_recovery_code_mail_paused_says_when_to_try_again(monkeypatch):
+    _accepted()
+    ui = _choice_ui(_recover_ui())
+    rc, fake = _recover(monkeypatch, {
+        "POST /recover/code": [(503, {"error": "sending_paused"}, 600)]}, ui)
+    assert rc == 1 and fake.count("POST /recover/code") == 1
+    assert ui.lines[-1] == ("warn", "Codes cannot be sent right now. Try again in about 10 "
+                                    "minutes with `buddhi-review setup --recover`.")
+
+
+@pytest.mark.parametrize("answer", [(502, None), (504, None), (0, None)])
+def test_the_recovery_code_request_is_never_retried(monkeypatch, answer):
+    """Each accepted request mails a new code that replaces the last: a retry after a
+    lost answer would void the code already on its way."""
+    _accepted()
+    naps = _naps(monkeypatch)
+    ui = _choice_ui(_recover_ui())
+    rc, fake = _recover(monkeypatch, {"POST /recover/code": [answer]}, ui)
+    assert rc == 1 and fake.count("POST /recover/code") == 1 and naps == []
+    assert ui.lines[-1] == ("warn", _NOT_ANSWERING)
+
+
+@pytest.mark.parametrize("route", ["POST /recover/address/code",
+                                   "POST /recover/address/new-code"])
+@pytest.mark.parametrize("answer", [(502, None), (504, None), (0, None)])
+def test_the_address_change_code_requests_are_never_retried(monkeypatch, route, answer):
+    naps = _naps(monkeypatch)
+    ui = _address_ui()
+    if route == "POST /recover/address/code":
+        ui._hidden[_CUR_PROMPT].clear()
+    ui._hidden[_NEW_PROMPT].clear()
+    rc, fake = _recover(monkeypatch, _address_routes(**{route: [answer]}), ui)
+    assert rc == 1 and fake.count(route) == 1 and naps == []
+    assert ui.lines[-1] == ("warn", _NOT_ANSWERING)
+
+
 def test_a_misshapen_address_change_code_is_never_sent(monkeypatch):
     ui = _address_ui(cur_code=("NOT-A-CODE",))
     rc, fake = _recover(monkeypatch, _address_routes(), ui)
