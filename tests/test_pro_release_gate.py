@@ -590,7 +590,7 @@ _GATED = {
         json.dumps({"shown_count": 1, "last_shown": time.time()})),
     "already-pro": lambda mp, path: mp.setattr(pro_trial, "pro_backend_active",
                                                lambda **k: True),
-    "off-tty": lambda mp, path: mp.setattr(wizard, "_is_tty", lambda: False),
+    "off-tty": lambda mp, path: mp.setattr(wizard, "_streams_are_tty", lambda: False),
 }
 
 

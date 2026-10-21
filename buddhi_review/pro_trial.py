@@ -62,7 +62,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from buddhi_review import netrc_writer
 
@@ -876,6 +876,19 @@ def save_seat_admin(entries: List[Tuple[str, str, int]]) -> Optional[Tuple[str, 
                 pass
 
 
+def _seat_admin_secret(sub_id: str) -> Optional[str]:
+    """The manage secret this computer holds for ``sub_id``, or None when the
+    seat-access file, or its entry for this subscription, cannot be read."""
+    try:
+        current = json.loads(_seat_admin_path().read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    entries = current.get("entries") if isinstance(current, dict) else None
+    entry = entries.get(f"{BRIDGE_ORIGIN} {sub_id}") if isinstance(entries, dict) else None
+    secret = entry.get("secret") if isinstance(entry, dict) else None
+    return secret if isinstance(secret, str) and secret else None
+
+
 def _seat_admin_line(failure: Tuple[str, str], *, installed: bool) -> str:
     kind, why = failure
     path = _seat_admin_path()
@@ -1383,12 +1396,13 @@ def _install_tail(netrc: Path, *, kind: str, buyer: bool, last_offer: bool, back
 
 def _finish_install(key: str, *, kind: str = "trial", buyer: bool = True,
                     last_offer: bool = False, drop_hold: Optional[str] = None,
-                    install: bool = True, backends=None, runner=None, netrc_path=None,
-                    is_active=None, sleep=None, attempts=20,
+                    install: bool = True, paused_subs: Sequence[str] = (), backends=None,
+                    runner=None, netrc_path=None, is_active=None, sleep=None, attempts=20,
                     state_path: Optional[Path] = None) -> TrialOutcome:
     """Write ``key`` as the index credential, record the install as unfinished, then
     run :func:`_install_tail` (unless ``install`` is False: the key is saved for a
-    later plain ``setup`` to finish). The held code named by ``drop_hold`` is dropped
+    later plain ``setup`` to finish, and the record notes it waits on ``paused_subs``
+    being paused, which that ``setup`` reads again before it installs). The held code named by ``drop_hold`` is dropped
     in the SAME state write that records the unfinished install, once the key is in
     ``~/.netrc`` — so a write that fails keeps the code, and some record always
     remains for a later ``setup`` to continue from."""
@@ -1398,6 +1412,8 @@ def _finish_install(key: str, *, kind: str = "trial", buyer: bool = True,
         return TrialOutcome(False, "netrc_failed", _netrc_failed_line(netrc, kind, last_offer))
     state = _read_state(state_path)
     state["install"] = {"kind": kind, "buyer": bool(buyer), "at": _now()}
+    if not install:
+        state["install"].update(deferred="paused", subscriptions=list(paused_subs))
     if drop_hold:
         state.pop(drop_hold, None)
     _write_state(state_path, state)
@@ -2132,6 +2148,22 @@ def _recovery_complete(ui: Ui, data: dict, opts: dict) -> int:
         return 1
 
 
+_PAUSED_NOT_INSTALLED = ("Buddhi Review Pro is not installed yet, because none of these "
+                         "subscriptions is active now. Once one is, run `buddhi-review setup` "
+                         "to finish.")
+
+
+def _still_paused(record: dict) -> bool:
+    """Whether an install deferred because every moved subscription was paused should
+    stay deferred: every one of them still reads as paused. A subscription that cannot
+    be read is never taken as paused, so the install goes ahead as it would have."""
+    subs = record.get("subscriptions")
+    if not isinstance(subs, list) or not subs:
+        return False
+    return all(isinstance(s, str) and _subscription_paused(s, _seat_admin_secret(s)) is True
+               for s in subs)
+
+
 def _recovery_seats(ui: Ui, data: dict, subs: list, opts: dict) -> int:
     state_path = opts.get("state_path")
     saved_ids, failure = _keep_recovery_secrets(data)
@@ -2177,13 +2209,12 @@ def _recovery_seats(ui: Ui, data: dict, subs: list, opts: dict) -> int:
     try:
         outcome = _show(ui, _finish_install(
             chosen[1], kind="recover", buyer=True,
-            install=not all(m[2] is True for m in moved), drop_hold="recover", **opts))
+            install=not all(m[2] is True for m in moved),
+            paused_subs=[m[0] for m in moved], drop_hold="recover", **opts))
     except KeyboardInterrupt:
         return 1    # the key is saved; the next plain setup finishes the install
     if outcome.status == "saved":
-        ui.row("info", "Buddhi Review Pro is not installed yet, because none of these "
-                       "subscriptions is active now. Once one is, run `buddhi-review setup` to "
-                       "finish.")
+        ui.row("info", _PAUSED_NOT_INSTALLED)
     if failure:
         ui.row("warn", _seat_admin_line(failure, installed=outcome.ok))
     return 0 if outcome.ok else 1
@@ -2503,6 +2534,12 @@ def _check_held_buy(ui: Ui, hold: dict, opts: dict) -> None:
 
 
 def _finish_unfinished_install(ui: Ui, record: dict, opts: dict) -> None:
+    # A recovery whose every subscription was paused saved the key without installing:
+    # while they still are, installing would only fail to activate (and drop this
+    # record), so the record is kept for the setup the user was told to run.
+    if record.get("deferred") == "paused" and _still_paused(record):
+        ui.row("info", _PAUSED_NOT_INSTALLED)
+        return
     kind = record.get("kind") if record.get("kind") in ("trial",) + _PAID_KINDS else "buy"
     state = _read_state(opts.get("state_path"))
     from buddhi_review import upsell
@@ -2549,9 +2586,10 @@ def finish_held_work(ui: Ui, *, release: Optional["ReleaseCheck"] = None, backen
     buy = _held(state, "buy")
     if buy is not None:
         _check_held_buy(ui, buy, opts)
+    # Only an install left by an EARLIER run: one the recovery or the purchase above
+    # wrote has already been tried (or deliberately deferred) in this run.
     state = _read_state(state_path)
-    record = _held(state, "install")
-    if record is not None:
+    if record is not None and _held(state, "install") == record:
         _finish_unfinished_install(ui, record, opts)
 
 

@@ -2852,7 +2852,7 @@ def step_pro_trial(_repo: Optional[str], *, pal, stream, input_fn=input,
     by :func:`run`; one is made there when not given). Until then the step is silent,
     like the off-TTY and capped paths, and the offer counters are left untouched.
     Returns True when the user stopped setup with Ctrl-C in the step."""
-    if not _is_tty():
+    if not _streams_are_tty():
         return False
     ui = _acquisition_ui(pal=pal, stream=stream, input_fn=input_fn, getpass_fn=getpass_fn)
     return pro_trial.trial_step(ui, release=release)
@@ -3118,7 +3118,7 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
         # the route is never contacted. One answer serves the whole run.
         held = pro_trial.has_held_work()
         release = (pro_trial.ReleaseCheck().start()
-                   if held or (_is_tty() and pro_trial.offer_allowed(now=None)) else None)
+                   if held or (_streams_are_tty() and pro_trial.offer_allowed(now=None)) else None)
         if held:
             # Build rule 2's order: a held recovery code, a held --buy code, then an
             # install whose key is already in ~/.netrc — before the wizard's own steps.

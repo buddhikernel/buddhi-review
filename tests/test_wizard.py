@@ -501,7 +501,7 @@ def test_step_pro_trial_skips_when_not_allowed(monkeypatch):
 
 def test_step_pro_trial_skips_off_tty(monkeypatch):
     calls = _pro_trial_stub(monkeypatch, allowed=True)
-    monkeypatch.setattr(wizard, "_is_tty", lambda: False)
+    monkeypatch.setattr(wizard, "_streams_are_tty", lambda: False)
     buf = io.StringIO()
     wizard.step_pro_trial(None, pal=wizard._Palette(False), stream=buf,
                           input_fn=lambda *a: "y")

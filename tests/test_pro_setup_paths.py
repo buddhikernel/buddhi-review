@@ -723,6 +723,50 @@ def test_recovery_when_every_moved_seat_is_paused(monkeypatch, tmp_path):
     assert _state()["install"]["kind"] == "recover"       # the next plain setup finishes it
 
 
+_PAUSED_LINE = ("Buddhi Review Pro is not installed yet, because none of these subscriptions is "
+                "active now. Once one is, run `buddhi-review setup` to finish.")
+
+
+def _paused_recovery(monkeypatch):
+    _accepted()
+    _recover(monkeypatch, {"POST /recover/code": [(202, {"status": "sent"})],
+                           "POST /recover": [_complete(_ready("sub_1", "KEY-1"))],
+                           "GET /seats": [(200, {"reasons": ["paused"]})]},
+             _choice_ui(_recover_ui()), runner=lambda *a, **k: pytest.fail("installed"))
+    assert _state()["install"]["deferred"] == "paused"
+    assert _state()["install"]["subscriptions"] == ["sub_1"]
+
+
+def test_a_plain_setup_keeps_a_paused_recovery_waiting_while_it_is_still_paused(monkeypatch):
+    _paused_recovery(monkeypatch)
+    for _ in range(2):      # not installed, not dropped: the promised later setup still works
+        ui, fake = _finish(monkeypatch, {"GET /seats": [(200, {"reasons": ["paused"]})]},
+                           runner=lambda *a, **k: pytest.fail("installed while paused"))
+        assert ui.text == [_PAUSED_LINE] and pro_trial.has_held_work()
+        assert fake.calls[0]["auth"] == "Bearer " + "sub_1-secret".ljust(43, "x")
+
+
+def test_a_plain_setup_installs_a_paused_recovery_once_it_is_active(monkeypatch):
+    _paused_recovery(monkeypatch)
+    ui, _fake = _finish(monkeypatch, {"GET /seats": [(200, {"reasons": []})]})
+    assert ui.lines == [("ok", _PAID_OK)] and "install" not in _state()
+
+
+def test_a_paused_recovery_whose_state_cannot_be_read_is_installed(monkeypatch):
+    _paused_recovery(monkeypatch)
+    ui, _fake = _finish(monkeypatch, {"GET /seats": [(503, {"error": "unavailable"})]})
+    assert ui.lines[-1] == ("ok", _PAID_OK) and "install" not in _state()
+
+
+def test_a_held_recovery_that_ends_paused_is_not_installed_in_the_same_run(monkeypatch):
+    _accepted(recover=_held_recovery(accepted=True, replay_until=pro_trial._now() + 600))
+    ui, _fake = _finish(monkeypatch, {"POST /recover": [_complete(_ready("sub_1", _KEY))],
+                                      "GET /seats": [(200, {"reasons": ["paused"]})]},
+                        runner=lambda *a, **k: pytest.fail("installed while paused"))
+    assert ui.text[-1] == _PAUSED_LINE and ui.text.count(_PAUSED_LINE) == 1
+    assert _state()["install"]["deferred"] == "paused"
+
+
 def test_recovery_with_no_purchase_at_the_address(monkeypatch):
     _accepted()
     ui = _choice_ui(_recover_ui())
@@ -1130,6 +1174,21 @@ def test_an_install_that_did_not_activate_is_not_retried(monkeypatch):
     assert "install" not in _state() and not pro_trial.has_held_work()
     ui, _fake = _finish(monkeypatch, {}, runner=runner, is_active=lambda: False)
     assert len(ran) == 1 and ui.lines == []
+
+
+def test_a_held_purchase_whose_install_fails_is_tried_once_per_run(monkeypatch):
+    _accepted(buy=_held_buy())
+    ran = []
+
+    def runner(cmd, env=None):
+        ran.append(cmd)
+        return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+
+    ui, _fake = _finish(monkeypatch, {"POST /claim": [_claim_200()]}, runner=runner)
+    assert len(ran) == 1 and len([t for t in ui.text if t.startswith("Install did not")]) == 1
+    assert "install" in _state()          # the next plain setup tries it again
+    ui, _fake = _finish(monkeypatch, {}, runner=runner)
+    assert len(ran) == 2
 
 
 def test_the_order_is_recovery_then_buy_then_install(monkeypatch):
