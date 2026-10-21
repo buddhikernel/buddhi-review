@@ -328,6 +328,7 @@ def _pro_trial_stub(monkeypatch, *, allowed=True):
     from packaging import tags
     calls = {"release": 0, "ui": []}
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "_streams_are_tty", lambda: True)
     monkeypatch.setattr(wizard.pro_trial, "offer_allowed", lambda **k: allowed)
 
     def _release():
@@ -376,6 +377,34 @@ def test_step_pro_trial_reads_codes_through_the_hidden_reader(monkeypatch):
     assert seen["ui"].interactive is True
     # no line of the reader's own before an approved prompt
     assert prefaces == [False]
+
+
+@pytest.mark.parametrize("stdin_tty,stdout_tty,expected", [
+    (True, True, True), (True, False, False), (False, True, False)])
+def test_acquisition_eligibility_does_not_need_posix_raw_input(monkeypatch, stdin_tty,
+                                                               stdout_tty, expected):
+    """A native Windows terminal (no termios / tty, so _is_tty() is False) is still
+    interactive for setup --buy / --activate / --recover: eligibility reads the streams."""
+    import builtins
+    real_import = builtins.__import__
+
+    def no_posix(name, *a, **k):
+        if name in ("termios", "tty"):
+            raise ImportError(name)
+        return real_import(name, *a, **k)
+    monkeypatch.setattr(builtins, "__import__", no_posix)
+    monkeypatch.setattr(wizard.sys, "stdin", types.SimpleNamespace(isatty=lambda: stdin_tty))
+    monkeypatch.setattr(wizard.sys, "stdout", types.SimpleNamespace(isatty=lambda: stdout_tty))
+    assert wizard._is_tty() is False
+    ui = wizard._acquisition_ui(pal=wizard._Palette(False), stream=io.StringIO())
+    assert ui.interactive is expected
+
+
+def test_acquisition_eligibility_is_false_on_a_closed_stream(monkeypatch):
+    def closed():
+        raise ValueError("I/O operation on closed file")
+    monkeypatch.setattr(wizard.sys, "stdin", types.SimpleNamespace(isatty=closed))
+    assert wizard._streams_are_tty() is False
 
 
 def test_the_acquisition_reader_never_falls_back_to_an_echoing_read(monkeypatch):

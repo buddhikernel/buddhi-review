@@ -2822,7 +2822,18 @@ def _acquisition_ui(*, pal, stream, input_fn=input,
         ask_hidden=lambda prompt: _read_pasted_secret(f"  {prompt}", hidden, preface=False),
         yes_no=lambda question, default: _ask_yes_no(question, default=default,
                                                      input_fn=input_fn, stream=stream, pal=pal),
-        interactive=_is_tty())
+        interactive=_streams_are_tty())
+
+
+def _streams_are_tty() -> bool:
+    """Whether stdin and stdout are both terminals — the acquisition paths' eligibility,
+    deliberately independent of :func:`_is_tty`'s POSIX raw-input check (termios / tty),
+    so a native Windows terminal is not refused. Their controls already fall back there:
+    yes/no to a text prompt, the hidden reader to a non-echoing ``getpass``."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (ValueError, OSError, AttributeError):
+        return False
 
 
 def step_pro_trial(_repo: Optional[str], *, pal, stream, input_fn=input,

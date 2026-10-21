@@ -548,6 +548,7 @@ def _never(prompt=""):
 @pytest.fixture
 def _tty(monkeypatch):
     monkeypatch.setattr(wizard, "_is_tty", lambda: True)
+    monkeypatch.setattr(wizard, "_streams_are_tty", lambda: True)
     monkeypatch.setattr(wizard, "single_select", _yn_bridge)
     # Not on Pro: deterministic whatever happens to be installed in this environment.
     monkeypatch.setattr(pro_trial, "pro_backend_active", lambda **k: False)
@@ -622,12 +623,25 @@ def _setup_run(calls):
     return run
 
 
-def _full_run(monkeypatch, tmp_path, *, answers, calls):
+def _full_run(monkeypatch, tmp_path, *, answers, calls, hidden=None):
+    """``answers`` are the visible prompts' answers, ``hidden`` the hidden reader's: a
+    code read through the echoing ``input_fn`` fails the test."""
     monkeypatch.setattr(wizard, "_set_claude_secret", lambda *a, **k: "present")
     monkeypatch.setattr(wizard, "_offer_update_managed_file", lambda *a, **k: None)
     monkeypatch.setattr(wizard, "_offer_gh_token", lambda *a, **k: None)
+    hidden = {k: list(v) for k, v in (hidden or {}).items()}
+
+    def read_hidden(prompt, preface=True):
+        for key, queue in hidden.items():
+            if key in prompt:
+                calls.append(("hidden", key))
+                return queue.pop(0) if queue else ""
+        return ""
+    monkeypatch.setattr(wizard, "_read_hidden_tty", read_hidden)
 
     def input_fn(prompt=""):
+        assert not any(c in prompt for c in ("6-digit code", "Paste")), (
+            f"a code was read with echo on: {prompt!r}")
         for key, value in answers.items():
             if key in prompt:
                 calls.append(("prompt", key))
@@ -668,16 +682,16 @@ def test_a_full_run_asks_once_early_and_the_trial_reuses_the_answer(
         "Start or continue your free 14-day Pro trial": "y",
         "Do you accept it": "y",
         "Email to set up your trial": "me@example.com",
-        "Enter the 6-digit code": "123456",
         "Send a new code": "n",
         "Review an open PR now": "n",
-    })
+    }, hidden={"Enter the 6-digit code": ["123456"]})
     assert len(fetch.calls) == 1                      # one request for the whole run
     assert calls[0] == ("release-check", None)        # started before the first step
     assert [c for c in calls if c[0] == "release-check"] == [("release-check", None)]
     assert wizard._PRO_TRIAL_OFFER in out
     assert bridge.count("POST /trial/code") == 1      # the open answer let it ask for a code
     assert ("prompt", "Send a new code") in calls
+    assert ("hidden", "Enter the 6-digit code") in calls  # read hidden, never echoed
 
 
 def test_a_full_run_while_closed_offers_nothing(monkeypatch, tmp_path, _tty):

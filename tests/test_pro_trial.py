@@ -706,8 +706,9 @@ def _trial_ui(*, codes=("123456",), email=("me@example.com",), accept=(True,), y
               offer=(True,)):
     questions = {_QUESTION: list(offer), "Do you accept it?": list(accept)}
     questions.update(yes or {})
-    return ScriptedUi(answers={"Email to set up your trial": list(email),
-                               "Enter the 6-digit code": list(codes)}, yes=questions)
+    # The emailed code is read hidden: a visible read of it fails the test.
+    return ScriptedUi(answers={"Email to set up your trial": list(email)},
+                      hidden={"Enter the 6-digit code": list(codes)}, yes=questions)
 
 
 def _trial_bridge(monkeypatch, *, code=((202, {"status": "sent"}),),

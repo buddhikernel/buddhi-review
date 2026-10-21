@@ -378,6 +378,13 @@ def test_buy_finishes_an_earlier_checkout_that_was_paid(monkeypatch):
     assert rc == 0 and fake.count("POST /pair") == 0 and ui.lines[-1] == ("ok", _PAID_OK)
 
 
+def test_ctrl_c_while_pairing_leaves_no_held_code(monkeypatch):
+    _accepted()
+    rc, ui, _fake = _buy(monkeypatch, {"POST /pair": [KeyboardInterrupt()]})
+    assert rc == 1 and ui.lines[-1] == ("info", _STOPPED)
+    assert "buy" not in _state() and not pro_trial.has_held_work()
+
+
 def test_buy_cannot_save_its_setup_details(monkeypatch):
     _accepted()
     real = pro_trial._save_state
@@ -1108,6 +1115,21 @@ def test_an_unfinished_install_is_finished_first(monkeypatch):
                        types.SimpleNamespace(returncode=0, stdout="", stderr=""))
     assert ran and ui.lines == [("ok", _TEAMMATE_OK)] and fake.calls == []
     assert "install" not in _state()
+
+
+def test_an_install_that_did_not_activate_is_not_retried(monkeypatch):
+    _accepted(install={"kind": "buy", "buyer": True, "at": pro_trial._now()})
+    ran = []
+
+    def runner(cmd, env=None):
+        ran.append(cmd)
+        return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    ui, _fake = _finish(monkeypatch, {}, runner=runner, is_active=lambda: False)
+    assert len(ran) == 1 and ui.lines[-1][1].startswith("Pro installed, but it did not activate")
+    assert "install" not in _state() and not pro_trial.has_held_work()
+    ui, _fake = _finish(monkeypatch, {}, runner=runner, is_active=lambda: False)
+    assert len(ran) == 1 and ui.lines == []
 
 
 def test_the_order_is_recovery_then_buy_then_install(monkeypatch):

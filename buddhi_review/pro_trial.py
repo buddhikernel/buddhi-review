@@ -1365,7 +1365,13 @@ def _install_tail(netrc: Path, *, kind: str, buyer: bool, last_offer: bool, back
             state.pop("trial_nonce", None)
         _write_state(state_path, state)
         return TrialOutcome(True, "active", _success_line(kind, buyer))
-    # Installed, but this computer did not activate: one calm line + a pointer.
+    # Installed, but this computer did not activate: one calm line + a pointer. The
+    # unfinished-install record is dropped, so a later plain ``setup`` does not re-run
+    # pip and repeat this line on every run (the cause is often permanent: a trial
+    # already used here, or a key active elsewhere).
+    state = _read_state(state_path)
+    if state.pop("install", None) is not None:
+        _write_state(state_path, state)
     if kind == "trial":
         return TrialOutcome(False, "not_activated",
                             "Pro installed, but it did not activate on this machine — it may "
@@ -1545,8 +1551,10 @@ def start_trial(email: str, *, release: Optional["ReleaseCheck"] = None, ui: Opt
                        f"on its way from Buddhi Review ({_CODES_SENDER}). It expires in 10 "
                        "minutes.")
         while True:  # one pass per code typed
-            code = "".join((ui.ask("Enter the 6-digit code (press Enter if none arrived): ")
-                            or "").split())
+            # Hidden: the emailed code authenticates the trial claim, so it must not
+            # reach the scrollback.
+            code = "".join((ui.ask_hidden("Enter the 6-digit code (press Enter if none "
+                                          "arrived): ") or "").split())
             if not code:
                 ui.row("info", "No code yet? It can take a few minutes, so check your spam "
                                "folder. If an email says this address or this computer has "
@@ -1878,7 +1886,13 @@ def _run_buy(ui: Ui, release: "ReleaseCheck", opts: dict) -> int:
         if why:
             ui.row("warn", _unsaved(path, why))
             return 1
-        paired = _call_retrying("POST", "/pair", {"setup_hash": setup_hash})
+        try:
+            paired = _call_retrying("POST", "/pair", {"setup_hash": setup_hash})
+        except KeyboardInterrupt:
+            # No pairing words were shown and no checkout opened: drop the new hold so
+            # the "Nothing was bought, used or changed" line stays true.
+            _drop_hold(state_path, "buy")
+            raise
         phrase = paired.data.get("phrase") if paired.data else None
         if paired.status in (200, 201) and isinstance(phrase, str) and _PHRASE_RE.match(phrase):
             break
