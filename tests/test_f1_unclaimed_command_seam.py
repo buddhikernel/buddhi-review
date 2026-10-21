@@ -186,6 +186,75 @@ def test_select_survives_a_backend_that_errors_on_claimed_commands():
     assert got is claimer
 
 
+class RunsWhenInactive(ClaimingBackend):
+    """Claims commands and runs some of them even while it is not active."""
+
+    def __init__(self, *, when_inactive=("seats",), **kw):
+        kw.setdefault("commands", ("seats", "review-batch"))
+        kw.setdefault("active", False)
+        super().__init__(**kw)
+        self._when_inactive = when_inactive
+
+    def claimed_commands_when_inactive(self):
+        if isinstance(self._when_inactive, BaseException):
+            raise self._when_inactive
+        return self._when_inactive
+
+
+def test_an_inactive_claimant_runs_only_the_commands_it_runs_when_inactive():
+    backend = RunsWhenInactive()
+    assert backends.select_command_backend("seats", backends=[_FREE(), backend]) is backend
+    assert backends.select_command_backend("review-batch", backends=[_FREE(), backend]) is None
+
+
+def test_a_command_run_when_inactive_must_also_be_claimed():
+    backend = RunsWhenInactive(commands=("review-batch",), when_inactive=("seats",))
+    assert backends.select_command_backend("seats", backends=[backend]) is None
+
+
+def test_a_backend_that_errors_listing_inactive_commands_is_skipped():
+    backend = RunsWhenInactive(when_inactive=RuntimeError("boom"))
+    assert backends.select_command_backend("seats", backends=[backend]) is None
+
+
+class _RaisesOnLookup(RunsWhenInactive):
+    """A backend one of whose optional hooks raises when it is merely looked up."""
+
+    def __init__(self, hook, **kw):
+        super().__init__(**kw)
+        self._raising_hook = hook
+
+    def __getattribute__(self, name):
+        if name == object.__getattribute__(self, "_raising_hook"):
+            raise RuntimeError(f"boom looking up {name}")
+        return object.__getattribute__(self, name)
+
+
+@pytest.mark.parametrize("hook", ["claimed_commands_when_inactive", "claimed_commands",
+                                  "run_command"])
+def test_a_backend_whose_hook_raises_on_lookup_is_skipped(hook):
+    """Looking an optional hook up can raise (a property, a lazy import): that backend
+    is skipped, and an active claimant beside it still runs the command."""
+    broken = _RaisesOnLookup(hook, priority=100, name="broken")
+    active = ClaimingBackend(commands=("seats",), active=True, priority=1, name="active")
+    assert backends.select_command_backend("seats", backends=[active, broken]) is active
+    assert backends.select_command_backend("seats", backends=[broken]) is None
+
+
+def test_an_active_claimant_comes_before_an_inactive_one():
+    inactive = RunsWhenInactive(priority=100, name="inactive")
+    active = ClaimingBackend(commands=("seats",), active=True, priority=1, name="active")
+    assert backends.select_command_backend("seats", backends=[inactive, active]) is active
+
+
+def test_the_front_door_runs_a_command_an_inactive_backend_runs_when_inactive(capsys):
+    rec = []
+    backend = RunsWhenInactive(rec=rec)
+    assert cli._dispatch_unclaimed_command("seats", ["release", "2"],
+                                           backends=[_FREE(), backend]) == 0
+    assert rec == [("seats", ["release", "2"])] and capsys.readouterr().err == ""
+
+
 # ── _dispatch_unclaimed_command: forward vs notice ─────────────────────────────────
 
 def test_active_claimant_gets_the_trailing_argv_verbatim():
@@ -205,7 +274,7 @@ def test_no_claimant_prints_notice_and_exits_2():
     out = buf.getvalue()
     assert out.rstrip("\n") == cli._UNCLAIMED_COMMAND_NOTICE.format(command="review-batch")
     assert "review-batch" in out
-    assert "https://buddhireview.com/buy" in out
+    assert out.rstrip("\n").splitlines()[-1] == "To get a licence, run: buddhi-review setup --buy"
 
 
 def test_inactive_backend_falls_through_to_the_notice():

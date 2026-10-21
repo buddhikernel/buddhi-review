@@ -20,9 +20,13 @@ clear ``BUDDHI_TEST_COMMAND``; a test that wants a config writes to
 The setup wizard asks a public route whether the paid release is published before
 it offers the trial, and records each offer in a state file. Every test gets that
 answer stubbed CLOSED and the state file in its own tmp dir (see
-``_release_closed``), so no test calls the route or writes the real state file.
+``_release_closed``), so no test calls the route or writes the real state file. The
+Pro acquisition paths' requests to the Buddhi Review service go through one seam
+(``pro_trial._bridge_transport``), pointed for every test at a stand-in that never
+reaches the network; a test that drives a path gives it a :class:`FakeBridge`.
 """
 import sys
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
@@ -37,6 +41,105 @@ def _log_line(stdout):
         if ln.startswith("log: "):
             return ln[len("log: "):]
     raise AssertionError(f"no `log:` line on stdout:\n{stdout}")
+
+
+class FakeBridge:
+    """A stand-in for the Buddhi Review service (``pro_trial._bridge_transport``).
+
+    ``routes`` maps ``"METHOD /path"`` to the answers it gives, each ``(status, data)``
+    or ``(status, data, retry_after)``: a list is served in order (its last answer
+    repeats), and a callable ``(body, auth, query) -> answer`` decides per request.
+    Every request is recorded in ``calls``; one to an unknown route, or to any host but
+    the service's own over HTTPS, is recorded in ``unexpected`` and gets no answer."""
+
+    def __init__(self, routes=None):
+        self.routes = {k: (list(v) if isinstance(v, list) else v)
+                       for k, v in (routes or {}).items()}
+        self.calls = []
+        self.unexpected = []
+
+    def __call__(self, method, url, body, auth):
+        parsed = urlparse(url)
+        key = f"{method} {parsed.path}"
+        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+        self.calls.append({"route": key, "body": body, "auth": auth, "query": query})
+        handler = self.routes.get(key)
+        if (parsed.scheme, parsed.netloc) != ("https", "api.buddhireview.com") or handler is None:
+            self.unexpected.append(url)
+            return 0, None, None
+        if callable(handler):
+            answer = handler(body, auth, query)
+        else:
+            answer = handler.pop(0) if len(handler) > 1 else handler[0]
+        if isinstance(answer, BaseException):
+            raise answer
+        return tuple(answer) + (None,) * (3 - len(answer))
+
+    def bodies(self, route):
+        return [c["body"] for c in self.calls if c["route"] == route]
+
+    def count(self, route):
+        return sum(1 for c in self.calls if c["route"] == route)
+
+
+class ScriptedUi:
+    """A ``pro_trial.Ui`` driven by a script. ``answers`` maps a prompt fragment to
+    the answers typed at it, in order (a str, or an exception to raise there); the
+    same for ``hidden`` (prompts that do not echo) and ``yes`` (yes/no questions, each
+    answer True/False or an exception). An exhausted or unmatched prompt fails the
+    test. Shown lines are in ``lines`` as ``(kind, text)``; ``asked`` records every
+    prompt and question in order; ``defaults`` maps each question to its default."""
+
+    def __init__(self, *, answers=None, hidden=None, yes=None, interactive=True,
+                 browser=True, clipboard=""):
+        self._answers = {k: list(v) for k, v in (answers or {}).items()}
+        self._hidden = {k: list(v) for k, v in (hidden or {}).items()}
+        self._yes = {k: list(v) for k, v in (yes or {}).items()}
+        self.interactive = interactive
+        self.lines, self.asked, self.defaults, self.opened = [], [], {}, []
+        self._browser, self._clipboard = browser, clipboard
+
+    def _take(self, table, prompt, what):
+        self.asked.append(prompt)
+        for fragment, queue in table.items():
+            if fragment in prompt:
+                if not queue:
+                    raise AssertionError(f"{what} asked again: {prompt!r}")
+                value = queue.pop(0)
+                if isinstance(value, BaseException) or (
+                        isinstance(value, type) and issubclass(value, BaseException)):
+                    raise value
+                return value
+        raise AssertionError(f"unexpected {what}: {prompt!r}")
+
+    def row(self, kind, text):
+        self.lines.append((kind, text))
+
+    def ask(self, prompt):
+        return self._take(self._answers, prompt, "prompt")
+
+    def ask_hidden(self, prompt):
+        return self._take(self._hidden, prompt, "hidden prompt")
+
+    def yes_no(self, question, default):
+        self.defaults[question] = default
+        return self._take(self._yes, question, "question")
+
+    def open_browser(self, url):
+        self.opened.append(url)
+        return self._browser
+
+    def read_clipboard(self):
+        return self._clipboard
+
+    @property
+    def text(self):
+        return [text for _kind, text in self.lines]
+
+
+def _no_network_bridge(method, url, body, auth):
+    """The default seam for every test: a request that is never sent (no answer)."""
+    return 0, None, None
 
 
 def _yn_bridge(prompt, options, *, preselect=0, input_fn=input, **kw):
@@ -96,6 +199,14 @@ def _release_closed(monkeypatch, tmp_path):
     (tests/test_pro_release_gate.py)."""
     monkeypatch.setattr(pro_trial, "_release_fetch", lambda: None)
     monkeypatch.setenv("BUDDHI_TRIAL_STATE", str(tmp_path / "trial-state.json"))
+    # The acquisition paths: no request reaches the service, the seat-access file and
+    # ~/.netrc are this test's own, the machine has a fixed name, and a pause between
+    # two polls costs nothing.
+    monkeypatch.setattr(pro_trial, "_bridge_transport", _no_network_bridge)
+    monkeypatch.setenv("BUDDHI_SEAT_ADMIN", str(tmp_path / "seat-admin.json"))
+    monkeypatch.setenv("BUDDHI_NETRC", str(tmp_path / ".netrc"))
+    monkeypatch.setattr(pro_trial, "_machine_id", lambda: "test-machine")
+    monkeypatch.setattr(pro_trial, "_nap", lambda seconds: None)
     # A test that opts into "open" gets open on any machine: the check that the
     # interpreter can pip-install (a uv-made environment ships no pip) is answered
     # yes here, and tested for real in tests/test_pro_release_gate.py.

@@ -237,9 +237,9 @@ def test_no_entitlement_logic_symbols(path):
 
 # ── The acquisition allowlist is scoped, not a hole: acquisition ONLY, never
 #    enforcement ──────────────────────────────────────────────────────────────────
-# pro_trial.py is allowed the Keygen acquisition vocabulary so the wizard can mint a
-# trial + install the wheel — but it must contain creation / registration /
-# validation calls ONLY, and ZERO entitlement-ENFORCEMENT logic (no signed-machine-
+# pro_trial.py is allowed the acquisition vocabulary so the free tool can get a key
+# from the Buddhi Review service + install the wheel — but it must contain acquisition
+# requests ONLY, and ZERO entitlement-ENFORCEMENT logic (no signed-machine-
 # file verify, no runtime lease check, no signature math). The compiled wheel checks
 # itself (§E.1/§E.3); a lease check in the readable free tree is both trivially
 # patched AND a blueprint of the paid architecture. These greppable markers pin that.
@@ -248,12 +248,13 @@ _ENFORCEMENT_MARKERS = (
     "machine file", "parse_and_verify", "heartbeat", "anti_rollback",
     "last_seen_online", "signed machine",
 )
-_ACQUISITION_MARKERS = ("register_user", "create_trial_license", "validate_key")
+# The service routes it acquires a key through: the trial, a paid seat's claim, recovery.
+_ACQUISITION_MARKERS = ('"/trial/code"', '"/claim"', '"/recover"')
 
 
 def test_acquisition_module_is_creation_only():
-    """The allowlisted acquisition module holds creation/registration/validation
-    calls only, and NO entitlement-enforcement logic."""
+    """The allowlisted acquisition module holds acquisition requests only, and NO
+    entitlement-enforcement logic."""
     allowlisted = [p for p in _CODE_FILES if _acquisition_allowlisted(p)]
     assert allowlisted, "the acquisition allowlist names a module that is not shipped"
     for path in allowlisted:

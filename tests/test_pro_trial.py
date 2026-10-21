@@ -1,67 +1,42 @@
-"""Unit tests for pro_trial.py — the wizard's Pro-trial ACQUISITION plumbing (PRO-6).
+"""Unit tests for pro_trial.py — the free tool's Buddhi Review Pro ACQUISITION plumbing.
 
-Network-free (every Keygen call goes through an injected transport) and pip-free
-(the install runner is injected). Covers: the server-less trial flow end to end;
-the four graceful-failure paths (email already registered, index 403, pip failure,
-machine not activated); the convert / concierge-paste path; daemon-start through
-discovery; the offer-gating conventions; and the adversarial invariants — the
-create-license payload carries NO expiry and only the TRIAL policy (Q1), and the
-license key never leaks into printed output or a world-readable file.
+Network-free (every request to the Buddhi Review service goes through a FakeBridge,
+tests/conftest.py) and pip-free (the install runner is injected). This file covers the
+pieces every setup path shares — the service client, the shapes checked before any
+request, the trial's machine fingerprint, the 0600 state, the licence agreement's
+gate, the seat-access file and the install tail — and the trial end to end, with its
+offer gating. The other paths (``setup --buy``, ``--activate``, ``--recover``, and what
+a plain setup finishes first) are tests/test_pro_setup_paths.py's.
+
+Every line asserted here is the approved on-screen wording, word for word.
 
 This file names the pro package it installs by design, so it is allowlisted in
 tests/test_oss_purity.py's _VOCAB_SCAFFOLDING.
 """
 from __future__ import annotations
 
-import io
+import base64
+import contextlib
+import hashlib
+import http.server
 import json
 import os
+import re
 import stat
+import threading
+import time
 import types
 
 import pytest
 
 from buddhi_review import pro_trial
+from conftest import FakeBridge, ScriptedUi
+
+_KEY = "TRIALKEY-ABC-123"
+_SUPPORT = "support@buddhireview.com"
 
 
-# ── Fake transport ────────────────────────────────────────────────────────────
-
-def make_transport(**handlers):
-    calls = []
-
-    def _resolve(h, body):
-        if h is None:
-            return 404, None
-        return h(body) if callable(h) else h
-
-    def transport(method, url, auth, body):
-        calls.append({"method": method, "url": url, "auth": auth, "body": body})
-        if url.endswith("/users"):
-            return _resolve(handlers.get("users"), body)
-        if url.endswith("/tokens"):
-            return _resolve(handlers.get("tokens"), body)
-        if url.endswith("/licenses/actions/validate-key"):
-            return _resolve(handlers.get("validate"), body)
-        if url.endswith("/licenses"):
-            return _resolve(handlers.get("licenses"), body)
-        return 404, None
-
-    transport.calls = calls
-    return transport
-
-
-_USERS_OK = (201, {"data": {"type": "users", "id": "user-1"}})
-_TOKENS_OK = (201, {"data": {"attributes": {"token": "tok-1"}}})
-_LICENSE_OK = (201, {"data": {"attributes": {
-    "key": "TRIALKEY-ABC", "expiry": "2026-07-26T00:00:00.000Z"}}})
-_VALIDATE_OK = (200, {"data": {"id": "lic-1"}, "meta": {"valid": True, "code": "VALID"}})
-
-
-def _full(**over):
-    h = dict(users=_USERS_OK, tokens=_TOKENS_OK, licenses=_LICENSE_OK, validate=_VALIDATE_OK)
-    h.update(over)
-    return make_transport(**h)
-
+# ── Shared fakes ──────────────────────────────────────────────────────────────
 
 class FakeProBackend:
     name = "pro"
@@ -91,80 +66,409 @@ def _open_here():
 @pytest.fixture(autouse=True)
 def _clean(monkeypatch, tmp_path):
     monkeypatch.delenv("BUDDHI_NO_UPSELL", raising=False)
-    monkeypatch.setenv("BUDDHI_NETRC", str(tmp_path / ".netrc"))
     monkeypatch.setenv("BUDDHI_TRIAL_STATE", str(tmp_path / "trial.json"))
     # These tests drive the acquisition itself, so the release is published here; the
     # closed answer and the gate around it are tests/test_pro_release_gate.py's.
     monkeypatch.setattr(pro_trial, "_release_fetch", _open_here)
+    # Not on Pro: deterministic whatever happens to be installed in this environment.
+    monkeypatch.setattr(pro_trial, "pro_backend_active", lambda **k: False)
 
 
-# ── primitives ────────────────────────────────────────────────────────────────
-
-def test_valid_email():
-    assert pro_trial.valid_email("a@b.co")
-    assert not pro_trial.valid_email("nope")
-    assert not pro_trial.valid_email("a@b")
-    assert not pro_trial.valid_email("")
+def _bridge(monkeypatch, routes):
+    fake = FakeBridge(routes)
+    monkeypatch.setattr(pro_trial, "_bridge_transport", fake)
+    return fake
 
 
-def test_register_user_open_registration_no_auth():
-    t = _full()
-    status, uid, code = pro_trial.register_user("me@x.io", "pw", transport=t)
-    assert (status, uid) == (201, "user-1")
-    call = [c for c in t.calls if c["url"].endswith("/users")][0]
-    assert call["auth"] is None                       # open registration: NO token
-    assert call["body"]["data"]["attributes"]["email"] == "me@x.io"
+def _ok_runner(cmd, env=None):
+    return types.SimpleNamespace(returncode=0, stdout="ok", stderr="")
 
 
-def test_register_user_email_taken():
-    t = _full(users=(422, {"errors": [{"code": "EMAIL_TAKEN"}]}))
-    status, uid, code = pro_trial.register_user("me@x.io", "pw", transport=t)
-    assert uid is None and status == 422 and code == "EMAIL_TAKEN"
+def _install_kw(**over):
+    kw = dict(runner=_ok_runner, backends=[FakeProBackend(active=True)],
+              is_active=lambda: True, sleep=lambda s: None, attempts=1)
+    kw.update(over)
+    return kw
 
 
-def test_mint_user_token_uses_basic_auth():
-    t = _full()
-    tok = pro_trial.mint_user_token("me@x.io", "pw", transport=t)
-    assert tok == "tok-1"
-    call = [c for c in t.calls if c["url"].endswith("/tokens")][0]
-    assert call["auth"].startswith("Basic ")
+def _state():
+    path = pro_trial._state_path()
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
 
 
-def test_create_trial_license_has_no_expiry_and_only_trial_policy():
-    """Q1 adversarial: the wizard's create-license payload carries NO expiry field
-    (the policy stamps it server-side) and references ONLY the unprotected trial
-    policy — never a paid or longer one."""
-    t = _full()
-    attrs = pro_trial.create_trial_license("tok-1", "user-1", transport=t)
-    assert attrs["key"] == "TRIALKEY-ABC"
-    call = [c for c in t.calls if c["url"].endswith("/licenses")][0]
-    body_json = json.dumps(call["body"])
-    assert "expiry" not in body_json          # the client cannot set the 14-day window
-    assert "duration" not in body_json
-    pol = call["body"]["data"]["relationships"]["policy"]["data"]["id"]
-    assert pol == pro_trial._TRIAL_POLICY_ID
-    assert call["auth"] == "Bearer tok-1"
+def _set_state(**values):
+    path = pro_trial._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(values), encoding="utf-8")
 
 
-def test_create_trial_license_server_ignores_injected_expiry():
-    """Even if a tampered client tried to send an expiry, the SERVER stamps its own:
-    the returned expiry is whatever the policy set, never the request's."""
-    def licenses(body):
-        # a server that ignores any client-sent expiry and stamps its own
-        return 201, {"data": {"attributes": {"key": "K", "expiry": "2026-07-26T00:00:00.000Z"}}}
-    t = _full(licenses=licenses)
-    attrs = pro_trial.create_trial_license("tok-1", "user-1", transport=t)
-    assert attrs["expiry"] == "2026-07-26T00:00:00.000Z"
+def _eula_accepted():
+    return {"version": "1.1", "sha256": pro_trial.EULA_SHA256,
+            "accepted_at": "2026-10-18T00:00:00Z"}
 
 
-def test_validate_key_is_tokenless():
-    t = _full()
-    valid, code = pro_trial.validate_key("SOMEKEY", transport=t)
-    assert valid and code == "VALID"
-    call = [c for c in t.calls if "validate-key" in c["url"]][0]
-    assert call["auth"] is None                       # public, tokenless
-    assert call["body"]["meta"]["key"] == "SOMEKEY"
+# ── Shapes checked before any request ─────────────────────────────────────────
 
+@pytest.mark.parametrize("seconds, phrase", [
+    (None, "a few minutes"), (0, "1 minute"), (1, "1 minute"), (60, "1 minute"),
+    (61, "2 minutes"), (59 * 60, "59 minutes"), (3599, "1 hour"), (3600, "1 hour"),
+    (3601, "2 hours"), (7200, "2 hours")])
+def test_time_phrase_rounds_up_and_says_a_few_minutes_without_retry_after(seconds, phrase):
+    assert pro_trial._time_phrase(seconds) == phrase
+
+
+@pytest.mark.parametrize("email", ["a@b.co", "Ann.Lee+x@GMail.com", "o'brien@example.com",
+                                   "  me@example.com  ", "a@b.c0"])
+def test_trial_email_accepts_what_the_service_accepts(email):
+    assert pro_trial.valid_email(email)
+
+
+@pytest.mark.parametrize("email", ["nope", "a@b", "+tag@example.com", "a.@example.com",
+                                   "a..b@example.com", "a@@example.com", "a b@example.com",
+                                   "a@-x.com", "a@x.1com", "x" * 65 + "@example.com",
+                                   ".@gmail.com"])
+def test_trial_email_refuses_what_the_service_refuses(email):
+    assert not pro_trial.valid_email(email)
+
+
+def test_new_recovery_address_uses_the_stricter_grammar():
+    assert pro_trial.valid_new_recovery_address("name@example.com")
+    assert pro_trial.valid_new_recovery_address("a_b%c+d-e@x.xn--p1ai")
+    for bad in ("o'brien@example.com", "a@b.c0", " name@example.com", "-@example.com",
+                "name@example", "näme@example.com", "a@b@c.com"):
+        assert not pro_trial.valid_new_recovery_address(bad), bad
+    # every address the stricter grammar takes, the current-address grammar takes too
+    assert pro_trial.valid_recovery_address("name@example.com")
+    assert pro_trial.valid_recovery_address("o'brien@example.com")
+
+
+@pytest.mark.parametrize("typed, code", [
+    ("abcd-efgh-jkmn-pqrs", "ABCDEFGHJKMNPQRS"),
+    ("ABCD EFGH JKMN PQRS", "ABCDEFGHJKMNPQRS"),
+    ("ilo0-ILO0-1234-5678", "1100110012345678"),
+])
+def test_recovery_code_is_read_as_crockford(typed, code):
+    assert pro_trial._recovery_code(typed) == code
+
+
+@pytest.mark.parametrize("typed", ["ABCD-EFGH-JKMN-PQRU", "ABCD-EFGH-JKMN-PQR", "", "ABCD!EFGHJKMNPQRS"])
+def test_a_recovery_code_of_the_wrong_shape_is_refused(typed):
+    assert pro_trial._recovery_code(typed) is None
+
+
+def test_a_setup_code_is_32_random_bytes_and_its_hash_is_of_the_raw_bytes():
+    code, setup_hash = pro_trial._new_setup_code()
+    assert re.fullmatch(r"[A-Za-z0-9_-]{43}", code)
+    raw = base64.urlsafe_b64decode(code + "=")
+    assert len(raw) == 32
+    assert setup_hash == hashlib.sha256(raw).hexdigest()
+    assert setup_hash != hashlib.sha256(code.encode()).hexdigest()
+    assert re.fullmatch(r"[A-Za-z0-9_-]{43}", pro_trial._new_nonce())
+
+
+# ── The service client ─────────────────────────────────────────────────────────
+
+@contextlib.contextmanager
+def _server(handler_fn):
+    """A local HTTP server; ``handler_fn(request_handler)`` answers each request."""
+    seen = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def _any(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            seen.append({"method": self.command, "path": self.path,
+                         "headers": dict(self.headers),
+                         "body": self.rfile.read(length) if length else b""})
+            handler_fn(self)
+
+        do_GET = do_POST = _any
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05},
+                              daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", seen
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def _reply(status, body=b"", headers=None):
+    def handler(h):
+        h.send_response(status)
+        for k, v in (headers or {}).items():
+            h.send_header(k, v)
+        h.send_header("Content-Length", str(len(body)))
+        h.end_headers()
+        h.wfile.write(body)
+    return handler
+
+
+@pytest.fixture
+def _direct(monkeypatch):
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.setenv("NO_PROXY", "*")
+
+
+def test_the_client_sends_json_with_the_secret_only_in_the_header(_direct):
+    with _server(_reply(202, b'{"status":"pending"}', {"Retry-After": "3"})) as (url, seen):
+        status, data, retry = pro_trial._https_once("POST", f"{url}/claim", {"a": 1},
+                                                    "Bearer s3cret")
+    assert (status, data, pro_trial._seconds(retry)) == (202, {"status": "pending"}, 3.0)
+    assert seen[0]["method"] == "POST" and seen[0]["path"] == "/claim"
+    assert json.loads(seen[0]["body"]) == {"a": 1}
+    assert seen[0]["headers"]["Content-Type"] == "application/json"
+    assert seen[0]["headers"]["Authorization"] == "Bearer s3cret"
+    assert "s3cret" not in seen[0]["path"]
+
+
+def test_the_client_reads_an_error_answer_body(_direct):
+    with _server(_reply(409, b'{"error":"seat_not_active"}')) as (url, _seen):
+        status, data, _ = pro_trial._https_once("POST", f"{url}/claim", {}, None)
+    assert (status, data) == (409, {"error": "seat_not_active"})
+
+
+@pytest.mark.parametrize("code", [301, 302, 307, 308])
+def test_the_client_never_follows_a_redirect(_direct, code, monkeypatch):
+    with _server(_reply(code, b"", {"Location": "https://elsewhere.example/"})) as (url, seen):
+        status, _data, _ = pro_trial._https_once("POST", f"{url}/claim", {}, None)
+        assert status == code and len(seen) == 1
+        monkeypatch.setattr(pro_trial, "_bridge_transport",
+                            lambda m, u, b, a: pro_trial._https_once(m, f"{url}/claim", b, a))
+        answer = pro_trial._bridge_call("POST", "/claim", {})
+    assert answer.status == 0                     # a redirect is no answer
+
+
+def test_the_client_caps_the_answer_size(_direct):
+    big = json.dumps({"x": "y" * (pro_trial._BRIDGE_MAX_BYTES + 10)}).encode()
+    with _server(_reply(200, big)) as (url, _seen):
+        status, data, _ = pro_trial._https_once("GET", f"{url}/seats", None, None)
+    assert status == 200 and data is None
+
+
+def test_a_network_failure_is_no_answer_never_a_raise():
+    status, data, retry = pro_trial._https_once("POST", "http://127.0.0.1:9/claim", {}, None)
+    assert (status, data, retry) == (0, None, None)
+
+
+def test_the_request_wall_clock_is_bounded(monkeypatch):
+    release = threading.Event()
+    monkeypatch.setattr(pro_trial, "_https_once",
+                        lambda *a: release.wait(5) or (200, {}, None))
+    monkeypatch.setattr(pro_trial, "_BRIDGE_WALL_S", 0.2)
+    started = time.monotonic()
+    assert pro_trial._https_json("POST", "https://api.buddhireview.com/claim", {}, None) == (
+        0, None, None)
+    assert time.monotonic() - started < 2
+    release.set()
+
+
+@pytest.mark.parametrize("status", ["not-a-number", None])
+def test_a_misbehaving_transport_is_no_answer(monkeypatch, status):
+    monkeypatch.setattr(pro_trial, "_bridge_transport", lambda *a: (status, {"x": 1}, None))
+    assert pro_trial._bridge_call("POST", "/claim", {}).status == 0
+    monkeypatch.setattr(pro_trial, "_bridge_transport",
+                        lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
+    assert pro_trial._bridge_call("POST", "/claim", {}).status == 0
+
+
+def test_requests_go_only_to_the_service_over_https(monkeypatch):
+    fake = _bridge(monkeypatch, {"GET /seats": [(200, {"seats": []})]})
+    pro_trial._bridge_call("GET", "/seats", query={"subscription_id": "sub_1"},
+                           auth="Bearer x")
+    assert fake.unexpected == []
+    assert fake.calls[0]["query"] == {"subscription_id": "sub_1"}
+    assert pro_trial.BRIDGE_ORIGIN == "https://api.buddhireview.com"
+
+
+def test_no_answer_is_retried_with_the_same_request_then_reported(monkeypatch):
+    fake = _bridge(monkeypatch, {"POST /trial": [(503, {"error": "unavailable"}, 5),
+                                                 (0, None), (500, None)]})
+    answer = pro_trial._call_retrying("POST", "/trial", {"claim_nonce": "n"})
+    assert answer.status == 500 and fake.count("POST /trial") == pro_trial._NO_ANSWER_TRIES
+    assert all(b == {"claim_nonce": "n"} for b in fake.bodies("POST /trial"))
+
+
+def test_an_answer_stops_the_retries(monkeypatch):
+    fake = _bridge(monkeypatch, {"POST /trial": [(0, None), (403, {"error": "code_invalid"})]})
+    assert pro_trial._call_retrying("POST", "/trial", {}).status == 403
+    assert fake.count("POST /trial") == 2
+
+
+def test_trial_mail_paused_is_an_answer_not_a_silence():
+    paused = pro_trial.BridgeAnswer(503, {"error": "sending_paused"}, 60)
+    assert not pro_trial._no_answer(paused)
+    assert pro_trial._no_answer(pro_trial.BridgeAnswer(503, {"error": "maintenance"}, 300))
+    assert pro_trial._no_answer(pro_trial.BridgeAnswer(200, None, None))
+
+
+# ── The trial's machine fingerprint ───────────────────────────────────────────
+
+def test_the_fingerprint_is_64_hex_from_the_machine_id(monkeypatch):
+    monkeypatch.setattr(pro_trial, "_machine_id", lambda: "MACHINE-UUID-1")
+    fp = pro_trial.trial_fingerprint()
+    assert re.fullmatch(r"[0-9a-f]{64}", fp)
+    assert fp == hashlib.sha256(b"buddhi-review trial fingerprint v1|MACHINE-UUID-1").hexdigest()
+    assert fp == pro_trial.trial_fingerprint()
+    monkeypatch.setattr(pro_trial, "_machine_id", lambda: "MACHINE-UUID-2")
+    assert pro_trial.trial_fingerprint() != fp
+
+
+def test_without_a_machine_id_a_kept_random_one_stands_in(monkeypatch):
+    monkeypatch.setattr(pro_trial, "_machine_id", lambda: "")
+    first = pro_trial.trial_fingerprint()
+    assert re.fullmatch(r"[0-9a-f]{64}", first)
+    assert pro_trial.trial_fingerprint() == first           # kept in the 0600 state
+    assert re.fullmatch(r"[0-9a-f]{64}", _state()["machine_id"])
+
+
+# ── The 0600 state ────────────────────────────────────────────────────────────
+
+def test_write_state_leaves_no_temp_file_behind(tmp_path):
+    p = tmp_path / "s" / "trial.json"
+    pro_trial._write_state(p, {"shown_count": 1})
+    assert json.loads(p.read_text()) == {"shown_count": 1}
+    assert [x.name for x in p.parent.iterdir()] == ["trial.json"]
+    assert stat.S_IMODE(os.stat(p).st_mode) == 0o600
+
+
+def test_write_state_removes_the_temp_file_when_replace_fails(tmp_path, monkeypatch):
+    p = tmp_path / "trial.json"
+
+    def boom(*a, **k):
+        raise OSError("replace failed")
+    monkeypatch.setattr(pro_trial.os, "replace", boom)
+    assert pro_trial._save_state(p, {"trial_nonce": "n"}) == "replace failed"
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_save_state_reports_why_it_could_not_save(tmp_path):
+    blocker = tmp_path / "not-a-dir"
+    blocker.write_text("x")
+    why = pro_trial._save_state(blocker / "trial.json", {"a": 1})
+    assert why                                   # the operating system's reason
+
+
+def test_an_older_releases_pending_password_is_dropped_on_the_next_write(tmp_path):
+    p = tmp_path / "trial.json"
+    p.write_text(json.dumps({"pending_email": "a@b.co", "pending_password": "pw",
+                             "pending_user_id": "u", "shown_count": 2}))
+    pro_trial._write_state(p, pro_trial._read_state(p))
+    assert json.loads(p.read_text()) == {"shown_count": 2}
+
+
+# ── The licence agreement, before any key ─────────────────────────────────────
+
+_EULA_LINE = ("To use Buddhi Review Pro, you must accept the Buddhi Review Pro End User Licence "
+              "Agreement, Version 1.1, effective 4 October 2026: https://buddhireview.com/eula")
+
+
+def test_assent_is_asked_with_the_approved_sentence_and_recorded(monkeypatch):
+    monkeypatch.setattr(pro_trial, "_now", lambda: 1_760_000_000.0)
+    ui = ScriptedUi(yes={"Do you accept it?": [True]})
+    assert pro_trial._eula_gate(ui, None) == ("ok", "")
+    assert ui.lines == [("step", _EULA_LINE)]
+    assert ui.defaults["Do you accept it?"] is False        # default No
+    assert _state()["eula"] == {"version": "1.1", "sha256": pro_trial.EULA_SHA256,
+                                "accepted_at": "2025-10-09T08:53:20Z"}
+    # recorded once: not asked again
+    assert pro_trial._eula_gate(ScriptedUi(), None) == ("ok", "")
+
+
+def test_a_refusal_records_nothing():
+    assert pro_trial._eula_gate(ScriptedUi(yes={"Do you accept it?": [False]}), None) == (
+        "refused", "")
+    assert "eula" not in _state()
+
+
+def test_a_changed_text_is_asked_again_with_its_notice():
+    _set_state(eula={"version": "1.0", "sha256": "0" * 64, "accepted_at": "x"})
+    ui = ScriptedUi(yes={"Do you accept it?": [True]})
+    assert pro_trial._eula_gate(ui, None)[0] == "ok"
+    assert ui.text == ["The Buddhi Review Pro End User Licence Agreement has changed since you "
+                       "last accepted it.", _EULA_LINE]
+    assert _state()["eula"]["sha256"] == pro_trial.EULA_SHA256
+
+
+def test_a_run_outside_a_terminal_never_assumes_assent():
+    ui = ScriptedUi(interactive=False)
+    assert pro_trial._eula_gate(ui, None) == ("no_terminal", "")
+    assert ui.asked == [] and "eula" not in _state()
+
+
+def test_an_assent_that_cannot_be_saved_is_reported(monkeypatch):
+    monkeypatch.setattr(pro_trial, "_save_state", lambda path, state: "Permission denied")
+    verdict = pro_trial._eula_gate(ScriptedUi(yes={"Do you accept it?": [True]}), None)
+    assert verdict == ("unsaved", "Permission denied")
+
+
+# ── seat-admin.json ───────────────────────────────────────────────────────────
+
+def _seat_admin():
+    return json.loads(pro_trial._seat_admin_path().read_text())
+
+
+def test_the_seat_access_file_is_written_to_the_schema_0600():
+    assert pro_trial.save_seat_admin([("sub_1", "S" * 43, 1)]) is None
+    path = pro_trial._seat_admin_path()
+    assert _seat_admin() == {"schema": 1, "entries": {
+        "https://api.buddhireview.com sub_1": {"secret": "S" * 43, "version": 1}}}
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+    assert [p.name for p in path.parent.iterdir() if p.name.startswith("seat-admin")] == [
+        "seat-admin.json"]
+
+
+def test_the_seat_access_file_keeps_other_entries_and_never_goes_back_a_version():
+    pro_trial.save_seat_admin([("sub_1", "A" * 43, 2), ("sub_2", "B" * 43, 1)])
+    pro_trial.save_seat_admin([("sub_1", "OLD", 1), ("sub_3", "C" * 43, 4)])
+    entries = _seat_admin()["entries"]
+    assert entries["https://api.buddhireview.com sub_1"] == {"secret": "A" * 43, "version": 2}
+    assert entries["https://api.buddhireview.com sub_2"]["version"] == 1
+    assert entries["https://api.buddhireview.com sub_3"]["version"] == 4
+    pro_trial.save_seat_admin([("sub_1", "N" * 43, 3)])
+    assert _seat_admin()["entries"]["https://api.buddhireview.com sub_1"]["version"] == 3
+
+
+@pytest.mark.parametrize("content, why", [
+    ("{not json", "it is not valid JSON"),
+    ('{"schema": "1", "entries": {}}', "it is not a seat access file"),
+    ('{"schema": 2, "entries": {}}', "it was written by a newer version of Buddhi Review"),
+])
+def test_a_seat_access_file_that_cannot_be_read_is_left_as_it_is(content, why):
+    path = pro_trial._seat_admin_path()
+    path.write_text(content)
+    assert pro_trial.save_seat_admin([("sub_1", "S" * 43, 1)]) == ("unreadable", why)
+    assert path.read_text() == content
+
+
+def test_an_unwritable_seat_access_folder_is_reported(monkeypatch, tmp_path):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    monkeypatch.setenv("BUDDHI_SEAT_ADMIN", str(blocker / "seat-admin.json"))
+    kind, why = pro_trial.save_seat_admin([("sub_1", "S" * 43, 1)])
+    assert kind == "unwritable" and why
+
+
+def test_the_seat_access_lines():
+    path = pro_trial._seat_admin_path()
+    assert pro_trial._seat_admin_line(("unwritable", "Permission denied"), installed=True) == (
+        "Buddhi Review Pro is set up, but this computer could not save the access it needs to "
+        f"manage your seats ({path}: Permission denied). Pro keeps working here. After you fix "
+        "that, run `buddhi-review setup --recover` to get that access again.")
+    assert pro_trial._seat_admin_line(("unwritable", "Permission denied"), installed=False) == (
+        "This computer could not save the access it needs to manage your seats "
+        f"({path}: Permission denied), so no computer can manage them now. After you fix that, "
+        "run `buddhi-review setup --recover` to get that access again.")
+    assert pro_trial._seat_admin_line(("unreadable", "bad"), installed=True) == (
+        f"The seat access file {path} could not be read (bad), so it was left as it is and your "
+        "seat access was not saved. Move it aside, then run `buddhi-review setup --recover`.")
+
+
+# ── The install tail ──────────────────────────────────────────────────────────
 
 def test_write_index_credential_writes_netrc(tmp_path):
     p = tmp_path / ".netrc"
@@ -193,7 +497,7 @@ def test_pip_install_command_targets_package_and_plain_index_no_key():
 
 def test_pip_install_disables_interactive_prompts():
     """Setup runs on an inherited TTY: without --no-input a rejected/missing netrc makes
-    pip block on its user/password prompt and the wizard just looks hung until the 600 s
+    pip block on its user/password prompt and setup just looks hung until the 600 s
     timeout, instead of failing fast into pip_failed / index_403."""
     captured = {}
 
@@ -212,9 +516,6 @@ def test_pip_install_403_detected():
 
 
 def test_pip_install_passes_netrc_env_to_a_runner_that_accepts_it(tmp_path):
-    """A production wrapper runner that declares ``env`` must receive the computed
-    NETRC env — the docstring's export guarantee must hold for injected runners,
-    not just the default subprocess.run lambda."""
     captured = {}
 
     def runner(cmd, env=None):
@@ -226,8 +527,6 @@ def test_pip_install_passes_netrc_env_to_a_runner_that_accepts_it(tmp_path):
 
 
 def test_pip_install_legacy_single_arg_runner_is_still_called_with_just_cmd(tmp_path):
-    """A legacy runner that only accepts ``cmd`` (no ``env`` keyword) must keep
-    working unchanged — it must NOT be called with an unexpected ``env=`` kwarg."""
     captured = {}
 
     def runner(cmd):
@@ -238,8 +537,6 @@ def test_pip_install_legacy_single_arg_runner_is_still_called_with_just_cmd(tmp_
     assert captured["cmd"][0:2] == [pro_trial.sys.executable, "-m"]
 
 
-# ── daemon start via discovery ──────────────────────────────────────────────────
-
 def test_start_daemon_via_discovered_backend():
     fake = FakeProBackend(active=True)
     assert pro_trial.start_daemon(backends=[fake]) is True
@@ -247,9 +544,6 @@ def test_start_daemon_via_discovered_backend():
 
 
 def test_start_daemon_targets_a_freshly_installed_backend_that_is_not_yet_active():
-    """A backend fresh off ``pip install`` legitimately reports inactive until its
-    OWN start_daemon performs first activation — select_backend's active-only
-    filter would exclude it, so start_daemon must select it directly instead."""
     fake = FakeProBackend(active=False)
     assert pro_trial.start_daemon(backends=[fake]) is True
     assert fake.started == 1
@@ -260,548 +554,519 @@ def test_start_daemon_no_method_is_noop():
     assert pro_trial.start_daemon(backends=[_b.FreeBackend()]) is False
 
 
-def test_pro_backend_active_reuses_upsell():
-    assert pro_trial.pro_backend_active(backends=[FakeProBackend(active=True)]) is True
-    assert pro_trial.pro_backend_active(backends=[FakeProBackend(active=False)]) is False
+@pytest.mark.parametrize("kind, buyer, line", [
+    ("trial", True, "✓ Buddhi Review Pro is active — your free trial is live. The live view is "
+                    "starting in the background."),
+    ("buy", True, "✓ Buddhi Pro is active — your subscription is active. The live view is "
+                  "starting in the background."),
+    ("recover", True, "✓ Buddhi Pro is active — your subscription is active. The live view is "
+                      "starting in the background."),
+    ("activate", False, "✓ Buddhi Review Pro is active on this computer. The live view is "
+                        "starting in the background."),
+])
+def test_the_success_line_names_what_became_active(kind, buyer, line):
+    out = pro_trial._finish_install(_KEY, kind=kind, buyer=buyer, **_install_kw())
+    assert (out.ok, out.status, out.message) == (True, "active", line)
+    state = _state()
+    assert "install" not in state and state["last_install_kind"] == kind
+    assert ("trial_active_since" in state) is (kind == "trial")
 
 
-# ── start_trial: full flow + graceful paths ─────────────────────────────────────
-
-def _start(email="me@x.io", *, transport=None, backends=None, runner=None,
-           is_active=True, tmp=None):
-    return pro_trial.start_trial(
-        email, transport=transport or _full(),
-        backends=backends if backends is not None else [FakeProBackend(True)],
-        runner=runner or (lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr="")),
-        netrc_path=(tmp / ".netrc") if tmp else None,
-        is_active=(lambda: is_active), sleep=lambda s: None, attempts=3)
+def test_an_unfinished_install_is_recorded_until_it_succeeds():
+    out = pro_trial._finish_install(_KEY, kind="buy", **_install_kw(
+        runner=lambda cmd, env=None: types.SimpleNamespace(returncode=1, stdout="",
+                                                           stderr="boom")))
+    assert out.status == "pip_failed"
+    assert _state()["install"]["kind"] == "buy"
+    assert pro_trial.has_held_work()
 
 
-def test_start_trial_active(tmp_path):
-    out = _start(tmp=tmp_path)
-    assert out.ok and out.status == "active"
-    assert "2026-07-26" in out.message          # server-stamped end date shown
-    assert (tmp_path / ".netrc").exists()
+def test_the_kept_pip_failure_line_names_the_exact_command(tmp_path):
+    netrc = tmp_path / "my netrc"
+    out = pro_trial._finish_install(_KEY, netrc_path=netrc, **_install_kw(
+        runner=lambda cmd, env=None: types.SimpleNamespace(returncode=1, stdout="", stderr="x")))
+    q = pro_trial.shlex.quote
+    assert out.message == (
+        f"Install did not complete — your license is set up and {netrc} is intact, so just "
+        f"re-run: NETRC={q(str(netrc))} {q(pro_trial.sys.executable)} -m pip install --upgrade "
+        f"buddhi-review-pro --index-url {q(pro_trial._index_url())} --no-input")
 
 
-def test_start_trial_email_registered_routes_to_convert(tmp_path):
-    out = _start(transport=_full(users=(409, {"errors": [{"code": "EMAIL_TAKEN"}]})),
-                 tmp=tmp_path)
-    assert not out.ok and out.status == "email_registered"
-    assert pro_trial.CHECKOUT_URL in out.message
-    assert not (tmp_path / ".netrc").exists()   # never got as far as writing creds
+_403 = lambda cmd, env=None: types.SimpleNamespace(returncode=1, stdout="", stderr="403 Forbidden")
 
 
-def test_start_trial_bad_email():
-    out = pro_trial.start_trial("not-an-email")
-    assert not out.ok and out.status == "bad_email"
+def test_the_kept_index_refusal_line_and_the_trials_last_offer_variant(tmp_path):
+    kept = pro_trial._finish_install(_KEY, kind="trial", **_install_kw(runner=_403))
+    assert kept.message == ("The license index refused the install (403). Your key may not be "
+                            "active yet — wait a moment and re-run setup.")
+    netrc = tmp_path / ".netrc"
+    last = pro_trial._finish_install(_KEY, kind="trial", last_offer=True, netrc_path=netrc,
+                                     **_install_kw(runner=_403))
+    q = pro_trial.shlex.quote
+    assert last.message == (
+        "The licence index refused the install (403). Your key may not be active yet. Wait a "
+        f"moment, then run NETRC={q(str(netrc))} {q(pro_trial.sys.executable)} -m pip install "
+        f"--upgrade buddhi-review-pro --index-url {q(pro_trial._index_url())} --no-input. If it "
+        f"still fails, email {_SUPPORT}.")
+    paid = pro_trial._finish_install(_KEY, kind="buy", last_offer=True, **_install_kw(runner=_403))
+    assert paid.message == kept.message
 
 
-def test_start_trial_index_403(tmp_path):
-    runner = lambda c: types.SimpleNamespace(returncode=1, stdout="", stderr="403 Forbidden")
-    out = _start(runner=runner, tmp=tmp_path)
-    assert not out.ok and out.status == "index_403"
-    assert (tmp_path / ".netrc").exists()       # netrc intact (key valid, retry later)
+def test_the_kept_unsafe_entry_line_and_the_trials_last_offer_variant(tmp_path):
+    netrc = tmp_path / ".netrc"
+    netrc.write_text("machine pypi.pkg.keygen.sh login license password OLD machine x.y login a\n")
+    os.chmod(netrc, 0o600)
+    kept = pro_trial._finish_install(_KEY, kind="trial", netrc_path=netrc, **_install_kw())
+    assert kept.message == (
+        f"{netrc} has an entry that could not be safely updated (it shares a line with another "
+        "entry) — your new credential was appended instead. Please clean up "
+        f"{netrc} by hand, then re-run setup.")
+    last = pro_trial._finish_install(_KEY, kind="trial", last_offer=True, netrc_path=netrc,
+                                     **_install_kw())
+    assert last.message == (
+        f"{netrc} has an entry that could not be safely updated (it shares a line with another "
+        f"entry), so your new credential was appended instead. Clean up {netrc} by hand. For "
+        f"help continuing trial setup, email {_SUPPORT}.")
 
 
-def test_start_trial_pip_failed_netrc_intact(tmp_path):
-    runner = lambda c: types.SimpleNamespace(returncode=1, stdout="", stderr="network down")
-    out = _start(runner=runner, tmp=tmp_path)
-    assert not out.ok and out.status == "pip_failed"
-    assert (tmp_path / ".netrc").exists()
-    assert "intact" in out.message.lower()
+@pytest.mark.parametrize("kind, last, line", [
+    ("trial", False, "Could not write `{n}`. Check the file's permissions, then run "
+                     "`buddhi-review setup` again with the same email to continue the trial if "
+                     "it is still live."),
+    ("trial", True, "Could not write `{n}`. Check the file's permissions. For help continuing "
+                    "trial setup, email support@buddhireview.com."),
+    ("buy", False, "Could not write {n}. Check the file's permissions, then run `buddhi-review "
+                   "setup` again within the next few minutes to finish. If that is too late, "
+                   "run `buddhi-review setup --recover` with your recovery address (the email "
+                   "you first paid with, unless you changed it; if you paid with two different "
+                   "emails, run it once with each)."),
+    ("recover", False, "Could not write {n}. Check the file's permissions, then run "
+                       "`buddhi-review setup` again within the next few minutes to finish. If "
+                       "that is too late, run `buddhi-review setup --recover` with your recovery "
+                       "address (the email you first paid with, unless you changed it; if you "
+                       "paid with two different emails, run it once with each)."),
+    ("activate", False, "Could not write {n}. Check the file's permissions, then run "
+                        "`buddhi-review setup --activate` within the next few minutes and paste "
+                        "the same code. If that is too late and you bought Pro, run "
+                        "`buddhi-review setup --recover` with your recovery address (the email "
+                        "you first paid with, unless you changed it; if you paid with two "
+                        "different emails, run it once with each); if someone gave you this "
+                        "code, ask them for a new one."),
+])
+def test_a_netrc_that_cannot_be_written(tmp_path, kind, last, line):
+    blocker = tmp_path / "blocker"
+    blocker.write_text("x")
+    netrc = blocker / ".netrc"
+    out = pro_trial._finish_install(_KEY, kind=kind, last_offer=last, netrc_path=netrc,
+                                    **_install_kw(runner=lambda *a, **k: pytest.fail("pip ran")))
+    assert (out.status, out.message) == ("netrc_failed", line.format(n=netrc))
+    assert "install" not in _state()             # no key saved: nothing to finish later
 
 
-def test_start_trial_pip_failed_message_includes_index_url(tmp_path):
-    """The manual retry command in the pip_failed message must carry the SAME
-    --index-url pip_install() itself uses — plain PyPI does not host the private
-    package, so a bare 'pip install buddhi-review-pro' cannot recover this state."""
-    runner = lambda c: types.SimpleNamespace(returncode=1, stdout="", stderr="network down")
-    out = _start(runner=runner, tmp=tmp_path)
-    assert not out.ok and out.status == "pip_failed"
-    assert f"--index-url {pro_trial._index_url()}" in out.message
+def test_not_activated_lines():
+    kw = _install_kw(is_active=lambda: False)
+    trial = pro_trial._finish_install(_KEY, kind="trial", **kw)
+    assert trial.message == (
+        "Pro installed, but it did not activate on this machine — it may have already been "
+        "used for a trial. To buy Pro, run `buddhi-review setup --buy`. If you have a setup "
+        "code, run `buddhi-review setup --activate`. To move your own seat from another "
+        "computer to this one, run `buddhi-review setup --recover`.")
+    paid = pro_trial._finish_install(_KEY, kind="buy", **kw)
+    assert paid.message == ("Pro installed, but it did not activate on this machine — your key "
+                            f"may already be active elsewhere. Contact {_SUPPORT}.")
 
 
-def test_start_trial_pip_failed_message_sets_netrc_for_a_custom_path(tmp_path):
-    """When ``netrc_path`` is not the default ``~/.netrc`` (e.g. BUDDHI_NETRC), the
-    printed manual retry command must itself set NETRC= to that same path — a bare
-    ``pip install`` would otherwise fall back to ~/.netrc and repeat the failure."""
-    runner = lambda c: types.SimpleNamespace(returncode=1, stdout="", stderr="network down")
-    custom_netrc = tmp_path / "custom.netrc"
-    out = pro_trial.start_trial(
-        "me@x.io", transport=_full(), backends=[FakeProBackend(True)], runner=runner,
-        netrc_path=custom_netrc, is_active=lambda: True, sleep=lambda s: None, attempts=3)
-    assert not out.ok and out.status == "pip_failed"
-    assert f"NETRC={custom_netrc}" in out.message
+@pytest.mark.parametrize("kind", ["buy", "activate", "recover"])
+def test_a_paid_key_that_did_not_activate_still_blocks_the_trial_offer(kind):
+    """The paid key stays in ~/.netrc, so a trial key must never be offered over it."""
+    assert pro_trial.offer_allowed()
+    out = pro_trial._finish_install(_KEY, kind=kind, **_install_kw(is_active=lambda: False))
+    assert out.status == "not_activated"
+    state = _state()
+    assert "install" not in state and state["last_install_kind"] == kind
+    assert "trial_active_since" not in state
+    assert not pro_trial.offer_allowed()
 
 
-# ── start_trial: pending-credential retry (token/license failure must not burn the email) ──
-
-def test_start_trial_retries_after_token_failure_reuse_same_password(tmp_path):
-    """A registration that succeeds but whose token mint fails right after must not
-    permanently lock the email out of its own account: a retry should mint a token
-    with the SAME password instead of re-registering (which the server would now
-    refuse as already-taken, dead-ending into email_registered)."""
-    attempt = {"n": 0}
-
-    def tokens(body):
-        attempt["n"] += 1
-        return (0, None) if attempt["n"] == 1 else _TOKENS_OK
-
-    t = _full(tokens=tokens)
-    out1 = _start(transport=t, tmp=tmp_path)
-    assert not out1.ok and out1.status == "token_failed"
-    assert len([c for c in t.calls if c["url"].endswith("/users")]) == 1
-
-    out2 = _start(transport=t, tmp=tmp_path)
-    assert out2.ok and out2.status == "active"
-    # no second registration attempt on retry
-    assert len([c for c in t.calls if c["url"].endswith("/users")]) == 1
-    token_calls = [c for c in t.calls if c["url"].endswith("/tokens")]
-    assert len(token_calls) == 2
-    assert token_calls[0]["auth"] == token_calls[1]["auth"]   # same password both times
+def test_a_trial_that_did_not_activate_records_no_install_kind():
+    pro_trial._finish_install(_KEY, kind="trial", **_install_kw(is_active=lambda: False))
+    assert "last_install_kind" not in _state()
 
 
-def test_start_trial_retries_after_install_failure_reuse_same_password(tmp_path):
-    """A license that mints successfully but whose local install then fails (netrc
-    write / pip install / activation) must not burn the pending credential: the key
-    never made it to disk, so a same-email retry must still mint a token directly
-    instead of re-registering (which the server would now refuse as already-taken,
-    dead-ending into email_registered with no emailed key to fall back on)."""
-    runner_fail = lambda c: types.SimpleNamespace(returncode=1, stdout="", stderr="network down")
-    t = _full()
-    out1 = _start(transport=t, runner=runner_fail, tmp=tmp_path)
-    assert not out1.ok and out1.status == "pip_failed"
-    state = json.loads((tmp_path / "trial.json").read_text(encoding="utf-8"))
-    assert state.get("pending_email") == "me@x.io"   # kept for retry, not cleared
-
-    out2 = _start(transport=t, tmp=tmp_path)
-    assert out2.ok and out2.status == "active"
-    # no second registration attempt on retry
-    assert len([c for c in t.calls if c["url"].endswith("/users")]) == 1
+def test_a_key_is_never_printed_nor_world_readable(tmp_path, monkeypatch):
+    netrc = tmp_path / ".netrc"
+    lines = []
+    for runner in (_ok_runner, _403,
+                   lambda cmd, env=None: types.SimpleNamespace(returncode=1, stdout="",
+                                                               stderr="x")):
+        lines.append(pro_trial._finish_install(_KEY, netrc_path=netrc,
+                                               **_install_kw(runner=runner)).message)
+    assert all(_KEY not in line for line in lines)
+    assert stat.S_IMODE(os.stat(netrc).st_mode) == 0o600
+    assert _KEY not in pro_trial._state_path().read_text()
 
 
-def test_start_trial_retries_after_license_failure_reuse_same_password(tmp_path):
-    attempt = {"n": 0}
+# ── The trial, end to end ─────────────────────────────────────────────────────
 
-    def licenses(body):
-        attempt["n"] += 1
-        return (0, None) if attempt["n"] == 1 else _LICENSE_OK
-
-    t = _full(licenses=licenses)
-    out1 = _start(transport=t, tmp=tmp_path)
-    assert not out1.ok and out1.status == "license_failed"
-
-    out2 = _start(transport=t, tmp=tmp_path)
-    assert out2.ok and out2.status == "active"
-    assert len([c for c in t.calls if c["url"].endswith("/users")]) == 1
+_SENT = "If this address can start a trial on this computer, a 6-digit code is on its way " \
+        "from Buddhi Review (codes@buddhireview.com). It expires in 10 minutes."
+_UPGRADE = ("To buy Pro, run `buddhi-review setup --buy`. If you have a setup code, run "
+            "`buddhi-review setup --activate`. To move your own seat from another computer to "
+            "this one, run `buddhi-review setup --recover`.")
+_OFFER = ("Try Buddhi Review Pro — automation that carries a run like this to the finish on "
+          "its own.")
+_QUESTION = "Start or continue your free 14-day Pro trial?"
+_CODE_PROMPT = "Enter the 6-digit code (press Enter if none arrived): "
 
 
-def test_start_trial_clears_pending_credential_after_success(tmp_path):
-    out = _start(tmp=tmp_path)
-    assert out.ok
-    state = json.loads((tmp_path / "trial.json").read_text(encoding="utf-8"))
-    assert "pending_password" not in state
-    assert "pending_email" not in state
-    assert "pending_user_id" not in state
+def _trial_ui(*, codes=("123456",), email=("me@example.com",), accept=(True,), yes=None,
+              offer=(True,)):
+    questions = {_QUESTION: list(offer), "Do you accept it?": list(accept)}
+    questions.update(yes or {})
+    # The emailed code is read hidden: a visible read of it fails the test.
+    return ScriptedUi(answers={"Email to set up your trial": list(email)},
+                      hidden={"Enter the 6-digit code": list(codes)}, yes=questions)
 
 
-def test_start_trial_pending_state_file_is_0600(tmp_path):
-    t = _full(tokens=lambda body: (0, None))
-    out = _start(transport=t, tmp=tmp_path)
-    assert not out.ok and out.status == "token_failed"
-    sp = tmp_path / "trial.json"
-    assert sp.exists()
-    assert stat.S_IMODE(os.stat(sp).st_mode) == 0o600
+def _trial_bridge(monkeypatch, *, code=((202, {"status": "sent"}),),
+                  trial=((200, {"licence_key": _KEY, "replay_until": "2026-10-18T00:15:00Z"}),)):
+    return _bridge(monkeypatch, {"POST /trial/code": list(code), "POST /trial": list(trial)})
 
 
-def test_start_trial_pending_credential_ignored_for_a_different_email(tmp_path):
-    """A pending credential for one email must never be reused to mint a token for a
-    DIFFERENT email — only an exact-email match is a legitimate same-account retry."""
-    t = _full(tokens=lambda body: (0, None))
-    out1 = _start(email="me@x.io", transport=t, tmp=tmp_path)
-    assert not out1.ok and out1.status == "token_failed"
-
-    t2 = _full()
-    out2 = _start(email="someone-else@x.io", transport=t2, tmp=tmp_path)
-    assert out2.ok
-    # the second email registered fresh — it did not reuse the first email's pending slot
-    assert len([c for c in t2.calls if c["url"].endswith("/users")]) == 1
+def _step(ui, **kw):
+    return pro_trial.trial_step(ui, **_install_kw(**kw))
 
 
-def test_start_trial_not_activated_unique_per_policy(tmp_path):
-    # install succeeds, but the machine never activates (already used its one trial).
-    out = _start(is_active=False, tmp=tmp_path)
-    assert not out.ok and out.status == "not_activated"
-    assert pro_trial.CHECKOUT_URL in out.message
-    # a single calm line — no stack trace / error spam vocabulary
-    assert "traceback" not in out.message.lower() and "error" not in out.message.lower()
+def test_the_trial_runs_from_the_offer_to_an_active_pro(monkeypatch, tmp_path):
+    fake = _trial_bridge(monkeypatch)
+    ui = _trial_ui()
+    assert _step(ui) is False
+    assert ui.lines[0] == ("step", _OFFER)
+    assert ui.asked[0] == _QUESTION and ui.defaults[_QUESTION] is True
+    assert ("step", _EULA_LINE) in ui.lines
+    assert ("info", _SENT) in ui.lines
+    assert ui.lines[-1] == ("ok", "✓ Buddhi Review Pro is active — your free trial is live. "
+                                  "The live view is starting in the background.")
+    fp = pro_trial.trial_fingerprint()
+    assert fake.bodies("POST /trial/code") == [{"email": "me@example.com", "fingerprint": fp}]
+    body = fake.bodies("POST /trial")[0]
+    assert body["code"] == "123456" and body["fingerprint"] == fp
+    assert re.fullmatch(r"[A-Za-z0-9_-]{43}", body["claim_nonce"])
+    assert fake.unexpected == []
+    state = _state()
+    assert state["shown_count"] == 1 and "trial_nonce" not in state
+    assert isinstance(state["trial_active_since"], float)
+    assert "password TRIALKEY-ABC-123" in (tmp_path / ".netrc").read_text()
 
 
-# ── convert / concierge-paste ───────────────────────────────────────────────────
-
-def test_convert_uses_valid_clipboard_key(tmp_path):
-    # A key-shaped clipboard is used ONLY once the user explicitly consents to it.
-    t = _full()
-    out = pro_trial.convert(
-        transport=t, clipboard_reader=lambda: "PAIDKEY-FROM-CLIP",
-        confirm_input=lambda *a: "y", backends=[FakeProBackend(True)],
-        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
-        netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2)
-    assert out.ok and out.status == "active"
-    assert (tmp_path / ".netrc").read_text().find("PAIDKEY-FROM-CLIP") >= 0
+def test_the_licence_agreement_comes_before_any_request(monkeypatch):
+    fake = _trial_bridge(monkeypatch)
+    ui = _trial_ui(accept=(False,))
+    _step(ui)
+    assert fake.calls == []
+    assert ui.lines[-1] == ("warn", "You did not accept the agreement, so trial setup stopped. "
+                                    "The free version keeps working. To start the trial, run "
+                                    "`buddhi-review setup` again and accept the agreement.")
+    assert pro_trial.offer_allowed()             # build rule 1: offered again at once
 
 
-def test_convert_falls_back_to_manual_paste_when_clipboard_invalid(tmp_path):
-    # consented clipboard that the SERVER rejects → prompt for manual paste.
-    def validate(body):
-        key = body["meta"]["key"]
-        return (200, {"meta": {"valid": key == "GOODKEY-PASTE", "code": "VALID" if key == "GOODKEY-PASTE" else "NOT_FOUND"}})
-    t = _full(validate=validate)
-    out = pro_trial.convert(
-        transport=t, clipboard_reader=lambda: "junk-not-a-key",
-        confirm_input=lambda *a: "y",
-        paste_input=lambda *a: "GOODKEY-PASTE", backends=[FakeProBackend(True)],
-        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
-        netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2)
-    assert out.ok and "GOODKEY-PASTE" in (tmp_path / ".netrc").read_text()
+def test_on_the_last_offer_the_refusal_points_nowhere_further(monkeypatch):
+    _set_state(shown_count=4)
+    _trial_bridge(monkeypatch)
+    ui = _trial_ui(accept=(False,))
+    _step(ui)
+    assert ui.lines[-1] == ("warn", "You did not accept the agreement, so trial setup stopped. "
+                                    "The free version keeps working.")
+    assert not pro_trial.offer_allowed()         # the cap: five offers
 
 
-# ── the clipboard never leaves the machine unbidden (P1: no arbitrary exfiltration) ──
+def test_a_no_to_the_offer_is_a_durable_decline(monkeypatch):
+    fake = _trial_bridge(monkeypatch)
+    ui = _trial_ui(offer=(False,))
+    assert _step(ui) is False
+    assert fake.calls == [] and _state()["declined"] is True
+    assert not pro_trial.offer_allowed()
 
-def test_clipboard_is_never_posted_without_explicit_consent(tmp_path):
-    """A stale clipboard holding an unrelated secret must NOT be POSTed just because the
-    user chose the key-paste path: without a yes, validate-key is never called on it."""
-    t = _full()
-    out = pro_trial.convert(
-        transport=t, clipboard_reader=lambda: "ghp_STALE_GITHUB_TOKEN_abcdef123456",
-        confirm_input=lambda *a: "n", paste_input=lambda *a: "",
-        netrc_path=tmp_path / ".netrc")
-    assert not out.ok and out.status == "no_key"
-    assert t.calls == []                                  # nothing left the machine at all
+
+def test_an_empty_email_ends_the_attempt_quietly_and_waives_the_gap(monkeypatch):
+    fake = _trial_bridge(monkeypatch)
+    ui = _trial_ui(email=("",))
+    assert _step(ui) is False
+    assert fake.calls == [] and ui.lines == [("step", _OFFER)]
+    assert "last_shown" not in _state() and pro_trial.offer_allowed()
+
+
+def test_an_address_the_service_would_refuse_is_asked_again(monkeypatch):
+    _trial_bridge(monkeypatch)
+    ui = _trial_ui(email=("+tag@example.com", "nope", "a@b"))
+    _step(ui)
+    assert ui.text.count("That doesn't look like an email address — try again.") == 3
+
+
+def test_an_address_that_cannot_take_mail_is_asked_for_again(monkeypatch):
+    fake = _trial_bridge(monkeypatch, code=((422, {"error": "send_failed"}),
+                                            (202, {"status": "sent"})))
+    ui = _trial_ui(email=("bad@example.com", "good@example.com"))
+    _step(ui)
+    assert ("warn", "We could not send to that address. Check it and try again.") in ui.lines
+    assert [b["email"] for b in fake.bodies("POST /trial/code")] == [
+        "bad@example.com", "good@example.com"]
+    assert ui.lines[-1][0] == "ok"
+
+
+@pytest.mark.parametrize("answer, line, last_line", [
+    ((429, {"error": "rate_limited"}, 120),
+     "Too many requests have been made for now. Try again in about 2 minutes with "
+     "`buddhi-review setup`.",
+     "This trial setup could not finish because too many requests have been made for now."),
+    ((503, {"error": "sending_paused"}, 3 * 3600),
+     "Trial codes cannot be sent right now. Try again in about 3 hours with "
+     "`buddhi-review setup`.",
+     "Trial codes cannot be sent right now, so this trial setup could not finish."),
+    ((503, {"error": "unavailable"}, 5),
+     "The Buddhi Review service is not answering right now. Try again in a few minutes with "
+     "`buddhi-review setup`.",
+     "The Buddhi Review service is not answering right now, so this trial setup could not "
+     "finish."),
+    ((400, {"error": "invalid_request"}),
+     "Buddhi Review did not accept this request. This points to a fault in this version of "
+     "Buddhi Review, not in anything you did. Run `buddhi-review upgrade`, then try again. If "
+     "it still fails, email support@buddhireview.com.",
+     "Buddhi Review did not accept this request. This points to a fault in this version of "
+     "Buddhi Review, not in anything you did. Run `buddhi-review upgrade`, and for help "
+     "continuing trial setup, email support@buddhireview.com."),
+])
+@pytest.mark.parametrize("last", [False, True], ids=["another-offer", "last-offer"])
+def test_a_code_request_that_cannot_go_out(monkeypatch, answer, line, last_line, last):
+    if last:
+        _set_state(shown_count=4)
+    fake = _trial_bridge(monkeypatch, code=(answer,))
+    ui = _trial_ui(codes=())
+    _step(ui)
+    assert ui.lines[-1] == ("warn", last_line if last else line)
+    assert fake.count("POST /trial") == 0
+
+
+def test_a_code_of_the_wrong_shape_is_asked_for_again(monkeypatch):
+    fake = _trial_bridge(monkeypatch)
+    ui = _trial_ui(codes=("12345", "abcdef", "123 456"))
+    _step(ui)
+    assert ui.text.count("That is not a trial code. A trial code has 6 digits.") == 2
+    assert fake.bodies("POST /trial")[0]["code"] == "123456"
+
+
+def test_no_code_yet_offers_a_new_one_default_no(monkeypatch):
+    fake = _trial_bridge(monkeypatch)
+    ui = _trial_ui(codes=("", "123456"), yes={"Send a new code?": [True]})
+    _step(ui)
+    assert ("info", "No code yet? It can take a few minutes, so check your spam folder. If an "
+                    "email says this address or this computer has already used its trial, no "
+                    "code will come.") in ui.lines
+    assert ui.defaults["Send a new code?"] is False
+    assert fake.count("POST /trial/code") == 2 and ui.lines[-1][0] == "ok"
+
+
+@pytest.mark.parametrize("last, line", [
+    (False, "Trial setup stopped. To try again, run `buddhi-review setup`."),
+    (True, "Trial setup stopped."),
+])
+def test_no_new_code_wanted_stops_then_points_at_the_paid_paths(monkeypatch, last, line):
+    if last:
+        _set_state(shown_count=4)
+    _trial_bridge(monkeypatch)
+    ui = _trial_ui(codes=("",), yes={"Send a new code?": [False]})
+    _step(ui)
+    assert ui.lines[-2:] == [("info", line), ("step", _UPGRADE)]
+
+
+def test_a_code_that_does_not_work_offers_a_new_one_default_yes(monkeypatch):
+    fake = _trial_bridge(monkeypatch, trial=((403, {"error": "code_invalid"}),
+                                             (200, {"licence_key": _KEY})))
+    ui = _trial_ui(codes=("111111", "222222"), yes={"Send a new code?": [True]})
+    _step(ui)
+    assert ("warn", "That code is not valid. It may be mistyped or expired, or too many wrong "
+                    "codes were entered for this address in the last 24 hours, and then a new "
+                    "code also fails until that time has passed. Ask for a new one.") in ui.lines
+    assert ui.defaults["Send a new code?"] is True
+    assert fake.count("POST /trial/code") == 2 and ui.lines[-1][0] == "ok"
+
+
+def test_an_ended_trial_installs_nothing_and_is_never_offered_again(monkeypatch, tmp_path):
+    _trial_bridge(monkeypatch, trial=((410, {"error": "trial_ended"}),))
+    ui = _trial_ui()
+    _step(ui, runner=lambda *a, **k: pytest.fail("installed"))
+    assert ui.lines[-2:] == [("info", "Your Buddhi Review Pro trial has ended. The free version "
+                                      "is still available."), ("step", _UPGRADE)]
+    assert _state()["declined"] is True and "trial_nonce" not in _state()
     assert not (tmp_path / ".netrc").exists()
+    assert not pro_trial.offer_allowed()
 
 
-def test_declined_clipboard_falls_through_to_manual_paste(tmp_path):
-    """Declining the clipboard costs one paste and leaks nothing — the manual key still
-    installs, and the clipboard value is never sent."""
-    t = _full()
-    out = pro_trial.convert(
-        transport=t, clipboard_reader=lambda: "SOME-OTHER-SECRET-VALUE",
-        confirm_input=lambda *a: "", paste_input=lambda *a: "GOODKEY-PASTE",
-        backends=[FakeProBackend(True)],
-        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
-        netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2)
-    assert out.ok
-    sent = [c["body"]["meta"]["key"] for c in t.calls if "validate-key" in c["url"]]
-    assert sent == ["GOODKEY-PASTE"]                      # the clipboard value was NOT sent
+@pytest.mark.parametrize("last, line", [
+    (False, "The trial setup could not finish. To try again, run `buddhi-review setup` in a few "
+            "minutes, using the same email. If a trial was started and is still live, setup "
+            "will try to continue it."),
+    (True, "The trial setup could not finish. For help continuing trial setup, email "
+           "support@buddhireview.com."),
+])
+def test_no_answer_from_trial_after_retries_with_the_same_nonce(monkeypatch, last, line):
+    if last:
+        _set_state(shown_count=4)
+    fake = _trial_bridge(monkeypatch, trial=((503, {"error": "unavailable"}, 5),))
+    ui = _trial_ui()
+    _step(ui)
+    assert ui.lines[-1] == ("warn", line)
+    nonces = {b["claim_nonce"] for b in fake.bodies("POST /trial")}
+    assert fake.count("POST /trial") == pro_trial._NO_ANSWER_TRIES and len(nonces) == 1
+    assert _state()["trial_nonce"] in nonces      # kept for the next attempt
 
 
-def test_non_key_shaped_clipboard_is_not_even_offered():
-    """Clipboard content that cannot be a key (prose / a passphrase with spaces) is
-    dropped locally — no network call AND no consent prompt."""
-    t = _full()
-    asked = []
-    got = pro_trial.detect_pasted_key(
-        transport=t, clipboard_reader=lambda: "the quick brown fox jumps",
-        confirm_input=lambda p: asked.append(p) or "y", paste_input=lambda *a: "")
-    assert got is None
-    assert t.calls == [] and asked == []
+def test_the_trial_nonce_is_kept_across_attempts(monkeypatch):
+    fake = _trial_bridge(monkeypatch, trial=((503, {"error": "unavailable"}),
+                                             (503, {"error": "unavailable"}),
+                                             (503, {"error": "unavailable"}),
+                                             (200, {"licence_key": _KEY})))
+    _step(_trial_ui())
+    _step(_trial_ui())
+    assert len({b["claim_nonce"] for b in fake.bodies("POST /trial")}) == 1
 
 
-def test_manual_paste_is_shape_gated_before_validation():
-    """A manually pasted value must clear the SAME narrow key-shape gate as the
-    clipboard candidate before it is POSTed to validate-key — prose, a passphrase,
-    or another secret accidentally pasted into the hidden prompt must never reach
-    the network."""
-    t = _full()
-    got = pro_trial.detect_pasted_key(
-        transport=t, clipboard_reader=lambda: "",
-        confirm_input=lambda *a: "y",
-        paste_input=lambda *a: "correct horse battery staple")
-    assert got is None
-    assert t.calls == []                                  # never even validated
+@pytest.mark.parametrize("where", ["question", "email", "code", "in-flight"])
+@pytest.mark.parametrize("last", [False, True], ids=["another-offer", "last-offer"])
+def test_ctrl_c_anywhere_in_the_trial_step(monkeypatch, where, last):
+    if last:
+        _set_state(shown_count=4)
+    trial = [KeyboardInterrupt()] if where == "in-flight" else [(200, {"licence_key": _KEY})]
+    _trial_bridge(monkeypatch, trial=trial)
+    ui = _trial_ui(offer=[KeyboardInterrupt] if where == "question" else (True,),
+                   email=[EOFError] if where == "email" else ("me@example.com",),
+                   codes=[KeyboardInterrupt] if where == "code" else ("123456",))
+    assert _step(ui) is True
+    assert ui.lines[-1] == ("info", "Trial setup stopped." if last else
+                            "Trial setup stopped. To try again, run `buddhi-review setup`.")
+    assert "last_shown" not in _state()          # nothing started the gap
 
 
-# ── a just-bought key has no activation on it yet (it must still convert) ───────
-
-def test_convert_accepts_a_key_that_is_not_activated_yet(tmp_path):
-    """A node-locked key Keygen emailed minutes ago validates ``false`` with
-    ``NO_MACHINE`` until something activates this box — and the thing that activates
-    it is the Pro wheel THIS flow is about to install. Demanding ``valid=True`` here
-    would therefore bounce every legitimate new buyer before _finish_install() could
-    write ~/.netrc, i.e. nobody could convert from the wizard at all."""
-    t = _full(validate=(200, {"meta": {"valid": False, "code": "NO_MACHINE"}}))
-    out = pro_trial.convert(
-        transport=t, clipboard_reader=lambda: "", paste_input=lambda *a: "PAIDKEY-NEW-001",
-        backends=[FakeProBackend(True)],
-        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
-        netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2)
-    assert out.ok and out.status == "active"
-    assert "PAIDKEY-NEW-001" in (tmp_path / ".netrc").read_text()
-
-
-def test_detect_pasted_key_accepts_the_floating_no_machines_verdict():
-    t = _full(validate=(200, {"meta": {"valid": False, "code": "NO_MACHINES"}}))
-    got = pro_trial.detect_pasted_key(transport=t, clipboard_reader=lambda: "",
-                                      paste_input=lambda *a: "PAIDKEY-NEW-001")
-    assert got == "PAIDKEY-NEW-001"
+@pytest.mark.parametrize("last", [False, True], ids=["another-offer", "last-offer"])
+def test_trial_details_that_cannot_be_saved(monkeypatch, last):
+    if last:
+        _set_state(shown_count=4, eula=_eula_accepted())
+    else:
+        _set_state(eula=_eula_accepted())
+    real = pro_trial._save_state
+    monkeypatch.setattr(pro_trial, "_save_state", lambda path, state: "Permission denied"
+                        if "trial_nonce" in state else real(path, state))
+    fake = _trial_bridge(monkeypatch)
+    ui = _trial_ui(accept=())
+    _step(ui)
+    path = pro_trial._state_path()
+    assert ui.lines[-1] == ("warn", (
+        f"Buddhi Review could not save its trial details in {path} (Permission denied), so "
+        "this trial setup could not finish. Fix that folder's permissions. For help continuing "
+        "trial setup, email support@buddhireview.com.") if last else (
+        f"Buddhi Review could not save its trial details in {path} (Permission denied), so "
+        "this trial setup could not finish. Fix that folder's permissions, then run "
+        "`buddhi-review setup` again."))
+    assert fake.calls == []
 
 
-def test_consented_clipboard_key_awaiting_activation_is_accepted():
-    t = _full(validate=(200, {"meta": {"valid": False, "code": "no_machine"}}))
-    got = pro_trial.detect_pasted_key(transport=t, clipboard_reader=lambda: "PAIDKEY-CLIP",
-                                      confirm_input=lambda *a: "y", paste_input=lambda *a: "")
-    assert got == "PAIDKEY-CLIP"          # the code compare is case-insensitive
+def test_the_last_offer_is_the_fifth(monkeypatch):
+    for shown in range(4):
+        _set_state(shown_count=shown)
+        assert pro_trial.record_offer_shown() is False
+    _set_state(shown_count=4)
+    assert pro_trial.record_offer_shown() is True
 
 
-@pytest.mark.parametrize("code", ["SUSPENDED", "EXPIRED", "BANNED", "NOT_FOUND",
-                                  "OVERDUE", "TOO_MANY_MACHINES", ""])
-def test_a_dead_key_is_still_rejected(code):
-    """The not-yet-activated carve-out is exactly two codes wide: every genuinely
-    dead verdict must still fall through to 'no valid key entered'."""
-    t = _full(validate=(200, {"meta": {"valid": False, "code": code}}))
-    got = pro_trial.detect_pasted_key(transport=t, clipboard_reader=lambda: "",
-                                      paste_input=lambda *a: "DEADKEY-1234-5678")
-    assert got is None
-    # rejected on the SERVER's verdict, not incidentally on the local shape gate
-    assert [c for c in t.calls if "validate-key" in c["url"]]
+# ── The offer's gating ────────────────────────────────────────────────────────
 
-
-def test_key_installable_predicate():
-    assert pro_trial._key_installable(True, "VALID") is True
-    assert pro_trial._key_installable(False, "NO_MACHINE") is True
-    assert pro_trial._key_installable(False, "NO_MACHINES") is True
-    assert pro_trial._key_installable(False, "SUSPENDED") is False
-    assert pro_trial._key_installable(False, "") is False
-
-
-def test_looks_like_license_key_shape_gate():
-    ok = ["2A26D5-D74C39-D5CDCA-38DA05-4F70E5-V3",          # Keygen hyphen-grouped hex
-          "40680ca7-99c5-4569-8c1d-611713612d3d",           # a UUID key
-          "key/eyJhY2NvdW50IjoiYnVkZGhpIn0=.c2lnbmF0dXJl"]  # a signed key/<payload>.<sig>
-    for k in ok:
-        assert pro_trial._looks_like_license_key(k) is True
-    bad = ["", "short", "correct horse battery staple",     # empty / too short / spaces
-           "my password is hunter2", "line one\nline two"]  # prose / multi-line
-    for k in bad:
-        assert pro_trial._looks_like_license_key(k) is False
-
-
-def test_consent_prompt_masks_the_candidate():
-    """The prompt must let the OWNER recognise their key without spilling a mis-copied
-    secret into the scrollback."""
-    masked = pro_trial._mask_key("ghp_STALE_GITHUB_TOKEN_abcdef123456")
-    assert "STALE_GITHUB_TOKEN" not in masked and masked.startswith("ghp_")
-    assert pro_trial._mask_key("shortkey") == "*" * 8       # short values disclose nothing
-
-
-def test_consent_declines_on_non_interactive_stdin():
-    """A headless / captured-stdin host cannot consent, so it must DECLINE (fail closed)
-    rather than raise or default to sending the clipboard."""
-    def boom(_prompt):
-        raise OSError("reading from stdin while output is captured")
-    assert pro_trial._clipboard_consented("KEY-1234-5678", boom) is False
-    assert pro_trial._clipboard_consented("KEY-1234-5678", lambda p: (_ for _ in ()).throw(EOFError())) is False
-    assert pro_trial._clipboard_consented("KEY-1234-5678", lambda p: "yes") is True
-
-
-# ── the manually pasted key is hidden (P2: no credential in the scrollback) ──────
-
-def test_manual_paste_default_is_hidden_not_echoing_input():
-    """The pasted key becomes the private-index password, so the DEFAULT reader must be
-    the hidden one — never the echoing builtin ``input``."""
-    import inspect
-    default = inspect.signature(pro_trial.detect_pasted_key).parameters["paste_input"].default
-    assert default is pro_trial._hidden_paste_input and default is not input
-    assert inspect.signature(pro_trial.convert).parameters["paste_input"].default is not input
-
-
-def test_hidden_paste_input_reads_via_getpass(monkeypatch):
-    seen = {}
-
-    def fake_getpass(prompt):
-        seen["p"] = prompt
-        return "K-1"
-    monkeypatch.setattr("getpass.getpass", fake_getpass)
-    assert pro_trial._hidden_paste_input("Paste your Pro key: ") == "K-1"
-    assert "Pro key" in seen["p"]
-
-
-def test_hidden_paste_input_never_falls_back_to_an_echoing_read(monkeypatch):
-    """If the hidden read fails outright, return "" (→ no key) rather than echoing."""
-    def boom(prompt):
-        raise RuntimeError("no terminal")
-    monkeypatch.setattr("getpass.getpass", boom)
-    assert pro_trial._hidden_paste_input("Paste your Pro key: ") == ""
-
-
-def test_convert_no_key_entered(tmp_path):
-    t = _full(validate=(200, {"meta": {"valid": False, "code": "NOT_FOUND"}}))
-    out = pro_trial.convert(transport=t, clipboard_reader=lambda: "",
-                            paste_input=lambda *a: "")
-    assert not out.ok and out.status == "no_key"
-
-
-def test_read_clipboard_swallows_all_exceptions():
-    def boom():
-        raise RuntimeError("no clipboard tool on this headless host")
-    assert pro_trial._read_clipboard(boom) == ""       # falls through, never raises
-
-
-def test_request_non_numeric_status_is_fail_open():
-    def weird(method, url, auth, body):
-        return "not-an-int", None                       # a misbehaving transport
-    assert pro_trial._request("POST", "/users", transport=weird) == (0, None)
-
-
-# ── the state file never strands the pending password in a temp file ────────────
-
-def test_write_state_leaves_no_temp_file_behind(tmp_path):
-    sp = tmp_path / "trial.json"
-    pro_trial._write_state(sp, {"shown_count": 1})
-    assert json.loads(sp.read_text(encoding="utf-8")) == {"shown_count": 1}
-    assert stat.S_IMODE(os.stat(sp).st_mode) == 0o600
-    assert list(tmp_path.glob("*.tmp")) == []
-
-
-def test_write_state_removes_the_temp_file_when_replace_fails(tmp_path, monkeypatch):
-    """The write is fail-soft, but a failed os.replace must not leave the temp file
-    sitting there: it holds the pending credential's password, and that stray copy
-    would outlive the state file the success path later clears."""
-    sp = tmp_path / "trial.json"
-
-    def boom(_src, _dst):
-        raise OSError("EXDEV: cross-device link")
-    monkeypatch.setattr(os, "replace", boom)
-
-    pro_trial._write_state(sp, {"pending_password": "SECRET-PW"})   # must not raise
-
-    assert not sp.exists()
-    on_disk = [p for p in tmp_path.iterdir() if p.is_file()]
-    assert on_disk == [], f"temp file left behind: {on_disk}"
-
-
-def test_write_state_survives_an_unwritable_directory(tmp_path):
-    """Fail-soft is preserved: an unwritable state dir is a no-op, never a crash."""
-    unwritable = tmp_path / "ro"
-    unwritable.mkdir()
-    os.chmod(unwritable, 0o500)
-    try:
-        pro_trial._write_state(unwritable / "trial.json", {"shown_count": 1})
-        assert not (unwritable / "trial.json").exists()
-        assert list(unwritable.iterdir()) == []
-    finally:
-        os.chmod(unwritable, 0o700)
-
-
-# ── offer gating ────────────────────────────────────────────────────────────────
-
-def test_offer_allowed_default(tmp_path):
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)]) is True
+def test_offer_allowed_default():
+    assert pro_trial.offer_allowed()
 
 
 def test_offer_suppressed_by_no_upsell(monkeypatch):
     monkeypatch.setenv("BUDDHI_NO_UPSELL", "1")
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)]) is False
+    assert not pro_trial.offer_allowed()
 
 
-def test_offer_suppressed_when_pro_active():
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(True)]) is False
+def test_offer_suppressed_when_pro_active(monkeypatch):
+    monkeypatch.setattr(pro_trial, "pro_backend_active", lambda **k: True)
+    assert not pro_trial.offer_allowed()
 
 
-def test_offer_suppressed_after_durable_decline(tmp_path):
-    sp = tmp_path / "trial.json"
-    pro_trial.record_declined(state_path=sp)
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], state_path=sp) is False
+def test_offer_suppressed_after_durable_decline():
+    pro_trial.record_declined()
+    assert not pro_trial.offer_allowed()
 
 
-def test_offer_frequency_cap(tmp_path, monkeypatch):
-    sp = tmp_path / "trial.json"
-    monkeypatch.setenv("BUDDHI_UPSELL_MAX_SHOWS", "1")
-    pro_trial.record_offer_shown(now=1000.0, state_path=sp)
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], now=1001.0,
-                                   state_path=sp) is False
+def test_offer_frequency_cap_and_gap():
+    now = time.time()
+    _set_state(shown_count=1, last_shown=now)
+    assert not pro_trial.offer_allowed(now=now + 60)          # the 24 h gap
+    assert pro_trial.offer_allowed(now=now + 25 * 3600)
+    _set_state(shown_count=5)
+    assert not pro_trial.offer_allowed()
 
 
-def test_offer_interval_is_waived_while_a_credential_is_pending(tmp_path):
-    """The offer is the ONLY door to start_trial, and it stamps itself shown just
-    before the attempt that failed — so the 24h interval would hide the very retry
-    the pending credential exists to serve, for exactly as long as it is worth
-    anything. A pending credential waives the interval; nothing else."""
-    sp = tmp_path / "trial.json"
-    pro_trial.record_offer_shown(now=1000.0, state_path=sp)
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], now=1001.0,
-                                   state_path=sp) is False        # no pending: cap holds
-
-    pro_trial._save_pending_credential("me@x.io", "PW", "user-1", state_path=sp)
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], now=1001.0,
-                                   state_path=sp) is True         # retry is reachable
-
-    pro_trial._clear_pending_credential(state_path=sp)
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(False)], now=1001.0,
-                                   state_path=sp) is False        # and the cap is back
+def test_an_attempt_without_a_no_is_offered_again_on_the_very_next_setup(monkeypatch):
+    """Build rule 1: the attempt counted toward the cap, but no gap."""
+    _trial_bridge(monkeypatch, trial=((403, {"error": "code_invalid"}),))
+    _step(_trial_ui(yes={"Send a new code?": [False]}))
+    assert _state()["shown_count"] == 1
+    assert pro_trial.offer_allowed(now=time.time() + 1)
 
 
-def test_a_failed_trial_can_be_retried_on_the_very_next_setup_run(tmp_path):
-    """End to end over the wizard's own sequence (offer_allowed → record_offer_shown
-    → start_trial): a token failure saves the pending credential, and the next run
-    minutes later must still be offered the trial so that credential can be used."""
-    sp = tmp_path / "trial.json"
-    backends = [FakeProBackend(False)]
-    assert pro_trial.offer_allowed(backends=backends, now=1000.0, state_path=sp) is True
-    pro_trial.record_offer_shown(now=1000.0, state_path=sp)
-
-    out = pro_trial.start_trial(
-        "me@x.io", transport=_full(tokens=lambda body: (0, None)), backends=backends,
-        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
-        netrc_path=tmp_path / ".netrc", is_active=lambda: False, sleep=lambda s: None,
-        attempts=1, state_path=sp)
-    assert not out.ok and out.status == "token_failed"
-    assert pro_trial._pending_credential(sp) is not None
-
-    # 60 s later — deep inside the 24h interval — the retry must still be offered
-    assert pro_trial.offer_allowed(backends=backends, now=1060.0, state_path=sp) is True
+def test_fourteen_days_after_a_trial_became_active_it_is_never_offered_here_again():
+    now = time.time()
+    _set_state(trial_active_since=now - 13 * 86400)
+    assert pro_trial.offer_allowed(now=now)                   # a reinstall mid-trial
+    assert not pro_trial.offer_allowed(now=now + 86400)
 
 
-def test_a_pending_credential_never_overrides_the_other_gates(tmp_path, monkeypatch):
-    """The waiver is the interval leg ONLY: suppression, a durable decline, an active
-    Pro backend and the max-shows ceiling all still say no."""
-    sp = tmp_path / "trial.json"
-    pro_trial._save_pending_credential("me@x.io", "PW", "user-1", state_path=sp)
-    free = [FakeProBackend(False)]
-
-    assert pro_trial.offer_allowed(backends=[FakeProBackend(True)], state_path=sp) is False
-    monkeypatch.setenv("BUDDHI_NO_UPSELL", "1")
-    assert pro_trial.offer_allowed(backends=free, state_path=sp) is False
-    monkeypatch.delenv("BUDDHI_NO_UPSELL")
-
-    monkeypatch.setenv("BUDDHI_UPSELL_MAX_SHOWS", "1")
-    pro_trial.record_offer_shown(now=1000.0, state_path=sp)
-    assert pro_trial.offer_allowed(backends=free, now=1e9, state_path=sp) is False
-    monkeypatch.delenv("BUDDHI_UPSELL_MAX_SHOWS")
-
-    pro_trial.record_declined(state_path=sp)
-    assert pro_trial.offer_allowed(backends=free, now=1e9, state_path=sp) is False
+def test_the_trial_start_is_recorded_only_when_the_success_line_shows(monkeypatch):
+    _trial_bridge(monkeypatch)
+    _step(_trial_ui(), runner=_403)
+    assert "trial_active_since" not in _state()
+    assert _state()["install"]["kind"] == "trial"             # the next setup finishes it
 
 
-# ── adversarial: the key never leaks into output or a world-readable file ────────
+def test_off_a_terminal_the_step_is_silent(monkeypatch):
+    fake = _trial_bridge(monkeypatch)
+    ui = ScriptedUi(interactive=False)
+    assert _step(ui) is False
+    assert ui.lines == [] and fake.calls == [] and _state() == {}
 
-def test_key_not_leaked_into_output_or_world_readable(tmp_path):
-    stream = io.StringIO()
-    # capture what start_trial's own printing would emit by driving the primitives
-    out = pro_trial.start_trial(
-        "me@x.io", transport=_full(), backends=[FakeProBackend(True)],
-        runner=lambda c: types.SimpleNamespace(returncode=0, stdout="", stderr=""),
-        netrc_path=tmp_path / ".netrc", is_active=lambda: True, sleep=lambda s: None,
-        attempts=2)
-    assert out.ok
-    # the user-facing message shows the end date, NOT the secret key
-    assert "TRIALKEY-ABC" not in out.message
-    # the key lives ONLY in the 0600 netrc, not world/group readable
-    mode = stat.S_IMODE(os.stat(tmp_path / ".netrc").st_mode)
-    assert mode == 0o600
+
+def test_a_trial_answer_without_a_key_is_no_answer(monkeypatch):
+    _trial_bridge(monkeypatch, trial=((200, {"replay_until": "x"}),))
+    ui = _trial_ui()
+    _step(ui, runner=lambda *a, **k: pytest.fail("installed"))
+    assert ui.lines[-1] == ("warn", "The trial setup could not finish. To try again, run "
+                                    "`buddhi-review setup` in a few minutes, using the same "
+                                    "email. If a trial was started and is still live, setup will "
+                                    "try to continue it.")
+
+
+def test_the_activation_order_lives_in_one_function(monkeypatch):
+    """Probe P1 decides whether activation must come before the install; until then
+    the order is today's — install, then the paid package's own first start activates
+    — and it is decided in exactly one place."""
+    order = []
+    monkeypatch.setattr(pro_trial, "pip_install",
+                        lambda **k: order.append("install") or (True, 0, ""))
+    monkeypatch.setattr(pro_trial, "start_daemon", lambda **k: order.append("activate"))
+    monkeypatch.setattr(pro_trial, "_await_active", lambda **k: True)
+    assert pro_trial._install_and_activate(pro_trial._state_path()) == (True, 0, "", True)
+    assert order == ["install", "activate"]
+    out = pro_trial._finish_install(_KEY, kind="buy")
+    assert out.ok and order == ["install", "activate"] * 2
+
+
+def test_a_continued_trial_keeps_its_first_start(monkeypatch):
+    """Build rule 12 counts 14 days from the FIRST time a trial became active here: a
+    reinstall that continues it on day 13 must not restart the count."""
+    first = time.time() - 13 * 86400
+    _set_state(trial_active_since=first)
+    out = pro_trial._finish_install(_KEY, kind="trial", **_install_kw())
+    assert out.ok and _state()["trial_active_since"] == first
+    assert not pro_trial.offer_allowed(now=first + 15 * 86400)

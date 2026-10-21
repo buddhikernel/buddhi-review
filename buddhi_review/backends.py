@@ -29,7 +29,7 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Protocol, runtime_checkable
+from typing import Any, Callable, List, Optional, Protocol, Tuple, runtime_checkable
 
 #: The entry-points group a backend registers under. This generic string is the
 #: ONLY coupling between this skill and any separately-installed backend.
@@ -52,13 +52,16 @@ class Backend(Protocol):
       * ``priority`` — higher wins when several backends are active (default ``0``).
 
     A backend MAY additionally CLAIM commands this skill does not define itself, via
-    two OPTIONAL hooks read by :func:`select_command_backend` through ``getattr`` —
+    OPTIONAL hooks read by :func:`select_command_backend` through ``getattr`` —
     deliberately kept OUT of this Protocol so ``runtime_checkable`` never requires
     them and a backend without them is simply skipped:
 
       * ``claimed_commands()`` — return an iterable of command names it handles;
       * ``run_command(name, argv)`` — run one such command with the verbatim,
-        unparsed trailing argv, returning an exit code.
+        unparsed trailing argv, returning an exit code;
+      * ``claimed_commands_when_inactive()`` — the claimed commands it runs even
+        while it is not active (a command whose service decides on its own what it
+        may do). A name it does not also claim is ignored.
 
     The free backend claims nothing, so an unclaimed command falls through to the
     front door's own answer (see :func:`select_command_backend`).
@@ -267,10 +270,23 @@ def select_backend(backends: List[Backend]) -> Backend:
     return active[0]
 
 
+def _runs_when_inactive(backend: Backend, command: str) -> bool:
+    """Whether ``backend`` runs ``command`` even while it is not active, read from the
+    OPTIONAL ``claimed_commands_when_inactive()`` hook. Without the hook, or when
+    looking it up or answering it raises, it does not."""
+    try:
+        hook = getattr(backend, "claimed_commands_when_inactive", None)
+        return callable(hook) and command in (hook() or ())
+    except Exception:
+        return False
+
+
 def select_command_backend(command: str, *,
                            backends: Optional[List[Backend]] = None) -> Optional[Backend]:
     """Return the highest-priority ACTIVE backend that CLAIMS ``command`` and can run
-    it, or ``None`` when no installed backend does.
+    it, or ``None`` when no installed backend does. A backend that is not active
+    counts only for a command it also lists in ``claimed_commands_when_inactive()``,
+    and any active claimant comes before it.
 
     A backend claims commands through the OPTIONAL ``claimed_commands()`` hook —
     deliberately NOT part of the :class:`Backend` Protocol, read via ``getattr`` so a
@@ -279,28 +295,31 @@ def select_command_backend(command: str, *,
     that claims a command it cannot run is treated as not claiming it, so the front
     door falls through to its own answer rather than calling a missing method. A
     backend that raises while answering is skipped (an installed package must never
-    break the free skill). ``backends`` is injectable for tests.
+    break the free skill) — whether it raises answering a hook or merely when the
+    hook is looked up. ``backends`` is injectable for tests.
     """
     candidates = backends if backends is not None else discover_backends()
-    claimants: List[Backend] = []
+    claimants: List[Tuple[int, Backend]] = []
     for backend in candidates:
-        claimed = getattr(backend, "claimed_commands", None)
-        if not callable(claimed):
-            continue
         try:
+            claimed = getattr(backend, "claimed_commands", None)
             # Stream the membership test (``in`` short-circuits on a match) instead
             # of materializing the full iterable first — a third-party backend's
             # claimed_commands() may be large or expensive to fully enumerate.
-            if command not in (claimed() or ()):
+            if not callable(claimed) or command not in (claimed() or ()):
+                continue
+            if not callable(getattr(backend, "run_command", None)):
                 continue
         except Exception:
             continue
-        if _is_active(backend) and callable(getattr(backend, "run_command", None)):
-            claimants.append(backend)
+        if _is_active(backend):
+            claimants.append((1, backend))
+        elif _runs_when_inactive(backend, command):
+            claimants.append((0, backend))
     if not claimants:
         return None
-    claimants.sort(key=_safe_priority, reverse=True)
-    return claimants[0]
+    claimants.sort(key=lambda c: (c[0], _safe_priority(c[1])), reverse=True)
+    return claimants[0][1]
 
 
 def launch_review_loop(pr: str, repo: Optional[str], cwd: Optional[str], *,

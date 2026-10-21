@@ -83,12 +83,11 @@ _NO_PR_REF = "(PR opened)"
 # named or advertised here (it may be cut).
 _BUDGETS_TEASER = "Budget controls — paid tier"
 _MONITORING_TEASER = "Live run monitoring — paid tier"
-# The first-run Pro trial offer (PRO-6, §E.9(a)) — a single benefit-led line +
-# a default-YES prompt shown at the end of a successful setup. It replaces the
-# earlier "coming soon" teaser now that the trial is live; the acquisition itself
-# lives in the scoped pro_trial module. Suppressible via BUDDHI_NO_UPSELL.
-_PRO_TRIAL_OFFER = ("Try Buddhi Pro free for 14 days — automation that carries a run "
-                    "like this to the finish on its own.")
+# The first-run Pro trial offer (§E.9(a)) — a single benefit-led line + a
+# default-YES prompt shown at the end of a successful setup. Its wording, and the
+# whole trial step behind it, live in the scoped pro_trial module, which owns every
+# line of the acquisition paths. Suppressible via BUDDHI_NO_UPSELL.
+_PRO_TRIAL_OFFER = pro_trial.OFFER_ROW
 
 # A one-line static note (NOT a live usage read) about the Claude review workflow's
 # GitHub Actions cost.
@@ -216,7 +215,7 @@ def _assemble_pasted_secret(read_char, more_pending, echo=None) -> str:
     return "".join("".join(chars).split())
 
 
-def _read_hidden_tty(prompt: str) -> Optional[str]:
+def _read_hidden_tty(prompt: str, *, preface: bool = True) -> Optional[str]:
     """Read a hidden secret from the TTY in a SELF-MANAGED no-echo session, capturing a
     wrapped MULTI-LINE paste intact. Deliberately NOT getpass: getpass returns only the
     first line AND its TCSAFLUSH restore DISCARDS the wrapped continuation before it can
@@ -284,7 +283,8 @@ def _read_hidden_tty(prompt: str) -> Optional[str]:
         new[6][termios.VTIME] = 0
         termios.tcsetattr(fd, termios.TCSANOW, new)          # NOW — never TCSAFLUSH
         # Prompt AFTER echo is off — no cleartext keystroke echo can leak to scrollback.
-        sys.stdout.write("  (paste the value, then press Enter)\n")
+        if preface:
+            sys.stdout.write("  (paste the value, then press Enter)\n")
         sys.stdout.write(prompt)
         sys.stdout.flush()
         return _assemble_pasted_secret(_read_char, _more_pending, echo=_mask)
@@ -299,14 +299,14 @@ def _read_hidden_tty(prompt: str) -> Optional[str]:
         sys.stdout.flush()
 
 
-def _read_pasted_secret(prompt: str, getpass_fn: Callable) -> str:
+def _read_pasted_secret(prompt: str, getpass_fn: Callable, *, preface: bool = True) -> str:
     """Read a hidden secret that may arrive as a MULTI-LINE paste (a token copied from a
     narrow console window wraps across lines). When a TTY is available, read via
     :func:`_read_hidden_tty` (preferred: it preserves wrapped lines); when not available
     (non-TTY stdin, missing termios/select, or reader failure), fall back to the injected
     ``getpass_fn`` (whitespace stripped). Either way the result is the token's true
     single-line form."""
-    got = _read_hidden_tty(prompt)
+    got = _read_hidden_tty(prompt) if preface else _read_hidden_tty(prompt, preface=False)
     if got is not None:
         return got
     return "".join((getpass_fn(prompt) or "").split())
@@ -2794,74 +2794,68 @@ def step_done(path: Path, *, pal, stream) -> None:
     ], pal, stream)
 
 
-def _prompt_email(*, input_fn, stream, pal) -> Optional[str]:
-    """Ask for the trial email and validate its shape, at most three tries. Returns
-    a valid address, or None if the user gives up / enters nothing (a soft cancel —
-    NOT a durable decline)."""
-    for _ in range(3):
-        try:
-            raw = input_fn("  Email to set up your trial: ")
-        except (EOFError, KeyboardInterrupt):
-            return None
-        email = (raw or "").strip()
-        if not email:
-            return None
-        if pro_trial.valid_email(email):
-            return email
-        _row("warn", "That doesn't look like an email address — try again.", pal, stream)
-    return None
+def _never_echoing_getpass(prompt: str) -> str:
+    """``getpass`` that refuses to read at all when it cannot turn echo off: Python's
+    own falls back to an ECHOING read after a ``GetPassWarning``, which would print a
+    token or a setup or recovery code into the scrollback. Returns '' then."""
+    import getpass
+    import warnings
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", getpass.GetPassWarning)
+            return getpass.getpass(prompt)
+    except Exception:
+        return ""
+
+
+def _acquisition_ui(*, pal, stream, input_fn=input,
+                    getpass_fn: Optional[Callable] = None) -> "pro_trial.Ui":
+    """The terminal the Pro acquisition paths (:mod:`pro_trial`) talk through: the
+    wizard's own rows, its yes/no control, and its hidden, wrapped-paste-safe reader
+    for every code that must not reach the scrollback — with no line of its own before
+    the prompt (every line these paths show is approved wording), and never an echoing
+    fallback."""
+    hidden = getpass_fn or _never_echoing_getpass
+    return pro_trial.Ui(
+        row=lambda kind, text: _row(kind, text, pal, stream),
+        ask=lambda prompt: input_fn(f"  {prompt}"),
+        ask_hidden=lambda prompt: _read_pasted_secret(f"  {prompt}", hidden, preface=False),
+        yes_no=lambda question, default: _ask_yes_no(question, default=default,
+                                                     input_fn=input_fn, stream=stream, pal=pal),
+        interactive=_streams_are_tty())
+
+
+def _streams_are_tty() -> bool:
+    """Whether stdin and stdout are both terminals — the acquisition paths' eligibility,
+    deliberately independent of :func:`_is_tty`'s POSIX raw-input check (termios / tty),
+    so a native Windows terminal is not refused. Their controls already fall back there:
+    yes/no to a text prompt, the hidden reader to a non-echoing ``getpass``."""
+    try:
+        return sys.stdin.isatty() and sys.stdout.isatty()
+    except (ValueError, OSError, AttributeError):
+        return False
 
 
 def step_pro_trial(_repo: Optional[str], *, pal, stream, input_fn=input,
-                   paste_input: Optional[Callable] = None,
-                   release: Optional["pro_trial.ReleaseCheck"] = None) -> None:
-    """Step 7c — the first-run Pro trial offer (PRO-6, §E.9(a): the one sanctioned
-    conversion moment). A single benefit-led line + a default-YES prompt, shown only
-    on an interactive first run where Pro is not already active and the upsell
-    suppression / durable-dismiss / frequency conventions permit it. Decline is one
-    keypress and leaves the locked teaser rows exactly as they are. All trial
-    acquisition + install is delegated to the scoped :mod:`pro_trial` module; this
-    function only asks and prints.
+                   getpass_fn: Optional[Callable] = None,
+                   release: Optional["pro_trial.ReleaseCheck"] = None) -> bool:
+    """Step 7c — the first-run Pro trial offer (§E.9(a): the one sanctioned conversion
+    moment): a single benefit-led line + a default-YES prompt, shown only on an
+    interactive run where Pro is not already active and the upsell suppression /
+    durable-dismiss / frequency conventions permit it. Decline is one keypress and
+    leaves the locked teaser rows exactly as they are. The offer and the whole trial
+    behind it are :func:`pro_trial.trial_step`; this function only hands it the
+    terminal.
 
     The offer is shown only once the paid release is published with a wheel for this
     interpreter (``release``, the run's :class:`pro_trial.ReleaseCheck`, started early
-    by :func:`run`; one is made here when not given). Until then the step is silent,
-    like the off-TTY and capped paths, and the offer counters are left untouched. The
-    same answer gates ``start_trial`` — and with it the paid-key prompt that follows an
-    already-registered email.
-
-    The Pro key is a live credential (it becomes the private-index password), so the
-    convert path reads it through the same HIDDEN, wrapped-paste-safe reader the wizard
-    uses for every other secret — never ``input_fn``, which echoes into the scrollback."""
-    if not _is_tty():
-        return
-    if not pro_trial.offer_allowed(now=None):
-        return
-    release = release or pro_trial.ReleaseCheck()
-    if not release.is_open():
-        return
-    pro_trial.record_offer_shown()
-    _row("step", _PRO_TRIAL_OFFER, pal, stream)
-    if not _ask_yes_no("Start your free 14-day Pro trial?", default=True,
-                       input_fn=input_fn, stream=stream, pal=pal):
-        pro_trial.record_declined()
-        return
-    email = _prompt_email(input_fn=input_fn, stream=stream, pal=pal)
-    if not email:
-        return  # soft cancel — not a durable decline, so a later setup may re-offer
-    outcome = pro_trial.start_trial(email, release=release)
-    if outcome.status == pro_trial.RELEASE_CLOSED:
-        return
-    _row("ok" if outcome.ok else "info", outcome.message, pal, stream)
-    # An already-registered email means the buyer likely has (or wants) a paid key —
-    # route them to the concierge-paste convert path rather than dead-ending.
-    if outcome.status == "email_registered" and _ask_yes_no(
-            "Already have a Pro key to paste?", default=False,
-            input_fn=input_fn, stream=stream, pal=pal):
-        _row("step", pro_trial.convert_checkout_prompt(), pal, stream)
-        paste = paste_input or (lambda prompt: _read_pasted_secret(prompt, _default_getpass))
-        conv = pro_trial.convert(paste_input=paste, confirm_input=input_fn)
-        _row("ok" if conv.ok else "info", conv.message, pal, stream)
+    by :func:`run`; one is made there when not given). Until then the step is silent,
+    like the off-TTY and capped paths, and the offer counters are left untouched.
+    Returns True when the user stopped setup with Ctrl-C in the step."""
+    if not _streams_are_tty():
+        return False
+    ui = _acquisition_ui(pal=pal, stream=stream, input_fn=input_fn, getpass_fn=getpass_fn)
+    return pro_trial.trial_step(ui, release=release)
 
 
 def _offer_first_review(repo: Optional[str], *, pal, stream, input_fn=input) -> None:
@@ -3094,6 +3088,15 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
         i = args.index("--repo")
         if i + 1 < len(args):
             preset_repo = args[i + 1]
+    # `setup --buy` / `--activate` / `--recover`: one Pro path each, then done — the
+    # wizard's own steps do not run.
+    acquire = {"--buy": pro_trial.run_buy, "--activate": pro_trial.run_activate,
+               "--recover": pro_trial.run_recover}
+    path = next((acquire[a] for a in args if a in acquire), None)
+    if path is not None and not preset_repo:
+        print(f"{pal.BOLD}buddhi-review setup{pal.RESET}", file=stream)
+        return path(_acquisition_ui(pal=pal, stream=stream, input_fn=input_fn,
+                                    getpass_fn=getpass_fn))
 
     try:
         # `setup --repo <owner/repo>` → the lightweight per-repo confirm mode (parity
@@ -3107,13 +3110,21 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
                 multi_select=multi_select, single_select=single_select, input_fn=input_fn)
 
         print(f"{pal.BOLD}buddhi-review setup{pal.RESET}", file=stream)
-        # The trial offer at the end waits on whether the paid release is published.
-        # Ask now, on a background thread, so the answer is in hand by the done panel
-        # instead of costing up to 8 s of silence after it — and only when the offer
-        # could be shown at all: off a TTY, or for a suppressed, declined, capped or
-        # already-Pro user, the route is never contacted.
+        # The trial offer at the end, and anything an earlier Pro setup left to finish,
+        # wait on whether the paid release is published. Ask now, on a background
+        # thread, so the answer is in hand by the done panel instead of costing up to
+        # 8 s of silence after it — and only when it is needed at all: with nothing
+        # held, and off a TTY or for a suppressed, declined, capped or already-Pro user,
+        # the route is never contacted. One answer serves the whole run.
+        held = pro_trial.has_held_work()
         release = (pro_trial.ReleaseCheck().start()
-                   if _is_tty() and pro_trial.offer_allowed(now=None) else None)
+                   if held or (_streams_are_tty() and pro_trial.offer_allowed(now=None)) else None)
+        if held:
+            # Build rule 2's order: a held recovery code, a held --buy code, then an
+            # install whose key is already in ~/.netrc — before the wizard's own steps.
+            pro_trial.finish_held_work(
+                _acquisition_ui(pal=pal, stream=stream, input_fn=input_fn,
+                                getpass_fn=getpass_fn), release=release)
 
         doctor = step_doctor(run=run, which=which, pal=pal, stream=stream)
         plan = step_plan(doctor, pal=pal, stream=stream, single_select=single_select, input_fn=input_fn)
@@ -3192,8 +3203,9 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
                      auto_merge=repo_auto_merge, label_gated_ci=repo_label_gated_ci)
         if ok:
             step_done(cfg_path, pal=pal, stream=stream)
-            step_pro_trial(repo, pal=pal, stream=stream, input_fn=input_fn, release=release)
-            _offer_first_review(repo, pal=pal, stream=stream, input_fn=input_fn)
+            if not step_pro_trial(repo, pal=pal, stream=stream, input_fn=input_fn,
+                                  getpass_fn=getpass_fn, release=release):
+                _offer_first_review(repo, pal=pal, stream=stream, input_fn=input_fn)
             return 0
         _row("bad", f"Could not write {cfg_path} — check the path's permissions, or "
                     f"whether another process holds the config lock", pal, stream)
@@ -3204,8 +3216,7 @@ def run(*, argv: Optional[Sequence[str]] = None, config_path: Optional[Path] = N
 
 
 def _default_getpass(prompt: str) -> str:
-    import getpass
-    try:
-        return getpass.getpass(prompt)
-    except Exception:
-        return ""
+    """The reader every secret prompt falls back to when the wizard's own hidden reader
+    cannot run — the Claude and GitHub tokens and every Pro setup code alike — so none
+    of them is ever read with echo on."""
+    return _never_echoing_getpass(prompt)

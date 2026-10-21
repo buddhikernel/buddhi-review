@@ -616,6 +616,94 @@ def test_a_failed_catch_up_after_the_rename_is_retried_from_the_backup(home, mon
     assert config.migrate_legacy_config() == "absent"
 
 
+def test_a_catch_up_write_that_fails_after_the_rename_says_the_move_is_done(
+        home, monkeypatch, capsys):
+    """Once the legacy file is the backup, "Both files were left unchanged" is untrue:
+    the line says the settings moved, where the old file is, and that the change made
+    during the move is merged on the next run."""
+    _catch_up_fails(home, monkeypatch, "refused")
+    backup = _backups(home)[0]
+    err = capsys.readouterr().err
+    assert (f"Warning: Settings from {_legacy(home)} are now in {_canonical(home)}, and the old "
+            f"file was kept as {backup}. A change made to the old file during the move could "
+            f"not be merged into {_canonical(home)} yet (writing the file failed). The next run "
+            f"tries again. Settings are read from {_canonical(home)}.") in err
+    assert "Both files were left unchanged" not in err
+
+
+def test_a_catch_up_that_cannot_read_the_canonical_file_says_how_to_fix_it(
+        home, monkeypatch, capsys):
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=time.time_ns() - 10**9)
+    _put(_legacy(home), {"repos": {"leg/one": {"auto_merge": False}}})
+    real_rename, real_read = os.rename, config._read_config_file
+    renamed = []
+
+    def racing(src, dst, *a, **k):
+        if str(src) == str(_legacy(home)) and ".migrated-" in str(dst):
+            _atomic_legacy_write(home, {"repos": {"leg/one": {"auto_merge": False},
+                                                  "old/a": {"auto_merge": True}}})
+            renamed.append(1)
+        return real_rename(src, dst, *a, **k)
+
+    def read(path):
+        if renamed and str(path) == str(_canonical(home)):
+            return None, None, "unreadable", None
+        return real_read(path)
+    monkeypatch.setattr(config.os, "rename", racing)
+    monkeypatch.setattr(config, "_read_config_file", read)
+    assert config.migrate_legacy_config() == "error"
+    backup = _backups(home)[0]
+    assert capsys.readouterr().err.strip().endswith(
+        f"Warning: Settings from {_legacy(home)} are now in {_canonical(home)}, and the old "
+        f"file was kept as {backup}. A change made to the old file during the move could not "
+        f"be merged into {_canonical(home)} yet (config.yaml could not be read: unreadable). "
+        f"The next run tries again. Settings are read from {_canonical(home)}. Fix "
+        f"{_canonical(home)} so it can be read.")
+
+
+def test_a_catch_up_whose_record_cannot_be_saved_says_it_merged(home, monkeypatch, capsys):
+    _put(_canonical(home), {"plan": "pro"}, mtime_ns=time.time_ns() - 10**9)
+    _put(_legacy(home), {"repos": {"leg/one": {"auto_merge": False}}})
+    real_rename, real_record = os.rename, config._write_record
+    renamed = []
+
+    def racing(src, dst, *a, **k):
+        if str(src) == str(_legacy(home)) and ".migrated-" in str(dst):
+            _atomic_legacy_write(home, {"repos": {"leg/one": {"auto_merge": False},
+                                                  "old/a": {"auto_merge": True}}})
+            renamed.append(1)
+        return real_rename(src, dst, *a, **k)
+
+    def record(*a, **k):
+        if renamed and k.get("state", "completed") == "completed":
+            raise OSError("disk full")
+        return real_record(*a, **k)
+    monkeypatch.setattr(config.os, "rename", racing)
+    monkeypatch.setattr(config, "_write_record", record)
+    assert config.migrate_legacy_config() == "error"
+    backup = _backups(home)[0]
+    assert capsys.readouterr().err.strip().endswith(
+        f"Warning: Settings from {_legacy(home)} are now in {_canonical(home)}, and the old "
+        f"file was kept as {backup}. A change made to the old file during the move was merged "
+        f"into {_canonical(home)}, but its record could not be saved, so the next run checks "
+        f"it again.")
+    assert "old/a" in _load(_canonical(home))["repos"]
+
+
+def test_any_other_error_once_the_old_name_is_gone(home, monkeypatch, capsys):
+    _put(_canonical(home), {"plan": "pro"})
+    _put(_legacy(home), {"repos": {"leg/one": {"auto_merge": False}}})
+
+    def boom(*a, **k):
+        raise RuntimeError("disk on fire")
+    monkeypatch.setattr(config, "_catch_up", boom)
+    assert config.migrate_legacy_config() == "error"
+    assert not _legacy(home).exists()
+    assert capsys.readouterr().err.strip() == (
+        f"Warning: Could not finish moving settings from {_legacy(home)} to "
+        f"{_canonical(home)} (disk on fire). Settings are read from {_canonical(home)}.")
+
+
 def test_an_unreadable_recovery_record_is_kept_for_the_next_catch_up(
         home, monkeypatch, capsys):
     """The legacy name is already gone, so an unreadable recovery record must not
@@ -1281,6 +1369,23 @@ def test_a_removal_follows_the_entries_readers_use_and_spares_what_changed_since
         "repos": {"o/R": {"test_command": "make"}, "emptied/z": {},
                   "touched/x": {"auto_merge": False}}}
     assert canonical == as_read
+
+
+@pytest.mark.parametrize("site", ["top-level key", "whole repo entry", "repo key"])
+def test_a_removal_compares_type_strictly_at_every_site(site):
+    """The legacy base holds ``1``, the canonical file ``true``: equal under ``==``, but
+    not the value the snapshot held, so the legacy edit's removal must leave it."""
+    if site == "top-level key":
+        base, canonical, now = {"x": 1, "plan": "pro"}, {"x": True, "plan": "pro"}, {"plan": "pro"}
+    elif site == "whole repo entry":
+        base = {"repos": {"a/b": {"k": 1}}, "plan": "pro"}
+        canonical = {"repos": {"a/b": {"k": True}}, "plan": "pro"}
+        now = {"repos": {}, "plan": "pro"}
+    else:
+        base = {"repos": {"a/b": {"k": 1}}}
+        canonical = {"repos": {"a/b": {"k": True}}}
+        now = {"repos": {"a/b": {}}}
+    assert config._carry_removals(canonical, base, now) == canonical
 
 
 def test_a_malformed_repos_block_or_entry_removes_nothing():
@@ -1954,7 +2059,9 @@ def test_a_failed_write_leaves_the_legacy_file_and_fails_open(home, monkeypatch,
     monkeypatch.setattr(config, "_write_bytes_atomic", lambda path, raw: False)
     assert config.config_path() == _canonical(home)
     assert _legacy(home).read_bytes() == before and _backups(home) == []
-    assert "because writing the file failed" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    # before the rename, the old sentence is still the true one
+    assert "because writing the file failed. Both files were left unchanged." in err
 
 
 def test_a_migration_crash_never_escapes_the_resolver(home, monkeypatch, capsys):
