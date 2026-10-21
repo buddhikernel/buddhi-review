@@ -1185,6 +1185,12 @@ def test_a_held_buy_code_that_was_paid_is_finished(monkeypatch):
     assert ui.text == [_HELD_CHECK, _WAITING, _PAID_OK] and "buy" not in _state()
 
 
+def test_ctrl_c_while_a_held_buy_code_is_checked(monkeypatch):
+    _accepted(buy=_held_buy())
+    ui, _fake = _finish(monkeypatch, {"POST /claim": [KeyboardInterrupt()]})
+    assert ui.lines[-1] == ("info", _BUY_CTRLC) and "buy" in _state()
+
+
 def test_a_held_buy_code_goes_quiet_after_a_recovery(monkeypatch):
     _accepted(buy=_held_buy(recovered=True))
     ui, _fake = _finish(monkeypatch, {"POST /claim": [(410, {"error": "expired_or_used"})]})

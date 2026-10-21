@@ -2553,8 +2553,15 @@ def _check_held_buy(ui: Ui, hold: dict, opts: dict) -> None:
     quiet = bool(hold.get("recovered"))
     if not quiet:
         ui.row("info", _HELD_CHECK)
-    answer = _bridge_call("POST", "/claim", {"setup_code": hold["code"],
-                                             "claim_nonce": hold["nonce"]})
+    # The earlier checkout may be paid, so a Ctrl-C here says not to pay again (as in
+    # ``_run_buy``) and setup carries on to the wizard.
+    try:
+        answer = _bridge_call("POST", "/claim", {"setup_code": hold["code"],
+                                                 "claim_nonce": hold["nonce"]})
+    except KeyboardInterrupt:
+        if not quiet:
+            ui.row("info", _BUY_CTRLC)
+        return
     if _claimed_key(answer) or (answer.status == 202 and answer.data is not None):
         _await_buy(ui, hold, opts, wait_s=0, first=answer)
         return
