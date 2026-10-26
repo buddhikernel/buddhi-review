@@ -5,6 +5,7 @@ are faked; ``apply_fix`` and the size measurement run real git in a temp repo.""
 import functools
 import json
 import subprocess
+import sys
 from dataclasses import replace
 
 import pytest
@@ -74,10 +75,12 @@ class Threads:
         self.fail = False
 
     def add(self, root, *, history=(), resolved=False, by=None, complete=True):
-        comments = tuple(gh_ingest.ThreadComment(id=str(i) if i else root, body=b, author=a,
-                                                 path="src/a.py", diff_hunk=HUNK)
-                         for i, (b, a) in enumerate([("please change it", "claude[bot]")]
-                                                    + list(history)))
+        """``history``: replies after the root, as ``(body, author)`` or, to give a
+        reply a known id, ``(id, body, author)``."""
+        entries = [(root, "please change it", "claude[bot]")] + [
+            h if len(h) == 3 else (f"{root}-{i}", *h) for i, h in enumerate(history, 1)]
+        comments = tuple(gh_ingest.ThreadComment(id=cid, body=b, author=a, path="src/a.py",
+                                                 diff_hunk=HUNK) for cid, b, a in entries)
         self.threads[root] = gh_ingest.ReviewThread(
             id=f"T{root}", is_resolved=resolved, root_comment_id=root,
             comment_ids=frozenset(c.id for c in comments), comments=comments,
@@ -133,7 +136,7 @@ def _drive(timeline, *, body=BODY, threads=None, post_ok=True, answer=lambda a: 
         return post_ok
     kw.setdefault("answer_waiter", _waiter(answer))
     driver, clock, gh = make_driver(
-        timeline, cfg=CLAUDE_ONLY, protections_fetch=fetch_body, reply_post=post,
+        timeline, cfg=kw.pop("cfg", CLAUDE_ONLY), protections_fetch=fetch_body, reply_post=post,
         login_fetch=lambda: login, threads_fetch=threads.fetch,
         resolve_thread=threads.resolve, **kw)
     driver.adapter.escalation.notifier = Events(events)
@@ -340,6 +343,21 @@ def test_fixer_conflict_is_its_own_outcome(repo, stdout, status):
     if status == "protection-conflict":
         assert out.protection_origin == "fixer" and out.protection_texts == (BLOCKS[1],)
         assert out.detail == P.visible_text("pending", [BLOCKS[1]]) and not out.rollback_failed
+    if status == "rejected":                  # the fixer's protocol line stays internal
+        assert out.detail == ""
+
+
+def test_fixer_conflict_naming_nothing_shows_no_protocol_text(repo, capsys):
+    def fix(c, r):
+        return apply_fix(c.text, cwd=str(repo), label="SUBSTANTIVE", protections=BLOCKS,
+                         runner=_fixer(repo, [("x\n", "PROTECTION-CONFLICT: 99", 0)], []))
+    d, gh, events, _ = _drive([(0, _inline("1", "fix it"))], classify=_classify(), fix=fix)
+    out = d.run()
+    printed = capsys.readouterr().out
+    assert [a.final for a in out.actions] == ["rejected"] and _clean(repo)
+    assert "  [rejected        ] comment 1 (fix)\n" in printed
+    assert "PROTECTION-CONFLICT" not in printed + json.dumps([e[1].detail for e in events
+                                                             if e[0] == "ask"])
 
 
 # ── V: required verification ───────────────────────────────────────────────
@@ -571,7 +589,7 @@ def test_conflict_lifecycle(origin):
                                     auto_merge=True, **kw)
     out = d.run()
     # W1 on the root thread, then the three-choice question; nothing lands
-    assert events[0] == ("post", "1", P.record_body("pending", "1", origin, [BLOCKS[0]]), True)
+    assert events[0] == ("post", "1", P.record_body("pending", "1", origin, [BLOCKS[0]], "1"), True)
     (ask,) = _asks(events)
     assert events.index(("ask", ask)) > 0 and ask.options == [P.KEEP, P.ALLOW, P.MANUAL]
     assert out.status == "needs-human" and out.actions[0].final == "escalated"
@@ -602,7 +620,7 @@ def test_conflict_lifecycle_keep_allow_manual(repo, monkeypatch):
     d, gh, events, threads = _drive([(0, _inline("1", "relax it"))], classify=_classify(),
                                     fix=fix, answer=lambda a: "2", max_rounds=1)
     out = d.run()
-    assert [p[2] for p in _posts(events)] == [P.record_body("pending", "1", "verifier", [BLOCKS[0]]),
+    assert [p[2] for p in _posts(events)] == [P.record_body("pending", "1", "verifier", [BLOCKS[0]], "1"),
                                               P.record_body("allow", "1", "verifier", [BLOCKS[0]])]
     assert fixed == [("1", (), BLOCKS), ("1", (BLOCKS[0],), BLOCKS)]
     assert [a.final for a in out.actions] == ["fixed"] and gh.matching("git", "push")
@@ -696,20 +714,23 @@ def _conflicting(*rules):
     return run
 
 
-def test_conflict_lifecycle_one_root_one_pending_record():
-    # The root and a reply in the same thread: one hold, one W1, widened when the
-    # reply names another protection; a stale answer to the narrower question is
-    # never applied to the wider hold.
+def test_conflict_lifecycle_one_root_one_hold_one_record_per_request():
+    # The root and a reply in the same thread: one hold and one question, a record
+    # naming each request, widened when the reply names another protection; a stale
+    # answer to the narrower question is never applied to the wider hold.
     same = [(0, _inline("1", "relax A")), (0, _inline("5", "relax A again", reply_to="1"))]
     d, gh, events, _ = _drive(same, classify=_conflicting(("relax", "COSMETIC", [1])))
     d.run()
-    assert len(_posts(events)) == 1 and len(_asks(events)) == 1
+    assert [p[2] for p in _posts(events)] == [
+        P.record_body("pending", "1", "classifier", [BLOCKS[0]], s) for s in ("1", "5")]
+    assert len(_asks(events)) == 1 and d._protection_holds["1"]["sources"] == ["1", "5"]
     wider = [(0, _inline("1", "relax A")), (0, _inline("5", "relax B", reply_to="1"))]
     d, gh, events, _ = _drive(wider, classify=_conflicting(("relax A", "COSMETIC", [1]),
                                                            ("relax B", "COSMETIC", [2])),
                               answer=lambda a: "1" if BLOCKS[1] not in a.detail else None)
     out = d.run()
     assert d._protection_holds["1"]["protection_texts"] == list(BLOCKS)
+    assert d._protection_holds["1"]["sources"] == ["1", "5"]           # widening keeps both
     assert d._protection_holds["1"]["state"] == "pending" and out.status == "needs-human"
     assert [p[2].split("\n")[0][:40] for p in _posts(events)] == [P.W1[:40]] * 2
 
@@ -881,6 +902,27 @@ def test_description_protection_bytes(name, new):
     assert out.protection_texts == ("- Keep the retry limit at 3",)
 
 
+@pytest.mark.parametrize("old,before,after", [
+    (f"Old.\n\n## {T}\nKeep A.\n<details>\nwhy\n</details>\n---\n- Never log tokens\n",
+     "- Never log", "- Do log"),
+    (f"Use the ` key.\n## {T} <!-- one per line -->\nKeep `r` at 3\n", "at 3", "at 9"),
+    (f"Notes:\n\n-  \n\n  ## {T}\n  - Keep retry count at 3\n", "at 3", "at 9"),
+], ids=["html-block-above-dashes", "lone-backtick-above", "empty-item-then-blank"])
+def test_description_protection_bytes_reported_shapes(old, before, after):
+    out, edits = _rewrite(old, old.replace(before, after))
+    assert edits == [] and out.status == "protection-conflict"
+
+
+def test_description_protection_bytes_inside_an_empty_marker_item():
+    # "-  " then the item's content on the next lines: the requirement stays guarded.
+    old = f"Old summary.\n\n## {T}\n-  \n  ## Nested heading\n  Keep retry count at 3\n- next rule\n"
+    new = old.replace("Old summary.", "New summary.")
+    out, edits = _rewrite(old, new.replace("count at 3", "count at 9"))
+    assert edits == [] and out.status == "protection-conflict"
+    out, edits = _rewrite(old, new)
+    assert out.status == "applied" and edits == [new]
+
+
 def test_description_protection_bytes_permitted_rewrites():
     old = f"Old summary.\n\n{SECTION}## Notes\nn\n"
     out, edits = _rewrite(old, f"New summary.\n\n{SECTION}## Notes\nn\n")
@@ -918,7 +960,7 @@ def test_description_protection_bytes_hold_menu_and_restart():
         # review-body finding: the records ride the PR conversation, not a thread
         assert all(p[3] is False for p in _posts(events))
     # restart: the guard origin and its two-choice menu come back before anything else
-    pend = P.record_body("pending", "9", "description_guard", ["- Keep the retry limit at 3"])
+    pend = P.record_body("pending", "9", "description_guard", ["- Keep the retry limit at 3"], "9")
     stale_allow = P.record_body("allow", "9", "classifier", ["- Keep the retry limit at 3"])
     history = [comment,
                Comment(id="90", text=pend, source=LOGIN, from_issue_channel=True),
@@ -1013,7 +1055,7 @@ def _restored(threads, *records, resolved=False, by=None):
 
 @pytest.mark.parametrize("entry", ENTRIES, ids=lambda e: ",".join(e) or "default")
 def test_entry_and_restart(entry):
-    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]])
+    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1")
     # an authentic pending hold is asked again (no second W1), and blocks merging
     t = _restored(Threads(), (pend, LOGIN))
     d, gh, events, _ = _drive([(0, _inline("1", "relax it"))], threads=t, auto_merge=True,
@@ -1041,7 +1083,7 @@ def test_entry_and_restart(entry):
 @pytest.mark.parametrize("broken", ["login", "threads"])
 def test_entry_and_restart_unreadable_history_lands_no_reviewer_edit(entry, broken):
     # A hold may exist that the run cannot see: nothing is fixed, pushed or merged.
-    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]])
+    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1")
     keep = P.record_body("keep", "1", "fixer", [BLOCKS[0]])
     t = _restored(Threads(), (pend, LOGIN), (keep, LOGIN))
     t.fail = broken == "threads"
@@ -1057,10 +1099,283 @@ def test_entry_and_restart_unreadable_history_lands_no_reviewer_edit(entry, brok
     assert deferred and all(a.detail == "" for a in deferred)   # no unapproved wording
 
 
+def _first_read_fails(d):
+    fetch, failures = d.fetch, [RuntimeError("comments unavailable")]
+
+    def read(*a, **k):
+        if failures:
+            raise failures.pop()
+        return fetch(*a, **k)
+    d.fetch = read
+
+
+@pytest.mark.parametrize("entry", ENTRIES, ids=lambda e: ",".join(e) or "default")
+@pytest.mark.parametrize("broken", ["login", "threads", "comments"])
+@pytest.mark.parametrize("attended", [False, True], ids=["auto-merge", "attended-merge"])
+def test_entry_and_restart_unreadable_history_without_the_section_lands_nothing(
+        monkeypatch, entry, broken, attended):
+    # The heading no longer matches and the hold history cannot be read: the held
+    # request on root 1 is not fixed, committed, pushed or merged, by either route.
+    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1"), LOGIN))
+    t.fail = broken == "threads"
+    fixed, offered = [], []
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: attended)
+    d, gh, _, _ = _drive([(0, _inline("1", "relax the retry limit"))], threads=t,
+                         body="## Other requirements\n- Keep the retry limit at 3\n",
+                         login=None if broken == "login" else LOGIN, classify=_classify("COSMETIC"),
+                         auto_merge=not attended, max_rounds=1,
+                         fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"), **entry)
+    d._interactive_merge_prompt = lambda: offered.append(1) or True
+    if broken == "comments":
+        _first_read_fails(d)
+    out = d.run()
+    assert fixed == [] and offered == [] and not _merged(gh) and out.status == "needs-human"
+    assert not gh.matching("git", "commit") and not gh.matching("git", "push")
+
+
+def _ingested(reviews, issues, inline=()):
+    """What the real comment ingest returns for these three endpoints' payloads."""
+    def run(argv, **kw):
+        endpoint = argv[-1]
+        data = (reviews if endpoint.endswith("/reviews")
+                else issues if "/issues/" in endpoint else list(inline))
+        return subprocess.CompletedProcess(argv, 0, json.dumps(data), "")
+    return gh_ingest.fetch_comments("7", repo="o/r", run=run)
+
+
+@pytest.mark.parametrize("review", ["missing", "blank", "same-id-as-inline"])
+def test_entry_and_restart_review_body_hold_outlives_its_review(monkeypatch, review):
+    # An authentic pending record for review 9, whose body the ingest cannot return:
+    # the hold stands, unavailable — never asked, never re-dispatched, never merged.
+    monkeypatch.delenv(gh_ingest.COMMENTS_JSON_ENV, raising=False)
+    bot = {"login": "claude[bot]"}
+    reviews = {"missing": [], "blank": [{"id": 9, "body": "  ", "user": bot}],
+               "same-id-as-inline": [{"id": 9, "body": "relax the retry limit", "user": bot}]}
+    inline = [{"id": 9, "path": "src/a.py", "body": "a note", "user": bot}]
+    comments = _ingested(reviews[review], [{"id": 90, "user": {"login": LOGIN},
+                                            "body": P.record_body("pending", "9", "fixer",
+                                                                  [BLOCKS[0]], "9")}],
+                         inline if review == "same-id-as-inline" else ())
+    assert not any(c.text == "relax the retry limit" for c in comments)
+    d, gh, events, _ = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
+                              auto_merge=True, rr_none=True, classify=_classify("INVALID"),
+                              answer=lambda a: "2", fix=lambda c, r: pytest.fail("re-dispatched"))
+    fetch = d.fetch
+    d.fetch = lambda *a, **k: comments + fetch(*a, **k)
+    out = d.run()
+    assert out.status == "needs-human" and not _merged(gh) and not gh.matching("git", "push")
+    hold = d._protection_holds.get("review:9") or {}
+    assert hold.get("state") == "pending" and hold.get("unavailable") and _asks(events) == []
+    # a record sharing its id with a review comment is still read
+    clash = _ingested(reviews["same-id-as-inline"], [{"id": 9, "user": {"login": LOGIN}, "body":
+                      P.record_body("pending", "9", "fixer", [BLOCKS[0]], "9")}])
+    assert sum(P.MARKER in c.text for c in clash) == 1
+    # another author's marker for a review that is not there claims nothing, even
+    # beside the loop's own settled records for another review
+    kept = [{"id": 92 + i, "user": {"login": LOGIN}, "body": P.record_body(
+        dec, "7", "fixer", [BLOCKS[0]], src)} for i, (dec, src) in enumerate((("pending", "7"), ("keep", None)))]
+    forged = _ingested([], [{"id": 91, "user": {"login": "someone"}, "body":
+                             P.record_body("pending", "4242", "fixer", [BLOCKS[0]], "4242")}] + kept)
+    d, gh, _, _ = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
+                         body="nothing listed", auto_merge=True, rr_none=True)
+    fetch = d.fetch
+    d.fetch = lambda *a, **k: forged + fetch(*a, **k)
+    assert d.run().status == "clean" and _merged(gh) and set(d._protection_holds) == {"review:7"}
+
+
+def test_entry_and_restart_review_body_history_is_read_from_the_review_first():
+    # The review heads its own history, as a thread's root does: a marker it quotes
+    # for itself is read before the records. A hold already in hand (raised before
+    # the history could be read) is kept, never restored over.
+    review = Comment(id="8", text="relax it\n" + P.record_body("pending", "8", "fixer", [BLOCKS[1]]),
+                     source="claude[bot]")
+    claim = Comment(id="80", text=P.record_body("pending", "8", "fixer", [BLOCKS[0]]),
+                    source="someone", from_issue_channel=True)
+    d, gh, events, _ = _drive([])
+    d.fetch = lambda *a, **k: [review, claim]
+    d._restore_protection_holds()
+    assert d._protection_holds["review:8"]["protection_texts"] == [BLOCKS[1]]
+    held = P.make_protection_hold(root_id="8", origin="fixer", protection_texts=[BLOCKS[0]])
+    d._adopt_hold(held, request="relax it", reviewer="claude[bot]", inline=False)
+    d._restore_protection_holds()
+    assert d._protection_holds["review:8"] is held
+
+
+def test_entry_and_restart_a_reply_hold_is_restored_and_allowed_from_that_reply():
+    # A hold raised by reply 2 survives a restart: the question quotes reply 2, and
+    # Allow re-dispatches reply 2 — never the root's own, different request.
+    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]], "2")
+    t = Threads().add("1", history=[("2", "relax the retry limit", "claude[bot]"), ("3", pend, LOGIN)])
+    fixed = []
+    d, gh, events, _ = _drive([(0, _inline("1", "rename a variable")),
+                               (0, _inline("2", "relax the retry limit", reply_to="1"))],
+                              threads=t, classify=_classify(), answer=lambda a: "2", max_rounds=1,
+                              fix=lambda c, r: fixed.append((c.id, c.text, c.path, r.allowances))
+                              or FixOutcome(status="applied"))
+    d.run()
+    (ask,) = _asks(events)
+    assert 'claude[bot] asks: "relax the retry limit"' in ask.detail
+    assert fixed == [("2", "relax the retry limit", "src/a.py", (BLOCKS[0],))]
+    # re-held after that Allow, it is held again on its own thread's root
+    seq = iter([_conflict("fixer", [BLOCKS[1]]), _conflict("fixer", [BLOCKS[1]])])
+    d, gh, events, _ = _drive([(0, _inline("2", "relax the retry limit", reply_to="1"))],
+                              threads=Threads().add("1", history=[
+                                  ("2", "relax the retry limit", "claude[bot]"), ("3", pend, LOGIN)]),
+                              classify=_classify(), answer=lambda a: "2" if BLOCKS[1] not in a.detail
+                              else None, max_rounds=1, fix=lambda c, r: next(seq)(c, r))
+    d.run()
+    assert set(d._protection_holds) == {"1"} and d._protection_holds["1"]["state"] == "pending"
+    assert _posts(events)[-1][1] == "1" and d._protection_holds["1"]["sources"] == ["2"]
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_conflict_lifecycle_two_requests_on_one_root_are_both_allowed(restart):
+    kw = {}
+    if restart:
+        records = [(f"p{s}", P.record_body("pending", "1", "classifier", [BLOCKS[0]], s), LOGIN)
+                   for s in "12"]
+        kw["threads"] = Threads().add("1", history=[("2", "loosen them more", "claude[bot]")]
+                                      + records)
+    fixed = []
+    d, gh, events, _ = _drive([(0, _inline("1", "loosen retries")),
+                               (0, _inline("2", "loosen them more", reply_to="1"))],
+                              classify=_classify("COSMETIC", [1]), answer=lambda a: "2", max_rounds=1,
+                              fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"), **kw)
+    out = d.run()
+    assert sorted(fixed) == ["1", "2"] and len(_asks(events)) == 1
+    assert {a.comment_id: a.final for a in out.actions} == {"1": "fixed", "2": "fixed"}
+    # the question quotes the first request it holds (a restart reads it back)
+    first = "please change it" if restart else "loosen retries"
+    assert f'asks: "{first}"' in _asks(events)[0].detail
+
+
+def test_conflict_lifecycle_a_re_held_request_alone_goes_back_after_a_second_allow():
+    # Both requests are allowed; request 1's fix breaks another protection and is
+    # held again; the second Allow sends only request 1 back, never request 2 twice.
+    sent, calls = [], {"1": 0}
+
+    def fix(c, r):
+        sent.append(c.id)
+        if c.id == "1" and calls["1"] == 0:
+            calls["1"] += 1
+            return _conflict("fixer", [BLOCKS[1]])(c, r)
+        return FixOutcome(status="applied")
+    d, gh, events, _ = _drive([(0, _inline("1", "loosen retries")),
+                               (0, _inline("2", "loosen them more", reply_to="1"))],
+                              classify=_classify("COSMETIC", [1]), answer=lambda a: "2",
+                              max_rounds=1, fix=fix)
+    d.run()
+    assert sent == ["1", "2", "1"] and len(_asks(events)) == 2
+
+
+@pytest.mark.parametrize("sources", [["77"], ["1", "77"]], ids=["deleted-reply", "one-of-two-deleted"])
+def test_entry_and_restart_an_unknown_request_is_never_guessed(sources):
+    t = _restored(Threads(), *[(P.record_body("pending", "1", "fixer", [BLOCKS[0]], s), LOGIN)
+                              for s in sources])
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it"))], threads=t, auto_merge=True,
+                              classify=_classify(), answer=lambda a: "2",
+                              fix=lambda c, r: pytest.fail("guessed"))
+    out = d.run()
+    assert out.status == "needs-human" and not _merged(gh) and _asks(events) == []
+    assert d._protection_holds["1"].get("unavailable")
+
+
+@pytest.mark.parametrize("author", [LOGIN, "someone-else"], ids=["older-record", "another-authors-marker"])
+def test_entry_and_restart_a_hold_naming_no_request_is_asked_and_allow_sends_nothing(author):
+    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]]), author))
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it"))], threads=t, classify=_classify(),
+                              answer=lambda a: "2", fix=lambda c, r: pytest.fail("guessed"))
+    d.run()
+    (ask,) = _asks(events)
+    assert 'asks: "please change it"' in ask.detail and d._protection_holds["1"]["state"] == "allow"
+    # Keep answers it: the thread is resolved and the PR merges
+    d, gh, events, threads = _drive([(0, _inline("1", "relax it"))], classify=_classify(),
+                                    threads=_restored(Threads(), (P.record_body(
+                                        "pending", "1", "fixer", [BLOCKS[0]]), author)),
+                                    answer=lambda a: "1", auto_merge=True)
+    d.run()
+    assert threads.resolved == ["T1"] and _merged(gh)
+    # and an older record's Keep still refuses its root
+    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]]), LOGIN),
+                  (P.record_body("keep", "1", "fixer", [BLOCKS[0]]), LOGIN))
+    prompts = []
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it"))], threads=t, classify=_classify(prompts=prompts))
+    assert [a.final for a in d.run().actions] == ["escalated"] and prompts == []
+
+
+@pytest.mark.parametrize("attended", [False, True], ids=["auto-merge", "attended-merge"])
+@pytest.mark.parametrize("answer", ["1", "2"], ids=["keep", "allow"])
+def test_entry_and_restart_a_held_reply_no_record_names_keeps_its_thread_open(
+        monkeypatch, answer, attended):
+    # Reply 5 was held only because its thread had a pending hold: when that hold
+    # is settled, the thread stays open (and the PR unmerged) for the next run.
+    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1"), LOGIN))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: attended)
+    d, gh, events, threads = _drive([(0, _inline("1", "relax it")),
+                                     (0, _inline("5", "also rename the helper", reply_to="1"))],
+                                    threads=t, classify=_classify(), auto_merge=not attended,
+                                    answer=lambda a: answer, fix=lambda c, r: FixOutcome(status="applied"))
+    offered = []
+    d._interactive_merge_prompt = lambda: offered.append(1) or True
+    out = d.run()
+    assert threads.resolved == [] and not _merged(gh) and offered == []
+    assert {a.comment_id: a.final for a in out.actions}["5"] == "escalated"
+
+
+def test_entry_and_restart_a_kept_reply_hold_with_nothing_new_closes_its_thread():
+    t = Threads().add("1", history=[("2", "relax it", "claude[bot]"), (
+        "p", P.record_body("pending", "1", "fixer", [BLOCKS[0]], "2"), LOGIN)])
+    d, gh, events, threads = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
+                                    threads=t, answer=lambda a: "1")
+    d.run()
+    assert threads.resolved == ["T1"]
+
+
+def test_conflict_lifecycle_a_widened_unposted_hold_is_not_asked():
+    def post(root, text, *, inline):
+        return '"source":"1"' not in text
+    d, gh, events, _ = _drive([(0, _inline("1", "relax A")), (0, _inline("5", "relax B", reply_to="1"))],
+                              classify=_conflicting(("relax A", "COSMETIC", [1]),
+                                                    ("relax B", "COSMETIC", [2])))
+    d.reply_post = post
+    d.run()
+    assert d._protection_holds["1"].get("unposted") is True and _asks(events) == []
+
+
+def test_entry_and_restart_a_kept_request_stays_refused():
+    records = [("p", P.record_body("pending", "1", "fixer", [BLOCKS[0]], "2"), LOGIN),
+               ("k", P.record_body("keep", "1", "fixer", [BLOCKS[0]]), LOGIN)]
+    t = Threads().add("1", history=[("2", "relax it", "claude[bot]")] + records)
+    prompts, fixed = [], []
+    # reply 2's request was refused; the root's own, different request is still open
+    d, gh, events, _ = _drive([(0, _inline("1", "rename a helper")),
+                               (0, _inline("2", "relax it", reply_to="1"))], threads=t,
+                              classify=_classify(prompts=prompts),
+                              fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
+    out = d.run()
+    assert len(prompts) == 1 and fixed == ["1"]
+    assert {a.comment_id: a.final for a in out.actions} == {"1": "fixed", "2": "escalated"}
+
+
+def test_entry_and_restart_an_unreadable_history_alone_keeps_a_clean_pr_unmerged():
+    d, gh, _, _ = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
+                         body="## Other requirements\n- x\n", login=None, auto_merge=True)
+    assert d.run().status == "needs-human" and not _merged(gh)
+
+
+def test_entry_and_restart_readable_history_without_a_section_keeps_todays_behaviour():
+    fixed = []
+    d, gh, _, _ = _drive([(0, _inline("1", "fix it"))], body="## Other requirements\n- x\n",
+                         classify=_classify("COSMETIC"), auto_merge=True,
+                         fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
+    out = d.run()
+    assert fixed == ["1"] and _merged(gh) and out.status == "clean"
+
+
 @pytest.mark.parametrize("entry", ENTRIES, ids=lambda e: ",".join(e) or "default")
 def test_entry_and_restart_holds_survive_a_description_without_the_section(entry):
     # The heading was reworded (an emoji no longer matches): the recorded hold stands.
-    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]])
+    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1")
     t = _restored(Threads(), (pend, LOGIN))
     d, gh, events, _ = _drive([(0, _inline("1", "relax it"))], threads=t, auto_merge=True,
                               body=f"## {T} ✅\n- Keep the retry limit at 3\n",
@@ -1074,7 +1389,7 @@ def test_entry_and_restart_holds_survive_a_description_without_the_section(entry
 @pytest.mark.parametrize("entry", ENTRIES, ids=lambda e: ",".join(e) or "default")
 def test_entry_and_restart_guard_hold_keeps_its_two_choices(entry):
     comment = Comment(id="9", text="the summary is wrong", source="claude[bot]")
-    pend = P.record_body("pending", "9", "description_guard", ["- Keep the retry limit at 3"])
+    pend = P.record_body("pending", "9", "description_guard", ["- Keep the retry limit at 3"], "9")
     allow = P.record_body("allow", "9", "fixer", ["- Keep the retry limit at 3"])
     history = [(0, comment), (0, Comment(id="90", text=pend, source=LOGIN, from_issue_channel=True)),
                (0, Comment(id="91", text=allow, source=LOGIN, from_issue_channel=True))]
@@ -1102,20 +1417,24 @@ class FlakyThreads(Threads):
 
 
 def test_entry_and_restart_history_is_retried_each_round():
-    # Unreadable at start on a PR whose description lists nothing: round 1 may fix,
-    # but round 2 reads the history again and finds the hold on root 1.
+    # Unreadable at start, even on a PR whose description lists nothing: round 1
+    # makes no edit. An outside push starts round 2, which reads the history again
+    # and finds the hold on root 1: the reply on that thread is held, not deferred.
     t = FlakyThreads(1)
-    t.add("1", history=[(P.record_body("pending", "1", "fixer", [BLOCKS[0]]), LOGIN)])
+    t.add("1", history=[(P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1"), LOGIN)])
     fixed = []
     d, gh, events, _ = _drive([(0, _inline("2", "fix it")), (90, _inline("5", "relax it", reply_to="1"))],
                               threads=t, body="nothing listed", classify=_classify(), max_rounds=2,
                               fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
-    d.run()
-    assert fixed == ["2"] and d._protection_holds["1"]["state"] == "pending"
+    moves = iter(["carry"])
+    d._absorb_foreign_head = lambda may_publish=False: next(moves, None)
+    out = d.run()
+    assert fixed == [] and out.rounds == 2 and d._protection_holds["1"]["state"] == "pending"
+    assert [(a.comment_id, a.final) for a in out.actions][:2] == [("2", "deferred"), ("5", "escalated")]
 
 
 def test_entry_and_restart_a_restored_hold_is_asked_with_no_reviewer_left():
-    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]]), LOGIN))
+    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1"), LOGIN))
     d, gh, events, _ = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
                               threads=t, preflight=True, rr_active=True, auto_merge=True,
                               classify=_classify(), answer=lambda a: None)
@@ -1125,7 +1444,7 @@ def test_entry_and_restart_a_restored_hold_is_asked_with_no_reviewer_left():
 
 def test_entry_and_restart_held_comment_is_not_classified_and_stays_open():
     prompts = []
-    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]]), LOGIN),
+    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1"), LOGIN),
                   (P.record_body("manual", "1", "fixer", [BLOCKS[0]]), LOGIN))
     d, gh, events, _ = _drive([(0, _inline("1", "relax it"))], threads=t,
                               classify=_classify(prompts=prompts))
@@ -1154,6 +1473,12 @@ def test_gh_seams_for_protections():
     assert t.comments[0] == gh_ingest.ThreadComment(id="1", body="b", author="bot", path="a.py", diff_hunk="@@")
     node["comments"]["pageInfo"]["hasNextPage"] = False
     assert gh_ingest._review_thread_from_raw(node).complete
+    ok = {"hasNextPage": False}
+    for broken in ({"nodes": []}, {"pageInfo": ok}, None, {"nodes": [], "pageInfo": {}},
+                   {"nodes": [{"body": "b"}], "pageInfo": ok},
+                   {"nodes": [{"databaseId": 1, "body": None}], "pageInfo": ok},
+                   {"nodes": [None], "pageInfo": ok}):
+        assert not gh_ingest._review_thread_from_raw(dict(node, comments=broken)).complete
     seen = []
 
     def post(stdout, rc=0):
@@ -1171,6 +1496,54 @@ def test_gh_seams_for_protections():
     assert gh_ingest.fetch_authenticated_login(run=answer("owner\n")) == "owner"
     assert gh_ingest.fetch_authenticated_login(run=answer("a\nb\n")) is None
     assert gh_ingest.fetch_authenticated_login(run=answer("owner", rc=1)) is None
+
+
+def _threads_answer(payload):
+    return lambda argv, **kw: subprocess.CompletedProcess(argv, 0, json.dumps(payload), "")
+
+
+@pytest.mark.parametrize("payload", [
+    {}, {"data": {"repository": {"pullRequest": None}}},
+    {"data": {"repository": {"pullRequest": {"reviewThreads": {"nodes": []}}}}},
+    {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "nodes": [], "pageInfo": {"hasNextPage": True, "endCursor": None}}}}}},
+], ids=["no-data", "null-pull-request", "no-page-info", "next-page-without-cursor"])
+def test_gh_seams_incomplete_thread_history_is_unavailable(monkeypatch, payload):
+    monkeypatch.delenv(gh_ingest.THREADS_JSON_ENV, raising=False)
+
+    def read(*a, **k):
+        return gh_ingest.fetch_review_threads("7", repo="o/r", run=_threads_answer(payload))
+    with pytest.raises(RuntimeError):
+        read()
+    fixed = []
+    d, gh, _, _ = _drive([(0, _inline("1", "fix it"))], classify=_classify("COSMETIC"),
+                         auto_merge=True, max_rounds=1,
+                         fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
+    d.fetch_threads = read
+    out = d.run()
+    assert fixed == [] and not _merged(gh) and out.status == "needs-human"
+    # an explicitly complete empty connection is still a complete, empty history; a
+    # malformed thread makes it incomplete, yet reads as resolved to the merge gate
+    empty = {"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}}}}}}
+    assert gh_ingest.fetch_review_threads("7", repo="o/r", run=_threads_answer(empty)) == []
+    empty["data"]["repository"]["pullRequest"]["reviewThreads"]["nodes"] = [None, {"id": None}]
+    odd = gh_ingest.fetch_review_threads("7", repo="o/r", run=_threads_answer(empty))
+    assert [(t.complete, t.is_resolved) for t in odd] == [(False, True)] * 2
+
+
+def test_gh_seams_a_partly_read_history_still_blocks_on_an_open_thread(monkeypatch):
+    # Page 1 holds a human's open thread; page 2 is not readable. The merge gate
+    # decides on what it read, as it did before the reader learned to stop short.
+    monkeypatch.delenv(gh_ingest.THREADS_JSON_ENV, raising=False)
+    pages = iter([{"data": {"repository": {"pullRequest": {"reviewThreads": {
+        "nodes": [{"id": "T100", "isResolved": False, "comments": {"nodes": [{"databaseId": 100}]}}],
+        "pageInfo": {"hasNextPage": True, "endCursor": "C1"}}}}}},
+        {"data": {"repository": {"pullRequest": None}}}])
+    d, gh, _, _ = _drive([])
+    d.fetch_threads = lambda *a, **k: gh_ingest.fetch_review_threads(
+        "7", repo="o/r", run=lambda argv, **kw: _threads_answer(next(pages))(argv))
+    assert d._thread_gate_ok() is False
 
 
 def test_the_real_engine_wires_the_description_reader(monkeypatch):
@@ -1214,7 +1587,7 @@ def test_dispatch_measures_the_pr_through_its_default_measure(repo, monkeypatch)
 
 
 def test_entry_and_restart_decided_holds():
-    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]])
+    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1")
     # restored Allow: classified and fixed again with exactly that waiver
     prompts, seen = [], []
     t = _restored(Threads(), (pend, LOGIN), (P.record_body("allow", "1", "fixer", [BLOCKS[0]]), LOGIN))
@@ -1260,7 +1633,7 @@ def test_entry_and_restart_decided_holds():
     assert d.run().status == "needs-human" and not _merged(gh)
     # a restored Allow whose protection text has since changed waives nothing
     prompts, seen = [], []
-    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", ["- Keep the retry limit at 2"]), LOGIN),
+    t = _restored(Threads(), (P.record_body("pending", "1", "fixer", ["- Keep the retry limit at 2"], "1"), LOGIN),
                   (P.record_body("allow", "1", "fixer", ["- Keep the retry limit at 2"]), LOGIN))
     d, gh, events, _ = _drive([(0, _inline("1", "relax it"))], threads=t, classify=_classify(prompts=prompts),
                               fix=lambda c, r: seen.append(r.allowances) or FixOutcome(status="applied"))

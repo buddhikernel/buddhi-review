@@ -1340,8 +1340,9 @@ class RoundDriver:
         # root comment id → its owner hold (protections.make_protection_hold),
         #   plus the request it holds and where its thread lives.
         self._protection_holds: Dict[str, dict] = {}
-        # root → the (comment, result) an Allow re-dispatches; None result = restored.
-        self._protection_sources: Dict[str, Tuple[Comment, Optional[CommentResult]]] = {}
+        # root → every (comment, result) its hold holds, which an Allow re-dispatches;
+        #   a None result = restored from the comment a record names.
+        self._protection_sources: Dict[str, List[Tuple[Comment, Optional[CommentResult]]]] = {}
         self._protection_ask_roots: Dict[str, str] = {}   # ask id → root, asked this run
         # True when the thread history or the loop's login could not be read: a hold
         #   may exist that the run cannot see, so merging waits.
@@ -1349,6 +1350,7 @@ class RoundDriver:
         self._kept_roots: Set[str] = set()       # Keep decided: the gate may resolve
         self._round_held_ids: Set[str] = set()   # comment ids held this round
         self._edits_deferred = False             # a reviewer edit was held back unmade
+        self._unsettled_roots: Set[str] = set()  # threads holding a request no hold names
 
     # ------------------------------------------------------------------ state
 
@@ -3893,8 +3895,9 @@ class RoundDriver:
         hold = self._protection_holds.get(key)
         if hold is None or hold["state"] not in ("pending", "keep", "manual"):
             return False
-        # A later reply on a kept thread is a new request: classified, never swallowed.
-        return hold["state"] != "keep" or comment.id == hold["root_id"]
+        # Keep refuses exactly the requests it held (the root, for a record naming
+        # none); any other comment on the thread is a request of its own.
+        return hold["state"] != "keep" or comment.id in (hold.get("sources") or [hold["root_id"]])
 
     def _allowances(self, key: str) -> Tuple[str, ...]:
         """The owner's waivers for this hold that still match a listed protection
@@ -3912,6 +3915,22 @@ class RoundDriver:
         if hold["state"] == "keep" and inline:
             self._kept_roots.add(hold["root_id"])
         return key
+
+    def _adopt_restored(self, hold: dict, by_id: Dict[str, Comment], *, inline: bool) -> None:
+        """Adopt a restored hold with the requests its records name, read back from
+        those very comments. A pending hold any of whose requests cannot be found
+        (a deleted or emptied comment, a record naming none) is unavailable: it
+        blocks, but is never asked about or re-dispatched by guesswork."""
+        names = hold.get("sources") or []
+        found = [by_id[s] for s in names if s in by_id]
+        if len(found) < len(names):
+            hold["unavailable"] = True          # read only by the pending-hold ask
+        # A hold naming no request (an older or another author's marker) is still
+        # asked about, quoting its root; its Allow re-sends nothing.
+        first = (found or [by_id.get(hold["root_id"]) or Comment(id=hold["root_id"], text="")])[0]
+        key = self._adopt_hold(hold, request=first.text, reviewer=first.source,
+                               inline=inline, path=first.path, diff_hunk=first.diff_hunk)
+        self._protection_sources[key] = [(c, None) for c in found]
 
     def _restore_protection_holds(self) -> None:
         """Rebuild every owner hold from the records the loop's own account posted —
@@ -3937,21 +3956,32 @@ class RoundDriver:
                 history=[{"root_id": root.id, "body": c.body, "author": c.author}
                          for c in t.comments])
             if hold is not None:
-                self._adopt_hold(hold, request=root.body, reviewer=root.author, inline=True,
-                                 path=root.path, diff_hunk=root.diff_hunk)
+                self._adopt_restored(hold, {c.id: Comment(
+                    id=c.id, text=c.body, source=c.author or "reviewer", path=c.path,
+                    diff_hunk=c.diff_hunk, in_reply_to=None if c is root else root.id)
+                    for c in t.comments}, inline=True)
         bodies = {c.id: c for c in comments if not c.path and not c.from_issue_channel}
         records = [c for c in comments if c.from_issue_channel and protections.MARKER in c.text]
         for root_id in sorted({d["root"] for d in map(protections.claimed_record,
                                                        (c.text for c in records)) if d}):
-            root = bodies.get(root_id)
-            if root is None or self._hold_key(root_id, False) in self._protection_holds:
+            if self._hold_key(root_id, False) in self._protection_holds:
                 continue
+            # A review whose body is gone, blank or lost to another id still has its
+            # authentic records: the hold stands, unavailable. Another author's
+            # marker for a review that is not there claims nothing.
+            root = bodies.get(root_id)
+            if root is None and not any(
+                    c.source == login and (protections.parse_record(c.text) or {}).get("root")
+                    == root_id for c in records):
+                continue
+            history = [] if root is None else [
+                {"root_id": root_id, "body": root.text, "author": root.source}]
             hold = protections.restore_protection_hold(
                 root_id=root_id, login=login,
-                history=[{"root_id": root_id, "body": root.text, "author": root.source}]
-                + [{"root_id": root_id, "body": c.text, "author": c.source} for c in records])
+                history=history + [{"root_id": root_id, "body": c.text, "author": c.source}
+                                   for c in records])
             if hold is not None:
-                self._adopt_hold(hold, request=root.text, reviewer=root.source, inline=False)
+                self._adopt_restored(hold, {root_id: root} if root else {}, inline=False)
 
     def _protections_at_start(self) -> None:
         """Pin the first reading and restore every hold already recorded on the PR —
@@ -3962,11 +3992,10 @@ class RoundDriver:
         self._restore_protection_holds()
 
     def _history_blocks_edits(self) -> bool:
-        """The hold history could not be read on a PR that lists protections: any
-        comment may sit on a held thread, so no reviewer edit may land."""
-        snap = self._round_protections
-        return (self._protection_history_unknown and snap is not None
-                and (snap.found or not snap.readable))
+        """The hold history could not be read: any comment may sit on a held
+        thread — whatever the description lists now, since a hold outlives its
+        section — so no reviewer edit may land until the history reads."""
+        return self._protection_history_unknown
 
     def _unasked_hold_comments(self, present: Iterable[str]) -> List[Comment]:
         """A comment standing for each pending hold not yet asked this run (a
@@ -3974,7 +4003,7 @@ class RoundDriver:
         present = set(present)
         out = []
         for key, hold in self._protection_holds.items():
-            if hold["state"] != "pending" or key in present or hold.get("unposted"):
+            if not self._askable(hold) or key in present:
                 continue
             if protections.protection_ask(hold, reviewer="", request="").id in \
                     self._protection_ask_roots:
@@ -3999,6 +4028,13 @@ class RoundDriver:
         except Exception:
             return False
 
+    @staticmethod
+    def _askable(hold: dict) -> bool:
+        """A pending hold the owner can be asked about: its record is on GitHub and
+        every request it holds is known."""
+        return (hold["state"] == "pending" and not hold.get("unposted")
+                and not hold.get("unavailable"))
+
     def _ask_hold(self, key: str) -> None:
         hold = self._protection_holds[key]
         ask = protections.protection_ask(hold, reviewer=hold.get("reviewer") or "reviewer",
@@ -4013,10 +4049,12 @@ class RoundDriver:
                                results: Sequence[CommentResult],
                                actions: Sequence[ActionResult]) -> None:
         """Turn this round's protection conflicts into owner holds: post the pending
-        record (W1) on the root thread, then ask (W2). The same pending record is
-        never posted twice; a second conflict on a still-pending root widens it. A
-        hold whose pending record cannot be posted is not asked — an answer the
-        thread cannot carry would not survive a restart — and stays pending."""
+        record (W1) on the root thread, then ask (W2). Each held request gets its
+        own pending record, naming its comment, and is never recorded twice; a
+        second request on a still-pending root joins its hold, widening it to any
+        new protection. A hold whose pending record cannot be posted is not asked —
+        an answer the thread cannot carry would not survive a restart — and stays
+        pending."""
         for c, r, a in zip(comments, results, actions):
             info = a.protection_hold
             if not info:
@@ -4024,31 +4062,39 @@ class RoundDriver:
             key, origin = self._comment_key(c), info["origin"]
             texts = list(info["protection_texts"])
             prior = self._protection_holds.get(key)
-            if prior is not None and prior["state"] == "pending":
-                if (prior["origin"], prior["protection_texts"]) == (origin, texts):
-                    self._protection_sources.setdefault(key, (c, r))
-                    continue
-                texts = list(dict.fromkeys(prior["protection_texts"] + texts))
-                if protections.GUARD in (origin, prior["origin"]):
-                    origin = protections.GUARD
-            hold = protections.make_protection_hold(root_id=c.root_id, origin=origin,
-                                                    protection_texts=texts)
-            hold["allowances"] = list((prior or {}).get("allowances") or [])
-            self._adopt_hold(hold, request=c.text, reviewer=c.source, inline=bool(c.path),
-                             path=c.path, diff_hunk=c.diff_hunk)
-            self._protection_sources[key] = (c, r)
+            pending = prior is not None and prior["state"] == "pending"
+            # A comment on a pending hold's thread is held, never classified, so
+            # each request reaches here once while its hold is open.
+            sources = self._protection_sources.get(key, []) if pending else []
+            self._protection_sources[key] = sources + [(c, r)]
+            if pending and (prior["origin"], prior["protection_texts"]) == (origin, texts):
+                hold = prior
+            else:
+                if pending:
+                    texts = list(dict.fromkeys(prior["protection_texts"] + texts))
+                    if protections.GUARD in (origin, prior["origin"]):
+                        origin = protections.GUARD
+                hold = protections.make_protection_hold(root_id=c.root_id, origin=origin,
+                                                        protection_texts=texts)
+                hold["allowances"] = list((prior or {}).get("allowances") or [])
+                hold["sources"] = list(prior["sources"]) if pending else []
+                hold["unposted"] = pending and prior.get("unposted", False)
+                self._adopt_hold(hold, request=c.text, reviewer=c.source, inline=bool(c.path),
+                                 path=c.path, diff_hunk=c.diff_hunk)
+            hold["sources"] = hold["sources"] + [c.id]
+            record = protections.record_body("pending", hold["root_id"], hold["origin"],
+                                             hold["protection_texts"], c.id)
             # W1 before any question; one retry, then the hold waits unasked.
-            if not (self._post_record(hold, hold["pending_record"])
-                    or self._post_record(hold, hold["pending_record"])):
+            if not (self._post_record(hold, record) or self._post_record(hold, record)):
                 hold["unposted"] = True
         for key, hold in list(self._protection_holds.items()):
-            if hold["state"] == "pending" and not hold.get("unposted"):
+            if self._askable(hold):
                 self._ask_hold(key)
 
     def _resolve_kept_root(self, hold: dict) -> None:
         """Keep closes only an inline root's own thread; a review-body finding has
         no thread, and its id must never be matched against a thread root."""
-        if not hold.get("inline", True):
+        if not hold.get("inline", True) or hold["root_id"] in self._unsettled_roots:
             return
         root = hold["root_id"]
         self._kept_roots.add(root)
@@ -4074,51 +4120,47 @@ class RoundDriver:
     def _redispatch_allowed(self, key: str, actionable: List[Comment],
                             results: List[CommentResult],
                             round_actions: List[ActionResult]) -> None:
-        """The owner allowed this root's change: re-run its request through the same
-        fixer and verification gates, waiving ONLY the allowed texts. Never on a
-        worktree a rollback this round could not prove clean: the round halts before
-        its push instead, and the recorded Allow is honoured on the next run."""
+        """The owner allowed this root's change: re-run every request its hold holds
+        through the same fixer and verification gates, waiving ONLY the allowed
+        texts. Never on a worktree a rollback this round could not prove clean: the
+        round halts before its push instead, and the recorded Allow is honoured on
+        the next run."""
         if any(a.rollback_failed for a in round_actions):
             return
-        hold = self._protection_holds[key]
         allow = self._allowances(key)
         blocks = self._round_prompt_protections()
-        c, r = self._protection_sources.get(key, (None, None))
-        if c is None or r is None or (r.kernel_status == loop.PROTECTION_HOLD
-                                      and not r.protection_conflicts):
-            c = c or Comment(id=hold["root_id"], text=hold.get("request") or "",
-                             source=hold.get("reviewer") or "reviewer",
-                             path=hold.get("path") if hold.get("inline", True) else None,
-                             diff_hunk=hold.get("diff_hunk"))
-            r = process_comments([c], adapter=self.adapter,
-                                 classify_runner=self.classify_runner,
-                                 max_rounds=self.max_rounds, protections=blocks,
-                                 allowances={c.id: allow})[0]
-        else:
-            r = replace(r, disposition="fix", protections=blocks, allowances=allow,
-                        protection_conflicts=())
-        if self._edits_blocked() and r.disposition == "fix":
-            a = self._blocked_action(c)
-        else:
-            a = act_on_result(c, r, adapter=self.adapter, fix_dispatch=self.fix_dispatch)
-        print(f"  [{a.final:16}] comment {a.comment_id} ({a.disposition})"
-              + (f" — {a.detail}" if a.detail else ""))
-        ids = [x.id for x in actionable]
-        if c.id in ids:
-            k = ids.index(c.id)
-            old = round_actions[k]
-            results[k], round_actions[k] = r, a
-            self.actions = [a if x is old else x for x in self.actions]
-        else:
-            actionable.append(c)
-            results.append(r)
-            round_actions.append(a)
-            self.actions.append(a)
-        if c.path and a.final in _RESOLVED_FINALS:
-            self._handled_inline_ids.add(c.id)
-        if a.protection_hold:
-            self._round_held_ids.add(c.id)
-            self._open_protection_holds([c], [r], [a])
+        for c, r in self._protection_sources.get(key, []):
+            if r is None or (r.kernel_status == loop.PROTECTION_HOLD
+                             and not r.protection_conflicts):
+                r = process_comments([c], adapter=self.adapter,
+                                     classify_runner=self.classify_runner,
+                                     max_rounds=self.max_rounds, protections=blocks,
+                                     allowances={c.id: allow})[0]
+            else:
+                r = replace(r, disposition="fix", protections=blocks, allowances=allow,
+                            protection_conflicts=())
+            if self._edits_blocked() and r.disposition == "fix":
+                a = self._blocked_action(c)
+            else:
+                a = act_on_result(c, r, adapter=self.adapter, fix_dispatch=self.fix_dispatch)
+            print(f"  [{a.final:16}] comment {a.comment_id} ({a.disposition})"
+                  + (f" — {a.detail}" if a.detail else ""))
+            ids = [x.id for x in actionable]
+            if c.id in ids:
+                k = ids.index(c.id)
+                old = round_actions[k]
+                results[k], round_actions[k] = r, a
+                self.actions = [a if x is old else x for x in self.actions]
+            else:
+                actionable.append(c)
+                results.append(r)
+                round_actions.append(a)
+                self.actions.append(a)
+            if c.path and a.final in _RESOLVED_FINALS:
+                self._handled_inline_ids.add(c.id)
+            if a.protection_hold:
+                self._round_held_ids.add(c.id)
+                self._open_protection_holds([c], [r], [a])
 
     def _settle_protection_answers(self, answers: Dict[str, Optional[str]],
                                    actionable: List[Comment], results: List[CommentResult],
@@ -4157,9 +4199,9 @@ class RoundDriver:
         if self.protections_fetch is None:
             return True
         snap = self._refresh_protections()
-        if snap.blocked or self._edits_deferred:
+        if snap.blocked or self._edits_deferred or self._unsettled_roots:
             return False
-        if self._protection_history_unknown and (snap.found or self._protection_holds):
+        if self._protection_history_unknown:
             self._restore_protection_holds()
             if self._protection_history_unknown:
                 return False
@@ -4411,6 +4453,13 @@ class RoundDriver:
             # hold is the owner's, not re-classified; an Allowed thread is classified
             # with exactly its waived texts.
             held_ids = {c.id for c in actionable if self._hold_blocks(self._comment_key(c), c)}
+            # A held comment that is not one of its hold's requests is never asked about
+            # here: its thread stays open, for the run after the hold is settled.
+            self._unsettled_roots |= {
+                c.root_id for c in actionable if c.id in held_ids
+                and all(c is not h for h in held_batch)
+                and c.id not in (self._protection_holds[self._comment_key(c)]["sources"]
+                                 or [c.root_id])}
             allow_map = {c.id: self._allowances(self._comment_key(c)) for c in actionable
                          if self._comment_key(c) in self._protection_holds}
             results = process_comments(
@@ -4927,6 +4976,8 @@ class RoundDriver:
                         status="stop",
                         hint="re-run with --repo owner/name to enable the thread gate")
             return False
+        except gh_ingest.IncompleteThreadsError as exc:
+            threads = exc.threads      # decided on what was read, as before the read stopped
         except RuntimeError:
             # Other RuntimeErrors (GraphQL blips, gh network failures) are transient.
             print(f"[thread-gate] could not read PR #{self.pr} review threads — "

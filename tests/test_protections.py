@@ -1,10 +1,11 @@
 """The protections section scanner, the round snapshot and its limits, and the
 owner-hold helpers — pure, no network, no git."""
 import json
+import time
 
 import pytest
 
-from buddhi_review import protections as P
+from buddhi_review import classify, protections as P
 
 F = "`" * 3
 T = "Protections this PR must keep"
@@ -27,6 +28,8 @@ SYNTAX = [
     # Setext
     ("setext_eq", f"{T}\n===\n- a\n", ["- a"]),
     ("setext_dash", f"{T}\n---\n- a\n", ["- a"]),
+    ("setext_three_lines", "Protections\nthis PR must\nkeep\n===\n- a\n", None),   # one-line titles only
+    ("setext_title_continued", f"{T}\nmore words\n===\n- a\n", None),
     # plain / bold label followed (after blank lines) by its list
     ("label_plain", f"intro\n\n{T}\n- a\n- b\n\nafter\n", ["- a", "- b"]),
     ("label_bold_colon", f"**{T}:**\n\n\n- a\n", ["- a"]),
@@ -143,6 +146,65 @@ EDGES = [
     ("comment_block_close_then_heading", S + "- a\n<!--\nx\n--> ## Appendix\n- b\n", ["- a", "## Appendix", "- b"]),
     ("setext_with_comment", S + "Note\n--- <!-- c -->\n- a\n", ["Note\n---", "- a"]),
     ("thematic_with_comment", S + "Note\n\n*** <!-- c -->\n", ["Note", "***"]),
+    # a code span opening on a comment's line may close on a later line of the same
+    # paragraph, never of another; a backslash escapes an opener only when not itself
+    # escaped, and an escaped backtick opens no span
+    ("double_backslash", S + "- Keep \\\\<!-- gone --> rule\n", ["- Keep \\\\ rule"]),
+    ("code_span_not_across_paragraphs", S + "Keep `x <!-- c -->\n\nNew ` y\n", ["Keep `x", "New ` y"]),
+    ("code_span_not_into_next_item", S + "1. Use ` <!-- c -->\n2. `x`\n", ["1. Use `", "2. `x`"]),
+    ("escaped_backtick", S + "Escape \\` <!-- note -->\nand keep `x` too\n", ["Escape \\`\nand keep `x` too"]),
+    ("chained_comments", S + "- Keep <!-- a\n  b --> mid <!-- c\n  d --> end\n", ["- Keep\n mid\n end"]),
+    ("chained_comment_item_heading", S + "-   a <!-- x\n    y --> b <!-- z\n    # Heading -->\n- c\n",
+     ["-   a\n b <!-- z\n    # Heading -->", "- c"]),
+    ("setext_after_comment_block", S + "- a\n\nPara\n<!-- c\n-->\nmore\n---\n- b\n", ["- a", "Para"]),
+    ("setext_sub_two_lines", f"# {T}\nSub\nline\n---\npara\n", ["Sub\nline\n---\npara"]),
+    # an HTML block line takes an underline with it; an item that begins with a blank
+    # line ends at a second; a heading or quote line keeps no code span open; a
+    # backslash escapes nothing in raw HTML; a quote holding no paragraph has no lazy line
+    ("html_block_then_dashes", S + "Keep A.\n<div>\n---\n- Never log tokens\n",
+     ["Keep A.\n<div>", "- Never log tokens"]),
+    ("empty_item_then_blank", f"Notes:\n\n-  \n\n  ## {T}\n  - Keep retry count at 3\n",
+     ["  - Keep retry count at 3"]),
+    ("empty_item_then_blank_ends", S + "- a\n-  \n\n  ## Next\n- outside\n", ["- a"]),
+    ("lone_backtick_above_title", f"Use the ` key.\n## {T} <!-- one per line -->\nKeep `r` at 3\n",
+     ["Keep `r` at 3"]),
+    ("quote_after_lone_backtick", S + "Some ` text\n> quoted <!-- hidden --> `x`\n",
+     ["Some ` text", "> quoted  `x`"]),
+    ("heading_with_lone_backtick", S + "### Detail ` <!-- hidden -->\nKeep `x` at 3\n",
+     ["### Detail `\nKeep `x` at 3"]),
+    ("raw_html_backslash", S + "<!-- x --> \\<!-- hidden --> tail\n", ["\\ tail"]),
+    ("quote_comment_then_code", S + "> <!-- note --> see below\n    retries = 3\n",
+     [">  see below", "    retries = 3"]),
+    ("quote_empty_item_then_code", S + "> -\n    retries = 3\n", ["> -", "    retries = 3"]),
+    ("empty_item_with_content", S + "-\n  foo\n\n  bar\n", ["-\n  foo\n\n  bar"]),
+    # a line that is no fence continues lazily; only plain quote text takes an
+    # indented lazy line; inline HTML still makes a heading, a lone tag does not;
+    # an item opening with a comment is raw HTML, where no backslash escapes
+    ("fence_like_lazy_line", S + "- Keep it quoted as\n```` `make` ````\nin every job\n---\n- b\n",
+     ["- Keep it quoted as\n```` `make` ````\nin every job", "- b"]),
+    ("indented_after_quote_item", f"> - ## Example\n    $ make\n{T}:\n\n- a\n", ["- a"]),
+    ("inline_html_setext_ends", S + "- a\n\n<b>Changelog</b>\n---\n- b\n", ["- a"]),
+    ("lone_tag_takes_underline", S + "- a\n\n<span>\n---\n- b\n", ["- a", "<span>", "- b"]),
+    ("item_html_no_escape", S + "- <!-- n --> \\<!-- hidden --> keep\n", ["-  \\ keep"]),
+    ("item_heading_backtick", S + "- ## Detail ` <!-- hidden -->\n  Keep `x` at 3\n",
+     ["- ## Detail `\n  Keep `x` at 3"]),
+    # inside a span a backslash is plain text, so an escaped backtick still closes it
+    ("escaped_closer", S + "Keep `a\\` <!-- x --> ` here\n", ["Keep `a\\`  ` here"]),
+    ("escaped_closer_below", S + "Use ` <!-- c -->\nand \\` here\n", ["Use ` <!-- c -->\nand \\` here"]),
+    ("escaped_backslash_opens", S + "Keep \\\\`code <!-- x -->` here\n",
+     ["Keep \\\\`code <!-- x -->` here"]),
+    # an indented line after quoted HTML or quoted code is code of its own
+    ("quote_html_then_code", S + "> <div>\n    retries = 3 <!-- keep -->\n",
+     ["> <div>", "    retries = 3 <!-- keep -->"]),
+    ("quote_code_then_code", S + ">     code\n    more <!-- keep -->\n",
+     [">     code", "    more <!-- keep -->"]),
+    ("quote_html_no_escape", S + "> <!-- n --> \\<!-- hidden --> x\n", [">  \\ x"]),
+    ("item_quote_html_no_escape", S + "- > <!-- n --> \\<!-- hidden --> x\n", ["- >  \\ x"]),
+    # every kind of HTML block opener is raw HTML; any lone tag takes the underline
+    *[(f"html_opener_{i}", S + f"{o} \\<!-- hidden --> x\n", [f"{o} \\ x"]) for i, o in
+      enumerate(["<pre>", "<?php", "<!DOCTYPE html", "<![CDATA[", "<DIV>", "<p/>", "</div>"])],
+    *[(f"lone_tag_{i}", S + f"- a\n\n{t}\n---\n- b\n", ["- a", t, "- b"]) for i, t in
+      enumerate(["</span>", '<span class="x">', "<br/>"])],
     # a title that continues a paragraph is not one
     ("setext_multiline_title", f"intro\n{T}\n===\n- a\n", None),
     ("label_continues_para", f"intro\n{T}:\n\n- a\n", None),
@@ -161,6 +223,32 @@ def test_section_syntax_edges(name, body, want):
     test_section_syntax(name, body, want)
 
 
+REPORTED = [
+    # an empty marker with trailing spaces: its content is one column on
+    ("empty_marker", S + "-  \n  ## Nested heading\n  rule inside item\n- next rule\n",
+     ["-\n  ## Nested heading\n  rule inside item", "- next rule"], None),
+    # a Setext heading of two lines ends the section before it
+    ("multiline_setext", S + "- keep\n\nSome\ntext\n===\noutside\n", ["- keep"], S + "- keep\n\n"),
+    # a lazy line indented four columns stays in the quote's paragraph
+    ("lazy_quote", S + "> Keep the\n    quoted rule\n", ["> Keep the\n    quoted rule"], None),
+    ("escaped_comment", S + "- Keep \\<!-- literal --> rule\n", ["- Keep \\<!-- literal --> rule"],
+     None),
+    ("multiline_code_span", S + "- Keep `<!--\nnot a comment -->` rule\n",
+     ["- Keep `<!--\nnot a comment -->` rule"], None),
+    ("second_inline_comment", S + "- Keep <!-- first\nend --> words <!-- second --> tail\n",
+     ["- Keep\n words  tail"], None),
+]
+
+
+@pytest.mark.parametrize("name,body,want,raw", REPORTED, ids=[r[0] for r in REPORTED])
+def test_section_syntax_reported_shapes(name, body, want, raw):
+    (section,) = P.parse_body(body).sections
+    assert list(section.blocks) == want and section.raw == (body if raw is None else raw)
+    snap = P.snapshot_from_body(body)
+    assert (snap.count, snap.chars) == (len(want), sum(map(len, want)))
+    assert P.numbered(want) in classify.build_prompt("x", protections=snap.blocks, nonce="n0")
+
+
 @pytest.mark.parametrize("body,raw", [
     # label form: the label through its list's last line, never the blank after it
     (f"{T}\n- a\n\nafter\n", f"{T}\n- a\n"),
@@ -174,6 +262,15 @@ def test_section_syntax_edges(name, body, want):
 def test_section_raw_slices(body, raw):
     (section,) = P.parse_body(body).sections
     assert section.raw == raw and body[section.start:section.end] == raw
+
+
+def test_section_reading_stays_linear_on_long_paragraphs():
+    rows = "".join(f"| `pkg-{i}` | `1.0.{i}` | <!-- r -->\n" for i in range(4000))
+    lone = S + "Keep ` " + "<!-- c --> " * 2000 + "\n" + "more text\n" * 2000
+    for body in (S + rows, S + "- item\n" + "`a <!-- c --> x\n" * 4000, lone):
+        started = time.perf_counter()
+        P.parse_body(body)
+        assert time.perf_counter() - started < 2.0
 
 
 def test_approved_copy_is_verbatim():
@@ -351,7 +448,12 @@ def test_record_body_is_exact_and_unforgeable_by_text():
     marker = body.rsplit("\n\n", 1)[1]
     assert marker.count("-->") == 1 and marker.endswith("-->") and "<" not in marker[4:]
     data = P.parse_record(body)
-    assert data == {"decision": "pending", "origin": "fixer", "root": "11", "protections": texts}
+    assert data == {"decision": "pending", "origin": "fixer", "root": "11", "protections": texts,
+                    "source": None}
+    # the requesting comment rides the marker, and is part of what must match exactly
+    sourced = P.record_body("pending", "11", "fixer", texts, "12")
+    assert P.parse_record(sourced)["source"] == "12" and sourced != body
+    assert P.parse_record(sourced.replace('"source":"12"', '"source":12')) is None
     # quoted, edited, or a guard Allow: never a record
     assert P.parse_record("> " + body) is None
     assert P.parse_record(body.replace("Not applied yet", "Applied")) is None
@@ -486,3 +588,15 @@ def test_restore():
         login="me")
     assert guard_first["origin"] == "description_guard" and guard_first["protection_texts"] == ["- a", "- z"]
     assert json.loads(json.dumps(mixed))  # plain data, persistable
+    # each held request is named once, across a widened hold and a record posted
+    # twice; a decision then a new hold starts the list afresh; a forgery names none
+    def src(texts, s):
+        return P.record_body("pending", "9", "fixer", texts, s), "me"
+    many = P.restore_protection_hold(root_id="9", login="me", history=_hist(
+        src(["- a"], "2"), src(["- a"], "2"), src(["- b"], "3")))
+    assert many["sources"] == ["2", "3"] and many["protection_texts"] == ["- a", "- b"]
+    again = P.restore_protection_hold(root_id="9", login="me", history=_hist(
+        src(["- a"], "2"), (keep, "me"), src(["- a"], "4")))
+    assert again["sources"] == ["4"] and again["state"] == "pending"
+    assert P.restore_protection_hold(root_id="9", login="me", history=_hist(
+        (src(["- a"], "2")[0], "eve")))["sources"] == []

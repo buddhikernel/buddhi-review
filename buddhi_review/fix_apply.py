@@ -2787,8 +2787,10 @@ def apply_fix(
                         attempts=total_attempts + attempt,
                         rollback_failed=not trustworthy or snap is None,
                         protection_origin="fixer", protection_texts=named)
+                # A claim naming no listed protection is rejected; the model's
+                # protocol line is internal and never shown as the outcome's detail.
                 return FixOutcome(
-                    status="rejected", detail=f"PROTECTION-CONFLICT: {conflict}",
+                    status="rejected", detail="",
                     attempts=total_attempts + attempt,
                     rollback_failed=not trustworthy or snap is None)
             skip_line = next(

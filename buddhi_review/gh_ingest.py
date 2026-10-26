@@ -27,6 +27,7 @@ from typing import Callable, FrozenSet, Iterable, List, Optional, Sequence, Tupl
 
 from buddhi.stage0.conditioning import RawItem
 
+from buddhi_review import protections
 from buddhi_review.loop import Comment
 
 COMMENTS_JSON_ENV = "BUDDHI_REVIEW_COMMENTS_JSON"
@@ -50,6 +51,15 @@ class RepoNotConfiguredError(RuntimeError):
     supplied. GraphQL variables require it; gh does not substitute the REST
     placeholder. Callers catch this specifically to distinguish a non-transient
     configuration error from a transient network / gh failure."""
+
+
+class IncompleteThreadsError(RuntimeError):
+    """A ``reviewThreads`` read that stopped short of the whole history; ``threads``
+    holds what it read before that."""
+
+    def __init__(self, message: str, threads: list):
+        super().__init__(message)
+        self.threads = threads
 
 
 @dataclass(frozen=True)
@@ -178,7 +188,9 @@ def fetch_comments(
         try:
             for raw in _decode_concatenated(proc.stdout):
                 c = _comment_from_raw(raw, from_issue_channel=from_issue_channel)
-                if c is not None and c.id not in seen:
+                # A hold's record numbers apart from review comments: an id they
+                # happen to share never hides it.
+                if c is not None and (c.id not in seen or protections.MARKER in c.text):
                     seen.add(c.id)
                     comments.append(c)
         except ValueError as exc:
@@ -516,7 +528,11 @@ def _review_thread_from_raw(raw: dict) -> Optional[ReviewThread]:
                     path=path if isinstance(path, str) else None,
                     diff_hunk=hunk if isinstance(hunk, str) else None))
     root = ids[0] if ids else None
-    complete = not (isinstance(page, dict) and page.get("hasNextPage"))
+    # A comments connection that is missing, holds a malformed comment, or does not
+    # say that none remain, is incomplete.
+    complete = (isinstance(nodes, list) and len(history) == len(nodes)
+                and all(isinstance(n.get("body"), str) for n in nodes)
+                and isinstance(page, dict) and page.get("hasNextPage") is False)
     return ReviewThread(id=tid, is_resolved=bool(raw.get("isResolved")),
                         root_comment_id=root, comment_ids=frozenset(ids),
                         comments=tuple(history), resolved_by=_login_of(raw.get("resolvedBy")),
@@ -611,17 +627,26 @@ def fetch_review_threads(
             raise RuntimeError(
                 f"gh api graphql reviewThreads returned errors: {data['errors']}")
         rt = ((((data or {}).get("data") or {}).get("repository") or {})
-              .get("pullRequest") or {}).get("reviewThreads") or {}
-        for node in (rt.get("nodes") or []):
-            if isinstance(node, dict):
-                t = _review_thread_from_raw(node)
-                if t is not None:
-                    threads.append(t)
-        page_info = rt.get("pageInfo") or {}
-        if page_info.get("hasNextPage") and page_info.get("endCursor"):
-            cursor = page_info["endCursor"]
-        else:
+              .get("pullRequest") or {}).get("reviewThreads")
+        nodes = rt.get("nodes") if isinstance(rt, dict) else None
+        page_info = rt.get("pageInfo") if isinstance(rt, dict) else None
+        # A connection GitHub did not return (no data, a null pull request) or a
+        # next page with no cursor is an incomplete read, never "no threads".
+        if not (isinstance(nodes, list) and isinstance(page_info, dict)):
+            raise IncompleteThreadsError("gh api graphql reviewThreads returned no complete "
+                                         "connection", threads)
+        for node in nodes:
+            t = _review_thread_from_raw(node) if isinstance(node, dict) else None
+            # A malformed thread leaves the history incomplete; read as resolved,
+            # it changes nothing for the merge gate, which used to skip it.
+            threads.append(t or ReviewThread(id="", is_resolved=True, root_comment_id=None,
+                                             complete=False))
+        if not page_info.get("hasNextPage"):
             break
+        cursor = page_info.get("endCursor")
+        if not cursor:
+            raise IncompleteThreadsError("gh api graphql reviewThreads: a next page has no "
+                                         "cursor", threads)
     return threads
 
 
