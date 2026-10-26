@@ -27,11 +27,11 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-from buddhi_review import plan_profile
+from buddhi_review import plan_profile, pr_size, protections
 from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.classify import REWRITE_LABELS
 from buddhi_review.fix_apply import FixOutcome, apply_fix, skip_kind
-from buddhi_review.loop import Comment, CommentResult
+from buddhi_review.loop import PROTECTION_HOLD, Comment, CommentResult
 from buddhi_review.notifier import Ask
 
 _GH_TIMEOUT = 120
@@ -113,6 +113,36 @@ def build_pr_description_prompt(current_body: str, comment_text: str,
     )
 
 
+def _protected_rewrite(current_body: str, new_body: str,
+                       original: "protections.Reading"):
+    """The exact string to post for a body that lists protections, or a
+    ``protection-conflict`` outcome when the rewrite would change them.
+
+    The model's output is stripped before posting; trailing whitespace the ORIGINAL
+    body ends with is put back when nothing but whitespace follows its last
+    protections section, so that strip — the loop's own normalization, not the
+    model's edit — never trims protected bytes. The complete sequence of section slices of the string
+    actually posted must equal the original's byte for byte: a changed, removed,
+    trimmed or ADDED section is held for the project owner, with no write."""
+    final = new_body
+    if not current_body[original.sections[-1].end:].strip():
+        final = new_body + current_body[len(current_body.rstrip()):]
+    proposed = protections.parse_body(final)
+    before = [s.raw for s in original.sections]
+    if [s.raw for s in proposed.sections] == before:
+        return final
+    changed = [s for i, s in enumerate(original.sections)
+               if i >= len(proposed.sections) or proposed.sections[i].raw != s.raw]
+    texts = [b for s in (changed or original.sections) for b in s.blocks]
+    if not texts:
+        # A section with nothing under it is still protected; name its heading.
+        texts = [(changed or list(original.sections))[0].raw.strip().splitlines()[0]]
+    return FixOutcome(status="protection-conflict",
+                      detail=protections.visible_text("pending", texts),
+                      protection_origin=protections.GUARD,
+                      protection_texts=tuple(texts))
+
+
 def rewrite_pr_description(
     comment: Comment,
     *,
@@ -169,6 +199,9 @@ def rewrite_pr_description(
     else:
         return FixOutcome(status="transient-failed",
                           detail="pr-description: gh pr view returned a non-string body")
+    # The protections sections of the body as fetched NOW (never the round's older
+    # snapshot): their exact bytes are what any rewrite must leave untouched.
+    original = protections.parse_body(current_body)
 
     # 2. Produce the addressed body via the model seam.
     try:
@@ -188,6 +221,11 @@ def rewrite_pr_description(
         # (a terminal skip, so it does not re-flag as a fresh change next round).
         return FixOutcome(status="skipped",
                           detail="pr-description: body already addresses the comment — no rewrite needed")
+    if original.found:
+        guarded = _protected_rewrite(current_body, new_body, original)
+        if isinstance(guarded, FixOutcome):
+            return guarded
+        new_body = guarded
 
     # 3. Write the addressed body back.
     edit = ["gh", "pr", "edit", str(pr), "--body-file", "-"]
@@ -216,6 +254,13 @@ class ActionResult:
     # poisons the shared worktree. The round driver halts before pushing on this,
     # regardless of ``final`` — so it is plumbed for EVERY fix disposition.
     rollback_failed: bool = False
+    # Set when the comment is held for the project owner because its request would
+    # break a listed protection: {"origin": ..., "protection_texts": [...]}. Its
+    # ``final`` is ``escalated`` — an owner question, never fixed or dismissed.
+    protection_hold: Optional[dict] = None
+    # Carried up from FixOutcome.verified: False marks a fix kept UNVERIFIED after a
+    # required verification returned no verdict.
+    verified: Optional[bool] = None
 
 
 def default_fix_dispatch(
@@ -229,11 +274,20 @@ def default_fix_dispatch(
     fix_pr_description: bool = True,
     gh_run: GhRun = _default_gh_run,
     rewrite_runner: Optional[Callable[[str], str]] = None,
+    size_measure: Optional[Callable[[], object]] = None,
 ) -> FixDispatch:
     """Build the ``fix`` actuator. A ``PR_DESCRIPTION`` comment is routed to the
     PR-body rewriter (``fix_pr_description`` on, the default); with it off the PR
     body is left untouched and the comment is skipped. Every other ``fix`` comment
-    runs the code fixer (``apply_fix``)."""
+    runs the code fixer (``apply_fix``).
+
+    The round's pinned protections and the thread's owner allowances ride in on
+    the comment's :class:`CommentResult`; when there are protections, each
+    verification measures the whole proposed PR through ``size_measure`` (default:
+    :func:`buddhi_review.pr_size.measure_pr_size` for ``pr`` in ``cwd``)."""
+    if size_measure is None and pr:
+        def size_measure() -> object:
+            return pr_size.measure_pr_size(cwd, pr=pr, repo=repo)
     def _dispatch(comment: Comment, result: CommentResult) -> FixOutcome:
         # result.classification (aliased to `c`) is guaranteed to be a valid
         # Classification object when disposition is "fix", and its attributes
@@ -278,6 +332,9 @@ def default_fix_dispatch(
             label=c.label,
             verify_runner=verify_runner,
             verify_mode=verify_mode,
+            protections=result.protections,
+            allowances=result.allowances,
+            size_measure=size_measure if result.protections else None,
         )
 
     return _dispatch
@@ -291,11 +348,27 @@ def act_on_result(
     fix_dispatch: Optional[FixDispatch] = None,
 ) -> ActionResult:
     d = result.disposition
+    if d == PROTECTION_HOLD:
+        # The classifier said the request would break a listed protection: an owner
+        # question (the round driver posts on the thread and asks), never a fix.
+        texts = list(result.protection_conflicts)
+        return ActionResult(
+            comment.id, "escalate", "escalated",
+            protections.visible_text("pending", texts) if texts else "",
+            protection_hold=({"origin": "classifier", "protection_texts": texts}
+                             if texts else None))
     if d == "fix":
         if fix_dispatch is None:
             return ActionResult(comment.id, d, "deferred", "no fixer wired (decision-only run)")
         outcome = fix_dispatch(comment, result)
         rb = outcome.rollback_failed
+        if outcome.status == "protection-conflict":
+            # Rolled back already; held for the owner on the thread, not escalated
+            # on the failed-fix rail.
+            return ActionResult(
+                comment.id, d, "escalated", outcome.detail, rollback_failed=rb,
+                protection_hold={"origin": outcome.protection_origin,
+                                 "protection_texts": list(outcome.protection_texts)})
 
         def _escalate(question: str) -> None:
             # Deliver a per-comment Ask on the SAME ``fix-<id>`` rail the round
@@ -317,7 +390,8 @@ def act_on_result(
             adapter.escalation.notifier.send(ask)
 
         if outcome.status == "applied":
-            return ActionResult(comment.id, d, "fixed", outcome.detail, rollback_failed=rb)
+            return ActionResult(comment.id, d, "fixed", outcome.detail, rollback_failed=rb,
+                                verified=outcome.verified)
         if outcome.status == "skipped":
             # A genuine validity judgment — the fixer decided nothing should be
             # applied. Render the honest sub-label it stated in its reason

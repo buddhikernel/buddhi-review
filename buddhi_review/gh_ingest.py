@@ -22,8 +22,8 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import dataclass
-from typing import Callable, FrozenSet, Iterable, List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Callable, FrozenSet, Iterable, List, Optional, Sequence, Tuple
 
 from buddhi.stage0.conditioning import RawItem
 
@@ -94,6 +94,9 @@ def _comment_from_raw(raw: dict, *, from_issue_channel: Optional[bool] = None) -
     # updated_at (when the payload carries it) lets an EDITED comment prove an
     # errored-reviewer comeback by its edit time; absent → None.
     updated = raw.get("updated_at")
+    # A reply inside a review thread names the thread's ROOT comment here; the
+    # protections hold and every thread decision are keyed on that root.
+    reply_to = raw.get("in_reply_to_id")
     # The loop passes from_issue_channel explicitly per endpoint. The seeded
     # (BUDDHI_REVIEW_COMMENTS_JSON) path has no endpoint, so infer it from the
     # payload: an issues/<pr>/comments object carries `issue_url` and lacks the
@@ -109,6 +112,8 @@ def _comment_from_raw(raw: dict, *, from_issue_channel: Optional[bool] = None) -
         created_at=str(created) if isinstance(created, str) and created else None,
         updated_at=str(updated) if isinstance(updated, str) and updated else None,
         from_issue_channel=from_issue_channel,
+        in_reply_to=(str(reply_to) if reply_to is not None and not isinstance(reply_to, bool)
+                     else None),
     )
 
 
@@ -179,6 +184,84 @@ def fetch_comments(
         except ValueError as exc:
             raise RuntimeError(f"failed to parse gh api response for {endpoint}: {exc}") from exc
     return comments
+
+
+def fetch_pr_body(
+    pr: str,
+    *,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> Optional[str]:
+    """The PR description, read whole — the source of the protections list. A
+    successful read of an empty or null body is ``""``; ANY failure (gh missing, a
+    non-zero exit, unparseable or body-less JSON, a non-string body) is ``None``, so
+    a caller never mistakes "could not read" for "no protections"."""
+    argv = ["gh", "pr", "view", str(pr), "--json", "body"]
+    if repo:
+        argv += ["-R", repo]
+    try:
+        proc = run(argv, cwd=cwd)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    try:
+        data = json.loads(getattr(proc, "stdout", "") or "")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict) or "body" not in data:
+        return None
+    body = data.get("body")
+    if body is None:
+        return ""
+    return body if isinstance(body, str) else None
+
+
+def fetch_authenticated_login(
+    *,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> Optional[str]:
+    """The login of the account ``gh`` is authenticated as — the account every
+    loop-posted thread reply carries — or None on any failure."""
+    try:
+        proc = run(["gh", "api", "user", "--jq", ".login"], cwd=cwd)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if getattr(proc, "returncode", 1) != 0:
+        return None
+    login = (getattr(proc, "stdout", "") or "").strip()
+    return login if login and "\n" not in login else None
+
+
+def post_protection_reply(
+    pr: str,
+    root_id: str,
+    body: str,
+    *,
+    inline: bool,
+    repo: Optional[str] = None,
+    cwd: Optional[str] = None,
+    run: Callable[..., "subprocess.CompletedProcess[str]"] = _default_run,
+) -> bool:
+    """Post ``body`` as a reply on the review thread whose ROOT is ``root_id``
+    (``inline``), or — for a review-body finding, which has no thread — on the PR
+    conversation. True only when GitHub accepted it and returned the new comment."""
+    repo_path = repo or "{owner}/{repo}"
+    endpoint = (f"repos/{repo_path}/pulls/{pr}/comments/{root_id}/replies" if inline
+                else f"repos/{repo_path}/issues/{pr}/comments")
+    try:
+        proc = run(["gh", "api", "-X", "POST", endpoint, "-f", f"body={body}"], cwd=cwd)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if getattr(proc, "returncode", 1) != 0:
+        return False
+    try:
+        data = json.loads(getattr(proc, "stdout", "") or "")
+    except (ValueError, TypeError):
+        return False
+    return isinstance(data, dict) and data.get("id") is not None
 
 
 def fetch_pr_diff_lines(
@@ -365,6 +448,17 @@ def _decode_concatenated(text: str) -> Iterable[dict]:
 
 
 @dataclass(frozen=True)
+class ThreadComment:
+    """One comment of a review thread, as the protections restore reads it: its
+    databaseId, body, author login, and the inline anchor it was posted on."""
+    id: str
+    body: str = ""
+    author: Optional[str] = None
+    path: Optional[str] = None
+    diff_hunk: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class ReviewThread:
     """One GitHub review thread on the PR. ``id`` is the GraphQL node id needed
     to resolve it; ``is_resolved`` is GitHub's own resolved flag; ``root_comment_id``
@@ -384,6 +478,18 @@ class ReviewThread:
     is_resolved: bool
     root_comment_id: Optional[str]
     comment_ids: FrozenSet[str] = frozenset()
+    # The thread's full history for the protections restore: every comment in
+    # order with its body and author, who resolved it, and whether GitHub returned
+    # ALL of its comments (an incomplete history is unavailable, never "absent").
+    # Kept out of equality so a thread built from ids alone still compares equal.
+    comments: Tuple[ThreadComment, ...] = field(default=(), compare=False)
+    resolved_by: Optional[str] = field(default=None, compare=False)
+    complete: bool = field(default=True, compare=False)
+
+
+def _login_of(node: object) -> Optional[str]:
+    login = node.get("login") if isinstance(node, dict) else None
+    return login if isinstance(login, str) and login else None
 
 
 def _review_thread_from_raw(raw: dict) -> Optional[ReviewThread]:
@@ -395,14 +501,26 @@ def _review_thread_from_raw(raw: dict) -> Optional[ReviewThread]:
         return None
     comments = raw.get("comments")
     nodes = comments.get("nodes") if isinstance(comments, dict) else None
+    page = comments.get("pageInfo") if isinstance(comments, dict) else None
     ids: List[str] = []
+    history: List[ThreadComment] = []
     if isinstance(nodes, list):
         for n in nodes:
             if isinstance(n, dict) and n.get("databaseId") is not None:
                 ids.append(str(n["databaseId"]))
+                body, path, hunk = n.get("body"), n.get("path"), n.get("diffHunk")
+                history.append(ThreadComment(
+                    id=str(n["databaseId"]),
+                    body=body if isinstance(body, str) else "",
+                    author=_login_of(n.get("author")),
+                    path=path if isinstance(path, str) else None,
+                    diff_hunk=hunk if isinstance(hunk, str) else None))
     root = ids[0] if ids else None
+    complete = not (isinstance(page, dict) and page.get("hasNextPage"))
     return ReviewThread(id=tid, is_resolved=bool(raw.get("isResolved")),
-                        root_comment_id=root, comment_ids=frozenset(ids))
+                        root_comment_id=root, comment_ids=frozenset(ids),
+                        comments=tuple(history), resolved_by=_login_of(raw.get("resolvedBy")),
+                        complete=complete)
 
 
 _REVIEW_THREADS_QUERY = """query($owner: String!, $name: String!, $pr: Int!, $cursor: String) {
@@ -413,11 +531,16 @@ _REVIEW_THREADS_QUERY = """query($owner: String!, $name: String!, $pr: Int!, $cu
         nodes {
           id
           isResolved
+          resolvedBy { login }
           # 100 comments/thread covers realistic review-thread depth; a thread
           # with >100 root+reply comments would need a per-thread nested-cursor
           # follow-up query (GraphQL can't paginate a nested connection in one
           # page fetch) — not worth the extra round-trips for a case this rare.
-          comments(first: 100) { nodes { databaseId } }
+          # pageInfo says when that happened, so the thread reads as incomplete.
+          comments(first: 100) {
+            pageInfo { hasNextPage }
+            nodes { databaseId body author { login } path diffHunk }
+          }
         }
       }
     }

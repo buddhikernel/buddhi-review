@@ -54,9 +54,12 @@ import fnmatch
 import os
 import re
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
+import tempfile
+from dataclasses import dataclass, field
 from typing import (
     AbstractSet, Callable, Dict, Iterator, List, Optional, Sequence, Set, Tuple,
 )
@@ -189,10 +192,11 @@ Run = Callable[..., "subprocess.CompletedProcess[str]"]
 
 
 def _default_run(argv: Sequence[str], *, cwd: Optional[str] = None,
-                 timeout: int = _GIT_TIMEOUT) -> "subprocess.CompletedProcess[str]":
+                 timeout: int = _GIT_TIMEOUT,
+                 env: Optional[Dict[str, str]] = None) -> "subprocess.CompletedProcess[str]":
     return subprocess.run(
         list(argv), capture_output=True, text=True, timeout=timeout,
-        stdin=subprocess.DEVNULL, cwd=cwd,
+        stdin=subprocess.DEVNULL, cwd=cwd, env=env,
     )
 
 
@@ -934,6 +938,43 @@ def _iter_porcelain_z(stdout: str) -> Iterator[Tuple[str, str]]:
         i += 1
 
 
+def _status_view(cwd: str, *, run: Run = _default_run
+                 ) -> Tuple[List[Tuple[str, str]], Optional[str]]:
+    """One ``git status --porcelain -z --untracked-files=all`` scan, parsed via
+    :func:`_iter_porcelain_z`, plus WHY it is incomplete (None when the read
+    succeeded). Staging reads only the entries (:func:`_status_entries`); a size
+    measurement must know an empty list from a failed read."""
+    try:
+        st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+                 cwd=cwd)
+    except (subprocess.SubprocessError, UnicodeDecodeError, OSError) as exc:
+        return [], f"git status could not run ({type(exc).__name__})"
+    if getattr(st, "returncode", 1) != 0:
+        return [], "git status failed"
+    out = getattr(st, "stdout", "") or ""
+    return list(_iter_porcelain_z(out)), (None if _porcelain_z_complete(out)
+                                          else "git status output was malformed")
+
+
+def _porcelain_z_complete(stdout: str) -> bool:
+    """True when every ``-z`` record is well formed: ``XY <path>``, and a rename or
+    copy record is followed by its origin field."""
+    fields = stdout.split("\0")
+    if fields and fields[-1] == "":
+        fields = fields[:-1]
+    i = 0
+    while i < len(fields):
+        rec = fields[i]
+        if len(rec) < 4 or rec[2] != " ":
+            return False
+        if rec[0] in "RC" or rec[1] in "RC":
+            if i + 1 >= len(fields) or not fields[i + 1]:
+                return False
+            i += 1
+        i += 1
+    return True
+
+
 def _status_entries(cwd: str, *, run: Run = _default_run) -> List[Tuple[str, str]]:
     """One ``git status --porcelain -z --untracked-files=all`` scan, parsed via
     :func:`_iter_porcelain_z` — the shared substrate for :func:`_detect_droppings`
@@ -945,14 +986,7 @@ def _status_entries(cwd: str, *, run: Run = _default_run) -> List[Tuple[str, str
     entry and would slip past both callers' scans, riding the ``git add -A`` into
     the commit. Best-effort: any error or a non-zero status → ``[]`` (each caller
     then falls back to its own safe default)."""
-    try:
-        st = run(["git", "status", "--porcelain", "-z", "--untracked-files=all"],
-                 cwd=cwd)
-    except (subprocess.SubprocessError, UnicodeDecodeError, OSError):
-        return []
-    if getattr(st, "returncode", 1) != 0:
-        return []
-    return list(_iter_porcelain_z(getattr(st, "stdout", "") or ""))
+    return _status_view(cwd, run=run)[0]
 
 
 def _detect_droppings(cwd: str, *, run: Run = _default_run) -> List[str]:
@@ -1177,6 +1211,7 @@ def _ambiguous_runner_parents(
 
 def _tracked_source_dirs(
     cwd: str, entries: Sequence[Tuple[str, str]], *, run: Run = _default_run,
+    failures: Optional[List[str]] = None,
 ) -> Set[str]:
     """Of the ambiguous runner-dir parents in ``entries``
     (:func:`_ambiguous_runner_parents`), those that DIRECTLY hold at least one file
@@ -1199,7 +1234,8 @@ def _tracked_source_dirs(
 
     Best-effort by design: any git/OS failure — including the unborn HEAD of a
     repo with no commits — returns an empty set, which is exactly the pre-existing
-    (hold-everything-back) behaviour."""
+    (hold-everything-back) behaviour. ``failures``, when given, records that the
+    answer came from a failure rather than from the repo."""
     parents = _ambiguous_runner_parents(entries)
     if not parents:
         return set()
@@ -1209,8 +1245,10 @@ def _tracked_source_dirs(
                   "HEAD", "--"],
             [f":(top,literal){d}" for d in sorted(set(parents.values()))], cwd=cwd)
     except (subprocess.SubprocessError, OSError, UnicodeDecodeError, ValueError):
-        return set()
+        listing = None
     if listing is None:
+        if failures is not None:
+            failures.append("reading the committed source directories failed")
         return set()
     # ``rpartition`` (not a segment rebuild) so a committed FILE named ``build``
     # yields ``""`` — it is emphatically not evidence that a ``build/`` DIRECTORY
@@ -1234,6 +1272,7 @@ def _tracked_source_dirs(
 def _renamed_into_runner_sources(
     cwd: str, entries: Sequence[Tuple[str, str]], *, run: Run = _default_run,
     source_dirs: AbstractSet[str] = frozenset(),
+    failures: Optional[List[str]] = None,
 ) -> Set[str]:
     """Deleted, still-tracked source paths from ``entries`` whose exact content is
     sitting in a NEW runner-classified path (:func:`_is_runner_dropping`) the glob
@@ -1312,7 +1351,7 @@ def _renamed_into_runner_sources(
         top = run(["git", "rev-parse", "--show-toplevel"], cwd=cwd)
         root = (getattr(top, "stdout", "") or "").strip()
         if getattr(top, "returncode", 1) != 0 or not root:
-            return set()
+            return _probe_failed(failures, "locating the repository top failed")
         blobs: Dict[str, str] = {}          # deleted path -> its pre-deletion blob sha
         modes: Dict[str, str] = {}          # deleted path -> its recorded file mode
         if worktree_deleted:
@@ -1325,7 +1364,7 @@ def _renamed_into_runner_sources(
                 run, ["git", "ls-files", "-s", "-z", "--full-name", "--"],
                 [f":(top,literal){p}" for p in worktree_deleted], cwd=cwd)
             if listing is None:
-                return set()
+                return _probe_failed(failures, "reading deleted files from the index failed")
             for rec in listing.split("\0"):
                 meta, sep, path = rec.partition("\t")
                 fields = meta.split()
@@ -1347,7 +1386,7 @@ def _renamed_into_runner_sources(
                 run, ["git", "ls-tree", "-l", "--full-tree", "-z", "HEAD", "--"],
                 [f":(top,literal){p}" for p in staged_deleted], cwd=cwd)
             if listing is None:
-                return set()
+                return _probe_failed(failures, "reading deleted files from HEAD failed")
             for rec in listing.split("\0"):
                 meta, sep, path = rec.partition("\t")
                 fields = meta.split()
@@ -1364,10 +1403,12 @@ def _renamed_into_runner_sources(
         for sha in sorted(set(blobs.values()) - set(blob_sizes)):
             r = run(["git", "cat-file", "-s", sha], cwd=cwd)
             if getattr(r, "returncode", 1) != 0:
+                _probe_failed(failures, "reading a deleted file's size failed")
                 continue
             try:
                 blob_sizes[sha] = int((getattr(r, "stdout", "") or "").strip())
             except ValueError:
+                _probe_failed(failures, "reading a deleted file's size failed")
                 continue
         # A 0-byte blob is NO identity at all: EVERY empty file hashes to the same
         # sha (``e69de29…``), so admitting that size would let any empty untracked
@@ -1405,7 +1446,7 @@ def _renamed_into_runner_sources(
             hashed = _run_batched_stdout(
                 run, ["git", "hash-object", "--"], probe, cwd=cwd)
             if hashed is None:
-                return set()
+                return _probe_failed(failures, "hashing candidate files failed")
             destinations = set(hashed.split())
         # EXACT blob identity, and a rename that also EDITS the file (``mv
         # src/old.py build/new.py`` followed by a rewrite) is a KNOWN, ACCEPTED
@@ -1433,10 +1474,18 @@ def _renamed_into_runner_sources(
         matched = {src for src, sha in blobs.items() if sha in destinations}
         if links:
             matched |= _symlink_renamed_sources(
-                links, blobs, modes, blob_sizes, cwd=cwd, run=run)
+                links, blobs, modes, blob_sizes, cwd=cwd, run=run, failures=failures)
         return matched
     except (subprocess.SubprocessError, OSError, UnicodeDecodeError, ValueError):
-        return set()
+        return _probe_failed(failures, "the moved-file probe failed")
+
+
+def _probe_failed(failures: Optional[List[str]], what: str) -> Set[str]:
+    """Record ``what`` for a caller that asked to know (a size measurement), and
+    give staging the same empty answer it has always fallen back on."""
+    if failures is not None:
+        failures.append(what)
+    return set()
 
 
 # A git index/tree entry mode of ``120000`` is a SYMLINK; its blob holds the link
@@ -1447,6 +1496,7 @@ _GIT_SYMLINK_MODE = "120000"
 def _symlink_renamed_sources(
     links: Sequence[str], blobs: Dict[str, str], modes: Dict[str, str],
     blob_sizes: Dict[str, int], *, cwd: str, run: Run = _default_run,
+    failures: Optional[List[str]] = None,
 ) -> Set[str]:
     """The SYMLINK half of :func:`_renamed_into_runner_sources`: of its deleted
     tracked paths (``blobs``: path -> index blob sha, ``modes``: path -> index
@@ -1485,6 +1535,8 @@ def _symlink_renamed_sources(
                                  if getattr(r, "returncode", 1) == 0 else None)
             except (subprocess.SubprocessError, OSError, UnicodeDecodeError):
                 contents[sha] = None
+            if contents[sha] is None:
+                _probe_failed(failures, "reading a deleted link's target failed")
         if contents[sha] in targets:
             matched.add(src)
     return matched
@@ -1497,64 +1549,120 @@ def _fmt_droppings(paths: Sequence[str], limit: int = 6) -> str:
     return f"{shown} (+{extra} more)" if extra > 0 else shown
 
 
-def _stage_all(
-    cwd: str, *, run: Run = _default_run,
-    notice: Callable[..., str] = automation_notice,
-) -> "subprocess.CompletedProcess[str]":
-    """``git add -A`` for the round's commit, minus editor/backup droppings, any
-    deleted source file paired with one (:func:`_risky_delete_pairs`) or moved into
-    a runner dir by an unstaged rename (:func:`_renamed_into_runner_sources`), and
-    — for a cold worktree — every UNTRACKED runner artifact (:func:`_is_runner_dropping`:
-    ``node_modules/``, ``target/``, ``build/``, ``bin/Debug/``, coverage output,
-    …). Runner artifacts are held back by a FIXED, count-INDEPENDENT glob pathspec
-    set (:func:`_runner_exclude_pathspecs`), so a tree with thousands of untracked
-    ``node_modules`` files never blows git's argv; a fixer's edit to a TRACKED file
-    under such a dir is recovered per-file and still committed, as is a NEW file the
-    fixer added beside committed source in an ambiguously-named ``build``/``target``/
-    ``deps``/``coverage`` dir (:func:`_tracked_source_dirs` — the glob is
-    source-blind, so those need the same per-file recovery).
+def scratch_index(cwd: str, *, run: Run = _default_run) -> Optional[str]:
+    """A private copy of the index ``run`` sees (its ``GIT_INDEX_FILE`` included),
+    for evaluating staging steps without touching that index. The caller deletes
+    the returned path. None when the index cannot be located or copied."""
+    try:
+        r = run(["git", "rev-parse", "--git-path", "index"], cwd=cwd)
+    except (subprocess.SubprocessError, OSError, UnicodeDecodeError):
+        return None
+    where = (getattr(r, "stdout", "") or "").strip()
+    if getattr(r, "returncode", 1) != 0 or not where:
+        return None
+    src = where if os.path.isabs(where) else os.path.join(cwd, where)
+    try:
+        fd, path = tempfile.mkstemp(prefix="buddhi-index-", suffix=".idx")
+        with os.fdopen(fd, "wb") as out:
+            if os.path.exists(src):
+                with open(src, "rb") as f:
+                    shutil.copyfileobj(f, out)
+        if os.path.getsize(path) == 0:
+            os.unlink(path)   # git builds a fresh index at a path that does not exist
+        else:
+            # Keep the index's own timestamp: git trusts an entry's cached stat
+            # data only when the index is newer than the file, so a fresh mtime
+            # would hide a same-second edit the live index still re-reads.
+            st = os.stat(src)
+            os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        return path
+    except OSError:
+        return None
 
-    The FIXED runner glob set is applied UNCONDITIONALLY — the guard must stay
-    fail-CLOSED for artifacts even when the porcelain scan came back empty because
-    it FAILED (see the comment above the exclude assembly), and with nothing
-    actually matching them the add is behaviourally a plain ``git add -A``. It
-    stages the whole worktree (``:/`` — the top of the tree, so the
-    scope matches a bare ``git add -A`` regardless of ``cwd``) with one
-    ``:(top,exclude,literal)`` pathspec per excluded path — a repo-root-anchored
-    LITERAL exact-path exclude (not a glob), aligning with the repo-root-relative
-    porcelain paths, matching at any depth, and never mis-firing on a legitimate
-    file — and emits an ``[auto]`` line naming what was kept out. Returns the ``git
-    add`` result unchanged so the caller's return-code check is untouched."""
-    entries = _status_entries(cwd, run=run)
-    # A staged rename whose DESTINATION is a dropping — a fixer that did
-    # ``git mv src.py src.py.bak`` (or ``mv src.py src.py.bak && git add -A``, which
-    # Git records the same way) — arrives as a SINGLE ``R  src.py.bak`` porcelain
-    # record, not the ``?? src.py.bak`` the dropping scan below keys on. Its staged
-    # column is ``R`` (already-in-HEAD per :func:`_new_to_head`), so it would sail
-    # straight past the scan and commit the ``.bak`` — the exact sweep this guard
-    # exists to stop. Un-stage those renames FIRST: that decomposes each back into
-    # its ``D src.py`` (the vanished real file) + ``?? src.py.bak`` (the new backup)
-    # halves, which the dropping scan and :func:`_risky_delete_pairs` below then
-    # handle exactly like a hand-rolled backup-then-replace — holding BOTH the backup
-    # and its now-orphaned source out of the commit. Only rename destinations that
-    # are themselves droppings are touched; a legitimate rename stays staged.
-    rename_droppings = sorted({
-        path for xy, path in entries
-        if (xy[0] in "RC" or xy[1] in "RC") and _is_dropping(path)
-    })
-    if rename_droppings:
-        reset_result = _run_batched(run, ["git", "reset", "-q", "--"],
-                     [f":(top,literal){p}" for p in rename_droppings], cwd=cwd)
-        if reset_result is not None and getattr(reset_result, "returncode", 1) != 0:
-            return reset_result
-        entries = _status_entries(cwd, run=run)
-    droppings = [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
-    risky = _risky_delete_pairs(entries)
+
+def scratch_run(cwd: str, *, run: Run = _default_run) -> Optional[Tuple[str, Run]]:
+    """A private copy of the index ``run`` sees and a runner pointed at it — or
+    None when the copy cannot be made, or ``run`` does not carry the environment
+    through to git (its commands would then reach the real index)."""
+    path = scratch_index(cwd, run=run)
+    if path is None:
+        return None
+    srun = with_index(run, path)
+    try:
+        r = srun(["git", "rev-parse", "--git-path", "index"], cwd=cwd)
+        seen = (getattr(r, "stdout", "") or "").strip()
+        honoured = (getattr(r, "returncode", 1) == 0 and seen
+                    and os.path.realpath(os.path.join(cwd, seen)) == os.path.realpath(path))
+    except (subprocess.SubprocessError, OSError, TypeError, UnicodeDecodeError):
+        honoured = False
+    if not honoured:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None
+    return path, srun
+
+
+def with_index(run: Run, index_path: str) -> Run:
+    """``run`` with every git command pointed at the index file ``index_path``
+    (through its environment, so the command itself is unchanged). An index an
+    inner wrapper already chose is kept."""
+    def _run(argv, **kw):
+        if kw.get("env") is not None:
+            env = dict(kw["env"])
+            env.setdefault("GIT_INDEX_FILE", index_path)
+        else:
+            env = dict(os.environ, GIT_INDEX_FILE=index_path)
+        kw["env"] = env
+        return run(argv, **kw)
+    return _run
+
+
+@dataclass
+class StagePlan:
+    """The complete staging decision for the round's commit, computed READ-ONLY
+    (:func:`stage_plan`): what to un-stage, what to hold back, what to recover. The
+    same plan drives the real commit (:func:`_stage_all`) and the projection of the
+    tree that commit would hold (``pr_size``), so the two can never disagree.
+
+    ``complete`` / ``reason``: whether every ``git status`` view the plan read
+    succeeded. Staging keeps its fail-closed fallback either way; a measurement
+    may not count from an incomplete view. ``normalized`` is False when a staged
+    rename into a dropping name was found but its un-staged view could not be
+    evaluated in a scratch index — staging then normalizes the live index and
+    re-reads, exactly as before."""
+    entries: List[Tuple[str, str]]
+    rename_droppings: List[str]
+    complete: bool = True
+    reason: Optional[str] = None
+    normalized: bool = True
+    droppings: List[str] = field(default_factory=list)
+    risky: Set[str] = field(default_factory=set)
+    source_dirs: Set[str] = field(default_factory=set)
+    moved_into_runner: Set[str] = field(default_factory=set)
+    excluded: List[str] = field(default_factory=list)
+    untracked_runner: List[str] = field(default_factory=list)
+    tracked_runner: List[str] = field(default_factory=list)
+    prestaged_runner: List[str] = field(default_factory=list)
+    source_children: List[str] = field(default_factory=list)
+
+
+def _plan_policy(cwd: str, plan: StagePlan, *, run: Run) -> StagePlan:
+    """Fill ``plan``'s hold-back / recovery lists from ``plan.entries`` — the
+    staging guard's whole policy, unchanged. ``run`` reads the same (normalized)
+    index the entries came from."""
+    entries = plan.entries
+    # Reads that fail fall back to the guard's long-standing safe answer; staging
+    # proceeds on it as always, but a measurement may not count from it.
+    failures: List[str] = []
+    plan.droppings = [path for xy, path in entries if _is_dropping(path) and _new_to_head(xy)]
+    plan.risky = _risky_delete_pairs(entries)
     # Which ambiguously-named dirs (``build``/``target``/``deps``/``coverage``) this
     # repo keeps SOURCE in, asked of the index ONCE and threaded through every
     # runner classification below, so the staging decision, the notice, the move
     # probe and the tripwire all read the same answer.
-    source_dirs = _tracked_source_dirs(cwd, entries, run=run)
+    plan.source_dirs = _tracked_source_dirs(cwd, entries, run=run, failures=failures)
     # An UNSTAGED rename INTO a runner dir (``mv src/old.py build/new.py``) arrives
     # as ``D src/old.py`` + ``?? build/new.py`` — no ``R`` record, so the staged-
     # rename decomposition above never sees it. The runner glob below holds the
@@ -1563,9 +1671,13 @@ def _stage_all(
     # runner_sources`), the same two-half protection a backup-then-replace pair
     # gets. Paths already held back as a risky-delete pair are dropped here so the
     # operator gets ONE notice about them, not two.
-    moved_into_runner = _renamed_into_runner_sources(
-        cwd, entries, run=run, source_dirs=source_dirs) - risky
-    excluded = droppings + sorted(risky | moved_into_runner)  # per-file holds
+    plan.moved_into_runner = _renamed_into_runner_sources(
+        cwd, entries, run=run, source_dirs=plan.source_dirs, failures=failures) - plan.risky
+    if failures:
+        plan.complete = False
+        plan.reason = plan.reason or failures[0]
+    plan.excluded = plan.droppings + sorted(plan.risky | plan.moved_into_runner)  # per-file holds
+    source_dirs = plan.source_dirs
 
     # ── Runner droppings (cold-worktree hardening) ───────────────────────────────
     # A cold worktree's gate run drops dependency-install / build / cache /
@@ -1612,27 +1724,91 @@ def _stage_all(
     #     file, the tripwire hid it, and the round reported ``pushed`` with the fix
     #     missing. Editor droppings and both held-back pair halves are subtracted:
     #     a ``build/src.py.bak`` must stay out however source-y its directory is.
-    runner_excludes = _runner_exclude_pathspecs()
-    untracked_runner = [path for xy, path in entries
-                        if _is_runner_dropping(path, source_dirs=source_dirs)
-                        and _new_to_head(xy)]
+    plan.untracked_runner = [path for xy, path in entries
+                             if _is_runner_dropping(path, source_dirs=source_dirs)
+                             and _new_to_head(xy)]
     # NO ``source_dirs`` here, deliberately: this list is "what the GLOB held back
     # that must be put back", and the glob is source-blind. Narrowing it would
     # strand a tracked ``build/keep.txt`` edit — excluded by the glob, then never
     # recovered — which is the very loss this whole guard exists to prevent.
-    tracked_runner = sorted({path for xy, path in entries
-                             if _is_runner_dropping(path) and not _new_to_head(xy)
-                             and xy[1] != " "}
-                            - risky - moved_into_runner)
-    prestaged_runner = sorted({
+    plan.tracked_runner = sorted({path for xy, path in entries
+                                  if _is_runner_dropping(path) and not _new_to_head(xy)
+                                  and xy[1] != " "}
+                                 - plan.risky - plan.moved_into_runner)
+    plan.prestaged_runner = sorted({
         path for xy, path in entries
         if _is_runner_dropping(path, source_dirs=source_dirs)
         and _new_to_head(xy) and xy != "??"})
-    source_children = sorted(
+    plan.source_children = sorted(
         {path for xy, path in entries
          if _new_to_head(xy) and _is_runner_dropping(path)
          and not _is_runner_dropping(path, source_dirs=source_dirs)}
-        - set(excluded))
+        - set(plan.excluded))
+    return plan
+
+
+def stage_plan(cwd: str, *, run: Run = _default_run) -> StagePlan:
+    """The round commit's staging decision, READ-ONLY: it never stages, resets or
+    rewrites the index ``run`` sees. The one normalization staging performs before
+    deciding — un-staging a staged rename whose destination is an editor dropping
+    (see :func:`_stage_all`) — is evaluated in a scratch copy of that index, and the
+    second status view and every index read after it come from there."""
+    entries, why = _status_view(cwd, run=run)
+    # A staged rename whose DESTINATION is a dropping — a fixer that did
+    # ``git mv src.py src.py.bak`` (or ``mv src.py src.py.bak && git add -A``, which
+    # Git records the same way) — arrives as a SINGLE ``R  src.py.bak`` porcelain
+    # record, not the ``?? src.py.bak`` the dropping scan keys on. Its staged
+    # column is ``R`` (already-in-HEAD per :func:`_new_to_head`), so it would sail
+    # straight past the scan and commit the ``.bak`` — the exact sweep the guard
+    # exists to stop. Staging un-stages those renames FIRST: that decomposes each
+    # back into its ``D src.py`` (the vanished real file) + ``?? src.py.bak`` (the
+    # new backup) halves, which the dropping scan and :func:`_risky_delete_pairs`
+    # then handle exactly like a hand-rolled backup-then-replace — holding BOTH the
+    # backup and its now-orphaned source out of the commit. Only rename
+    # destinations that are themselves droppings are touched; a legitimate rename
+    # stays staged.
+    rename_droppings = sorted({
+        path for xy, path in entries
+        if (xy[0] in "RC" or xy[1] in "RC") and _is_dropping(path)
+    })
+    plan = StagePlan(entries=entries, rename_droppings=rename_droppings,
+                     complete=why is None, reason=why)
+    if not rename_droppings:
+        return _plan_policy(cwd, plan, run=run)
+    scratch = scratch_run(cwd, run=run)
+    if scratch is None:
+        plan.normalized, plan.complete = False, False
+        plan.reason = plan.reason or "the index could not be copied to evaluate a staged rename"
+        return _plan_policy(cwd, plan, run=run)
+    scratch, srun = scratch
+    try:
+        reset = _run_batched(srun, ["git", "reset", "-q", "--"],
+                             [f":(top,literal){p}" for p in rename_droppings], cwd=cwd)
+        if reset is not None and getattr(reset, "returncode", 1) != 0:
+            plan.normalized, plan.complete = False, False
+            plan.reason = plan.reason or "un-staging a rename into a dropping name failed"
+            return _plan_policy(cwd, plan, run=run)
+        plan.entries, why = _status_view(cwd, run=srun)
+        if why is not None:
+            plan.complete, plan.reason = False, plan.reason or why
+        return _plan_policy(cwd, plan, run=srun)
+    finally:
+        try:
+            os.unlink(scratch)
+        except OSError:
+            pass
+
+
+def execute_stage_plan(cwd: str, plan: StagePlan, *, run: Run = _default_run
+                       ) -> "subprocess.CompletedProcess[str]":
+    """Carry out ``plan`` against the index ``run`` sees: the rename normalization,
+    the un-stage resets, the ``git add -A`` with every exclude, and the per-file
+    recoveries. Returns the result the caller checks, exactly as ``_stage_all``
+    always has. A staged rename into a dropping name needs no separate step here:
+    the plan was computed from its un-staged view, the backup is un-staged below
+    as a dropping, and its source is held or staged exactly as that view decided."""
+    excluded = plan.excluded
+    runner_excludes = _runner_exclude_pathspecs()
 
     # There is deliberately NO "nothing to hold back → bare ``git add -A``"
     # short-circuit here. Every list above is derived from :func:`_status_entries`,
@@ -1663,7 +1839,7 @@ def _stage_all(
     # the WRONG path (or miss its own); wrap each in ``:(top,literal)`` — an exact,
     # repo-root-anchored match — mirroring the ``:(top,exclude,literal)`` form
     # already used for the ``git add`` exclude below.
-    resets = [f":(top,literal){p}" for p in excluded + prestaged_runner]
+    resets = [f":(top,literal){p}" for p in excluded + plan.prestaged_runner]
     if resets:
         reset_result = _run_batched(run, ["git", "reset", "-q", "--"], resets, cwd=cwd)
         if reset_result is not None and getattr(reset_result, "returncode", 1) != 0:
@@ -1711,10 +1887,10 @@ def _stage_all(
     # install — becomes a directory pathspec that recursively stages the whole
     # untracked artifact tree the exclude had just held back (proven to reach a
     # remote). ``-u`` records that path's deletion and nothing else.
-    if getattr(add, "returncode", 1) == 0 and tracked_runner:
+    if getattr(add, "returncode", 1) == 0 and plan.tracked_runner:
         recovered = _run_batched(
             run, ["git", "add", "-u", "--"],
-            [f":(top,literal){p}" for p in tracked_runner], cwd=cwd)
+            [f":(top,literal){p}" for p in plan.tracked_runner], cwd=cwd)
         if recovered is not None:
             add = recovered
     # Recover the fixer's NEW files added beside committed source in an
@@ -1723,12 +1899,57 @@ def _stage_all(
     # artifact subtree before): every path here came from ``--untracked-files=all``
     # porcelain as an individual FILE, and a porcelain DIRECTORY entry is excluded
     # upstream in :func:`_is_runner_dropping`, so no pathspec here can name a tree.
-    if getattr(add, "returncode", 1) == 0 and source_children:
+    if getattr(add, "returncode", 1) == 0 and plan.source_children:
         kept = _run_batched(
             run, ["git", "add", "--"],
-            [f":(top,literal){p}" for p in source_children], cwd=cwd)
+            [f":(top,literal){p}" for p in plan.source_children], cwd=cwd)
         if kept is not None:
             add = kept
+    return add
+
+
+def _stage_all(
+    cwd: str, *, run: Run = _default_run,
+    notice: Callable[..., str] = automation_notice,
+) -> "subprocess.CompletedProcess[str]":
+    """``git add -A`` for the round's commit, minus editor/backup droppings, any
+    deleted source file paired with one (:func:`_risky_delete_pairs`) or moved into
+    a runner dir by an unstaged rename (:func:`_renamed_into_runner_sources`), and
+    — for a cold worktree — every UNTRACKED runner artifact (:func:`_is_runner_dropping`:
+    ``node_modules/``, ``target/``, ``build/``, ``bin/Debug/``, coverage output,
+    …). Runner artifacts are held back by a FIXED, count-INDEPENDENT glob pathspec
+    set (:func:`_runner_exclude_pathspecs`), so a tree with thousands of untracked
+    ``node_modules`` files never blows git's argv; a fixer's edit to a TRACKED file
+    under such a dir is recovered per-file and still committed, as is a NEW file the
+    fixer added beside committed source in an ambiguously-named ``build``/``target``/
+    ``deps``/``coverage`` dir (:func:`_tracked_source_dirs` — the glob is
+    source-blind, so those need the same per-file recovery).
+
+    The FIXED runner glob set is applied UNCONDITIONALLY — the guard must stay
+    fail-CLOSED for artifacts even when the porcelain scan came back empty because
+    it FAILED (see the comment above the exclude assembly), and with nothing
+    actually matching them the add is behaviourally a plain ``git add -A``. It
+    stages the whole worktree (``:/`` — the top of the tree, so the
+    scope matches a bare ``git add -A`` regardless of ``cwd``) with one
+    ``:(top,exclude,literal)`` pathspec per excluded path — a repo-root-anchored
+    LITERAL exact-path exclude (not a glob), aligning with the repo-root-relative
+    porcelain paths, matching at any depth, and never mis-firing on a legitimate
+    file — and emits an ``[auto]`` line naming what was kept out. Returns the ``git
+    add`` result unchanged so the caller's return-code check is untouched."""
+    plan = stage_plan(cwd, run=run)
+    if plan.rename_droppings and not plan.normalized:
+        # The scratch evaluation of the rename un-staging failed: normalize this
+        # index and plan from its fresh status, as the guard always did.
+        reset_result = _run_batched(run, ["git", "reset", "-q", "--"],
+                                    [f":(top,literal){p}" for p in plan.rename_droppings],
+                                    cwd=cwd)
+        if reset_result is not None and getattr(reset_result, "returncode", 1) != 0:
+            return reset_result
+        plan = _plan_policy(cwd, StagePlan(entries=_status_entries(cwd, run=run),
+                                           rename_droppings=[]), run=run)
+    add = execute_stage_plan(cwd, plan, run=run)
+    droppings, risky = plan.droppings, plan.risky
+    untracked_runner, moved_into_runner = plan.untracked_runner, plan.moved_into_runner
     if getattr(add, "returncode", 1) == 0:
         if droppings:
             notice("stage",

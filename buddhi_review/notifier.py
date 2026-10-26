@@ -32,6 +32,12 @@ class Ask:
     options: List[str] = field(default_factory=list)
     recommended_index: int = 0
     detail: str = ""
+    # Optional, in the same order as ``options``: one line explaining each option,
+    # and the action each displayed number stands for. An ask that sets details is
+    # rendered with its body, every detail and the recommendation on the console
+    # exactly as in its answer file; one that does not renders as it always has.
+    option_details: List[str] = field(default_factory=list)
+    actions: List[str] = field(default_factory=list)
 
 
 @runtime_checkable
@@ -78,14 +84,27 @@ class ConsoleNotifier:
     def startup_log(self) -> None:
         print("notifier: console — Clearance requests (decisions the loop needs from you) are answered from the terminal")
 
+    @staticmethod
+    def _option_lines(ask: Ask) -> List[str]:
+        """The numbered options; an ask with option details marks its recommended
+        option with a leading ⭐ and shows each detail under its option."""
+        lines: List[str] = []
+        for i, opt in enumerate(ask.options, 1):
+            recommended = (i - 1) == ask.recommended_index
+            if ask.option_details:
+                lines.append(f"{'⭐ ' if recommended else ''}{i}. {opt}")
+            else:
+                lines.append(f"{i}. {opt}{'  (recommended)' if recommended else ''}")
+            if i - 1 < len(ask.option_details) and ask.option_details[i - 1]:
+                lines.append(f"   {ask.option_details[i - 1]}")
+        return lines
+
     def send(self, ask: Ask) -> None:
         p = _answer_path(ask.id, self._pr, self._repo)
         lines: List[str] = [f"# {ask.question}", ""]
         if ask.detail:
             lines += [ask.detail, ""]
-        for i, opt in enumerate(ask.options, 1):
-            star = "  (recommended)" if (i - 1) == ask.recommended_index else ""
-            lines.append(f"{i}. {opt}{star}")
+        lines += self._option_lines(ask)
         lines += [
             "",
             "# Type a number (or your own text) after the '>' character (or on the next line), then save:",
@@ -124,8 +143,14 @@ class ConsoleNotifier:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
         print(f"\n[Clearance — a decision the loop needs from you] {ask.question}")
-        for i, opt in enumerate(ask.options, 1):
-            print(f"  {i}. {opt}")
+        if ask.option_details:
+            if ask.detail:
+                print(f"  {ask.detail}")
+            for line in self._option_lines(ask):
+                print(f"  {line}")
+        else:
+            for i, opt in enumerate(ask.options, 1):
+                print(f"  {i}. {opt}")
         print(f"  answer here → file://{p}")
 
     def read_answer(self, ask: Ask) -> Optional[str]:
