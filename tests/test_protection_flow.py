@@ -907,10 +907,15 @@ def test_description_protection_bytes(name, new):
      "- Never log", "- Do log"),
     (f"Use the ` key.\n## {T} <!-- one per line -->\nKeep `r` at 3\n", "at 3", "at 9"),
     (f"Notes:\n\n-  \n\n  ## {T}\n  - Keep retry count at 3\n", "at 3", "at 9"),
-], ids=["html-block-above-dashes", "lone-backtick-above", "empty-item-then-blank"])
+    (f"Old.\n\n## {T}\n<div>\n## Appendix\nKeep retry count at 3\n\n", "at 3", "at 9"),
+], ids=["html-block-above-dashes", "lone-backtick-above", "empty-item-then-blank",
+        "heading-inside-html-block"])
 def test_description_protection_bytes_reported_shapes(old, before, after):
     out, edits = _rewrite(old, old.replace(before, after))
     assert edits == [] and out.status == "protection-conflict"
+    # an unrelated rewrite that keeps the section still lands
+    out, edits = _rewrite(old, "New intro.\n\n" + old)
+    assert out.status == "applied" and edits == ["New intro.\n\n" + old]
 
 
 def test_description_protection_bytes_inside_an_empty_marker_item():
@@ -1280,6 +1285,51 @@ def test_entry_and_restart_an_unknown_request_is_never_guessed(sources):
     assert d._protection_holds["1"].get("unavailable")
 
 
+def _root_deleted(threads):
+    """The review thread on root 1 as GitHub returns it once that root is deleted."""
+    t = threads.threads["1"]
+    threads.threads["1"] = replace(t, comments=t.comments[1:], root_comment_id=t.comments[1].id,
+                                   comment_ids=frozenset(c.id for c in t.comments[1:]))
+    return threads
+
+
+@pytest.mark.parametrize("source", [None, "1", "2"],
+                         ids=["record-naming-no-request", "record-naming-the-root", "record-naming-the-reply"])
+def test_entry_and_restart_a_deleted_inline_root_keeps_its_hold(source):
+    # Root 1 is gone; its authentic pending record and reply 2 remain on the thread.
+    # The hold stands, unavailable, since no decision could be recorded against a
+    # deleted root: reply 2 is never applied and nothing merges.
+    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]], source)
+    t = _root_deleted(Threads().add("1", history=[("2", "relax it", "claude[bot]"), ("3", pend, LOGIN)]))
+    fixed = []
+    d, gh, events, _ = _drive([(0, _inline("2", "relax it", reply_to="1"))], threads=t, auto_merge=True,
+                              classify=_classify("COSMETIC"), answer=lambda a: "2",
+                              fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
+    out = d.run()
+    assert d._protection_holds["1"].get("unavailable") and _asks(events) == []
+    assert fixed == [] and not _merged(gh) and out.status == "needs-human"
+    # a thread whose deleted root left no record, only another author's marker, or a
+    # quoted one, is read as before
+    for extra in ([], [("3", pend, "someone")], [("3", "> " + pend, LOGIN)]):
+        t = _root_deleted(Threads().add("1", history=[("2", "relax it", "claude[bot]")] + extra))
+        fixed = []
+        d, gh, events, _ = _drive([(0, _inline("2", "relax it", reply_to="1"))], threads=t,
+                                  auto_merge=True, classify=_classify("COSMETIC"),
+                                  fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
+        assert d.run().status == "clean" and fixed == ["2"] and _merged(gh)
+
+
+def test_entry_and_restart_a_record_copied_to_another_thread_never_reopens_its_hold():
+    # Root 1's thread holds its pending record and the owner's Keep; an exact copy of
+    # the pending record on thread 7 does not restore root 1's hold over that Keep.
+    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]], "1")
+    t = _restored(Threads(), (pend, LOGIN), (P.record_body("keep", "1", "fixer", [BLOCKS[0]]), LOGIN))
+    t.add("7", history=[("70", pend, LOGIN)])
+    d, gh, events, _ = _drive([], threads=t)
+    d._protections_at_start()
+    assert d._protection_holds["1"]["state"] == "keep" and set(d._protection_holds) == {"1"}
+
+
 @pytest.mark.parametrize("author", [LOGIN, "someone-else"], ids=["older-record", "another-authors-marker"])
 def test_entry_and_restart_a_hold_naming_no_request_is_asked_and_allow_sends_nothing(author):
     t = _restored(Threads(), (P.record_body("pending", "1", "fixer", [BLOCKS[0]]), author))
@@ -1357,10 +1407,47 @@ def test_entry_and_restart_a_kept_request_stays_refused():
     assert {a.comment_id: a.final for a in out.actions} == {"1": "fixed", "2": "escalated"}
 
 
-def test_entry_and_restart_an_unreadable_history_alone_keeps_a_clean_pr_unmerged():
-    d, gh, _, _ = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
-                         body="## Other requirements\n- x\n", login=None, auto_merge=True)
-    assert d.run().status == "needs-human" and not _merged(gh)
+@pytest.mark.parametrize("case", ["login-only", "section-listed", "marker-read", "marker-read-no-edit",
+                                  "marker-read-later", "marker-read-at-merge", "marker-in-poll",
+                                  "threads-unread", "comments-unread"])
+def test_entry_and_restart_a_login_failure_alone_keeps_todays_behaviour(case):
+    # A section-free PR whose login cannot be read: with complete, marker-free reads
+    # it is fixed and merged as today. A marker anyone posted, valid or not, even one
+    # read only when merging, or a failed read that could hide one, keeps it unmerged;
+    # one the round's own poll reads stops that round's edit.
+    t, fixed = Threads(), []
+    t.fail = case == "threads-unread"
+    marker = Comment(id="90", text="> " + P.record_body("keep", "5", "fixer", ["x"]), source="someone",
+                     from_issue_channel=True)
+    late = 30 if case == "marker-in-poll" else 0
+
+    def fix(c, r):
+        fixed.append(c.id)
+        if case == "marker-read-later":     # a marker reply lands on the thread meanwhile
+            t.add("1", history=[("m", marker.text, "someone")])
+        return FixOutcome(status="applied")
+    timeline = ([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))]
+                if case in ("marker-read-no-edit", "marker-read-at-merge")
+                else [(late, _inline("1", "fix it"))] + ([(late, marker)] if late else []))
+    d, gh, _, _ = _drive(timeline, threads=t,
+                         body=BODY if case == "section-listed" else "## Other requirements\n- x\n",
+                         login=None, classify=_classify("COSMETIC"), auto_merge=True, fix=fix)
+    fetch, reads = d.fetch, []
+    d.fetch = lambda *a, **k: fetch(*a, **k) + (
+        [marker] if case in ("marker-read", "marker-read-no-edit") else [])
+    if case == "marker-read-at-merge":      # on a resolved thread, after the start read
+
+        def threads_now(*a, **k):
+            reads.append(1)
+            if len(reads) == 2:
+                t.add("1", history=[("m", marker.text, "someone")], resolved=True, by="someone")
+            return t.fetch(*a, **k)
+        d.fetch_threads = threads_now
+    if case == "comments-unread":
+        _first_read_fails(d)
+    out = d.run()
+    assert _merged(gh) == (case == "login-only") and (out.status == "clean") == _merged(gh)
+    assert fixed == (["1"] if case in ("login-only", "marker-read-later") else [])
 
 
 def test_entry_and_restart_readable_history_without_a_section_keeps_todays_behaviour():

@@ -1347,6 +1347,9 @@ class RoundDriver:
         # True when the thread history or the loop's login could not be read: a hold
         #   may exist that the run cannot see, so merging waits.
         self._protection_history_unknown = False
+        # A hold may stand: the latest reads show a record marker (whoever wrote it,
+        #   valid or not), or one that would show it failed.
+        self._history_may_hold = False
         self._kept_roots: Set[str] = set()       # Keep decided: the gate may resolve
         self._round_held_ids: Set[str] = set()   # comment ids held this round
         self._edits_deferred = False             # a reviewer edit was held back unmade
@@ -1717,6 +1720,9 @@ class RoundDriver:
 
     def _ingest_new(self) -> List[Comment]:
         comments = self.fetch(self.pr, repo=self.repo, cwd=self.cwd)
+        # A record marker read here, whoever wrote it, may stand for a hold.
+        if any(protections.MARKER in (c.text or "") for c in comments):
+            self._history_may_hold = True
         fresh = [c for c in comments if c.id not in self.processed_ids]
         for c in fresh:
             self.processed_ids.add(c.id)
@@ -3918,15 +3924,16 @@ class RoundDriver:
 
     def _adopt_restored(self, hold: dict, by_id: Dict[str, Comment], *, inline: bool) -> None:
         """Adopt a restored hold with the requests its records name, read back from
-        those very comments. A pending hold any of whose requests cannot be found
-        (a deleted or emptied comment, a record naming none) is unavailable: it
-        blocks, but is never asked about or re-dispatched by guesswork."""
+        those very comments. A pending hold whose root or any of whose requests
+        cannot be found (a deleted or emptied comment, which no decision can then
+        be recorded against) is unavailable: it blocks, but is never asked about or
+        re-dispatched by guesswork."""
         names = hold.get("sources") or []
         found = [by_id[s] for s in names if s in by_id]
-        if len(found) < len(names):
+        if len(found) < len(names) or hold["root_id"] not in by_id:
             hold["unavailable"] = True          # read only by the pending-hold ask
-        # A hold naming no request (an older or another author's marker) is still
-        # asked about, quoting its root; its Allow re-sends nothing.
+        # A hold naming no request (an older or another author's marker) whose root
+        # reads is still asked about, quoting it; its Allow re-sends nothing.
         first = (found or [by_id.get(hold["root_id"]) or Comment(id=hold["root_id"], text="")])[0]
         key = self._adopt_hold(hold, request=first.text, reviewer=first.source,
                                inline=inline, path=first.path, diff_hunk=first.diff_hunk)
@@ -3938,28 +3945,38 @@ class RoundDriver:
         before any resolved-thread filtering. An unreadable login or history leaves
         the run unable to rule a hold out, so merging waits."""
         login = self._login()
-        threads = self._thread_history() if login else None
+        threads = self._thread_history()
         try:
             comments = self.fetch(self.pr, repo=self.repo, cwd=self.cwd)
         except Exception:
             comments = None
+        bodies = ([c.body or "" for t in threads or () for c in t.comments]
+                  + [c.text or "" for c in comments or ()])
+        self._history_may_hold = (threads is None or comments is None
+                                  or any(protections.MARKER in b for b in bodies))
         if login is None or threads is None or comments is None:
             self._protection_history_unknown = True
             return
         self._protection_history_unknown = False
+        firsts = {t.comments[0].id for t in threads if t.comments}
         for t in threads:
             if not t.comments:
                 continue
-            root = t.comments[0]
-            hold = protections.restore_protection_hold(
-                root_id=root.id, login=login,
-                history=[{"root_id": root.id, "body": c.body, "author": c.author}
-                         for c in t.comments])
-            if hold is not None:
-                self._adopt_restored(hold, {c.id: Comment(
-                    id=c.id, text=c.body, source=c.author or "reviewer", path=c.path,
-                    diff_hunk=c.diff_hunk, in_reply_to=None if c is root else root.id)
-                    for c in t.comments}, inline=True)
+            # A deleted root's authentic records still name it: its hold is restored
+            # from the thread that carries them, as is the thread's first comment's.
+            # Another author's marker for a root that is not there claims nothing.
+            named = {d["root"] for d in (protections.parse_record(c.body)
+                                         for c in t.comments if c.author == login) if d}
+            for root_id in [t.comments[0].id] + sorted(named - firsts):
+                hold = protections.restore_protection_hold(
+                    root_id=root_id, login=login,
+                    history=[{"root_id": root_id, "body": c.body, "author": c.author}
+                             for c in t.comments])
+                if hold is not None:
+                    self._adopt_restored(hold, {c.id: Comment(
+                        id=c.id, text=c.body, source=c.author or "reviewer", path=c.path,
+                        diff_hunk=c.diff_hunk, in_reply_to=None if c.id == root_id else root_id)
+                        for c in t.comments}, inline=True)
         bodies = {c.id: c for c in comments if not c.path and not c.from_issue_channel}
         records = [c for c in comments if c.from_issue_channel and protections.MARKER in c.text]
         for root_id in sorted({d["root"] for d in map(protections.claimed_record,
@@ -3992,10 +4009,13 @@ class RoundDriver:
         self._restore_protection_holds()
 
     def _history_blocks_edits(self) -> bool:
-        """The hold history could not be read: any comment may sit on a held
-        thread — whatever the description lists now, since a hold outlives its
-        section — so no reviewer edit may land until the history reads."""
-        return self._protection_history_unknown
+        """The hold history could not be read where a hold may stand — the
+        description lists protections, a marker was read, or a read that would
+        show one failed — so no reviewer edit may land until it reads. A login
+        failure alone, with complete marker-free reads, changes nothing."""
+        snap = self._round_protections
+        return self._protection_history_unknown and (
+            self._history_may_hold or (snap is not None and snap.found))
 
     def _unasked_hold_comments(self, present: Iterable[str]) -> List[Comment]:
         """A comment standing for each pending hold not yet asked this run (a
@@ -4193,9 +4213,9 @@ class RoundDriver:
         """Every merge route — automatic, attended, no reviewers left — asks this
         first. Merging waits while the protections are unreadable with no earlier
         reading or over the limit, after any reviewer edit was held back unmade, while
-        the hold history could not be read, while any hold is unanswered, and while a
-        manual hold's thread has not since been resolved by the account the loop runs
-        as."""
+        the hold history could not be read where a hold may stand, while any hold is
+        unanswered, and while a manual hold's thread has not since been resolved by
+        the account the loop runs as."""
         if self.protections_fetch is None:
             return True
         snap = self._refresh_protections()
@@ -4203,7 +4223,7 @@ class RoundDriver:
             return False
         if self._protection_history_unknown:
             self._restore_protection_holds()
-            if self._protection_history_unknown:
+            if self._history_blocks_edits():
                 return False
         if self._has_pending_hold():
             return False

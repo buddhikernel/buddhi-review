@@ -158,11 +158,49 @@ EDGES = [
      ["-   a\n b <!-- z\n    # Heading -->", "- c"]),
     ("setext_after_comment_block", S + "- a\n\nPara\n<!-- c\n-->\nmore\n---\n- b\n", ["- a", "Para"]),
     ("setext_sub_two_lines", f"# {T}\nSub\nline\n---\npara\n", ["Sub\nline\n---\npara"]),
-    # an HTML block line takes an underline with it; an item that begins with a blank
-    # line ends at a second; a heading or quote line keeps no code span open; a
+    # an HTML block runs to its blank line, underline and all; an item that begins with
+    # a blank line ends at a second; a heading or quote line keeps no code span open; a
     # backslash escapes nothing in raw HTML; a quote holding no paragraph has no lazy line
     ("html_block_then_dashes", S + "Keep A.\n<div>\n---\n- Never log tokens\n",
-     ["Keep A.\n<div>", "- Never log tokens"]),
+     ["Keep A.", "<div>\n---\n- Never log tokens"]),
+    ("html_block_ends_item", S + "- a\n<div>\n## Appendix\nKeep it\n", ["- a", "<div>\n## Appendix\nKeep it"]),
+    ("html_block_ends_at_blank", S + "<div>\nKeep A\n\n## Next\n- b\n", ["<div>\nKeep A"]),
+    ("html_block_ends_with_item", S + "- a\n\n  <div>\n  x\n## Next\n- b\n", ["- a\n\n  <div>\n  x"]),
+    ("html_block_ends_with_its_item", S + "- a\n\n  <div>\n- b\n  x \\<!-- c -->\n",
+     ["- a\n\n  <div>", "- b\n  x \\<!-- c -->"]),
+    # a comment in raw HTML closes within its block, never past a blank line or its item
+    ("html_comment_stops_at_blank", S + "<div> <!-- x\n\nKeep -->\n", ["<div> <!-- x", "Keep -->"]),
+    ("html_comment_stops_at_item", S + "- <div> <!-- x\n- b -->\n", ["- <div> <!-- x", "- b -->"]),
+    ("html_block_comment_line", S + "<div>\n<!-- c -->\nx\n", ["<div>\nx"]),
+    ("html_block_multiline_comment", S + "<div>\na <!-- x\ny --> b\n", ["<div>\na\n b"]),
+    ("html_block_comment_over_tags", S + "<div>\n<!--\n<p>Drop the retry cap</p>\n-->\nKeep retry count at 3\n</div>\n",
+     ["<div>\nKeep retry count at 3\n</div>"]),
+    ("two_comment_lines", S + "<!-- a --> x\n<!-- b --> y\n", ["x", "y"]),
+    ("lone_tag_continues_para", S + "Para\n<span>\n## Next\n", ["Para\n<span>"]),
+    ("lone_tag_continues_quote", S + "> quote\n<span>\n## Next\n", ["> quote\n<span>"]),
+    ("lazy_underline_then_tag", f"- a\n===\n<span>\n## {T}\n- Keep retry count at 3\n", ["- Keep retry count at 3"]),
+    # an item or quote holding an HTML block has no paragraph, so nothing after it is lazy
+    ("setext_after_tag_item", f"- <div>\nOther\n===\n{T}\n===\n\n- keep this\n", ["- keep this"]),
+    ("tag_item_then_lone_tag", S + "- keep a\n- <div>x\n<span>\n## Notes\n- keep b\n",
+     ["- keep a", "- <div>x", "<span>\n## Notes\n- keep b"]),
+    ("tag_quote_then_lone_tag", S + "> <div>x\n<span>\n## Notes\n- keep b\n", ["> <div>x", "<span>\n## Notes\n- keep b"]),
+    ("lone_tag_quote_then_lone_tag", S + "> <span>\n<i>\n## Notes\n- keep b\n", ["> <span>", "<i>\n## Notes\n- keep b"]),
+    ("tag_item_block_continues", S + "- <div>\n  x \\<!-- c -->\n", ["- <div>\n  x \\"]),
+    ("tag_item_then_label", f"- <div>\n{T}:\n\n- keep a\n", ["- keep a"]),
+    ("tag_item_then_text_and_block", f"- <span>\ntext\n\n  <div>\n{T}:\n\n- keep\n", None),
+    ("comment_rest_in_item_block", S + "- item\n\n  <div>\n  <!-- a\n  --> <!-- b\nkeep this rule -->\n",
+     ["- item\n\n  <div>\n <!-- b", "keep this rule -->"]),
+    ("quote_kind3_then_code", S + "> <?php\n    x <!-- keep -->\n", ["> <?php", "    x <!-- keep -->"]),
+    ("quote_inline_html_lazy", S + "> <b>bold</b> text\n    more <!-- c -->\n", ["> <b>bold</b> text\n    more"]),
+    ("tag_with_comment_takes_setext", S + "- a\n\n<span> <!-- c -->\n---\n- b\n", ["- a"]),
+    # kinds 1-5 are not read as blocks, but their opener keeps an underline from a heading
+    ("html_kind3_then_dashes", S + "Keep A.\n<?php\n---\n- b\n", ["Keep A.\n<?php", "- b"]),
+    # pre, script, style and textarea (kind 1) and malformed tags open no lone-tag block
+    *[(f"no_lone_tag_{i}", f"## Above\n{t}\n## {T}\n- Keep retry count at 3\n", ["- Keep retry count at 3"])
+      for i, t in enumerate(["<pre>\nx\n</pre>", "<script>\nx\n</script>", "<style>\nx\n</style>",
+                             "<textarea>\nx\n</textarea>", "<PRE>\nx\n</PRE>", "<What changed, and why?>",
+                             '</span class="x">',
+                             "<a href=https://x/?q=1>", "<a 1x>", '<a "b">'])],
     ("empty_item_then_blank", f"Notes:\n\n-  \n\n  ## {T}\n  - Keep retry count at 3\n",
      ["  - Keep retry count at 3"]),
     ("empty_item_then_blank_ends", S + "- a\n-  \n\n  ## Next\n- outside\n", ["- a"]),
@@ -178,13 +216,13 @@ EDGES = [
     ("quote_empty_item_then_code", S + "> -\n    retries = 3\n", ["> -", "    retries = 3"]),
     ("empty_item_with_content", S + "-\n  foo\n\n  bar\n", ["-\n  foo\n\n  bar"]),
     # a line that is no fence continues lazily; only plain quote text takes an
-    # indented lazy line; inline HTML still makes a heading, a lone tag does not;
+    # indented lazy line; inline HTML still makes a heading, a lone tag opens a block;
     # an item opening with a comment is raw HTML, where no backslash escapes
     ("fence_like_lazy_line", S + "- Keep it quoted as\n```` `make` ````\nin every job\n---\n- b\n",
      ["- Keep it quoted as\n```` `make` ````\nin every job", "- b"]),
     ("indented_after_quote_item", f"> - ## Example\n    $ make\n{T}:\n\n- a\n", ["- a"]),
     ("inline_html_setext_ends", S + "- a\n\n<b>Changelog</b>\n---\n- b\n", ["- a"]),
-    ("lone_tag_takes_underline", S + "- a\n\n<span>\n---\n- b\n", ["- a", "<span>", "- b"]),
+    ("lone_tag_takes_underline", S + "- a\n\n<span>\n---\n- b\n", ["- a", "<span>\n---\n- b"]),
     ("item_html_no_escape", S + "- <!-- n --> \\<!-- hidden --> keep\n", ["-  \\ keep"]),
     ("item_heading_backtick", S + "- ## Detail ` <!-- hidden -->\n  Keep `x` at 3\n",
      ["- ## Detail `\n  Keep `x` at 3"]),
@@ -200,11 +238,12 @@ EDGES = [
      [">     code", "    more <!-- keep -->"]),
     ("quote_html_no_escape", S + "> <!-- n --> \\<!-- hidden --> x\n", [">  \\ x"]),
     ("item_quote_html_no_escape", S + "- > <!-- n --> \\<!-- hidden --> x\n", ["- >  \\ x"]),
-    # every kind of HTML block opener is raw HTML; any lone tag takes the underline
+    # every kind of HTML block opener is raw HTML; any lone tag opens a block
     *[(f"html_opener_{i}", S + f"{o} \\<!-- hidden --> x\n", [f"{o} \\ x"]) for i, o in
       enumerate(["<pre>", "<?php", "<!DOCTYPE html", "<![CDATA[", "<DIV>", "<p/>", "</div>"])],
-    *[(f"lone_tag_{i}", S + f"- a\n\n{t}\n---\n- b\n", ["- a", t, "- b"]) for i, t in
-      enumerate(["</span>", '<span class="x">', "<br/>"])],
+    *[(f"lone_tag_{i}", S + f"- a\n\n{t}\n---\n- b\n", ["- a", f"{t}\n---\n- b"]) for i, t in
+      enumerate(["</span>", '<span class="x">', "<br/>", "<a b=c>", "<a b='c d'>", "<input disabled>",
+                 '<img alt="a -> b">', "<pre-x>"])],
     # a title that continues a paragraph is not one
     ("setext_multiline_title", f"intro\n{T}\n===\n- a\n", None),
     ("label_continues_para", f"intro\n{T}:\n\n- a\n", None),
@@ -237,6 +276,9 @@ REPORTED = [
      ["- Keep `<!--\nnot a comment -->` rule"], None),
     ("second_inline_comment", S + "- Keep <!-- first\nend --> words <!-- second --> tail\n",
      ["- Keep\n words  tail"], None),
+    # a heading-like line inside an HTML block is raw HTML, up to the block's blank line
+    ("html_block", f"Old.\n\n{S}<div>\n## Appendix\nKeep retry count at 3\n\n",
+     ["<div>\n## Appendix\nKeep retry count at 3"], f"{S}<div>\n## Appendix\nKeep retry count at 3\n\n"),
 ]
 
 
