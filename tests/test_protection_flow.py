@@ -907,9 +907,11 @@ def test_description_protection_bytes(name, new):
      "- Never log", "- Do log"),
     (f"Use the ` key.\n## {T} <!-- one per line -->\nKeep `r` at 3\n", "at 3", "at 9"),
     (f"Notes:\n\n-  \n\n  ## {T}\n  - Keep retry count at 3\n", "at 3", "at 9"),
-    (f"Old.\n\n## {T}\n<div>\n## Appendix\nKeep retry count at 3\n\n", "at 3", "at 9"),
-], ids=["html-block-above-dashes", "lone-backtick-above", "empty-item-then-blank",
-        "heading-inside-html-block"])
+    *[(f"Old.\n\n## {T}\n{o}\n## Appendix\nKeep retry count at 3\n\n", "at 3", "at 9") for o in (
+        "<div>", "<pre>", "<?php", "<!X", "<![CDATA[", "<div>\n\xa0", "<div>\n\f", "<div>\n\v", "<div>\n ")],
+], ids=["html-block-above-dashes", "lone-backtick-above", "empty-item-then-blank"] + [
+    f"heading-inside-html-block-{n}" for n in ("div", "pre", "pi", "decl", "cdata", "nbsp", "form-feed",
+                                                 "vertical-tab", "em-space")])
 def test_description_protection_bytes_reported_shapes(old, before, after):
     out, edits = _rewrite(old, old.replace(before, after))
     assert edits == [] and out.status == "protection-conflict"

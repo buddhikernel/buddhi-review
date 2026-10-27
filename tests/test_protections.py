@@ -193,8 +193,58 @@ EDGES = [
     ("quote_kind3_then_code", S + "> <?php\n    x <!-- keep -->\n", ["> <?php", "    x <!-- keep -->"]),
     ("quote_inline_html_lazy", S + "> <b>bold</b> text\n    more <!-- c -->\n", ["> <b>bold</b> text\n    more"]),
     ("tag_with_comment_takes_setext", S + "- a\n\n<span> <!-- c -->\n---\n- b\n", ["- a"]),
-    # kinds 1-5 are not read as blocks, but their opener keeps an underline from a heading
-    ("html_kind3_then_dashes", S + "Keep A.\n<?php\n---\n- b\n", ["Keep A.\n<?php", "- b"]),
+    # kinds 1-5 interrupt a paragraph and run to their end, past blank lines, or to
+    # the end of their container
+    ("html_kind3_then_dashes", S + "Keep A.\n<?php\n---\n- b\n", ["Keep A.", "<?php\n---\n- b"]),
+    *[(f"html_ends_{i}", S + f"{o}\n\nx\n{e}\n## Next\n- b\n", [f"{o}\n\nx\n{e}"]) for i, (o, e) in
+      enumerate([("<pre>", "</script>"), ("<Script>", "</PRE>"), ("<?php", "?>"), ("<!X", ">"),
+                 ("<![CDATA[", "]]>")])],
+    ("html_ends_on_its_line", S + "<pre>x</pre>\n## Next\n", ["<pre>x</pre>"]),
+    ("html_ends_with_item", S + "- <pre>\n  ## x\n## Next\n", ["- <pre>\n  ## x"]),
+    ("html_ends_with_item_then_blank", S + "- <pre>\n## Next\n\n- b\n", ["- <pre>"]),
+    ("html_end_in_comment_rest", S + "<pre> <!-- x\n--> </pre>\n## Next\n", ["<pre>\n </pre>"]),
+    ("cdata_is_case_sensitive", S + "<![cdata[\n## Next\n", ["<![cdata["]),
+    ("pre_x_is_a_lone_tag", S + "<pre-x>\n\n## Next\n", ["<pre-x>"]),
+    ("item_comment_block", S + "- <!-- c -->\n\n  x \\<!-- y -->\n", ["-\n\n  x \\<!-- y -->"]),
+    ("label_after_item_block", f"- <pre>\n## Above\n\n{T}:\n\n- a\n", ["- a"]),
+    # a comment in a kind 1-5 block never reaches past the block's end line
+    *[(f"comment_in_block_{i}", f"{b}\n{S}- Keep retry count at 3{t}\n", [f"- Keep retry count at 3{t}"])
+      for i, (b, t) in enumerate([("Intro\n<pre>\n<!-- sample output\n</pre>\n-->", ""),
+                                  ("<pre>\nfoo <!-- x\n</pre>", " -->"), ("<pre> <!-- x\n</pre>\n-->", ""),
+                                  ("<?php\n<!-- x\n?>\n-->", "")])],
+    ("end_on_opener_with_comment", S + "<pre> <!-- x </pre>\nKeep -->\n", ["<pre> <!-- x </pre>", "Keep -->"]),
+    ("comment_spans_blank_in_pre", S + "<pre>\na <!-- x\n\ny -->\n</pre>\n", ["<pre>\na\n</pre>"]),
+    ("reopened_comment_in_pre", S + "<pre>\na <!-- x\nb --> c <!-- y\n</pre>\n## Next\nz -->\n",
+     ["<pre>\na\n c <!-- y\n</pre>"]),
+    ("item_pre_comment", S + "- <pre> <!-- x\n  </pre>\n  y -->\n", ["- <pre> <!-- x\n  </pre>\n  y -->"]),
+    ("fence_close_nbsp", S + "```\nretry = 3\n```\xa0\n## Next\nKeep retry count at 3\n",
+     ["```\nretry = 3\n```\xa0\n## Next\nKeep retry count at 3"]),
+    # a line of other whitespace is paragraph text that shows nothing
+    ("nbsp_then_lone_tag", f"## Shots\n\xa0\n<img src=\"a.png\">\n\xa0\n{S}- Keep retry count at 3\n",
+     ["- Keep retry count at 3"]),
+    ("nbsp_label_paragraph", S + f"- Keep retry count at 3\n\n{T}:\n\xa0\nNever log tokens\n",
+     ["- Keep retry count at 3", f"{T}:\n\nNever log tokens"]),
+    ("nbsp_lazy_in_item", f"{T}:\n- Keep retry count at 3\n\n  \xa0\nand never log tokens\n",
+     ["- Keep retry count at 3\n\n\nand never log tokens"]),
+    ("nbsp_then_setext", f"Summary.\n\n{S}- Keep A\n\n\xa0\nNotes\n-----\nold note\n", ["- Keep A"]),
+    ("comment_nbsp_split", S + "Keep A\n<!-- c -->\n\xa0\nKeep B\n", ["Keep A", "Keep B"]),
+    ("ff_comment_lazy", S + "- Keep A\n\f<!-- note\n-->\n", ["- Keep A"]),
+    ("quote_comment_nbsp", f"> <!-- quoted note\n\xa0\n{S}- Keep A\n<!-- end -->\n", ["- Keep A"]),
+    # a tag name ends at a space, a tab, ">" or the line end; a closing pre is no lone tag
+    ("pre_nbsp_name", S + "<pre\xa0x\n\n## Next\n", ["<pre\xa0x"]),
+    ("div_ff_name", S + "<div\fx\n　\n### Sub x\n", ["<div\fx", "### Sub x"]),
+    *[(f"closing_pre_{i}", S + f"{t}\n## Next\n", [t]) for i, t in enumerate(["</pre>", "</PRE>"])],
+    # past four spaces an item holds indented code, not HTML
+    ("item_indented_pre", f"{T}:\n-     <pre>\n  Keep A\nat 3\n\nNotes\n", ["-     <pre>\n  Keep A\nat 3"]),
+    ("indented_code_item_comment", S + "-     <!-- c -->\nlazy\n", ["lazy"]),
+    # only spaces and tabs make a line blank: a line of other whitespace is content
+    ("nbsp_item_interrupts", S + "Para\n- \xa0\n", ["Para"]),
+    ("nbsp_item_not_empty", S + "- \xa0\n\n  ## Next\n- b\n", ["-\n\n  ## Next", "- b"]),
+    ("nbsp_item_content_column", S + "-   \xa0\n  ## Next\n- b\n", []),
+    ("nbsp_item_paragraph", S + "- \xa0\nlazy\n", ["-\nlazy"]),
+    ("nbsp_quote_paragraph", S + "> \xa0\nlazy\n", [">\nlazy"]),
+    ("nbsp_in_html_comment", S + "<div> <!-- x\n\xa0\nkeep -->\n", ["<div>"]),
+    ("nbsp_in_para_comment", S + "Keep <!-- x\n\xa0\ny --> z\n", ["Keep\n z"]),
     # pre, script, style and textarea (kind 1) and malformed tags open no lone-tag block
     *[(f"no_lone_tag_{i}", f"## Above\n{t}\n## {T}\n- Keep retry count at 3\n", ["- Keep retry count at 3"])
       for i, t in enumerate(["<pre>\nx\n</pre>", "<script>\nx\n</script>", "<style>\nx\n</style>",
@@ -276,9 +326,15 @@ REPORTED = [
      ["- Keep `<!--\nnot a comment -->` rule"], None),
     ("second_inline_comment", S + "- Keep <!-- first\nend --> words <!-- second --> tail\n",
      ["- Keep\n words  tail"], None),
-    # a heading-like line inside an HTML block is raw HTML, up to the block's blank line
-    ("html_block", f"Old.\n\n{S}<div>\n## Appendix\nKeep retry count at 3\n\n",
-     ["<div>\n## Appendix\nKeep retry count at 3"], f"{S}<div>\n## Appendix\nKeep retry count at 3\n\n"),
+    # a heading-like line inside an HTML block is raw HTML, up to the block's end: a
+    # blank line for kinds 6 and 7 (a line of other whitespace is not blank), the end
+    # marker for kinds 1-5
+    *[(f"html_block_{n}", f"Old.\n\n{S}{o}\n## Appendix\nKeep retry count at 3\n\n",
+       [f"{o.split(chr(10))[0]}\n## Appendix\nKeep retry count at 3"],
+       f"{S}{o}\n## Appendix\nKeep retry count at 3\n\n") for n, o in [
+           ("div", "<div>"), ("pre", "<pre>"), ("pi", "<?php"), ("decl", "<!X"), ("cdata", "<![CDATA["),
+           ("nbsp", "<div>\n\xa0"), ("form_feed", "<div>\n\f"), ("vertical_tab", "<div>\n\v"),
+           ("em_space", "<div>\n ")]],
 ]
 
 
