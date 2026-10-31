@@ -113,23 +113,31 @@ def build_pr_description_prompt(current_body: str, comment_text: str,
     )
 
 
+_UNREADABLE = "pr-description: protections could not be read; description left unchanged"
+
+
 def _protected_rewrite(current_body: str, new_body: str,
                        original: "protections.Reading"):
-    """The exact string to post for a body that lists protections, or a
-    ``protection-conflict`` outcome when the rewrite would change them.
+    """The exact string to post, or the outcome that refuses it: ``transient-failed``
+    when that string's protections cannot be read, ``protection-conflict`` when the
+    rewrite would change the original's.
 
     The model's output is stripped before posting; trailing whitespace the ORIGINAL
     body ends with is put back when nothing but whitespace follows its last
     protections section, so that strip — the loop's own normalization, not the
-    model's edit — never trims protected bytes. The complete sequence of section slices of the string
-    actually posted must equal the original's byte for byte: a changed, removed,
-    trimmed or ADDED section is held for the project owner, with no write."""
+    model's edit — never trims protected bytes. For a body that lists protections,
+    the complete sequence of section slices of the string actually posted must equal
+    the original's byte for byte: a changed, removed, trimmed or ADDED section is held
+    for the project owner, with no write."""
     final = new_body
-    if not current_body[original.sections[-1].end:].strip():
+    if original.found and not current_body[original.sections[-1].end:].strip():
         final = new_body + current_body[len(current_body.rstrip()):]
-    proposed = protections.parse_body(final)
+    try:
+        proposed = protections.parse_body(final)
+    except protections.ProtectionReadError:
+        return FixOutcome(status="transient-failed", detail=_UNREADABLE)
     before = [s.raw for s in original.sections]
-    if [s.raw for s in proposed.sections] == before:
+    if not original.found or [s.raw for s in proposed.sections] == before:
         return final
     changed = [s for i, s in enumerate(original.sections)
                if i >= len(proposed.sections) or proposed.sections[i].raw != s.raw]
@@ -200,8 +208,12 @@ def rewrite_pr_description(
         return FixOutcome(status="transient-failed",
                           detail="pr-description: gh pr view returned a non-string body")
     # The protections sections of the body as fetched NOW (never the round's older
-    # snapshot): their exact bytes are what any rewrite must leave untouched.
-    original = protections.parse_body(current_body)
+    # snapshot): their exact bytes are what any rewrite must leave untouched. A body
+    # whose protections cannot be read is never rewritten.
+    try:
+        original = protections.parse_body(current_body)
+    except protections.ProtectionReadError:
+        return FixOutcome(status="transient-failed", detail=_UNREADABLE)
 
     # 2. Produce the addressed body via the model seam.
     try:
@@ -221,11 +233,10 @@ def rewrite_pr_description(
         # (a terminal skip, so it does not re-flag as a fresh change next round).
         return FixOutcome(status="skipped",
                           detail="pr-description: body already addresses the comment — no rewrite needed")
-    if original.found:
-        guarded = _protected_rewrite(current_body, new_body, original)
-        if isinstance(guarded, FixOutcome):
-            return guarded
-        new_body = guarded
+    guarded = _protected_rewrite(current_body, new_body, original)
+    if isinstance(guarded, FixOutcome):
+        return guarded
+    new_body = guarded
 
     # 3. Write the addressed body back.
     edit = ["gh", "pr", "edit", str(pr), "--body-file", "-"]

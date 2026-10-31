@@ -165,7 +165,7 @@ def test_round_snapshot(capsys):
         return FixOutcome(status="applied")
     timeline = [(0, _inline("1", "first")), (90, _inline("2", "second"))]
     # round 1 reads BODY; round 2's read fails and reuses round 1's reading
-    driver, gh, events, _ = _drive(timeline, body=[BODY, BODY, None],
+    driver, gh, events, _ = _drive(timeline, body=[BODY, None],
                                    classify=_classify(prompts=prompts), fix=fix, max_rounds=2)
     driver.run()
     assert len(prompts) == 2 and all(P.numbered(BLOCKS) in p for p in prompts)
@@ -211,6 +211,35 @@ def test_round_snapshot_blocks_edits_when_unreadable_or_over_limit():
     d, gh, _, _ = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
                          body=None, auto_merge=True)
     assert d.run().status == "needs-human" and not _merged(gh)
+
+
+# The parser gives a paragraph that runs straight into a table no line; inside a
+# section, that description cannot be read.
+UNREADABLE = f"Old.\n\n## {T}\nResults:\n| a |\n| - |\n"
+
+
+def test_round_snapshot_a_description_the_parser_cannot_read(capsys):
+    with pytest.raises(P.ProtectionReadError, match="source-map-invalid"):
+        P.parse_body(UNREADABLE)
+    # a failed read, never an empty one: the run's last good reading, limits and all
+    over = f"## {T}\n" + "".join(f"- p{i}\n" for i in range(41))
+    for good in (BODY, over):
+        d, _, _, _ = _drive([], body=[good, UNREADABLE])
+        first, second = d._refresh_protections(), d._refresh_protections()
+        assert second == replace(first, reused=True) and second.blocks == first.blocks
+        assert second.over_limit == (good == over) and first.found and not first.reused
+    capsys.readouterr()
+    # with none, the round is unreadable: W7 once, and reviewer edits wait
+    d, _, _, _ = _drive([], body=UNREADABLE)
+    assert [d._refresh_protections() for _ in range(3)] == [P.UNREADABLE] * 3
+    assert capsys.readouterr().out.count(P.W7) == 1
+    fixed = []
+    d, gh, _, _ = _drive([(0, _inline("1", "fix it"))], body=UNREADABLE, classify=_classify(),
+                         fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"),
+                         auto_merge=True)
+    out = d.run()
+    assert fixed == [] and out.status == "needs-human" and not _merged(gh)
+    assert [(a.final, a.detail) for a in out.actions] == [("deferred", P.W7)]
 
 
 # ── C: the classifier ──────────────────────────────────────────────────────
@@ -324,6 +353,49 @@ def test_fixer_context(repo, monkeypatch):
                         protections=BLOCKS, allowances=(BLOCKS[1],))
     assert dispatch(_inline("1", "x"), res).status == "applied"
     assert P.numbered(BLOCKS) in seen[0] and "ALLOWED ON THIS THREAD ONLY" in seen[0]
+
+
+# The parser makes the line of NBSP part of the Setext heading below it, and that
+# heading's end reaches into the list; the list is still the section's requirement.
+RECOVERED = f"\xa0\n{T}\n---\n- Keep retry count at 3\n"
+RECOVERED_BLOCKS = ("- Keep retry count at 3",)
+
+
+def test_recovered_requirement_reaches_every_prompt_and_round(repo, monkeypatch):
+    assert P.parse_body(RECOVERED).blocks == RECOVERED_BLOCKS
+    prompts, seen = [], []
+
+    def fix(c, r):
+        seen.append(r.protections)
+        return FixOutcome(status="applied")
+    # the classifier, in both rounds; round 2's description cannot be read and keeps
+    # round 1's reading
+    timeline = [(0, _inline("1", "first")), (90, _inline("2", "second"))]
+    driver, _, _, _ = _drive(timeline, body=[RECOVERED, UNREADABLE],
+                             classify=_classify(prompts=prompts), fix=fix, max_rounds=2)
+    driver.run()
+    assert len(prompts) == 2 and all(P.numbered(RECOVERED_BLOCKS) in p for p in prompts)
+    assert seen == [RECOVERED_BLOCKS, RECOVERED_BLOCKS]
+    # the fixer and the verifier, through the real dispatcher
+    fixer_prompts, verifier_prompts = [], []
+    monkeypatch.setattr(actuators, "apply_fix", functools.partial(
+        apply_fix, runner=_fixer(repo, [("v\n", "done", 0)], fixer_prompts)))
+    dispatch = default_fix_dispatch(
+        cwd=str(repo), size_measure=lambda: pr_size.unavailable("test"),
+        verify_runner=lambda p: verifier_prompts.append(p) or '{"verdict":"CONFIRM","reason":"y"}')
+    res = CommentResult("1", classify.Classification(label="COSMETIC"), "x", "fix", protections=seen[0])
+    assert dispatch(_inline("1", "x"), res).status == "applied"
+    assert P.numbered(RECOVERED_BLOCKS) in fixer_prompts[0]
+    assert P.numbered(RECOVERED_BLOCKS) in verifier_prompts[0]
+    # the description guard keeps its bytes, and lets the text around them change
+    old = f"Old intro.\n\n{RECOVERED}\n## Notes\nOld note.\n"
+    new = old.replace("Old intro.", "New intro.").replace("Old note.", "New note.")
+    out, edits = _rewrite(old, new)
+    assert out.status == "applied" and edits == [new.strip()]
+    for before, after in (("at 3", "at 9"), ("at 3\n", "at 3 <!-- c -->\n"), ("at 3\n", "at 3 \n")):
+        out, edits = _rewrite(old, new.replace(before, after))
+        assert edits == [] and out.status == "protection-conflict"
+        assert out.protection_origin == "description_guard" and out.protection_texts == RECOVERED_BLOCKS
 
 
 @pytest.mark.parametrize("stdout,status", [
@@ -879,8 +951,12 @@ class GhBody:
 
 def _rewrite(body, model_out):
     gh = GhBody(body)
-    out = rewrite_pr_description(Comment(id="9", text="fix the summary"), pr="7", repo="o/r",
-                                 cwd=None, gh_run=gh, rewrite_runner=lambda p: model_out)
+    try:
+        out = rewrite_pr_description(Comment(id="9", text="fix the summary"), pr="7", repo="o/r",
+                                     cwd=None, gh_run=gh, rewrite_runner=lambda p: model_out)
+    except Exception as exc:
+        # the rewriter reports every failure as an outcome; it never raises to the loop
+        raise AssertionError(f"rewrite raised {exc!r}") from exc
     return out, gh.edits
 
 
@@ -930,6 +1006,26 @@ def test_description_protection_bytes_inside_an_empty_marker_item():
     assert out.status == "applied" and edits == [new]
 
 
+@pytest.mark.parametrize("old,before,after", [
+    # a comment indented by one to three spaces between a label and its list
+    *[(f"Intro.\n\n{T}:\n\n{pad}<!-- why -->\n\n- Keep retry count at 3\n- Keep B\n\n## Notes\nOld note.\n",
+       "at 3", "at 9") for pad in (" ", "  ", "   ")],
+    (f"Intro.\n\n{T}:\n   <!-- why -->\n- Keep retry count at 3\n\n## Notes\nOld note.\n", "at 3", "at 9"),
+    # a fence or <pre> left open in the label's last item keeps its blank lines
+    (f"Intro.\n\n{T}:\n- Keep A\n  ```\n  x = 1\n  \t\n\n## Notes\nOld note.\n", "  \t\n", "  \t\t\n"),
+    (f"Intro.\n\n{T}:\n- Keep A\n  ```\n  x = 1\n  \t\n\n## Notes\nOld note.\n", "  \t\n", ""),
+    (f"Intro.\n\n{T}:\n- <pre>\n  a\n     \n\n## Notes\nOld note.\n", "     \n", ""),
+], ids=["comment-1", "comment-2", "comment-3", "comment-no-blank", "open-fence-tab", "open-fence-line",
+        "open-pre-line"])
+def test_description_protection_bytes_after_a_label(old, before, after):
+    new = old.replace("Intro.", "New intro.").replace("Old note.", "New note.")
+    out, edits = _rewrite(old, new.replace(before, after))
+    assert edits == [] and out.status == "protection-conflict"
+    assert out.protection_origin == "description_guard"
+    out, edits = _rewrite(old, new)
+    assert out.status == "applied" and edits == [new.strip()]
+
+
 def test_description_protection_bytes_permitted_rewrites():
     old = f"Old summary.\n\n{SECTION}## Notes\nn\n"
     out, edits = _rewrite(old, f"New summary.\n\n{SECTION}## Notes\nn\n")
@@ -948,6 +1044,29 @@ def test_description_protection_bytes_permitted_rewrites():
     # a no-op is still a skip
     out, edits = _rewrite(old, old)
     assert out.status == "skipped" and edits == []
+
+
+UNREAD = "pr-description: protections could not be read; description left unchanged"
+
+
+def test_description_unreadable_is_never_rewritten():
+    # a current body the parser cannot read: no model call, no write
+    calls, gh = [], GhBody(UNREADABLE)
+    out = rewrite_pr_description(Comment(id="9", text="fix the summary"), pr="7", repo="o/r", cwd=None,
+                                 gh_run=gh, rewrite_runner=lambda p: calls.append(p) or "New.")
+    assert (out.status, out.detail) == ("transient-failed", UNREAD) and calls == [] and gh.edits == []
+    # a final body it cannot read, whatever the current one held: one model call, no
+    # write — never a prior reading in its place
+    for old in (f"Old.\n\n{SECTION}## Notes\nn\n", "Old summary.\n", f"Old.\n\n## {T}\n\n## Notes\nn\n"):
+        calls, gh = [], GhBody(old)
+        out = rewrite_pr_description(Comment(id="9", text="fix the summary"), pr="7", repo="o/r",
+                                     cwd=None, gh_run=gh,
+                                     rewrite_runner=lambda p: calls.append(p) or UNREADABLE)
+        assert (out.status, out.detail) == ("transient-failed", UNREAD)
+        assert len(calls) == 1 and gh.edits == []
+    # the same final read, readable, lands
+    out, edits = _rewrite("Old summary.\n", "New summary.\n")
+    assert out.status == "applied" and edits == ["New summary."]
 
 
 def test_description_protection_bytes_hold_menu_and_restart():

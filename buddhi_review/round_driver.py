@@ -3837,22 +3837,25 @@ class RoundDriver:
 
     def _refresh_protections(self) -> Optional[protections.Snapshot]:
         """Read the PR description afresh and pin THIS round's protections. A failed
-        read reuses the run's last good reading (over-limit state included); with
-        none, the round is unreadable and reviewer edits wait. W5–W7 print once per
-        run. None when the feature is not wired."""
+        read — the fetch, or a description whose protections cannot be read — reuses
+        the run's last good reading (over-limit state included); with none, the round
+        is unreadable and reviewer edits wait. W5–W7 print once per run. None when
+        the feature is not wired."""
         if self.protections_fetch is None:
             return None
         try:
             body = self.protections_fetch()
         except Exception:
             body = None
+        snap = None
         if isinstance(body, str):
-            snap = protections.snapshot_from_body(body)
-            self._protections_last_good = snap
-        elif self._protections_last_good is not None:
-            snap = replace(self._protections_last_good, reused=True)
-        else:
-            snap = protections.UNREADABLE
+            try:
+                snap = self._protections_last_good = protections.snapshot_from_body(body)
+            except protections.ProtectionReadError:
+                pass
+        if snap is None:
+            snap = (protections.UNREADABLE if self._protections_last_good is None
+                    else replace(self._protections_last_good, reused=True))
         for key, text in protections.round_warnings(snap):
             if key in self._protection_warned:
                 continue

@@ -1,5 +1,9 @@
-"""The protections section scanner, the round snapshot and its limits, and the
-owner-hold helpers — pure, no network, no git."""
+"""The protections section reader, the round snapshot and its limits, and the
+owner-hold helpers — pure, no network, no git.
+
+The reader's structure comes from cmark-gfm 0.29.0.gfm.13 (multimark 0.4.0). Where an
+expectation below differs from CommonMark 0.31, its comment names what that parser's
+tree holds."""
 import json
 import time
 
@@ -11,8 +15,26 @@ F = "`" * 3
 T = "Protections this PR must keep"
 
 
+def _read(body):
+    # a body these tests expect to read must read: its failure fails the assertion
+    # here, and so does any failure the reader does not report as unreadable
+    try:
+        return P.parse_body(body)
+    except P.ProtectionReadError as exc:
+        raise AssertionError(f"unreadable ({exc.reason}): {body!r}") from exc
+    except Exception as exc:
+        raise AssertionError(f"reader raised {exc!r}: {body!r}") from exc
+
+
+def _snap(body):
+    try:
+        return P.snapshot_from_body(body)
+    except P.ProtectionReadError as exc:
+        raise AssertionError(f"unreadable ({exc.reason}): {body!r}") from exc
+
+
 def _blocks(body):
-    return list(P.parse_body(body).blocks)
+    return list(_read(body).blocks)
 
 
 # ── S: the section syntax ───────────────────────────────────────────────────
@@ -53,7 +75,7 @@ SYNTAX = [
 
 @pytest.mark.parametrize("name,body,want", SYNTAX, ids=[s[0] for s in SYNTAX])
 def test_section_syntax(name, body, want):
-    reading = P.parse_body(body)
+    reading = _read(body)
     if want is None:
         assert not reading.found and reading.blocks == ()
     else:
@@ -63,7 +85,7 @@ def test_section_syntax(name, body, want):
 
 
 CONTAINERS = [
-    # a literal "<!--" is a comment only where CommonMark reads one
+    # a literal "<!--" is a comment only where the parser reads one
     ("code_span", f"## {T}\n\n- Keep the `<!--` handling in the sanitizer\n- Never log tokens\n",
      ["- Keep the `<!--` handling in the sanitizer", "- Never log tokens"]),
     ("indented_code_before", f"Example:\n\n    s = \"<!--\"\n\n## {T}\n\n- Never log tokens\n",
@@ -138,12 +160,13 @@ EDGES = [
     ("open_comment_nested_para", S + "-   a\n\n    b <!-- x\n    - s --> y\n",
      ["-   a\n\n    b <!-- x\n    - s --> y"]),
     ("comment_continues_para", S + "Keep A\n    <!-- c -->\nKeep B\n", ["Keep A\nKeep B"]),
-    # what follows a comment block's "-->" is raw HTML text; a comment spoils an underline
+    # what follows a comment block's first "-->" is raw HTML text, kept as written; a
+    # comment spoils an underline
     ("comment_close_then_heading", S + "- a\n<!-- x --> # Appendix <!-- z -->\n- b\n",
-     ["- a", "# Appendix", "- b"]),
+     ["- a", " # Appendix <!-- z -->", "- b"]),
     ("raw_html_title", f"<!-- x --> **{T}:**\n\n- a\n", None),
     ("comment_ends_para", S + "Para\n<!-- c -->\n===\n", ["Para", "==="]),
-    ("comment_block_close_then_heading", S + "- a\n<!--\nx\n--> ## Appendix\n- b\n", ["- a", "## Appendix", "- b"]),
+    ("comment_block_close_then_heading", S + "- a\n<!--\nx\n--> ## Appendix\n- b\n", ["- a", " ## Appendix", "- b"]),
     ("setext_with_comment", S + "Note\n--- <!-- c -->\n- a\n", ["Note\n---", "- a"]),
     ("thematic_with_comment", S + "Note\n\n*** <!-- c -->\n", ["Note", "***"]),
     # a code span opening on a comment's line may close on a later line of the same
@@ -168,28 +191,33 @@ EDGES = [
     ("html_block_ends_with_item", S + "- a\n\n  <div>\n  x\n## Next\n- b\n", ["- a\n\n  <div>\n  x"]),
     ("html_block_ends_with_its_item", S + "- a\n\n  <div>\n- b\n  x \\<!-- c -->\n",
      ["- a\n\n  <div>", "- b\n  x \\<!-- c -->"]),
-    # a comment in raw HTML closes within its block, never past a blank line or its item
+    # comment-like text inside other raw HTML is raw text, kept as written: the parser
+    # makes no comment of it, and its block never runs past a blank line or its item
     ("html_comment_stops_at_blank", S + "<div> <!-- x\n\nKeep -->\n", ["<div> <!-- x", "Keep -->"]),
     ("html_comment_stops_at_item", S + "- <div> <!-- x\n- b -->\n", ["- <div> <!-- x", "- b -->"]),
-    ("html_block_comment_line", S + "<div>\n<!-- c -->\nx\n", ["<div>\nx"]),
-    ("html_block_multiline_comment", S + "<div>\na <!-- x\ny --> b\n", ["<div>\na\n b"]),
+    ("html_block_comment_line", S + "<div>\n<!-- c -->\nx\n", ["<div>\n<!-- c -->\nx"]),
+    ("html_block_multiline_comment", S + "<div>\na <!-- x\ny --> b\n", ["<div>\na <!-- x\ny --> b"]),
     ("html_block_comment_over_tags", S + "<div>\n<!--\n<p>Drop the retry cap</p>\n-->\nKeep retry count at 3\n</div>\n",
-     ["<div>\nKeep retry count at 3\n</div>"]),
-    ("two_comment_lines", S + "<!-- a --> x\n<!-- b --> y\n", ["x", "y"]),
+     ["<div>\n<!--\n<p>Drop the retry cap</p>\n-->\nKeep retry count at 3\n</div>"]),
+    # each line is a comment block of its own, whose comment ends at its "-->"
+    ("two_comment_lines", S + "<!-- a --> x\n<!-- b --> y\n", [" x", " y"]),
     ("lone_tag_continues_para", S + "Para\n<span>\n## Next\n", ["Para\n<span>"]),
-    ("lone_tag_continues_quote", S + "> quote\n<span>\n## Next\n", ["> quote\n<span>"]),
-    ("lazy_underline_then_tag", f"- a\n===\n<span>\n## {T}\n- Keep retry count at 3\n", ["- Keep retry count at 3"]),
+    # the parser ends the quote before a lone tag, which opens an HTML block that takes
+    # the heading below it
+    ("lone_tag_continues_quote", S + "> quote\n<span>\n## Next\n", ["> quote", "<span>\n## Next"]),
+    # ...and the title below the tag is inside that block, so there is no section
+    ("lazy_underline_then_tag", f"- a\n===\n<span>\n## {T}\n- Keep retry count at 3\n", None),
     # an item or quote holding an HTML block has no paragraph, so nothing after it is lazy
     ("setext_after_tag_item", f"- <div>\nOther\n===\n{T}\n===\n\n- keep this\n", ["- keep this"]),
     ("tag_item_then_lone_tag", S + "- keep a\n- <div>x\n<span>\n## Notes\n- keep b\n",
      ["- keep a", "- <div>x", "<span>\n## Notes\n- keep b"]),
     ("tag_quote_then_lone_tag", S + "> <div>x\n<span>\n## Notes\n- keep b\n", ["> <div>x", "<span>\n## Notes\n- keep b"]),
     ("lone_tag_quote_then_lone_tag", S + "> <span>\n<i>\n## Notes\n- keep b\n", ["> <span>", "<i>\n## Notes\n- keep b"]),
-    ("tag_item_block_continues", S + "- <div>\n  x \\<!-- c -->\n", ["- <div>\n  x \\"]),
+    ("tag_item_block_continues", S + "- <div>\n  x \\<!-- c -->\n", ["- <div>\n  x \\<!-- c -->"]),
     ("tag_item_then_label", f"- <div>\n{T}:\n\n- keep a\n", ["- keep a"]),
     ("tag_item_then_text_and_block", f"- <span>\ntext\n\n  <div>\n{T}:\n\n- keep\n", None),
     ("comment_rest_in_item_block", S + "- item\n\n  <div>\n  <!-- a\n  --> <!-- b\nkeep this rule -->\n",
-     ["- item\n\n  <div>\n <!-- b", "keep this rule -->"]),
+     ["- item\n\n  <div>\n  <!-- a\n  --> <!-- b", "keep this rule -->"]),
     ("quote_kind3_then_code", S + "> <?php\n    x <!-- keep -->\n", ["> <?php", "    x <!-- keep -->"]),
     ("quote_inline_html_lazy", S + "> <b>bold</b> text\n    more <!-- c -->\n", ["> <b>bold</b> text\n    more"]),
     ("tag_with_comment_takes_setext", S + "- a\n\n<span> <!-- c -->\n---\n- b\n", ["- a"]),
@@ -202,8 +230,10 @@ EDGES = [
     ("html_ends_on_its_line", S + "<pre>x</pre>\n## Next\n", ["<pre>x</pre>"]),
     ("html_ends_with_item", S + "- <pre>\n  ## x\n## Next\n", ["- <pre>\n  ## x"]),
     ("html_ends_with_item_then_blank", S + "- <pre>\n## Next\n\n- b\n", ["- <pre>"]),
-    ("html_end_in_comment_rest", S + "<pre> <!-- x\n--> </pre>\n## Next\n", ["<pre>\n </pre>"]),
-    ("cdata_is_case_sensitive", S + "<![cdata[\n## Next\n", ["<![cdata["]),
+    ("html_end_in_comment_rest", S + "<pre> <!-- x\n--> </pre>\n## Next\n", ["<pre> <!-- x\n--> </pre>"]),
+    # the parser opens a CDATA block at a lowercase "<![cdata[" too, which runs to its
+    # "]]>", past blank lines
+    ("cdata_is_case_insensitive", S + "<![cdata[\n## Next\n", ["<![cdata[\n## Next"]),
     ("pre_x_is_a_lone_tag", S + "<pre-x>\n\n## Next\n", ["<pre-x>"]),
     ("item_comment_block", S + "- <!-- c -->\n\n  x \\<!-- y -->\n", ["-\n\n  x \\<!-- y -->"]),
     ("label_after_item_block", f"- <pre>\n## Above\n\n{T}:\n\n- a\n", ["- a"]),
@@ -213,9 +243,9 @@ EDGES = [
                                   ("<pre>\nfoo <!-- x\n</pre>", " -->"), ("<pre> <!-- x\n</pre>\n-->", ""),
                                   ("<?php\n<!-- x\n?>\n-->", "")])],
     ("end_on_opener_with_comment", S + "<pre> <!-- x </pre>\nKeep -->\n", ["<pre> <!-- x </pre>", "Keep -->"]),
-    ("comment_spans_blank_in_pre", S + "<pre>\na <!-- x\n\ny -->\n</pre>\n", ["<pre>\na\n</pre>"]),
+    ("comment_spans_blank_in_pre", S + "<pre>\na <!-- x\n\ny -->\n</pre>\n", ["<pre>\na <!-- x\n\ny -->\n</pre>"]),
     ("reopened_comment_in_pre", S + "<pre>\na <!-- x\nb --> c <!-- y\n</pre>\n## Next\nz -->\n",
-     ["<pre>\na\n c <!-- y\n</pre>"]),
+     ["<pre>\na <!-- x\nb --> c <!-- y\n</pre>"]),
     ("item_pre_comment", S + "- <pre> <!-- x\n  </pre>\n  y -->\n", ["- <pre> <!-- x\n  </pre>\n  y -->"]),
     ("fence_close_nbsp", S + "```\nretry = 3\n```\xa0\n## Next\nKeep retry count at 3\n",
      ["```\nretry = 3\n```\xa0\n## Next\nKeep retry count at 3"]),
@@ -230,20 +260,23 @@ EDGES = [
     ("comment_nbsp_split", S + "Keep A\n<!-- c -->\n\xa0\nKeep B\n", ["Keep A", "Keep B"]),
     ("ff_comment_lazy", S + "- Keep A\n\f<!-- note\n-->\n", ["- Keep A"]),
     ("quote_comment_nbsp", f"> <!-- quoted note\n\xa0\n{S}- Keep A\n<!-- end -->\n", ["- Keep A"]),
-    # a tag name ends at a space, a tab, ">" or the line end; a closing pre is no lone tag
+    # a tag name ends at a space, a tab, a form feed, ">" or the line end, and a block
+    # it opens runs over a line of other whitespace (which reads as an empty line); a
+    # closing pre is a lone tag, whose block runs to a blank line
     ("pre_nbsp_name", S + "<pre\xa0x\n\n## Next\n", ["<pre\xa0x"]),
-    ("div_ff_name", S + "<div\fx\n　\n### Sub x\n", ["<div\fx", "### Sub x"]),
-    *[(f"closing_pre_{i}", S + f"{t}\n## Next\n", [t]) for i, t in enumerate(["</pre>", "</PRE>"])],
-    # past four spaces an item holds indented code, not HTML
+    ("div_ff_name", S + "<div\fx\n　\n### Sub x\n", ["<div\fx\n\n### Sub x"]),
+    *[(f"closing_pre_{i}", S + f"{t}\n## Next\n", [f"{t}\n## Next"]) for i, t in enumerate(["</pre>", "</PRE>"])],
+    # past four spaces an item holds indented code, not HTML: its "<!--" is code, and
+    # the line after it is a paragraph of its own
     ("item_indented_pre", f"{T}:\n-     <pre>\n  Keep A\nat 3\n\nNotes\n", ["-     <pre>\n  Keep A\nat 3"]),
-    ("indented_code_item_comment", S + "-     <!-- c -->\nlazy\n", ["lazy"]),
+    ("indented_code_item_comment", S + "-     <!-- c -->\nlazy\n", ["-     <!-- c -->", "lazy"]),
     # only spaces and tabs make a line blank: a line of other whitespace is content
     ("nbsp_item_interrupts", S + "Para\n- \xa0\n", ["Para"]),
     ("nbsp_item_not_empty", S + "- \xa0\n\n  ## Next\n- b\n", ["-\n\n  ## Next", "- b"]),
     ("nbsp_item_content_column", S + "-   \xa0\n  ## Next\n- b\n", []),
     ("nbsp_item_paragraph", S + "- \xa0\nlazy\n", ["-\nlazy"]),
     ("nbsp_quote_paragraph", S + "> \xa0\nlazy\n", [">\nlazy"]),
-    ("nbsp_in_html_comment", S + "<div> <!-- x\n\xa0\nkeep -->\n", ["<div>"]),
+    ("nbsp_in_html_comment", S + "<div> <!-- x\n\xa0\nkeep -->\n", ["<div> <!-- x\n\nkeep -->"]),
     ("nbsp_in_para_comment", S + "Keep <!-- x\n\xa0\ny --> z\n", ["Keep\n z"]),
     # pre, script, style and textarea (kind 1) and malformed tags open no lone-tag block
     *[(f"no_lone_tag_{i}", f"## Above\n{t}\n## {T}\n- Keep retry count at 3\n", ["- Keep retry count at 3"])
@@ -260,20 +293,21 @@ EDGES = [
      ["Some ` text", "> quoted  `x`"]),
     ("heading_with_lone_backtick", S + "### Detail ` <!-- hidden -->\nKeep `x` at 3\n",
      ["### Detail `\nKeep `x` at 3"]),
-    ("raw_html_backslash", S + "<!-- x --> \\<!-- hidden --> tail\n", ["\\ tail"]),
+    ("raw_html_backslash", S + "<!-- x --> \\<!-- hidden --> tail\n", [" \\<!-- hidden --> tail"]),
     ("quote_comment_then_code", S + "> <!-- note --> see below\n    retries = 3\n",
      [">  see below", "    retries = 3"]),
     ("quote_empty_item_then_code", S + "> -\n    retries = 3\n", ["> -", "    retries = 3"]),
     ("empty_item_with_content", S + "-\n  foo\n\n  bar\n", ["-\n  foo\n\n  bar"]),
     # a line that is no fence continues lazily; only plain quote text takes an
     # indented lazy line; inline HTML still makes a heading, a lone tag opens a block;
-    # an item opening with a comment is raw HTML, where no backslash escapes
+    # an item opening with a comment is raw HTML, where no backslash escapes and the
+    # text after the comment's "-->" stays as written
     ("fence_like_lazy_line", S + "- Keep it quoted as\n```` `make` ````\nin every job\n---\n- b\n",
      ["- Keep it quoted as\n```` `make` ````\nin every job", "- b"]),
     ("indented_after_quote_item", f"> - ## Example\n    $ make\n{T}:\n\n- a\n", ["- a"]),
     ("inline_html_setext_ends", S + "- a\n\n<b>Changelog</b>\n---\n- b\n", ["- a"]),
     ("lone_tag_takes_underline", S + "- a\n\n<span>\n---\n- b\n", ["- a", "<span>\n---\n- b"]),
-    ("item_html_no_escape", S + "- <!-- n --> \\<!-- hidden --> keep\n", ["-  \\ keep"]),
+    ("item_html_no_escape", S + "- <!-- n --> \\<!-- hidden --> keep\n", ["-  \\<!-- hidden --> keep"]),
     ("item_heading_backtick", S + "- ## Detail ` <!-- hidden -->\n  Keep `x` at 3\n",
      ["- ## Detail `\n  Keep `x` at 3"]),
     # inside a span a backslash is plain text, so an escaped backtick still closes it
@@ -286,10 +320,11 @@ EDGES = [
      ["> <div>", "    retries = 3 <!-- keep -->"]),
     ("quote_code_then_code", S + ">     code\n    more <!-- keep -->\n",
      [">     code", "    more <!-- keep -->"]),
-    ("quote_html_no_escape", S + "> <!-- n --> \\<!-- hidden --> x\n", [">  \\ x"]),
-    ("item_quote_html_no_escape", S + "- > <!-- n --> \\<!-- hidden --> x\n", ["- >  \\ x"]),
-    # every kind of HTML block opener is raw HTML; any lone tag opens a block
-    *[(f"html_opener_{i}", S + f"{o} \\<!-- hidden --> x\n", [f"{o} \\ x"]) for i, o in
+    ("quote_html_no_escape", S + "> <!-- n --> \\<!-- hidden --> x\n", [">  \\<!-- hidden --> x"]),
+    ("item_quote_html_no_escape", S + "- > <!-- n --> \\<!-- hidden --> x\n", ["- >  \\<!-- hidden --> x"]),
+    # every kind of HTML block opener is raw HTML, kept as written; any lone tag opens
+    # a block
+    *[(f"html_opener_{i}", S + f"{o} \\<!-- hidden --> x\n", [f"{o} \\<!-- hidden --> x"]) for i, o in
       enumerate(["<pre>", "<?php", "<!DOCTYPE html", "<![CDATA[", "<DIV>", "<p/>", "</div>"])],
     *[(f"lone_tag_{i}", S + f"- a\n\n{t}\n---\n- b\n", ["- a", f"{t}\n---\n- b"]) for i, t in
       enumerate(["</span>", '<span class="x">', "<br/>", "<a b=c>", "<a b='c d'>", "<input disabled>",
@@ -327,10 +362,10 @@ REPORTED = [
     ("second_inline_comment", S + "- Keep <!-- first\nend --> words <!-- second --> tail\n",
      ["- Keep\n words  tail"], None),
     # a heading-like line inside an HTML block is raw HTML, up to the block's end: a
-    # blank line for kinds 6 and 7 (a line of other whitespace is not blank), the end
-    # marker for kinds 1-5
+    # blank line for kinds 6 and 7 (a line of other whitespace is not blank, and reads
+    # as an empty line), the end marker for kinds 1-5
     *[(f"html_block_{n}", f"Old.\n\n{S}{o}\n## Appendix\nKeep retry count at 3\n\n",
-       [f"{o.split(chr(10))[0]}\n## Appendix\nKeep retry count at 3"],
+       ["\n".join(line.rstrip() for line in o.split("\n")) + "\n## Appendix\nKeep retry count at 3"],
        f"{S}{o}\n## Appendix\nKeep retry count at 3\n\n") for n, o in [
            ("div", "<div>"), ("pre", "<pre>"), ("pi", "<?php"), ("decl", "<!X"), ("cdata", "<![CDATA["),
            ("nbsp", "<div>\n\xa0"), ("form_feed", "<div>\n\f"), ("vertical_tab", "<div>\n\v"),
@@ -340,9 +375,9 @@ REPORTED = [
 
 @pytest.mark.parametrize("name,body,want,raw", REPORTED, ids=[r[0] for r in REPORTED])
 def test_section_syntax_reported_shapes(name, body, want, raw):
-    (section,) = P.parse_body(body).sections
+    (section,) = _read(body).sections
     assert list(section.blocks) == want and section.raw == (body if raw is None else raw)
-    snap = P.snapshot_from_body(body)
+    snap = _snap(body)
     assert (snap.count, snap.chars) == (len(want), sum(map(len, want)))
     assert P.numbered(want) in classify.build_prompt("x", protections=snap.blocks, nonce="n0")
 
@@ -356,18 +391,38 @@ def test_section_syntax_reported_shapes(name, body, want, raw):
     (f"## {T}\n- a\n<!-- c -->\n## Next\n", f"## {T}\n- a\n<!-- c -->\n"),
     # Setext form, to body end
     (f"intro\n\n{T}\n===\n- a\n", f"{T}\n===\n- a\n"),
+    # a no-break-space line is a written line of the list, not a blank one
+    (f"{T}:\n- a\n\xa0\n\nafter\n", f"{T}:\n- a\n\xa0\n"),
+    # a label with no list is its own line
+    (f"{T}:\n\nSome text\n", f"{T}:\n"),
+    # a fence or <pre> left open in the last item keeps its blank lines; a closed
+    # fence ends the item, and indented code keeps the line after its text
+    (f"{T}:\n- a\n  ```\n  x = 1\n  \t\n\nafter\n", f"{T}:\n- a\n  ```\n  x = 1\n  \t\n\n"),
+    (f"{T}:\n- <pre>\n  a\n     \n\nafter\n", f"{T}:\n- <pre>\n  a\n     \n\n"),
+    (f"{T}:\n- a\n  ```\n  x\n  ```\n  \n\nafter\n", f"{T}:\n- a\n  ```\n  x\n  ```\n"),
+    (f"{T}:\n- a\n  ```\n  x\n  ```\n- b\n  ```\n  y\n  \t\n\nafter\n",
+     f"{T}:\n- a\n  ```\n  x\n  ```\n- b\n  ```\n  y\n  \t\n\n"),
+    (f"{T}:\n- a\n\n      code  \n      \t\n\nafter\n", f"{T}:\n- a\n\n      code  \n      \t\n"),
+    (f"{T}:\n- a\n  <!-- c\n\n  -->\n\nafter\n", f"{T}:\n- a\n  <!-- c\n\n  -->\n"),
 ])
 def test_section_raw_slices(body, raw):
-    (section,) = P.parse_body(body).sections
+    (section,) = _read(body).sections
     assert section.raw == raw and body[section.start:section.end] == raw
 
 
 def test_section_reading_stays_linear_on_long_paragraphs():
     rows = "".join(f"| `pkg-{i}` | `1.0.{i}` | <!-- r -->\n" for i in range(4000))
     lone = S + "Keep ` " + "<!-- c --> " * 2000 + "\n" + "more text\n" * 2000
-    for body in (S + rows, S + "- item\n" + "`a <!-- c --> x\n" * 4000, lone):
+    # Here every other "<!-- c -->" sits in a code span that runs over a line, where the
+    # parser gives the next comment no reliable line: the body cannot be read.
+    spans = S + "- item\n" + "`a <!-- c --> x\n" * 4000
+    for body, readable in ((S + rows, True), (spans, False), (lone, True)):
         started = time.perf_counter()
-        P.parse_body(body)
+        if readable:
+            assert _read(body).found
+        else:
+            with pytest.raises(P.ProtectionReadError, match="source-map-invalid"):
+                P.parse_body(body)
         assert time.perf_counter() - started < 2.0
 
 
@@ -422,7 +477,7 @@ def test_section_syntax_termination_and_blocks():
             "+ plus item\n* star item\n1. one\n2) two\n\nA paragraph\nspanning lines\n\n"
             "| col | col |\n|-----|-----|\n\n" + F + "py\nkeep_this()\n" + F + "\n\n"
             "### Sub rule\nits paragraph\n\n## Next section\n- not a protection\n")
-    reading = P.parse_body(body)
+    reading = _read(body)
     assert list(reading.blocks) == [
         "- keep A", "- keep B\n  wrapped line\n  - nested child", "+ plus item",
         "* star item", "1. one", "2) two", "A paragraph\nspanning lines",
@@ -449,6 +504,24 @@ def test_section_syntax_termination_and_blocks():
     # indentation: up to 3 columns is top level; a tab counts as 4 (code)
     (f"## {T}\n   - three\n", ["   - three"]),
     (f"## {T}\n\t- tab\n", ["\t- tab"]),
+    # a subordinate heading stands alone before a heading, a list or the section's end
+    (f"## {T}\n### A\n### B\npara\n", ["### A", "### B\npara"]),
+    (f"## {T}\n### Sub\n- a\n\npara\n", ["### Sub", "- a", "para"]),
+    (f"## {T}\n- a\n### Tail\n", ["- a", "### Tail"]),
+    # the parser ends a Setext heading on the line after its underline: the block
+    # still stops where the next one starts, in a section and in a list item
+    (f"# {T}\n- a\n\nSub\n---\n# Next\n", ["- a", "Sub\n---"]),
+    (f"## {T}\n- a\n  ---\n- b\n", ["- a\n  ---", "- b"]),
+    # a label skips comment blocks to its list, but no other block
+    (f"{T}:\n<!-- c -->\n- a\n", ["- a"]),
+    # ...indented by up to three spaces too, and such a comment protects nothing
+    *[(f"{T}:\n\n{pad}<!-- c -->\n\n- a\n", ["- a"]) for pad in (" ", "  ", "   ")],
+    (f"{T}:\n   <!-- c -->\n- a\n", ["- a"]),
+    (f"## {T}\n  <!-- c -->\n- a\n", ["- a"]),
+    (f"## {T}\n### Detail\n  <!-- c -->\nKeep A\n", ["### Detail\nKeep A"]),
+    (f"## {T}\n- a\n\n     <!-- c -->\n- b\n", ["- a", "- b"]),
+    (f"{T}:\n<div>x</div>\n\n- a\n", []),
+    (f"{T}:\n\nSome text\n", []),
 ])
 def test_section_syntax_more(body, want):
     assert _blocks(body) == want
@@ -460,17 +533,29 @@ def test_section_syntax_comments_removed_without_joining_words():
     # a comment-only line is invisible: it neither ends a list item nor hides a title
     assert _blocks(f"para\n<!-- c -->\n{T}\n\n- a\n") == ["- a"]
     assert _blocks(f"## {T}\n- a\n  <!-- c -->\n  still a\n") == ["- a\n  still a"]
-    # at column 0 the comment block ends the list item, as CommonMark reads it
+    # at column 0 the comment block ends the list item, as the parser reads it
     assert _blocks(f"## {T}\n- a\n<!-- c -->\n  still a\n") == ["- a", "  still a"]
     # the raw slice keeps the comments (the description guard compares it)
-    assert "<!-- a note -->" in P.parse_body(body).sections[0].raw
+    assert "<!-- a note -->" in _read(body).sections[0].raw
+    # a space already beside the comment is enough; the same comment twice is two
+    assert _blocks(f"## {T}\n- a <!-- c -->b\n- a<!-- c --> b\n") == ["- a b", "- a b"]
+    assert _blocks(f"## {T}\n- a <!-- c --> b <!-- c --> d\n") == ["- a  b  d"]
+    # an HTML block keeps what follows its comment; an unclosed one runs to the end
+    assert _blocks(f"## {T}\n<!-- c -->tail\n") == ["tail"]
+    assert _blocks(f"## {T}\n- a\n\n<!-- open\nmore") == ["- a"]
+    # a comment over lines inside a quote or behind an item's tab-indented lines
+    assert _blocks(f"## {T}\n> a <!-- x\n> y --> b\n") == ["> a\n b"]
+    assert _blocks(f"## {T}\n- <!-- a\n\t  b -->\n- c\n") == ["- c"]
+    # an item that held only a comment protects nothing, whatever its marker
+    for one, two in (("1.", "2."), ("1)", "2)"), ("+", "+")):
+        assert _blocks(f"## {T}\n{one} <!-- c -->\n{two} b\n") == [f"{two} b"]
 
 
 def test_section_syntax_empty_and_absent():
-    empty = P.parse_body(f"## {T}\n\n## Other\n- x\n")
+    empty = _read(f"## {T}\n\n## Other\n- x\n")
     assert empty.found and empty.blocks == ()
-    assert not P.parse_body("no section here\n- a\n").found
-    assert not P.parse_body(None).found and not P.parse_body("").found
+    assert not _read("no section here\n- a\n").found
+    assert not _read(None).found and not _read("").found
 
 
 def test_section_syntax_beyond_the_general_cap_stays_whole():
@@ -480,6 +565,247 @@ def test_section_syntax_beyond_the_general_cap_stays_whole():
     assert blocks[-1] == long and len(blocks[-1]) > 4000
 
 
+# ── G: the pinned parser, and a body it cannot read ─────────────────────────
+
+def _kinds(tree):
+    seen, stack = set(), [tree]
+    while stack:
+        node = stack.pop()
+        seen.add(node["kind"])
+        stack.extend(node.get("children", []))
+    return seen
+
+
+def test_parser_is_pinned_with_githubs_extensions(monkeypatch):
+    import pathlib
+    import re
+    import multimark
+    assert P._MULTIMARK == ("0.4.0", "0.29.0.gfm.13")
+    assert (multimark.__version__, multimark.cmark_version()) == P._MULTIMARK
+    assert P._EXTENSIONS == ("table", "strikethrough", "autolink", "tagfilter", "tasklist")
+    text = (pathlib.Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    deps = re.search(r"^dependencies = \[\n(.*?)^\]", text, re.S | re.M).group(1)
+    assert [line.strip() for line in deps.splitlines() if "multimark" in line] == ['"multimark==0.4.0",']
+    # every reading hands the parser all five, in that order
+    seen, real = [], P._gfm_tree
+    monkeypatch.setattr(P, "_gfm_tree", lambda body, *, extensions: seen.append(tuple(extensions))
+                        or real(body, extensions=extensions))
+    _read(f"## {T}\n- a\n")
+    assert seen == [P._EXTENSIONS]
+
+
+@pytest.mark.parametrize("extension,body,kind", [
+    ("table", "| a |\n| - |\n", "table"),
+    ("strikethrough", "~~a~~\n", "strikethrough"),
+    ("autolink", "www.example.com\n", "link"),
+    ("tasklist", "- [ ] a\n", "tasklist"),
+])
+def test_parser_extensions_each_shape_the_tree(extension, body, kind):
+    assert kind in _kinds(P._gfm_tree(body, extensions=P._EXTENSIONS))
+    assert kind not in _kinds(P._gfm_tree(body, extensions=[e for e in P._EXTENSIONS if e != extension]))
+
+
+def test_parser_tree_is_plain_owned_data():
+    tree = P._gfm_tree("## T\n\n- [x] a *b*\n\n| h |\n| - |\n", extensions=P._EXTENSIONS)
+    assert tree == {"kind": "document", "start": 1, "end": 6, "children": [
+        {"kind": "heading", "start": 1, "end": 1, "level": 2,
+         "children": [{"kind": "text", "start": 1, "end": 1, "literal": "T"}]},
+        {"kind": "list", "start": 3, "end": 4, "children": [
+            {"kind": "tasklist", "start": 3, "end": 4, "children": [
+                {"kind": "paragraph", "start": 3, "end": 3, "children": [
+                    {"kind": "text", "start": 3, "end": 3, "literal": "a "},
+                    {"kind": "emph", "start": 3, "end": 3,
+                     "children": [{"kind": "text", "start": 3, "end": 3, "literal": "b"}]}]}]}]},
+        {"kind": "table", "start": 5, "end": 6, "children": [
+            {"kind": "table_header", "start": 5, "end": 5, "children": [
+                {"kind": "table_cell", "start": 5, "end": 5,
+                 "children": [{"kind": "text", "start": 5, "end": 5, "literal": "h"}]}]}]}]}
+
+
+def _unreadable(body, reason):
+    # never any other exception: the round and the description guard catch only this one
+    for read in (P.parse_body, P.snapshot_from_body):
+        with pytest.raises(Exception) as caught:
+            read(body)
+        assert isinstance(caught.value, P.ProtectionReadError) and caught.value.reason == reason
+
+
+def test_unreadable_without_the_pinned_parser(monkeypatch):
+    import sys
+    import types
+    body = f"## {T}\n- a\n"
+    pinned = dict(__version__="0.4.0", cmark_version=lambda: "0.29.0.gfm.13",
+                  VALID_EXTENSIONS=frozenset(P._EXTENSIONS))
+    for module in (None,                                                    # not installed
+                   types.SimpleNamespace(**{**pinned, "__version__": "0.4.1"}),
+                   types.SimpleNamespace(**{**pinned, "cmark_version": lambda: "0.29.0.gfm.12"}),
+                   types.SimpleNamespace(**{**pinned, "VALID_EXTENSIONS": frozenset({"table"})}),
+                   types.SimpleNamespace(**{k: v for k, v in pinned.items() if k != "cmark_version"})):
+        monkeypatch.setattr(P, "_multimark", None)
+        monkeypatch.setitem(sys.modules, "multimark", module)
+        _unreadable(body, "dependency-unavailable")
+    # an empty body never needs the parser: it reads as none
+    assert _read("") == P.Reading() and _read(None) == P.Reading()
+
+
+def test_parser_is_loaded_once(monkeypatch):
+    import sys
+    loaded = P._load_multimark()
+    monkeypatch.setitem(sys.modules, "multimark", None)
+    # a body still reads after the import system loses the package
+    assert _blocks(f"## {T}\n- a\n") == ["- a"]
+    assert P._load_multimark() is loaded
+
+
+@pytest.mark.parametrize("tree", [
+    None, {}, {"kind": "paragraph", "start": 1, "end": 1},
+    {"kind": "document", "start": 1, "end": 2, "children": [{"kind": "paragraph", "start": "1", "end": 1}]},
+    {"kind": "document", "start": 1, "end": 2, "children": [{"kind": "paragraph", "start": 1, "end": None}]},
+    {"kind": "document", "start": 1, "end": 2, "children": [{"kind": "paragraph", "start": True, "end": 1}]},
+    {"kind": "document", "start": 1, "end": 2, "children": [{"kind": None, "start": 1, "end": 1}]},
+    {"kind": "document", "start": 1, "end": 2, "children": [{"kind": "code", "start": 1, "end": 1, "literal": 5}]},
+    {"kind": "document", "start": 1, "end": 2, "children": [{"kind": "text", "start": 1, "end": 1}]},
+    {"kind": "document", "start": 1, "end": 2, "children": [{"kind": "heading", "start": 1, "end": 1}]},
+    {"kind": "document", "start": 1, "end": 2, "children": {"kind": "list"}},
+    {"kind": "document", "start": 1, "end": 2, "children": ({"kind": "paragraph", "start": 1, "end": 1},)},
+])
+def test_unreadable_when_the_parser_fails_or_returns_no_document(monkeypatch, tree):
+    monkeypatch.setattr(P, "_gfm_tree", lambda body, *, extensions: tree)
+    _unreadable(f"## {T}\n- a\n", "parse-failed")
+    monkeypatch.setattr(P, "_gfm_tree", lambda body, *, extensions: 1 / 0)
+    _unreadable(f"## {T}\n- a\n", "parse-failed")
+
+
+def _heading(start, end=None):
+    return {"kind": "heading", "start": start, "end": start if end is None else end, "level": 2,
+            "children": [{"kind": "text", "start": start, "end": start, "literal": T}]}
+
+
+@pytest.mark.parametrize("nodes", [
+    [_heading(3)],                                                        # past the body's end
+    [_heading(0)],                                                        # no line at all
+    [_heading(1), {"kind": "paragraph", "start": 2, "end": 1,             # ends before it starts
+                   "children": [{"kind": "text", "start": 2, "end": 2, "literal": "a"}]}],
+    [_heading(2), {"kind": "paragraph", "start": 1, "end": 1,             # out of order
+                   "children": [{"kind": "text", "start": 1, "end": 1, "literal": "x"}]}],
+    [_heading(1), {"kind": "paragraph", "start": 2, "end": 3,             # ends past the body
+                   "children": [{"kind": "text", "start": 2, "end": 2, "literal": "a"}]}],
+    [{"kind": "paragraph", "start": 1, "end": 1,                          # a label's list ends past it
+      "children": [{"kind": "text", "start": 1, "end": 1, "literal": T}]},
+     {"kind": "list", "start": 2, "end": 3, "children": [{"kind": "item", "start": 2, "end": 2}]}],
+    [{"kind": "paragraph", "start": 1, "end": 1,                          # a node no reading needs,
+      "children": [{"kind": "text", "start": 1, "end": 1, "literal": "x"}]},  # past the body's end
+     {"kind": "paragraph", "start": 3, "end": 3,
+      "children": [{"kind": "text", "start": 3, "end": 3, "literal": "a"}]}],
+    [{"kind": "paragraph", "start": 1, "end": 1,                          # a code block in a label's
+      "children": [{"kind": "text", "start": 1, "end": 1, "literal": T}]},  # list with no line
+     {"kind": "list", "start": 2, "end": 2, "children": [{"kind": "item", "start": 2, "end": 2, "children": [
+         {"kind": "code_block", "start": 0, "end": 0, "literal": "x\n"}]}]}],
+])
+def test_unreadable_when_the_tree_does_not_map_onto_the_body(monkeypatch, nodes):
+    monkeypatch.setattr(P, "_gfm_tree", lambda body, *, extensions: {
+        "kind": "document", "start": 1, "end": 2, "children": nodes})
+    _unreadable(f"## {T}\n- a\n", "source-map-invalid")
+
+
+def test_unreadable_only_where_the_parser_gives_a_needed_node_no_line():
+    # The parser gives a paragraph that runs straight into a table no line, and the
+    # table that paragraph's first line. Inside a section that is unreadable...
+    _unreadable(f"## {T}\nResults:\n| a |\n| - |\n", "source-map-invalid")
+    _unreadable(f"## {T}\n---\nResults:\n| a |\n| - |\n", "source-map-invalid")
+    _unreadable(f"{T}:\n| a |\n| - |\n", "source-map-invalid")
+    _unreadable(f"## {T}\n- a\n\nResults:\n| a |\n| - |\n", "source-map-invalid")  # the list ends at it
+    # ...but outside one, after a label's list, or inside an item, nothing needs it
+    assert _blocks(f"Results:\n| a |\n| - |\n\n## {T}\n- keep\n") == ["- keep"]
+    assert _blocks(f"{T}:\n- keep\n\nResults:\n| a |\n| - |\n") == ["- keep"]
+    assert _blocks(f"## {T}\n- keep\n  b\n  | a |\n  | - |\n") == ["- keep\n  b\n  | a |\n  | - |"]
+    # A comment is found by its text, so a block that also holds that text as code
+    # cannot be read; different text, or the same text in another block, can.
+    _unreadable(f"## {T}\n- Keep `<!-- c -->` and <!-- c --> it\n", "source-map-invalid")
+    assert _blocks(f"## {T}\n- Keep `<!-- x -->` and <!-- c --> it\n") == ["- Keep `<!-- x -->` and  it"]
+    assert _blocks(f"## {T}\n- Keep `<!-- c -->`\n- and <!-- c --> it\n") == ["- Keep `<!-- c -->`", "- and  it"]
+    # a backslash break shifts the parser's lines, not the reading
+    assert _blocks(f"## {T}\n- Keep\\\n  retries <!-- c --> at 3\n") == ["- Keep\\\n  retries  at 3"]
+
+
+@pytest.mark.parametrize("eol", ["\n", "\r\n", "\r"])
+def test_section_bytes_are_the_bodys_own(eol):
+    # a BOM, NUL and every line ending stay where the body has them
+    body = "﻿" + eol.join([f"## {T}", "- keep\x00 3 <!-- why\x00 -->", "- b", "", "## Next", ""])
+    sections = _read(body).sections
+    assert len(sections) == 1
+    section = sections[0]
+    assert section.raw == body[section.start:section.end] == body[:body.index("## Next")]
+    assert section.raw.encode() == body.encode()[:body.encode().index(b"## Next")]
+    assert list(section.blocks) == ["- keep\x00 3", "- b"]
+    # a comment over two lines ends with whichever line ending the body uses
+    assert _blocks(eol.join([f"## {T}", "- a <!-- x", "  y --> b", ""])) == ["- a\n b"]
+
+
+@pytest.mark.parametrize("title", [
+    "&#80;rotections this PR must keep", f"{T}&#58;", "Protections&#32;this PR must keep",   # entities
+    f"{T}\\:", f"**{T}\\:**", f"*{T}*\\:",                                                   # escapes
+    f"[{T}](https://example.invalid)", f"`{T}`", f"~~{T}~~", f"<b>{T}</b>", f"![{T}](i.png)",
+    "prOTECTIONS this *&#112;r* must keep",               # an entity's text found earlier
+    "Protections this PR must<!-- keep -->&#107;eep",     # ...or inside a comment
+])
+def test_title_spelling_is_the_bodys_own(title):
+    assert not _read(f"## {title}\n- a\n").found
+    assert not _read(f"{title}\n\n- a\n").found
+    # ordinary emphasis and a trailing colon keep their place, and a comment is taken
+    # out without joining the words around it
+    assert _blocks(f"## *{T}*:\n- a\n") == _blocks(f"__{T}:__\n\n- a\n") == ["- a"]
+    assert _blocks("## **Protections *this* PR must keep**\n- a\n") == ["- a"]
+    assert _blocks(f"## {T} :\n- a\n") == _blocks(f"## {T}: <!-- c -->\n- a\n") == ["- a"]
+    assert _blocks(f"{T}: <!-- c -->\n- a\n") == ["- a"]
+    assert _blocks("## Protections<!-- why -->this PR must keep\n- a\n") == ["- a"]
+    # the title's text is looked for in its own block, never in the next one
+    assert not _read(f"## &#80;rotections this PR must keep\nWe say {T} here.\n- a\n").found
+
+
+def test_title_written_out_on_its_line():
+    E = "Protections this PR must k&#101;ep"
+    # a reference definition that spells the title, after an entity-written one or
+    # before it in the same block, on whichever line, does not make it a declaration
+    for body in (f"## {E}\n[{T}]: https://example.invalid\n- a\n",
+                 f"## &#80;rotections this PR must keep\n[r]: /x '{T}'\n- a\n",
+                 f"[{T}]: /x\n{E}:\n- a\n", f"[{T}]: /x\n{E}\n---\n- a\n",
+                 f"[r]: /x '\n{T}\n'\n{E}\n---\n- a\n", f"[r]: /x '\n{T}:\n'\n{E}:\n- a\n",
+                 f"[r]: /x (\n{T}\n)\n{E}\n---\n- a\n", f"{E}\n---\n[r]: /x 'note: {T}\n'\n- a\n",
+                 f"* {T}\n  ---\n## {E}\n"):
+        assert not _read(body).found
+    # ...nor does the next block's first line, which a Setext heading's end takes in
+    assert [s.raw for s in _read(f"{E}\n---\n## {T}\n").sections] == [f"## {T}\n"]
+    # ...and code, a link, an image or struck-through text on the line above, in the
+    # same paragraph, is part of its text
+    for body in (f"`x`\n{T}:\n- a\n", f"[x](https://example.invalid)\n{T}\n---\n- a\n",
+                 f"![x](i.png)\n{T}:\n- a\n", f"~~x~~\n{T}\n---\n- a\n"):
+        assert not _read(body).found
+    # ...nor hides a title written out after it
+    for body in (f"[{T}]: /x\n{T}:\n- a\n", f"[r]: /x '\n{T}\n'\n{T}\n---\n- a\n", f"[x]: /u\r{T}:\r- a\r"):
+        assert _blocks(body) == ["- a"]
+    # what may stand before the title on its line, between its parts and after it,
+    # in every line ending, with a Setext heading's underline and the line the parser
+    # gives it after that
+    for body in (f"##\t{T}\n- a\n", f"## <!-- c -->{T}\n- a\n", f"   {T}:\n- a\n",
+                 "## _Protections_ this PR must keep\n- a\n", f"\xa0  \n{T}\n---\n- a\n",
+                 f"\xa0\t\n{T}\n---\n- a\n", f"\xa0\n   {T}\n---\n- a\n", f"\xa0\r{T}\r---\r- a\r",
+                 f"\xa0\r\n{T}\r\n---\r\n- a\r\n", f"## {T}\t##\n- a\n", f"{T}:\t\n- a\n",
+                 f"{T} <!-- a\nb -->\n---\n- a\n", "Protections<!-- a\nb -->this PR must keep:\n- a\n",
+                 f"{T}\n   ---\n- a\n", f"{T}\n--- \n- a\n", f"{T}\n---\t\n- a\n",
+                 f"{T}\n---\n[x]: /u\n- a\n", f"{T}\r\n---\r\n[x]: /u\r\n- a\r\n", f"{T}\r---\r[x]: /u\r- a\r",
+                 f"{T}\r\n---\r\n- a\r\n", f"{T}\r---\r- a\r", f"## {T}\n[x]: /u\n- a\n",
+                 f"{T}\n---\n[x]: /u\n[y]: /v\n- a\n", f"{T}:\n\t<!-- c -->\n- a\n",
+                 f"{T}:\r\n\t<!-- c -->\r\n- a\r\n", f"\xa0\n\\\n{T}\n---\n- a\n",
+                 f"\xa0\r\n\\\r\n  __{T}__\r\n- a\r\n", "Protections<!-- c -->this PR must keep \n\\\n\xa0\n- a\n",
+                 f"\\\n{T}:\n- a\n", f"{T}:\\\n\t<!-- c -->\n- a\n"):
+        assert _blocks(body) == ["- a"]
+    for body in (f"## {T}", f"{T}\n---", f"{T}\n---\n[x]: /u"):
+        assert _read(body).found
+    # a label read whole although the paragraph after it, split off a table, has no line
+    assert [(s.raw, s.blocks) for s in _read(f"{T}:\n\nResults:\n| a |\n| - |\n").sections] == [(f"{T}:\n", ())]
+
+
 # ── L: limits, snapshot, warnings ───────────────────────────────────────────
 
 def _list(n, size=3):
@@ -487,14 +813,14 @@ def _list(n, size=3):
 
 
 def test_limits_and_snapshot():
-    at = P.snapshot_from_body(_list(40))
-    over = P.snapshot_from_body(_list(41))
+    at = _snap(_list(40))
+    over = _snap(_list(41))
     assert at.count == 40 and not at.over_limit and not at.blocked
     assert over.count == 41 and over.over_limit and over.blocked
     # characters: list markers count, comments and separators do not
-    chars_at = P.snapshot_from_body(f"## {T}\n- {'z' * 7998}\n")
-    chars_over = P.snapshot_from_body(f"## {T}\n- {'z' * 7999}\n")
-    commented = P.snapshot_from_body(f"## {T}\n- {'z' * 7998}<!-- {'c' * 50} -->\n")
+    chars_at = _snap(f"## {T}\n- {'z' * 7998}\n")
+    chars_over = _snap(f"## {T}\n- {'z' * 7999}\n")
+    commented = _snap(f"## {T}\n- {'z' * 7998}<!-- {'c' * 50} -->\n")
     assert chars_at.chars == 8000 and not chars_at.over_limit
     assert chars_over.chars == 8001 and chars_over.over_limit
     assert commented.chars == 8000 and not commented.over_limit
@@ -503,12 +829,12 @@ def test_limits_and_snapshot():
     assert P.round_warnings(over) == [("W5", P.W5.format(n=41, m=over.chars))]
     assert "41 protections" in P.round_warnings(over)[0][1]
     # an empty section warns W6; an unreadable round W7; a list neither
-    assert P.round_warnings(P.snapshot_from_body(f"## {T}\n\n")) == [("W6", P.W6)]
+    assert P.round_warnings(_snap(f"## {T}\n\n")) == [("W6", P.W6)]
     assert P.round_warnings(P.UNREADABLE) == [("W7", P.W7)]
     assert P.UNREADABLE.blocked and not P.UNREADABLE.present
     assert P.round_warnings(at) == []
     # no section: nothing present, nothing blocked
-    none = P.snapshot_from_body("plain body")
+    none = _snap("plain body")
     assert not none.found and not none.present and not none.blocked
 
 

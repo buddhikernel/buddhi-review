@@ -4,11 +4,14 @@ that keep a review fix from breaking one.
 A PR author lists requirements under a ``Protections this PR must keep`` heading
 (or a plain/bold label line followed by a list). This module:
 
-* **reads** that section exactly (:func:`parse_body`): ATX levels 1–6, Setext and
-  label forms; never inside a fence, indented code, a block quote or an HTML
-  comment. Every top-level list item, paragraph, table, code block and subordinate
+* **reads** that section exactly (:func:`parse_body`) from the tree of one pinned
+  parser, cmark-gfm 0.29.0.gfm.13 (bundled in multimark 0.4.0) with GitHub's
+  extensions: ATX levels 1–6, Setext and label forms, at the top level of the
+  document only — never inside a fence, indented code, a block quote, a list or raw
+  HTML. Every top-level list item, paragraph, table, code block and subordinate
   heading-with-paragraph is one protection, numbered in encounter order across
-  repeated sections, carried whole (no truncation);
+  repeated sections, carried whole (no truncation). A body it cannot read raises
+  :class:`ProtectionReadError`, never an empty reading;
 * **pins** one reading per round (:class:`Snapshot`), with the 40-protection /
   8,000-character limits and the failed-read fallback to the run's last good
   reading;
@@ -29,8 +32,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
-from typing import Callable, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from buddhi_review.notifier import Ask
 
@@ -81,549 +85,174 @@ def actions_for(origin: str) -> Tuple[str, ...]:
     return ("keep", "manual") if origin == GUARD else ("keep", "allow", "manual")
 
 
-# ── The section scanner ──────────────────────────────────────────────────────
+# ── The section reader ───────────────────────────────────────────────────────
 #
-# A line pass that follows the Markdown containers that matter here: list items
-# (with nesting, by content column) and fenced code (closed when its list item
-# ends). Every line records its list depth; only top-level lines (depth 0) can open
-# or end a protections section. HTML comments are removed the way CommonMark reads
-# them — a line starting ``<!--`` opens a comment block that runs to ``-->``; a
-# ``<!--`` elsewhere is a comment only when its ``-->`` closes within the same
-# paragraph — and never inside code (fenced, indented, or a code span).
+# The body's structure comes from one pinned parser: cmark-gfm 0.29.0.gfm.13 as
+# bundled in multimark 0.4.0, with GitHub's five extensions on. Its tree is copied
+# into plain dicts while the parser is open, and every section, protection and
+# boundary is then cut from the body's own text by the tree's line numbers — never
+# from rendered output, and never from a second scanner. A body the parser cannot
+# read, or whose tree does not map onto the body's lines, raises
+# :class:`ProtectionReadError`; it never reads as an empty one.
 
-_FENCE_RE = re.compile(r"^( {0,3})(`{3,}|~{3,})(.*)$")
-_ATX_RE = re.compile(r"^ {0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$")
-_ATX_CLOSE_RE = re.compile(r"(?:^|[ \t]+)#+[ \t]*$")
-_SETEXT_RE = re.compile(r"^ {0,3}(=+|-+)[ \t]*$")
-_THEMATIC_RE = re.compile(r"^ {0,3}(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
-_QUOTE_RE = re.compile(r"^ {0,3}>")
-_ITEM_RE = re.compile(r"^( {0,3})([-*+]|(\d{1,9})[.)])([ \t]+|$)")
+_EXTENSIONS = ("table", "strikethrough", "autolink", "tagfilter", "tasklist")
+_MULTIMARK = ("0.4.0", "0.29.0.gfm.13")    # the package, and the cmark-gfm it bundles
+# Only CR, LF and CRLF end a line, as for the parser (never str.splitlines()).
 _LINE_RE = re.compile(r"[^\r\n]*(?:\r\n|\r|\n)|[^\r\n]+$")
-_BACKTICKS_RE = re.compile(r"`+")
-_QUOTE_MARKS_RE = re.compile(r"^(?: {0,3}>[ \t]?)+")
-# A line opening an HTML block of CommonMark kinds 1-6, any of which may interrupt a
-# paragraph: 1 ``pre``, 2 ``comment``, 3 ``pi``, 4 ``decl``, 5 ``cdata``, 6 ``tag``; and
-# a line holding one lone tag (kind 7, which may only open one). Kinds 6 and 7 run to
-# the next blank line, the others to the first line holding their end (_HTML_ENDS).
-_HTML_BLOCK_RE = re.compile(
-    r" {0,3}(?:(?P<pre><(?:script|pre|style|textarea)(?:[ \t>]|$))|(?P<comment><!--)|(?P<pi><\?)"
-    r"|(?P<decl><![A-Za-z])|(?P<cdata><!\[(?-i:CDATA)\[)|(?P<tag></?"
-    r"(?:address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd"
-    r"|details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset"
-    r"|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol"
-    r"|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title"
-    r"|tr|track|ul)(?:[ \t]|/?>|$)))", re.IGNORECASE)
-_HTML_ENDS = {"pre": re.compile(r"</(?:script|pre|style|textarea)>", re.IGNORECASE),
-              "comment": re.compile("-->"), "pi": re.compile(r"\?>"), "decl": re.compile(">"),
-              "cdata": re.compile(r"\]\]>")}
-_TAG_ATTR = r"""[ \t]+[A-Za-z_:][A-Za-z0-9_.:-]*(?:[ \t]*=[ \t]*(?:[^ \t"'=<>`]+|'[^']*'|"[^"]*"))?"""
-_HTML_TAG_LINE_RE = re.compile(
-    r" {0,3}(?!</?(?:pre|script|style|textarea)(?![A-Za-z0-9-]))(?:<[A-Za-z][A-Za-z0-9-]*(?:"
-    + _TAG_ATTR + r")*[ \t]*/?>|</[A-Za-z][A-Za-z0-9-]*[ \t]*>)[ \t]*$", re.IGNORECASE)
+_LINE_END_RE = re.compile(r"\r\n|\r|\n")
+_MARKER_RE = re.compile(r"^\s*(?:[-+*]|\d+[.)])\s*")
+_ITEM_RE = re.compile(r"^( {0,3})([-*+]|(\d{1,9})[.)])([ \t]+|$)")
 
 
-def _columns(ws: str, start: int = 0) -> int:
-    col = start
-    for ch in ws:
-        col = col + 4 - (col % 4) if ch == "\t" else col + 1
-    return col - start
+class ProtectionReadError(Exception):
+    """The body's protections could not be read. ``reason`` (never shown to anyone)
+    is ``dependency-unavailable``, ``parse-failed`` or ``source-map-invalid``."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
-def _indent(text: str) -> int:
-    return _columns(text[:len(text) - len(text.lstrip(" \t"))])
+_multimark = None
 
 
-def _strip_cols(text: str, n: int) -> str:
-    """``text`` without its first ``n`` columns of leading whitespace (a tab that
-    straddles the cut leaves its remaining columns as spaces)."""
-    col = i = 0
-    while i < len(text) and col < n and text[i] in " \t":
-        if text[i] == "\t":
-            nxt = col + 4 - col % 4
-            if nxt > n:
-                return " " * (nxt - n) + text[i + 1:]
-            col = nxt
-        else:
-            col += 1
-        i += 1
-    return text[i:]
+def _load_multimark():
+    """The pinned parser package, imported on first use. Any other build, or none,
+    is ``dependency-unavailable``."""
+    global _multimark
+    if _multimark is None:
+        try:
+            import multimark
+            pinned = ((multimark.__version__, multimark.cmark_version()) == _MULTIMARK
+                      and set(_EXTENSIONS) <= multimark.VALID_EXTENSIONS)
+        except Exception as exc:
+            raise ProtectionReadError("dependency-unavailable") from exc
+        if not pinned:
+            raise ProtectionReadError("dependency-unavailable")
+        _multimark = multimark
+    return _multimark
 
 
-def _code_spans(text: str, later: Callable[[int], bool]) -> List[Tuple[int, int]]:
-    """``(start, end)`` of every backtick code span on one line; a run of ``n`` with
-    no partner on the line opens a span to its end when ``later(n)`` finds one on a
-    following line of the same paragraph. A backslash escapes a backtick only outside
-    a span: it can stop a run opening one, never closing one."""
-    spans: List[Tuple[int, int]] = []
-    runs = list(_BACKTICKS_RE.finditer(text))
-    k = 0
-    while k < len(runs):
-        start, end = runs[k].span()
-        b = start
-        while b and text[b - 1] == "\\":
-            b -= 1
-        start += (start - b) % 2                # an escaped first backtick is literal
-        n = end - start
-        close = next((j for j in range(k + 1, len(runs)) if len(runs[j].group(0)) == n), None)
-        if close is not None:
-            spans.append((start, runs[close].end()))
-            k = close + 1
-        elif n and later(n):
-            spans.append((start, len(text)))
-            break
-        else:
-            k += 1
-    return spans
+def _gfm_tree(body: str, *, extensions: Sequence[str]) -> dict:
+    """The parser's tree for ``body`` as plain dicts: ``kind``, 1-based ``start`` and
+    ``end`` lines, ``literal`` where the parser has one, ``level`` for a heading, and
+    ``children`` when there are any. Copied while the parser is open, so no node
+    outlives it."""
+    multimark = _load_multimark()
+    with multimark.Parser(extensions=list(extensions)) as parser:
+        parser.feed(body)
+        return _owned(parser.finish())
 
 
-def _blank(text: str) -> bool:
-    """Only spaces and tabs make a line blank."""
-    return not text.strip(" \t")
+def _owned(root) -> dict:
+    tree: dict = {}
+    stack = [(root, tree)]
+    while stack:
+        node, out = stack.pop()
+        out.update(kind=node.type_string, start=node.start_line, end=node.end_line)
+        literal = node.literal
+        if literal is not None:
+            out["literal"] = literal
+        if out["kind"] == "heading":
+            out["level"] = node.heading_level
+        children = []
+        child = node.first_child
+        while child is not None:
+            children.append((child, {}))
+            child = child.next
+        if children:
+            out["children"] = [copy for _, copy in children]
+            stack.extend(children)
+    return tree
 
 
-def _html_start(rel: str, para: bool) -> Tuple[bool, Optional["re.Pattern[str]"]]:
-    """Does ``rel`` open an HTML block, and what ends it: for kinds 1-5 the first
-    line ``end`` finds, for kinds 6 and 7 (``end`` None) a blank line. A lone tag
-    (kind 7) cannot interrupt a paragraph (``para``)."""
-    m = _HTML_BLOCK_RE.match(rel)
-    if m:
-        return True, next((end for kind, end in _HTML_ENDS.items() if m.group(kind)), None)
-    return not para and bool(_HTML_TAG_LINE_RE.match(rel)), None
-
-
-def _is_fence(rel: str) -> bool:
-    """Does ``rel`` open a fence? A backtick fence's info string has no backtick."""
-    fm = _FENCE_RE.match(rel)
-    return bool(fm and not (fm.group(2)[0] == "`" and "`" in fm.group(3)))
-
-
-def _comment_end(text: str, at: int) -> int:
-    """Index just past the comment opening at ``text[at]`` (``<!-->`` and
-    ``<!--->`` are complete comments), or -1 when it does not close here."""
-    if text.startswith("<!-->", at):
-        return at + 5
-    if text.startswith("<!--->", at):
-        return at + 6
-    j = text.find("-->", at + 4)
-    return -1 if j < 0 else j + 3
-
-
-def _join_cut(before: str, after: str) -> str:
-    """Join the text around a removed comment without gluing two words together."""
-    if before and after and not before[-1].isspace() and not after[0].isspace():
-        return before + " " + after
-    return before + after
-
-
-@dataclass
-class _Line:
-    start: int
-    end: int
-    raw: str           # the line as written, without its line ending
-    full: str          # the line with comments removed (block text)
-    text: str          # ``full`` relative to its list container (classification)
-    kind: str          # blank code quote atx setext thematic item indented text html
-    depth: int = 0     # enclosing list items; 0 = top level
-    level: int = 0     # heading level
-    title: str = ""    # ATX heading text
-    indent: int = 0    # indent of ``text``
-    fence_open: bool = False
-    fence_close: bool = False
-    after_comment: bool = False   # follows a line that held nothing but a comment
-    opens: bool = True            # text that starts a paragraph rather than continuing one
-
-
-def _block_start(rel: str, para: bool) -> bool:
-    """Would ``rel`` (container-relative) start a block of its own rather than
-    continue a paragraph lazily?"""
-    if _indent(rel) >= 4 or _blank(rel):
-        return _blank(rel)
-    return bool(_is_fence(rel) or _ATX_RE.match(rel) or _QUOTE_RE.match(rel)
-                or _THEMATIC_RE.match(rel) or _HTML_BLOCK_RE.match(rel)
-                or (_ITEM_RE.match(rel) and _interrupts(_ITEM_RE.match(rel), rel, para)))
-
-
-def _interrupts(m: "re.Match[str]", rel: str, para: bool) -> bool:
-    """May this list marker start an item here? After paragraph text only a
-    non-empty bullet item or an ordered item starting at 1 can."""
-    if not para:
-        return True
-    if _blank(rel[m.end():]):
-        return False
-    return m.group(3) is None or int(m.group(3)) == 1
-
-
-def _lines(body: str) -> List[_Line]:
-    """The body's lines, classified, with list depth. A line holding nothing but an
-    HTML comment is dropped — it is invisible, so it neither separates nor joins
-    blocks — and the line after it may start a fresh block."""
-    raws = [(m.start(), m.end(), m.group(0).rstrip("\r\n"))
-            for m in _LINE_RE.finditer(body) if m.group(0)]
-    lines: List[_Line] = []
-    items: List[int] = []                       # open list items' content columns
-    fence: Optional[Tuple[str, int, int]] = None   # (char, length, depth)
-    html_depth: Optional[int] = None            # an open comment block's depth
-    html_block: Optional[int] = None            # an open HTML block's depth (not a comment)
-    html_end: Optional["re.Pattern[str]"] = None   # ...and its end, None for a blank line
-    skip_to: Tuple[int, int] = (-1, 0)          # an inline comment's (line, col) end
-    para_at: Optional[int] = None              # depth of the open paragraph
-    empty_item: Optional[int] = None            # depth of an item whose first line is blank
-    quote_para = False                          # the last quote line holds paragraph text
-    quote_prose = False                         # ...plainly, so even an indented line is lazy
-    prev_blank = True
-    after_comment = False
-
-    def push(ln: _Line) -> None:
-        nonlocal after_comment
-        ln.after_comment, after_comment = after_comment, False
-        lines.append(ln)
-
-    def raw_html(start: int, end: int, raw: str, rest: str) -> None:
-        """The rest of a line a comment block closed on is raw HTML: visible text
-        (its own complete comments removed), never a heading, item or fence."""
-        nonlocal after_comment, para_at
-        text = _strip_inline_comments([], 0, rest, [], 0, markdown=False)
-        if text.strip():
-            push(_Line(start, end, raw, " " * _indent(raw) + text.strip(), text.strip(),
-                       "html", depth=len(items)))
-        else:
-            after_comment = True
-        para_at = None
-
-    def open_html(line: str, closer: Optional["re.Pattern[str]"]) -> None:
-        """An HTML block opens at this depth, unless it ends on its own line."""
-        nonlocal html_block, html_end
-        html_block, html_end = len(items), closer
-        if closer is not None and closer.search(line):
-            html_block = html_end = None
-
-    for idx, (start, end, bare) in enumerate(raws):
-        if idx < skip_to[0]:
-            after_comment = True       # wholly inside a multi-line inline comment
-            continue
-        if idx == skip_to[0]:
-            # The rest of a line an inline comment closed on: more of the same
-            # paragraph, never a fresh block — and any comment on it goes too.
-            more: List[Tuple[int, int]] = []
-            rest = _strip_inline_comments(raws, idx, bare[skip_to[1]:], more,
-                                          items[-1] if items else 0, True, html_block is None,
-                                          html_end)
-            if more:
-                skip_to = more[0]
-            after_comment = False
-            if rest.strip():
-                lines.append(_Line(start, end, bare, rest.rstrip(), rest.strip(),
-                                   "text" if html_block is None else "html",
-                                   depth=len(items), opens=False))
-            if html_end is not None and html_end.search(bare):
-                html_block = html_end = None
-            prev_blank = False
-            continue
-        ind = _indent(bare)
-        if _blank(bare):
-            if html_depth is not None:
-                after_comment = True
-                continue
-            if html_end is not None:            # kinds 1-5 run on past a blank line
-                push(_Line(start, end, bare, bare, "", "html", depth=html_block, opens=False))
-                continue
-            html_block = None
-            if empty_item == len(items):
-                del items[-1]           # an item may begin with at most one blank line
-            kind = "code" if fence is not None else "blank"
-            push(_Line(start, end, bare, bare, "", kind,
-                       depth=fence[2] if fence is not None else len(items)))
-            para_at, prev_blank = None, True
-            continue
-        empty_item = None
-        # Which open list items does this line continue?
-        k = sum(1 for col in items if ind >= col)
-        rel_here = _strip_cols(bare, items[k - 1]) if k else bare
-        lazy = (k < len(items) and para_at == len(items) and fence is None
-                and html_depth is None and not _block_start(rel_here, False))
-        if lazy:
-            k = len(items)                      # a lazy paragraph continuation
-        if fence is not None:
-            if k >= fence[2]:
-                rel = _strip_cols(bare, items[fence[2] - 1]) if fence[2] else bare
-                fm = _FENCE_RE.match(rel)
-                closes = bool(fm and fm.group(2)[0] == fence[0]
-                              and len(fm.group(2)) >= fence[1] and _blank(fm.group(3)))
-                push(_Line(start, end, bare, bare, rel, "code", depth=fence[2],
-                           indent=_indent(rel), fence_close=closes))
-                if closes:
-                    fence = None
-                para_at, prev_blank = None, False
-                continue
-            fence = None                        # its list item ended: so did the fence
-        if html_block is not None:
-            if k >= html_block:
-                # Raw HTML to its end: no heading, item or fence is read in it.
-                ends: List[Tuple[int, int]] = []
-                full = _strip_inline_comments(raws, idx, bare, ends, items[-1] if items else 0,
-                                              False, False, html_end)
-                if ends:
-                    skip_to = ends[0]
-                if full.strip():
-                    push(_Line(start, end, bare, full.rstrip(), full.strip(), "html",
-                               depth=len(items), opens=False))
-                else:
-                    after_comment = True
-                if html_end is not None and html_end.search(bare):
-                    html_block = html_end = None
-                prev_blank = False
-                continue
-            html_block = html_end = None        # its list item ended: so did the block
-        if html_depth is not None:
-            if k >= html_depth:
-                close = bare.find("-->")
-                if close < 0:
-                    after_comment = True
-                    continue
-                html_depth = None
-                raw_html(start, end, bare, bare[close + 3:])
-                continue
-            else:
-                html_depth = None
-        del items[k:]
-        col = items[-1] if items else 0
-        rel = _strip_cols(bare, col)
-        rel_ind = _indent(rel)
-        ln = _Line(start, end, raws[idx][2], bare, rel, "text", depth=len(items), indent=rel_ind)
-        # A comment block: a line opening with "<!--" (up to 3 columns in).
-        if rel_ind <= 3 and rel.lstrip(" \t").startswith("<!--"):
-            at = len(bare) - len(rel.lstrip(" \t"))
-            cut = _comment_end(bare, at)
-            if cut < 0:
-                html_depth = len(items)
-                after_comment = True
-                para_at, prev_blank = None, False
-                continue
-            raw_html(start, end, raws[idx][2], bare[cut:])
-            continue
-        im = _ITEM_RE.match(rel) if rel_ind <= 3 and not _THEMATIC_RE.match(rel) else None
-        if im is not None and _interrupts(im, rel, para_at == len(items)):
-            spaces = _columns(im.group(4), col + _columns(im.group(1)) + len(im.group(2)))
-            # A marker with nothing after it puts its content one column on,
-            # whatever trailing spaces the line carries.
-            content_col = col + _columns(im.group(1)) + len(im.group(2)) + (
-                spaces if 1 <= spaces <= 4 and not _blank(rel[im.end():]) else 1)
-            ln.kind = "item"
-            items.append(content_col)
-            inner = rel[im.end():]               # the item's first line, after its marker
-            empty_item = len(items) if _blank(inner) else None
-            fm = _FENCE_RE.match(inner)
-            if _is_fence(inner):
-                fence = (fm.group(2)[0], len(fm.group(2)), len(items))
-                ln.full = bare
-                para_at = None
-            else:
-                closes: List[Tuple[int, int]] = []
-                # (past four spaces, the content is indented code, not HTML)
-                opens, closer = _html_start(rel[im.end():], False) if spaces <= 4 else (False, None)
-                ln.full = _strip_inline_comments(
-                    raws, idx, bare, closes, content_col, not _ATX_RE.match(inner),
-                    not _HTML_BLOCK_RE.match(_QUOTE_MARKS_RE.sub("", inner)), closer)
-                if closes:
-                    skip_to = closes[0]
-                ln.text = _strip_cols(ln.full, col)
-                inner = ln.text[im.end():]       # a comment alone opens no paragraph
-                para_at = (len(items) if not _blank(inner) and not _ATX_RE.match(inner)
-                           else None)
-                if opens:                       # an HTML block: no paragraph, nothing lazy
-                    para_at = None
-                    open_html(rel[im.end():], closer)
-            push(ln)
-            prev_blank = False
-            continue
-        fm = _FENCE_RE.match(rel)        # at most 3 columns in, by the pattern
-        if _is_fence(rel):
-            fence = (fm.group(2)[0], len(fm.group(2)), len(items))
-            ln.kind, ln.fence_open = "code", True
-            push(ln)
-            para_at, prev_blank = None, False
-            continue
-        lazy_quote = (bool(lines) and lines[-1].kind == "quote" and quote_para
-                      and not prev_blank and not after_comment)
-        if rel_ind >= 4 and para_at != len(items) and not (lazy_quote and quote_prose):
-            ln.kind = "indented"        # code: no comment is read inside it
-            push(ln)
-            para_at, prev_blank = None, False
-            continue
-        found: List[Tuple[int, int]] = []
-        # An HTML block runs to its end; a lone tag cannot interrupt a paragraph.
-        opens, closer = _html_start(rel, para_at == len(items) or lazy_quote)
-        # A heading's code spans end with its line; raw HTML knows no backslash escape.
-        ln.full = _strip_inline_comments(raws, idx, bare, found, col, not _ATX_RE.match(rel),
-                                         not _HTML_BLOCK_RE.match(_QUOTE_MARKS_RE.sub("", rel)),
-                                         closer)
-        if found:
-            skip_to = found[0]
-        # A comment alone neither separates nor joins blocks; a line of other
-        # whitespace is paragraph text that shows nothing.
-        if not ln.full.strip() and bare.strip():
-            after_comment = True
-            continue
-        ln.text = _strip_cols(ln.full, col)
-        ln.indent = rel_ind = _indent(ln.text)
-        text = ln.text
-        if opens:
-            ln.kind = "html"
-            open_html(rel, closer)
-        elif _QUOTE_RE.match(text):
-            ln.kind = "quote"
-            q = _QUOTE_MARKS_RE.sub("", text)
-            quote_para = not _blank(q) and not (
-                _ATX_RE.match(q) or _FENCE_RE.match(q) or _THEMATIC_RE.match(q)
-                or _html_start(q, False)[0])
-            # Only plain text before any comment is removed — no item, HTML block or
-            # other block start — is surely a paragraph an indented line continues.
-            raw_q = _QUOTE_MARKS_RE.sub("", rel)
-            quote_prose = _indent(raw_q) < 4 and not _block_start(raw_q, False)
-        elif _ATX_RE.match(text):
-            am = _ATX_RE.match(text)
-            ln.kind, ln.level = "atx", len(am.group(1))
-            ln.title = _ATX_CLOSE_RE.sub("", am.group(2) or "").strip()
-        elif _SETEXT_RE.match(rel) and para_at == len(items) and not lazy:   # nor a comment
-            ln.kind, ln.level = "setext", 1 if text.strip()[0] == "=" else 2
-        elif _THEMATIC_RE.match(rel):
-            ln.kind = "thematic"
-        elif lazy_quote:
-            ln.kind = "quote"           # a lazy continuation of a quote's paragraph
-        else:
-            ln.kind = "text"
-            ln.opens = para_at != len(items)
-        push(ln)
-        para_at = len(items) if ln.kind == "text" else None
-        prev_blank = False
-    return lines
-
-
-def _later_lines(raws, idx: int, col: int) -> Iterator[Tuple[int, str]]:
-    """The lines after ``idx`` that continue its paragraph (whose container starts
-    at column ``col``): up to the first that would start a block of its own."""
-    for j in range(idx + 1, len(raws)):
-        raw = raws[j][2]
-        rel = _strip_cols(raw, col)
-        # Left of the container's content, a line continues the paragraph only
-        # lazily: then any list item starts a block, as in the line pass.
-        if _block_start(rel, _indent(raw) >= col) or _SETEXT_RE.match(rel):
-            return
-        yield j, raw
-
-
-def _html_lines(raws, idx: int, col: int, end=None) -> Iterator[Tuple[int, str]]:
-    """The lines after ``idx`` of its raw HTML (inside a container whose content
-    starts at column ``col``): up to one left of the container or past a quote's
-    end, and to a blank line or, for a block with an ``end``, through the line
-    holding it."""
-    if end is not None and end.search(raws[idx][2]):
-        return
-    quoted = _QUOTE_RE.match(_strip_cols(raws[idx][2], col)) if raws else None
-    for j in range(idx + 1, len(raws)):
-        raw = raws[j][2]
-        if _blank(raw):
-            if end is None:
-                return
-        elif _indent(raw) < col or (quoted and not _QUOTE_RE.match(_strip_cols(raw, col))):
-            return
-        yield j, raw
-        if end is not None and end.search(raw):
-            return
-
-
-def _strip_inline_comments(raws, idx: int, bare: str, found: list, col: int,
-                           cross: bool = True, markdown: bool = True, end=None) -> str:
-    """``bare`` with each ``<!--`` that is a real comment removed: in Markdown text
-    one not escaped with a backslash; outside a code span — one opening on this
-    line may close on a later line of the paragraph (``cross``: paragraph text, not
-    a heading); and whose ``-->`` closes on this line or on a later line of the same
-    paragraph (in raw HTML, ``markdown`` off: of the same block). A comment closing
-    on a later line is reported through ``found`` as
-    ``(line index, column after -->)``; the text from it to the line end goes."""
-    out, pos, seen = bare, 0, {}
-
-    def later(n: int) -> bool:             # a run of exactly n backticks further on
-        if n not in seen:
-            seen[n] = cross and any(re.search(r"(?<!`)`{%d}(?!`)" % n, t)
-                                    for _, t in _later_lines(raws, idx, col))
-        return seen[n]
-    while True:
-        at = out.find("<!--", pos)
-        if at < 0:
-            break
-        escaped = markdown and (len(out[:at]) - len(out[:at].rstrip("\\"))) % 2 == 1
-        if escaped or any(a <= at < b for a, b in _code_spans(out, later)):
-            pos = at + 4
-            continue
-        stop = _comment_end(out, at)
-        if stop >= 0:
-            out = _join_cut(out[:at], out[stop:])
-            pos = at
-            continue
-        scope = _later_lines(raws, idx, col) if markdown else _html_lines(raws, idx, col, end)
-        close = next(((j, t.find("-->")) for j, t in scope if "-->" in t), None)
-        if close is not None:
-            found.append((close[0], close[1] + 3))
-            out = out[:at].rstrip()
-            break
-        pos = at + 4                       # never closes: literal text
-    return out
+def _check_shape(tree: object) -> None:
+    """A document of well-typed nodes, or ``parse-failed``."""
+    if not isinstance(tree, dict) or tree.get("kind") != "document":
+        raise ProtectionReadError("parse-failed")
+    stack = [tree]
+    while stack:
+        node = stack.pop()
+        if not (isinstance(node, dict) and isinstance(node.get("kind"), str)
+                and type(node.get("start")) is int and type(node.get("end")) is int
+                and isinstance(node.get("literal", ""), str)
+                and (node["kind"] != "text" or "literal" in node)
+                and (node["kind"] != "heading" or type(node.get("level")) is int)
+                and isinstance(node.get("children", []), list)):
+            raise ProtectionReadError("parse-failed")
+        stack.extend(node.get("children", []))
 
 
 def _norm_title(text: str) -> str:
-    prev = None
-    s = text
-    while s != prev:
-        prev = s
-        s = s.strip()
-        s = s.strip("*_").strip()
-        if s.endswith(":"):
-            s = s[:-1]
-    return s.casefold()
+    s = text.strip()
+    return (s[:-1] if s.endswith(":") else s).strip().casefold()
 
 
 _TITLE_KEY = TITLE.casefold()
 
 
-def _setext_at(lines: List[_Line], i: int) -> Tuple[int, int]:
-    """``(level, underline index)`` when top-level line ``i`` opens a paragraph —
-    of one line or several — that a Setext underline closes, else ``(0, i)``."""
-    if not (lines[i].kind == "text" and lines[i].depth == 0 and lines[i].opens):
-        return 0, i
-    j = i + 1
-    while j < len(lines) and lines[j].kind == "text" and not lines[j].opens:
-        j += 1
-    if j < len(lines) and lines[j].kind == "setext":
-        return lines[j].level, j
-    return 0, i
+def _is_comment(node: dict) -> bool:
+    # An HTML block's literal keeps the up to three spaces the block is indented by.
+    return (node["kind"] in ("html_inline", "html_block")
+            and node.get("literal", "").lstrip(" ").startswith("<!--"))
 
 
-def _start_at(lines: List[_Line], i: int) -> Optional[Tuple[str, int, int]]:
-    """``(form, level, first body line)`` when line ``i`` opens a protections
-    section."""
-    ln = lines[i]
-    if ln.depth:
-        return None
-    if ln.kind == "atx" and _norm_title(ln.title) == _TITLE_KEY:
-        return "heading", ln.level, i + 1
-    level, under = _setext_at(lines, i)
-    if level and under == i + 1 and _norm_title(ln.text) == _TITLE_KEY:   # a one-line title
-        return "setext", level, under + 1
-    if (ln.kind == "text" and _norm_title(ln.text) == _TITLE_KEY and ln.opens
-            and (i + 1 >= len(lines) or lines[i + 1].kind in ("blank", "item")
-                 or lines[i + 1].after_comment)):
-        return "label", 0, i + 1
-    return None
+# What may stand before a title's first text run on its line (indentation, a BOM, a
+# heading's opening #s, emphasis, a removed comment), between two of its runs
+# (spacing, a line break or a backslash one, emphasis, a removed comment), and after
+# its last run: the same, closing #s too, to the end of its text; then a Setext
+# heading's underline and the one line after it that the parser's end can take in.
+_TITLE_LEAD = "(?:^|(?<=[\r\n]))[ \t﻿#*_\x00]*"
+_TITLE_SPACE = " \t\r\n*_\x00"
+_TITLE_BREAK = "\\\\(?=[\r\n])"
+_TITLE_GAP = "(?:[" + _TITLE_SPACE + "]|" + _TITLE_BREAK + ")*"
+_EOL = "(?:" + _LINE_END_RE.pattern + ")"
+_TITLE_END = ("(?:[#" + _TITLE_SPACE + "]|" + _TITLE_BREAK + ")*"
+              "(?:" + _EOL + " {0,3}(?:=+|-+)[ \t]*(?:" + _EOL + "[^\r\n]*)?)?"
+              + _EOL + "?\\Z")
 
 
-def _heading_level(lines: List[_Line], i: int) -> int:
-    """The level of a TOP-LEVEL heading starting at line ``i``, else 0."""
-    if lines[i].depth:
-        return 0
-    if lines[i].kind == "atx":
-        return lines[i].level
-    return _setext_at(lines, i)[0]
+def _title(node: dict) -> Optional[Tuple[str, List[str], List[str]]]:
+    """A heading's or paragraph's text with its emphasis unwrapped and its comments
+    taken out, the text runs it is made of, and its comments; None when it holds
+    anything else (a link, code, an image, struck-through or raw HTML text)."""
+    parts: List[str] = []
+    runs: List[str] = []
+    comments: List[str] = []
+    stack = list(reversed(node.get("children", [])))
+    while stack:
+        n = stack.pop()
+        if n["kind"] in ("softbreak", "linebreak"):
+            parts.append("\n")
+        elif n["kind"] == "text":
+            parts.append(n["literal"])
+            runs.append(n["literal"])
+        elif n["kind"] in ("emph", "strong"):
+            stack.extend(reversed(n.get("children", [])))
+        elif _is_comment(n):
+            parts.append(" ")
+            comments.append(n["literal"])
+        else:
+            return None
+    return "".join(parts), runs, comments
+
+
+def _gap(before: str, after: str) -> str:
+    """What stands in for a removed one-line comment: a space only where the text
+    around it would otherwise glue two words together."""
+    return " " if before and after and not before[-1].isspace() and not after[0].isspace() else ""
+
+
+def _comment_pattern(literal: str) -> "re.Pattern[str]":
+    """The comment that ``literal`` opens, as written in the body: an HTML block's
+    comment ends at its first ``-->``; a line after the first may sit behind the
+    container's indentation or quote markers, which the parser drops, and the parser
+    reads a NUL as U+FFFD."""
+    end = literal.find("-->", 2)
+    comment = (literal if end < 0 else literal[:end + 3]).rstrip("\r\n")
+    return re.compile(r"(?:\r\n|\r|\n)[ \t>]*".join(
+        re.escape(part.lstrip(" \t")).replace("�", "[\x00�]")
+        for part in _LINE_END_RE.split(comment)))
 
 
 @dataclass(frozen=True)
@@ -648,137 +277,212 @@ class Reading:
         return tuple(b for s in self.sections for b in s.blocks)
 
 
-def _block_text(lines: Sequence[_Line]) -> str:
-    # Trailing whitespace carries no meaning outside code (and a removed comment
-    # would otherwise leave its leading space behind).
-    texts = [ln.raw if ln.kind == "code" else ln.full.rstrip() for ln in lines]
-    while texts and not texts[0].strip():
-        texts.pop(0)
-    while texts and not texts[-1].strip():
-        texts.pop()
-    return "\n".join(texts)
-
-
-def _item_end(lines: List[_Line], i: int, stop: int) -> int:
-    """One past the last line of the top-level list item opening at ``i``: every
-    following line the line pass placed inside a list item belongs to it."""
-    j = i + 1
-    while j < stop and lines[j].depth >= 1:
-        j += 1
-    return j
-
-
-def _blocks(lines: List[_Line], lo: int, hi: int) -> Tuple[str, ...]:
-    out: List[str] = []
-    i = lo
-    pending_heading: Optional[List[_Line]] = None
-
-    def emit(group: List[_Line]) -> None:
-        nonlocal pending_heading
-        if pending_heading is not None:
-            group = pending_heading + group
-            pending_heading = None
-        text = _block_text(group)
-        # A bare list marker (an item that held only a comment) protects nothing.
-        if _ITEM_RE.sub("", text, count=1).strip():
-            out.append(text)
-
-    while i < hi:
-        ln = lines[i]
-        if ln.kind in ("blank", "thematic", "setext") and ln.depth == 0:
-            i += 1
-            continue
-        if _heading_level(lines, i):
-            if pending_heading is not None:
-                emit([])
-            span = 1 if ln.kind == "atx" else _setext_at(lines, i)[1] - i + 1
-            pending_heading = lines[i:i + span]
-            i += span
-            continue
-        if ln.kind == "item" and ln.depth == 0:
-            j = _item_end(lines, i, hi)
-            if pending_heading is not None:
-                emit([])
-            emit(lines[i:j])
-            i = j
-            continue
-        j = i + 1
-        if ln.kind == "code":
-            if not ln.fence_close or ln.fence_open:
-                while j < hi and lines[j].kind == "code" and lines[j].depth == ln.depth:
-                    j += 1
-                    if lines[j - 1].fence_close:
-                        break
-        elif ln.kind == "quote":
-            while j < hi and lines[j].kind == "quote":
-                j += 1
-        elif ln.kind == "indented":
-            while j < hi and lines[j].kind in ("indented", "blank") and lines[j].depth == 0:
-                j += 1
-        elif ln.kind == "html":
-            while j < hi and lines[j].kind == "html" and not lines[j].opens:
-                j += 1
-        else:
-            # (an indented line that continues a paragraph is classed as text)
-            while (j < hi and lines[j].kind == "text" and lines[j].depth == 0
-                   and not lines[j].opens and not _heading_level(lines, j)):
-                j += 1
-        emit(lines[i:j])
-        i = j
-    if pending_heading is not None:
-        emit([])
-    return tuple(out)
-
-
 def parse_body(body: Optional[str]) -> Reading:
     """Every protections section in ``body``, in order, with its raw slice and its
-    protections. ``None`` or a body with no matching section reads as none."""
+    protections. ``None`` or an empty body reads as none; a body that cannot be read
+    raises :class:`ProtectionReadError`."""
     body = body or ""
-    lines = _lines(body)
-    sections: List[Section] = []
-    n = len(lines)
-    i = 0
-    while i < n:
-        start = _start_at(lines, i)
-        if start is None:
-            i += 1
-            continue
-        form, level, body_from = start
-        if form == "label":
-            j = i + 1
-            while j < n and lines[j].kind == "blank":
-                j += 1
-            end_line = i + 1
-            if j < n and lines[j].kind == "item" and lines[j].depth == 0:
-                k = j
-                while k < n and lines[k].kind == "item" and lines[k].depth == 0:
-                    stop = _item_end(lines, k, n)
-                    end_line = stop
-                    while end_line - 1 > k and lines[end_line - 1].kind == "blank":
-                        end_line -= 1
-                    k = stop
-                    while k < n and lines[k].kind == "blank":
-                        k += 1
-                blocks = _blocks(lines, j, end_line)
+    if not body:
+        return Reading()
+    try:
+        tree = _gfm_tree(body, extensions=_EXTENSIONS)
+    except ProtectionReadError:
+        raise
+    except Exception as exc:
+        raise ProtectionReadError("parse-failed") from exc
+    _check_shape(tree)
+    return _read(body, tree)
+
+
+def _read(body: str, tree: dict) -> Reading:
+    """The sections ``tree`` places in ``body``. A heading or label paragraph at the
+    top level of the document opens one; a heading's runs to the next top-level
+    heading of the same or a higher rank, or the next section; a label's takes the
+    list that follows it, past comment-only blocks."""
+    lines = _LINE_RE.findall(body)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    nodes = tree.get("children", [])
+
+    def span(node: dict) -> Tuple[int, int]:
+        first, last = node["start"], node["end"]
+        if node["kind"] == "html_block":
+            # The parser can end an HTML block before its closing line; its literal
+            # holds every line the block took.
+            last = first - 1 + len(_LINE_RE.findall(node.get("literal", "")))
+        if not 1 <= first <= last <= len(lines):
+            raise ProtectionReadError("source-map-invalid")
+        return offsets[first - 1], offsets[last]
+
+    if any(n["start"] > len(lines) for n in nodes):
+        raise ProtectionReadError("source-map-invalid")
+    # The parser gives the paragraph it splits off the head of a table no line at
+    # all (and the table that paragraph's first line), so a reading that needs that
+    # paragraph fails; every reading that reaches the table needs it first. (Only
+    # top-level nodes and list items are placed by line; comments by their text.)
+    starts = [offsets[n["start"] - 1] if n["start"] >= 1 else None for n in nodes]
+    placed = [s for s in starts if s is not None]
+    if placed != sorted(placed):
+        raise ProtectionReadError("source-map-invalid")
+
+    def start(i: int) -> int:
+        """Where top-level node ``i`` starts, for a reading that needs it."""
+        if i == len(nodes):
+            return len(body)
+        if starts[i] is None:
+            raise ProtectionReadError("source-map-invalid")
+        return starts[i]
+
+    def declares(i: int) -> bool:
+        node = nodes[i]
+        title = _title(node) if node["kind"] in ("heading", "paragraph") else None
+        if title is None or _norm_title(title[0]) != _TITLE_KEY:
+            return False
+        # Every text run must be the body's own characters, in order, in the title's
+        # own lines and outside its comments, with nothing between them but spacing,
+        # emphasis or a comment, and the last must end the node's text: an entity, an
+        # escape or a reference definition that renders as the title does not make one.
+        hi = span(node)[1]
+        if i + 1 < len(nodes) and starts[i + 1] is not None:
+            # A Setext heading's end can take in the next block's first line.
+            hi = min(hi, starts[i + 1])
+        source = body[start(i):hi]
+        for comment in title[2]:
+            source = _comment_pattern(comment).sub(lambda m: "\x00" * len(m.group()), source)
+        pattern = _TITLE_LEAD + _TITLE_GAP.join(re.escape(run) for run in title[1]) + _TITLE_END
+        return re.search(pattern, source) is not None
+
+    opens = [declares(i) for i in range(len(nodes))]
+
+    def text(node: dict, limit: int) -> str:
+        """``node``'s protection: its lines, up to ``limit`` where the next sibling
+        starts (a Setext heading's end can reach into it), with its comments taken
+        out and any line that held nothing but a comment dropped."""
+        lo, hi = span(node)
+        source = body[lo:min(hi, limit)]
+        comments = []
+        stack = [node]
+        while stack:
+            n = stack.pop()
+            if _is_comment(n):
+                comments.append(n)
             else:
-                blocks = ()
-            # Up to the next line read, so a comment closing the last item stays inside.
-            end = lines[end_line].start if end_line < n else len(body)
-            sections.append(Section(lines[i].start, end, body[lines[i].start:end], blocks))
-            i = end_line
+                stack.extend(reversed(n.get("children", [])))
+        # The parser's line for an inline node lags behind after a code span, raw
+        # HTML, a link title or a backslash break that runs over a line, so a comment
+        # is found by its text alone: in order, and only where every copy of that text
+        # in the block is one of its comments (never code or escaped text).
+        patterns = [_comment_pattern(comment["literal"]) for comment in comments]
+        wanted = Counter(p.pattern for p in patterns)
+        if any(len(re.findall(p, source)) != n for p, n in wanted.items()):
+            raise ProtectionReadError("source-map-invalid")
+        cuts: List[Tuple[int, int]] = []
+        for pattern in patterns:
+            m = pattern.search(source, cuts[-1][1] if cuts else 0)
+            if m is None:
+                raise ProtectionReadError("source-map-invalid")
+            cuts.append(m.span())
+        out, last = "", 0
+        for start, end in cuts:
+            out += source[last:start]
+            breaks = "".join(_LINE_END_RE.findall(source[start:end]))
+            out += breaks or _gap(out, source[end:])
+            last = end
+        out += source[last:]
+        # The cuts keep every line break, so line i of ``out`` is line i of ``source``.
+        bounds = [m.span() for m in _LINE_RE.finditer(source)]
+        chunks = [chunk.rstrip("\r\n") for chunk in _LINE_RE.findall(out)]
+        if node["kind"] != "code_block":
+            # Trailing whitespace carries no meaning outside code.
+            chunks = [chunk.rstrip() for chunk in chunks]
+        chunks = [chunk for (a, b), chunk in zip(bounds, chunks) if chunk.strip()
+                  or not any(start < b and end > a for start, end in cuts)]
+        while chunks and not chunks[0].strip():
+            chunks.pop(0)
+        while chunks and not chunks[-1].strip():
+            chunks.pop()
+        return "\n".join(chunks)
+
+    def blocks(first: int, stop: int, end: int) -> Tuple[str, ...]:
+        # Every top-level list item is one protection, and every other block; a
+        # subordinate heading joins the block after it. A block ends where the next
+        # one starts, and the last where the section ends.
+        def limit(i: int) -> int:
+            return end if i + 1 == stop else start(i + 1)
+
+        out: List[str] = []
+        pending: Optional[str] = None
+        for i in range(first, stop):
+            node = nodes[i]
+            if node["kind"] == "thematic_break":
+                continue
+            if node["kind"] == "heading":
+                if pending:
+                    out.append(pending)
+                pending = text(node, limit(i))
+                continue
+            if node["kind"] == "list":
+                if pending:
+                    out.append(pending)
+                    pending = None
+                items = node.get("children", [])
+                for k, item in enumerate(items):
+                    value = text(item, span(items[k + 1])[0] if k + 1 < len(items) else limit(i))
+                    # A bare list marker (an item that held only a comment) protects nothing.
+                    if _MARKER_RE.sub("", value).strip():
+                        out.append(value)
+                continue
+            value = text(node, limit(i))
+            if value:
+                if pending:
+                    value = pending + "\n" + value
+                    pending = None
+                out.append(value)
+        if pending:
+            out.append(pending)
+        return tuple(out)
+
+    sections: List[Section] = []
+    for i, node in enumerate(nodes):
+        if not opens[i]:
             continue
-        j = body_from
-        while j < n:
-            if _start_at(lines, j) is not None:
-                break
-            lvl = _heading_level(lines, j)
-            if lvl and lvl <= level:
-                break
-            j += 1
-        end = lines[j].start if j < n else len(body)
-        blocks = _blocks(lines, body_from, j)
-        sections.append(Section(lines[i].start, end, body[lines[i].start:end], blocks))
-        i = j
+        lo = start(i)
+        if node["kind"] == "heading":
+            stop = next((j for j in range(i + 1, len(nodes)) if opens[j] or (
+                nodes[j]["kind"] == "heading" and nodes[j]["level"] <= node["level"])), len(nodes))
+            hi = start(stop)
+            found = blocks(i + 1, stop, hi)
+        else:
+            j = i + 1
+            while j < len(nodes) and nodes[j]["kind"] == "html_block" and _is_comment(nodes[j]):
+                j += 1
+            if j < len(nodes) and nodes[j]["kind"] == "list":
+                span(nodes[j])
+                # The list's end can take in the blank line after it; the label's
+                # slice ends with the list's last written line, or with the last line
+                # of a code or raw HTML block in it, whose blank lines are its own (a
+                # fenced block's text starts after its fence; an indented one may so
+                # keep one blank line more).
+                floor = nodes[j]["start"]
+                stack = list(nodes[j].get("children", []))
+                while stack:
+                    n = stack.pop()
+                    if n["kind"] in ("code_block", "html_block"):
+                        if n["start"] < 1:
+                            raise ProtectionReadError("source-map-invalid")
+                        floor = max(floor, n["start"] - 1 + len(_LINE_RE.findall(n.get("literal", "")))
+                                    + (1 if n["kind"] == "code_block" else 0))
+                    stack.extend(n.get("children", []))
+                last = nodes[j]["end"]
+                while last > floor and not lines[last - 1].strip(" \t\r\n"):
+                    last -= 1
+                hi = offsets[last]
+                found = blocks(j, j + 1, hi)
+            else:
+                hi = span(node)[1]
+                found = ()
+        sections.append(Section(lo, hi, body[lo:hi], found))
     return Reading(tuple(sections))
 
 
