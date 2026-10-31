@@ -45,9 +45,9 @@ REQUEST_MAX = 300
 
 ORIGINS = ("classifier", "fixer", "verifier", "description_guard")
 GUARD = "description_guard"
-# The structured record marker. Spelled in two parts only because the publish
-# gate's paid-package-name check matches this name's leading letters; the marker
-# itself names no paid package.
+# The structured record marker, hidden in each decision the loop posts. Written
+# in two parts so that a text scan of this repository for another name with the
+# same leading letters never matches this line.
 MARKER = "buddhi-" + "protection"
 
 # ── Approved wording (W1–W7) ─────────────────────────────────────────────────
@@ -216,7 +216,7 @@ def _title(node: dict) -> Optional[Tuple[str, List[str], List[str]]]:
     """A heading's or paragraph's text with its emphasis unwrapped and its comments
     taken out, the text runs it is made of, and its comments; None when it holds
     anything else (a link, code, an image, struck-through or raw HTML text)."""
-    parts: List[str] = []
+    parts: List[Optional[str]] = []    # None where a comment was
     runs: List[str] = []
     comments: List[str] = []
     stack = list(reversed(node.get("children", [])))
@@ -230,11 +230,20 @@ def _title(node: dict) -> Optional[Tuple[str, List[str], List[str]]]:
         elif n["kind"] in ("emph", "strong"):
             stack.extend(reversed(n.get("children", [])))
         elif _is_comment(n):
-            parts.append(" ")
+            parts.append(None)
             comments.append(n["literal"])
         else:
             return None
-    return "".join(parts), runs, comments
+    # A removed comment leaves what _gap leaves: a space only where the text on
+    # either side of it would otherwise glue two words together.
+    following, after = [], ""
+    for part in reversed(parts):
+        following.append(after)
+        after = part or after
+    text = ""
+    for part, after in zip(parts, reversed(following)):
+        text += _gap(text, after) if part is None else part
+    return text, runs, comments
 
 
 def _gap(before: str, after: str) -> str:

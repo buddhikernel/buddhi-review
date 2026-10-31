@@ -806,6 +806,62 @@ def test_title_written_out_on_its_line():
     assert [(s.raw, s.blocks) for s in _read(f"{T}:\n\nResults:\n| a |\n| - |\n").sections] == [(f"{T}:\n", ())]
 
 
+# A title declares exactly when deleting its comments without joining words leaves
+# the literal title. Between two words, a space already beside the comment is enough;
+# spaces on both sides, or a tab, leave two spaces or a tab between them, so those
+# rows are not declarations (a stated limitation). At the title's start or end that
+# whitespace only surrounds the title. Left out: cells the parser cannot read as a
+# title holding an inline comment (an ATX heading holds no multi-line comment; a
+# plain-label or Setext line beginning with "<!--" is an HTML block, or indented code
+# behind a tab; whitespace just inside a bold label's ** stops it being bold).
+_FORMS = {"atx": "## {}\n", "setext": "{}\n---\n", "label": "{}:\n", "bold": "**{}:**\n"}
+_AT = {"start": ("", T, "<!-- c -->"), "middle": ("Protections", "this PR must keep", "<!-- c -->"),
+       "end": (T, "", "<!-- c -->"), "multiline": ("Protections", "this PR must keep", "<!-- c\nd -->")}
+_BESIDE = {"none": ("", ""), "space-before": (" ", ""), "space-after": ("", " "),
+           "spaces-both": (" ", " "), "tab-before": ("\t", ""), "tab-after": ("", "\t")}
+
+
+def _cell(form, at, beside):
+    (left, right, comment), (before, after) = _AT[at], _BESIDE[beside]
+    kept = left + (before + after or (" " if left and right else "")) + right
+    title = left + before + comment + after + right
+    return (f"{form}-{at}-{beside}", _FORMS[form].format(title) + "- Keep retry count at 3\n",
+            ["- Keep retry count at 3"] if kept.strip() == T else None)
+
+
+_F1 = "Old intro.\n\n{}\n- Keep retry count at 3\n\n## Notes\nOld note.\n".format
+# Titles with a space on one side of their comment, each followed by a later section.
+ONE_SIDED = {
+    "atx-space-before-comment": _F1("## Protections <!-- c -->this PR must keep"),
+    "atx-space-after-comment": _F1("## Protections<!-- c --> this PR must keep"),
+    "atx-space-before-comment-mid": _F1("## Protections this <!-- c -->PR must keep"),
+    "setext-space-before-comment": _F1("Protections <!-- c -->this PR must keep\n---"),
+    "label-space-before-comment": _F1("**Protections <!-- c -->this PR must keep:**"),
+    "label-space-after-comment-colon-outside": _F1("**Protections<!-- c --> this PR must keep**:"),
+    "label-multiline-comment-space-before": _F1("**Protections <!--\nc\n-->this PR must keep:**"),
+    "beside-recognised-section": _F1(f"## {T}\n- Never skip the test gate\n\n"
+                                     "## Protections <!-- c -->this PR must keep"),
+    "atx-comment-space-before": _F1("## Protections <!-- why -->this PR must keep"),
+    "label-comment-space-after": _F1("Protections<!-- why --> this PR must keep:"),
+    "setext-multiline-comment-space": _F1("Protections <!-- a\nb -->this PR must keep\n---"),
+    # a Setext h1: the later "## Notes" is a subordinate heading inside its section
+    "C-setext-bold-title-one-sided-space": "Intro.\n\n**Protections <!-- always -->this PR must keep**\n"
+                                           "===\n- Keep the retry limit at 3\n\n## Notes\nOld note.\n",
+}
+TITLE_COMMENTS = [
+    _cell(form, at, beside) for form in _FORMS for at in _AT for beside in _BESIDE
+    if not (form == "atx" and at == "multiline") and not (form in ("setext", "label") and at == "start")
+    and not (form == "bold" and at == "start" and _BESIDE[beside][0])
+] + [(name, body, ["- Never skip the test gate", "- Keep retry count at 3"] if name.startswith("beside")
+      else ["- Keep the retry limit at 3", "## Notes\nOld note."] if name.startswith("C-")
+      else ["- Keep retry count at 3"]) for name, body in ONE_SIDED.items()]
+
+
+@pytest.mark.parametrize("name,body,want", TITLE_COMMENTS, ids=[c[0] for c in TITLE_COMMENTS])
+def test_title_comment_removed_without_joining_words(name, body, want):
+    test_section_syntax(name, body, want)
+
+
 # ── L: limits, snapshot, warnings ───────────────────────────────────────────
 
 def _list(n, size=3):

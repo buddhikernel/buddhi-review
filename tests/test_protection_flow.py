@@ -19,6 +19,7 @@ from buddhi_review.adapter import ReviewAdapter
 from buddhi_review.fix_apply import FixOutcome, apply_fix
 from buddhi_review.loop import Comment, CommentResult
 
+from test_protections import ONE_SIDED
 from test_round_driver import CLAUDE_ONLY, FakeNotifier, make_driver
 
 T = "Protections this PR must keep"
@@ -1022,6 +1023,28 @@ def test_description_protection_bytes_after_a_label(old, before, after):
     out, edits = _rewrite(old, new.replace(before, after))
     assert edits == [] and out.status == "protection-conflict"
     assert out.protection_origin == "description_guard"
+    out, edits = _rewrite(old, new)
+    assert out.status == "applied" and edits == [new.strip()]
+
+
+# A title whose comment has a space on one side (ATX, Setext, plain and bold labels,
+# and one beside a section already recognised) declares its section. Left out: the
+# Setext h1, whose section takes in the later "## Notes", so no unrelated text
+# follows it (the reader test pins its blocks).
+ONE_SIDED_FLOW = [(n, b) for n, b in ONE_SIDED.items() if n != "C-setext-bold-title-one-sided-space"]
+
+
+@pytest.mark.parametrize("name,old", ONE_SIDED_FLOW, ids=[o[0] for o in ONE_SIDED_FLOW])
+def test_description_protection_bytes_one_sided_title_comment(name, old):
+    out, edits = _rewrite(old, old.replace("at 3", "at 9"))
+    assert edits == [] and out.status == "protection-conflict"
+    assert out.protection_origin == "description_guard"
+    assert out.protection_texts == ("- Keep retry count at 3",)
+
+
+@pytest.mark.parametrize("name,old", ONE_SIDED_FLOW, ids=[o[0] for o in ONE_SIDED_FLOW])
+def test_description_protection_bytes_one_sided_title_comment_unrelated_edit(name, old):
+    new = old.replace("Old intro.", "New intro.").replace("Old note.", "New note.")
     out, edits = _rewrite(old, new)
     assert out.status == "applied" and edits == [new.strip()]
 
