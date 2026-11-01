@@ -1357,6 +1357,10 @@ class RoundDriver:
         #   valid or not), or one that would show it failed.
         self._history_may_hold = False
         self._kept_roots: Set[str] = set()       # Keep decided: the gate may resolve
+        # inline comment id → (its thread root, its latest final) for every request
+        #   the run processed: a kept or allowed thread is the run's to close only
+        #   once every request it processed on that thread reached a resolved final.
+        self._inline_finals: Dict[str, Tuple[str, str]] = {}
         self._round_held_ids: Set[str] = set()   # comment ids held this round
         self._edits_deferred = False             # a reviewer edit was held back unmade
         self._unsettled_roots: Set[str] = set()  # threads holding a request no hold names
@@ -4120,13 +4124,46 @@ class RoundDriver:
             if self._askable(hold):
                 self._ask_hold(key)
 
+    def _thread_requests_resolved(self, root: str, refused: Iterable[str] = ()) -> bool:
+        """Every request the run processed on this inline thread — bar the ones a
+        Keep refused — reached a resolved final, and none waits unsettled. A thread
+        whose own root fix was rejected is never closed on a reply's decision."""
+        if root in self._unsettled_roots:
+            return False
+        refused = set(refused)
+        return all(final in _RESOLVED_FINALS for cid, (r, final) in self._inline_finals.items()
+                   if r == root and cid not in refused)
+
+    def _kept_sources(self, root: str) -> List[str]:
+        hold = self._protection_holds.get(root) or {}
+        return list(hold.get("sources") or [root])
+
+    def _settled_hold_roots(self) -> Set[str]:
+        """Inline threads an owner decision made the run's to close: a kept one, and
+        an allowed one whose held requests were all re-run to a resolved final — in
+        both, only once every other request processed on the thread is resolved."""
+        out = {r for r in self._kept_roots
+               if self._thread_requests_resolved(r, self._kept_sources(r))}
+        for hold in self._protection_holds.values():
+            if not hold.get("inline", True) or hold["state"] != "allow":
+                continue
+            root = hold["root_id"]
+            held = hold.get("sources") or [root]
+            if (all(s in self._inline_finals for s in held)
+                    and self._thread_requests_resolved(root)):
+                out.add(root)
+        return out
+
     def _resolve_kept_root(self, hold: dict) -> None:
         """Keep closes only an inline root's own thread; a review-body finding has
-        no thread, and its id must never be matched against a thread root."""
+        no thread, and its id must never be matched against a thread root. A thread
+        with another request still unresolved stays open for the merge gate."""
         if not hold.get("inline", True) or hold["root_id"] in self._unsettled_roots:
             return
         root = hold["root_id"]
         self._kept_roots.add(root)
+        if not self._thread_requests_resolved(root, hold.get("sources") or [root]):
+            return
         for t in self._thread_history() or ():
             if t.root_comment_id == root and not t.is_resolved:
                 try:
@@ -4192,6 +4229,8 @@ class RoundDriver:
                 results.append(r)
                 round_actions.append(a)
                 self.actions.append(a)
+            if c.path:
+                self._inline_finals[c.id] = (c.root_id, a.final)
             if c.path and a.final in _RESOLVED_FINALS:
                 self._handled_inline_ids.add(c.id)
             if a.protection_hold:
@@ -4576,6 +4615,10 @@ class RoundDriver:
             # thread gate resolves ONLY the run's own inline threads and can never
             # match a review-body / conversation id against a thread root.
             for c, a in zip(actionable, round_actions):
+                # A held comment's outcome is its hold's (owner) decision, not a
+                # request the run processed: an Allow records it once re-run.
+                if c.path and c.id not in held_ids:
+                    self._inline_finals[c.id] = (c.root_id, a.final)
                 if c.path and a.final in _RESOLVED_FINALS:
                     self._handled_inline_ids.add(a.comment_id)
             for a in round_actions:
@@ -5066,8 +5109,9 @@ class RoundDriver:
         # Everything else unresolved is "foreign" — a human's open thread or a
         # rejected fix — never touched. A thread whose root carries an unanswered or
         # manual protections hold is never the run's to close, whatever an earlier
-        # outcome on it was; one the owner kept the protection on is, until re-held.
-        handled = ((self._handled_inline_ids | self._kept_roots)
+        # outcome on it was; one the owner kept the protection on, or allowed and saw
+        # fixed, is — but only once every request the run processed on it resolved.
+        handled = ((self._handled_inline_ids | self._settled_hold_roots())
                    - {h["root_id"] for h in self._protection_holds.values()
                       if h.get("inline", True) and h["state"] in ("pending", "manual")})
         own = [t for t in unresolved

@@ -114,6 +114,7 @@ def build_pr_description_prompt(current_body: str, comment_text: str,
 
 
 _UNREADABLE = "pr-description: protections could not be read; description left unchanged"
+_BARE_LF = re.compile(r"(?<!\r)\n")
 
 
 def _protected_rewrite(current_body: str, new_body: str,
@@ -228,6 +229,13 @@ def rewrite_pr_description(
     if not new_body:
         return FixOutcome(status="transient-failed",
                           detail="pr-description: rewrite produced no body")
+    if original.found and "\r\n" in current_body:
+        # The model runner decodes its output with universal newlines, so a CRLF body
+        # (one edited in GitHub's web UI) comes back with bare LFs. Restore the
+        # original's line endings before comparing, so a rewrite that leaves the
+        # protections untouched still matches them byte for byte. Only bare LFs are
+        # converted; the byte-for-byte guard below is unchanged.
+        new_body = _BARE_LF.sub("\r\n", new_body)
     if new_body == current_body.strip():
         # A no-op rewrite means the body already reads correctly; skip the write
         # (a terminal skip, so it does not re-flag as a fresh change next round).

@@ -1092,6 +1092,36 @@ def test_description_protection_bytes_permitted_rewrites():
     assert out.status == "skipped" and edits == []
 
 
+def test_description_crlf_body_keeps_its_protections_through_an_lf_rewrite():
+    # A web-edited body arrives with CRLF; the model runner's text-mode decode hands
+    # back bare LFs. An unrelated rewrite must still land, in the body's own endings.
+    old = f"Old summary.\r\n\r\n{SECTION}## Notes\r\nn\r\n".replace(
+        SECTION, SECTION.replace("\n", "\r\n"))
+    lf = old.replace("\r\n", "\n")
+    out, edits = _rewrite(old, lf.replace("Old summary.", "New summary."))
+    assert out.status == "applied"
+    assert edits == [old.replace("Old summary.", "New summary.").strip()]
+    # a model output that already kept some CRLFs is not doubled
+    out, edits = _rewrite(old, lf.replace("Old summary.\n", "New summary.\r\n"))
+    assert out.status == "applied" and "\r\r\n" not in edits[0]
+    # an LF echo of the unchanged body is still a no-op skip
+    out, edits = _rewrite(old, lf)
+    assert out.status == "skipped" and edits == []
+    # a changed protection on a CRLF body is still held, with no write
+    out, edits = _rewrite(old, lf.replace("at 3", "at 5"))
+    assert edits == [] and out.status == "protection-conflict"
+    assert out.protection_texts == ("- Keep the retry limit at 3",)
+    # a section at the very end keeps its CRLF trailing bytes despite the strip
+    tail = f"Old.\r\n\r\n## {T}\r\n- keep\r\n\r\n"
+    out, edits = _rewrite(tail, f"New.\n\n## {T}\n- keep\n")
+    assert out.status == "applied" and edits == [f"New.\r\n\r\n## {T}\r\n- keep\r\n\r\n"]
+
+
+def test_description_crlf_body_without_protections_is_posted_as_the_model_wrote_it():
+    out, edits = _rewrite("Old.\r\nmore\r\n", "New.\nmore\n")
+    assert out.status == "applied" and edits == ["New.\nmore"]
+
+
 UNREAD = "pr-description: protections could not be read; description left unchanged"
 
 
@@ -1545,6 +1575,62 @@ def test_entry_and_restart_a_kept_reply_hold_with_nothing_new_closes_its_thread(
     d, gh, events, threads = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
                                     threads=t, answer=lambda a: "1")
     d.run()
+    assert threads.resolved == ["T1"]
+
+
+def test_entry_and_restart_an_allowed_reply_hold_fixed_closes_its_thread():
+    # A restored hold naming only reply 2: once Allow re-runs reply 2 to a fix and
+    # nothing else on the thread is open, the thread is the run's to close.
+    pend = P.record_body("pending", "1", "fixer", [BLOCKS[0]], "2")
+    t = Threads().add("1", history=[("2", "relax the retry limit", "claude[bot]"), ("3", pend, LOGIN)])
+    fixed = []
+    d, gh, events, threads = _drive(
+        [(0, Comment(id="z", text="No issues found.", source="claude[bot]"))], threads=t,
+        classify=_classify(), answer=lambda a: "2", auto_merge=True,
+        fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
+    d.run()
+    assert fixed == ["2"] and d._protection_holds["1"]["state"] == "allow"
+    assert threads.resolved == ["T1"] and _merged(gh)
+
+
+def _gate_driver(state, sources, finals):
+    """A driver with one inline hold on root 1 and the run's per-request finals."""
+    t = Threads().add("1", history=[("2", "relax it", "claude[bot]")])
+    d, gh, events, threads = _drive([], threads=t)
+    hold = P.make_protection_hold(root_id="1", origin="fixer", protection_texts=[BLOCKS[0]])
+    hold.update(state=state, sources=list(sources), inline=True)
+    d._protection_holds["1"] = hold
+    if state == "keep":
+        d._kept_roots.add("1")
+    d._inline_finals = {cid: ("1", final) for cid, final in finals.items()}
+    return d, threads
+
+
+@pytest.mark.parametrize("state,sources,finals,closes", [
+    # a Keep naming only reply 2 never closes a thread whose root fix was rejected
+    ("keep", ["2"], {"1": "rejected"}, False),
+    ("keep", ["2"], {"1": "fixed"}, True),
+    ("keep", ["2"], {}, True),
+    ("keep", [], {"2": "rejected"}, False),
+    # an allowed reply closes its thread once re-run to a fix, alone on it
+    ("allow", ["2"], {"2": "fixed"}, True),
+    ("allow", ["2"], {"2": "fixed", "1": "rejected"}, False),
+    ("allow", ["2"], {"2": "rejected"}, False),
+    ("allow", ["2"], {}, False),
+])
+def test_merge_gate_closes_a_decided_thread_only_when_every_request_resolved(
+        state, sources, finals, closes):
+    d, threads = _gate_driver(state, sources, finals)
+    assert d._thread_gate_ok() is closes
+    assert threads.resolved == (["T1"] if closes else [])
+
+
+def test_keep_settle_leaves_a_thread_with_a_rejected_root_open():
+    d, threads = _gate_driver("keep", ["2"], {"1": "rejected"})
+    d._resolve_kept_root(d._protection_holds["1"])
+    assert threads.resolved == [] and "1" in d._kept_roots
+    d._inline_finals["1"] = ("1", "fixed")
+    d._resolve_kept_root(d._protection_holds["1"])
     assert threads.resolved == ["T1"]
 
 
