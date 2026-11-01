@@ -963,6 +963,42 @@ def test_ask_menus_and_decoding():
     assert P.decode_protection_answer(forged, "2") is None
 
 
+def test_a_hold_opened_after_a_settled_one_gets_its_own_question_id():
+    first = P.make_protection_hold(root_id="5", origin="verifier", protection_texts=["- a"])
+    first["sources"] = ["6"]
+    first_id = P.protection_ask(first, reviewer="", request="").id
+    # a second request joining the still-open hold keeps the same question
+    first["sources"] = ["6", "7"]
+    assert P.protection_ask(first, reviewer="", request="").id == first_id
+    # after Keep, a later reply on the same thread raising the same conflict opens a
+    # new hold: same origin, root and texts, but a distinct question
+    again = P.make_protection_hold(root_id="5", origin="verifier", protection_texts=["- a"])
+    again["sources"] = ["8"]
+    again_id = P.protection_ask(again, reviewer="", request="").id
+    assert again_id != first_id and again_id.startswith("protection-verifier-5-")
+    # a restart rebuilds the same hold from its records, hence the same question id
+    history = [{"author": "me", "body": P.record_body("pending", "5", "verifier", ["- a"], "6")},
+               {"author": "me", "body": P.record_body("keep", "5", "verifier", ["- a"])},
+               {"author": "me", "body": P.record_body("pending", "5", "verifier", ["- a"], "8")}]
+    restored = P.restore_protection_hold(root_id="5", history=history, login="me")
+    assert restored["state"] == "pending" and restored["sources"] == ["8"]
+    assert P.protection_ask(restored, reviewer="", request="").id == again_id
+
+
+def test_an_inline_hold_and_a_review_body_hold_on_one_id_get_distinct_questions():
+    inline = P.make_protection_hold(root_id="5", origin="fixer", protection_texts=["- a"])
+    inline.update(sources=["5"], inline=True)
+    body = P.make_protection_hold(root_id="5", origin="fixer", protection_texts=["- a"])
+    body.update(sources=["5"], inline=False)
+    inline_id = P.protection_ask(inline, reviewer="", request="").id
+    body_id = P.protection_ask(body, reviewer="", request="").id
+    assert inline_id != body_id
+    assert body_id.startswith("protection-fixer-5-")
+    # an inline hold's id is the same with or without the driver's ``inline`` field
+    del inline["inline"]
+    assert P.protection_ask(inline, reviewer="", request="").id == inline_id
+
+
 @pytest.mark.parametrize("origin,labels", [
     ("description_guard", [P.KEEP, P.MANUAL]),
     ("fixer", [P.KEEP, P.ALLOW, P.MANUAL]),

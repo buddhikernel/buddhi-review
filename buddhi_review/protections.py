@@ -720,7 +720,20 @@ def make_protection_hold(*, root_id, origin: str, protection_texts: Sequence[str
 
 
 def _ask_id(hold: dict) -> str:
-    digest = hashlib.sha256("\0".join(hold["protection_texts"]).encode("utf-8")).hexdigest()[:10]
+    # The request that opened the hold (its first source) is part of the id, so a
+    # hold opened after an earlier one on the same root was settled — same origin,
+    # same texts — is a NEW question, never de-duplicated as the settled one. A
+    # request joining a still-open hold keeps that first source, so the same hold
+    # keeps one id; a restart rebuilds the same sources, hence the same id.
+    # The hold's kind is part of the id too: an inline comment's id and a review
+    # body's id are separate GitHub id spaces that may coincide (the driver keys
+    # their holds apart for the same reason), so each kind gets its own question.
+    # The driver sets ``inline`` before asking; an inline hold's id is unchanged.
+    sources = hold.get("sources") or []
+    opener = str(sources[0]) if sources else ""
+    kind = [] if hold.get("inline", True) else ["review"]
+    digest = hashlib.sha256("\0".join(kind + [opener] + list(hold["protection_texts"]))
+                            .encode("utf-8")).hexdigest()[:10]
     return f"protection-{hold['origin']}-{hold['root_id']}-{digest}"
 
 
@@ -861,6 +874,10 @@ def restore_protection_hold(*, root_id, history: Sequence[dict], login: Optional
                     hold["sources"] = sources
                 hold["sources"] = list(dict.fromkeys(hold["sources"] + source))
             else:
+                # ``allowances`` deliberately carries over: the live driver copies an
+                # earlier Allow onto a fresh hold on the same root too, so a restart
+                # must neither revoke nor widen it. A waived text is never re-held
+                # (conflicts on it are dropped), and a pending hold blocks regardless.
                 hold = make_protection_hold(root_id=root, origin=origin, protection_texts=texts)
                 hold["sources"] = source
             continue

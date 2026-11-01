@@ -1344,6 +1344,12 @@ class RoundDriver:
         #   a None result = restored from the comment a record names.
         self._protection_sources: Dict[str, List[Tuple[Comment, Optional[CommentResult]]]] = {}
         self._protection_ask_roots: Dict[str, str] = {}   # ask id → root, asked this run
+        # This round's fixer-output fingerprint as an Allow re-dispatch keeps it
+        #   current (:meth:`_redispatch_fix`): None once any part of it is unreadable
+        #   or the tree changed outside the loop's own fixers. Only tracked while
+        #   ``_round_fingerprinting`` (a round that started clean and pushes).
+        self._round_fixer_output: Optional[Tuple[str, Dict[str, tuple]]] = None
+        self._round_fingerprinting = False
         # True when the thread history or the loop's login could not be read: a hold
         #   may exist that the run cannot see, so merging waits.
         self._protection_history_unknown = False
@@ -4153,8 +4159,13 @@ class RoundDriver:
         allow = self._allowances(key)
         blocks = self._round_prompt_protections()
         for c, r in self._protection_sources.get(key, []):
-            if r is None or (r.kernel_status == loop.PROTECTION_HOLD
-                             and not r.protection_conflicts):
+            # A classifier-origin hold (kernel_status PROTECTION_HOLD, with or
+            # without named conflicts) never reached the kernel: the Allow waives
+            # the protection, not the label, so the request is classified again
+            # with the waiver and the kernel decides its disposition — an INVALID or
+            # OUTDATED request is still discarded, a question still escalated. Only
+            # a fixer / verifier hold already carries the kernel's own "fix".
+            if r is None or r.kernel_status == loop.PROTECTION_HOLD:
                 r = process_comments([c], adapter=self.adapter,
                                      classify_runner=self.classify_runner,
                                      max_rounds=self.max_rounds, protections=blocks,
@@ -4164,6 +4175,8 @@ class RoundDriver:
                             protection_conflicts=())
             if self._edits_blocked() and r.disposition == "fix":
                 a = self._blocked_action(c)
+            elif r.disposition == "fix":
+                a = self._redispatch_fix(c, r)
             else:
                 a = act_on_result(c, r, adapter=self.adapter, fix_dispatch=self.fix_dispatch)
             print(f"  [{a.final:16}] comment {a.comment_id} ({a.disposition})"
@@ -4184,6 +4197,25 @@ class RoundDriver:
             if a.protection_hold:
                 self._round_held_ids.add(c.id)
                 self._open_protection_holds([c], [r], [a])
+
+    def _redispatch_fix(self, comment: Comment, result: CommentResult) -> ActionResult:
+        """Run an allowed request's fix, keeping the round's fixer-output fingerprint
+        current. The re-dispatch runs after the round's fingerprint was taken (and
+        after the escalation wait), so its edit would otherwise read as foreign at
+        commit time. Fail-closed: the tree must still be exactly what the round's
+        fixers left — nothing at all when none fixed — before this fixer runs, or
+        the fingerprint is dropped for the round; an edit made during the wait is
+        therefore never vouched for. Taken again once the fixer returns."""
+        if not self._round_fingerprinting:
+            return act_on_result(comment, result, adapter=self.adapter,
+                                 fix_dispatch=self.fix_dispatch)
+        expected = self._round_fixer_output
+        if expected is not None and self._fixer_output_fingerprint() != expected:
+            expected = None
+        a = act_on_result(comment, result, adapter=self.adapter, fix_dispatch=self.fix_dispatch)
+        self._round_fixer_output = (self._fixer_output_fingerprint()
+                                    if expected is not None else None)
+        return a
 
     def _settle_protection_answers(self, answers: Dict[str, Optional[str]],
                                    actionable: List[Comment], results: List[CommentResult],
@@ -4528,10 +4560,17 @@ class RoundDriver:
             # anything it carries that the fixers did not write moves the boundary.
             # Only a round that started clean and is about to commit needs it — a
             # dirty start already denies the commit the cosmetic exemption.
+            self._round_fingerprinting = not round_start_dirty and self.push
             fixer_output = (self._fixer_output_fingerprint()
-                            if (not round_start_dirty and self.push
+                            if (self._round_fingerprinting
                                 and any(a.final == "fixed" for a in round_actions))
                             else None)
+            # An Allow settled below re-dispatches its fix after this read; it keeps
+            # the fingerprint current from here (:meth:`_redispatch_fix`). With no
+            # fix yet, the fixers left nothing: a clean tree at the reviewed head.
+            self._round_fixer_output = (
+                fixer_output if any(a.final == "fixed" for a in round_actions)
+                else (self._round_review_head, {}))
             # Record which INLINE comments (path-anchored — the only comments that
             # are review-thread ROOTS) the run genuinely finished, so the pre-merge
             # thread gate resolves ONLY the run's own inline threads and can never
@@ -4577,7 +4616,18 @@ class RoundDriver:
                        if not k.startswith("protection-")):
                     print("[round] unanswered escalation(s) — handing over for manual review")
                     return self._handback("needs-human", round_no)
-            self.adapter.escalation.delivered.clear()
+            if self.adapter.escalation.delivered:
+                # The bound ran out with a question still delivered (a re-dispatch
+                # raised another hold or an ordinary escalation): it was never
+                # answered, so nothing of this round may be committed past it.
+                print("[round] unanswered escalation(s) — handing over for manual review")
+                return self._handback("needs-human", round_no)
+            # Include any fix an Allow re-dispatched after the fingerprint above.
+            fixer_output = (self._round_fixer_output
+                            if (self._round_fingerprinting
+                                and any(a.final == "fixed" for a in round_actions))
+                            else None)
+            self._round_fingerprinting = False
             if self._has_pending_hold():
                 # An owner hold is unanswered (or its decision could not be posted):
                 # nothing of this round is committed, pushed or merged.

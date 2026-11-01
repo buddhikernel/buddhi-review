@@ -374,6 +374,26 @@ def test_scratch_index_keeps_the_live_index_timestamp(repo):
         os.unlink(path)
 
 
+def test_scratch_index_removes_its_file_when_the_copy_fails(repo, tmp_path, monkeypatch):
+    _ordinary(repo)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(commit_push.tempfile, "tempdir", str(scratch))
+
+    def failing_utime(*a, **k):
+        raise OSError("utime failed")
+    monkeypatch.setattr(commit_push.os, "utime", failing_utime)
+    assert commit_push.scratch_index(str(repo)) is None
+    assert list(scratch.glob("buddhi-index-*.idx")) == []
+
+
+def test_scratch_index_is_none_when_mkstemp_fails(repo, monkeypatch):
+    def failing_mkstemp(*a, **k):
+        raise OSError("no temp dir")
+    monkeypatch.setattr(commit_push.tempfile, "mkstemp", failing_mkstemp)
+    assert commit_push.scratch_index(str(repo)) is None
+
+
 def test_a_runner_that_drops_the_environment_never_reaches_the_live_index(repo):
     _staged_rename_into_dropping(repo)
     before = _index_bytes(repo)

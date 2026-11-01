@@ -828,6 +828,29 @@ def test_conflict_lifecycle_a_re_held_allow_is_asked_again_and_others_once():
     assert len(held2) == 1
 
 
+def test_conflict_lifecycle_a_question_left_when_the_answer_bound_runs_out_hands_back(
+        monkeypatch):
+    # The bounded answer loop runs out while the last Allow's re-dispatch has
+    # delivered another ordinary escalation: it is unanswered, never discarded,
+    # and nothing of the round is pushed or merged.
+    monkeypatch.setattr(P, "MAX_PROTECTIONS", 0)            # one pass of the loop
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it"))],
+                              classify=_classify("SUBSTANTIVE", [1]), answer=lambda a: "2",
+                              fix=lambda c, r: FixOutcome(status="applied"),
+                              auto_merge=True, max_rounds=1)
+    settle = d._settle_protection_answers
+    leftover = object()
+
+    def settle_and_escalate(*a, **k):
+        settle(*a, **k)
+        d.adapter.escalation.delivered.append(leftover)
+    monkeypatch.setattr(d, "_settle_protection_answers", settle_and_escalate)
+    out = d.run()
+    assert out.status == "needs-human"
+    assert leftover in d.adapter.escalation.delivered
+    assert not gh.matching("git", "push") and not _merged(gh)
+
+
 def test_conflict_lifecycle_pending_hold_stops_sibling_fixes_landing():
     d, gh, events, _ = _drive([(0, _inline("1", "relax it")), (0, _inline("2", "fix other"))],
                               classify=_conflicting(("relax", "SUBSTANTIVE", [1])),
@@ -1881,3 +1904,101 @@ def test_entry_and_restart_decided_holds():
                                   threads=t, auto_merge=True, classify=_classify(),
                                   login=broken.get("login", LOGIN))
         assert d.run().status == "needs-human" and not _merged(gh)
+
+
+# ── an Allow's re-dispatch: the kernel decides, the fingerprint follows ─────
+
+@pytest.mark.parametrize("label", ["INVALID", "OUTDATED"])
+def test_allow_on_a_classifier_hold_goes_back_through_the_kernel(label):
+    # The Allow waives the protection, not the label: a request the kernel discards
+    # is never handed to the fixer because its owner allowed the protection.
+    fixed, prompts = [], []
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it"))],
+                              classify=_classify(label, [1], prompts=prompts),
+                              fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"),
+                              answer=lambda a: "2", max_rounds=1)
+    out = d.run()
+    assert d._protection_holds["1"]["state"] == "allow"
+    assert fixed == [] and len(prompts) == 2              # classified again, with the waiver
+    assert [a.final for a in out.actions] == ["skipped"]
+    assert not gh.matching("git", "push")
+
+
+def test_allow_on_a_classifier_hold_fixes_what_the_kernel_would_fix():
+    fixed = []
+
+    def fix(c, r):
+        fixed.append((r.allowances, r.disposition))
+        return FixOutcome(status="applied")
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it"))],
+                              classify=_classify("SUBSTANTIVE", [1]), fix=fix,
+                              answer=lambda a: "2", max_rounds=1)
+    out = d.run()
+    assert fixed == [((BLOCKS[0],), "fix")] and [a.final for a in out.actions] == ["fixed"]
+
+
+def _disk_fingerprint(d, disk):
+    """The round's fingerprint read from ``disk`` (path → identity) at the reviewed head."""
+    d._fixer_output_fingerprint = lambda: (d._round_review_head, dict(disk))
+    d._worktree_residue = lambda: False                  # the round starts clean
+    seen = []
+    real = d._commit_carries_foreign
+
+    def spy(output):
+        seen.append(output)
+        return real(output)
+    d._commit_carries_foreign = spy
+    return seen
+
+
+def test_allow_redispatched_fix_is_in_the_round_fingerprint():
+    # No fix before the wait, so the round took no fingerprint; the allowed fix
+    # changes the tree afterwards and the commit is compared with that change.
+    disk = {}
+
+    def fix(c, r):
+        disk["src/a.py"] = ("file", "abc", "100644")
+        return FixOutcome(status="applied")
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it"))],
+                              classify=_classify("SUBSTANTIVE", [1]), fix=fix,
+                              answer=lambda a: "2", max_rounds=1)
+    seen = _disk_fingerprint(d, disk)
+    d.run()
+    assert gh.matching("git", "push")
+    assert seen and seen[0] is not None
+    assert seen[0][1] == {"src/a.py": ("file", "abc", "100644")}
+
+
+def test_allow_redispatched_fix_extends_an_earlier_fingerprint():
+    # A sibling was fixed before the wait: the allowed fix's path joins it.
+    disk = {}
+
+    def fix(c, r):
+        disk[f"src/{c.id}.py"] = ("file", c.id, "100644")
+        return FixOutcome(status="applied")
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it")), (0, _inline("2", "other"))],
+                              classify=_conflicting(("relax", "SUBSTANTIVE", [1])), fix=fix,
+                              answer=lambda a: "2", max_rounds=1)
+    seen = _disk_fingerprint(d, disk)
+    d.run()
+    assert seen and seen[0][1] == {"src/1.py": ("file", "1", "100644"),
+                                   "src/2.py": ("file", "2", "100644")}
+
+
+def test_allow_redispatch_never_vouches_for_an_edit_made_during_the_wait():
+    # Something changed the tree while the owner was being asked: fail closed.
+    disk = {}
+
+    def wait(esc, **k):
+        disk["src/operator.py"] = ("file", "op", "100644")
+        return {a.id: "2" for a in esc.delivered}
+
+    def fix(c, r):
+        disk["src/a.py"] = ("file", "abc", "100644")
+        return FixOutcome(status="applied")
+    d, gh, events, _ = _drive([(0, _inline("1", "relax it"))],
+                              classify=_classify("SUBSTANTIVE", [1]), fix=fix,
+                              answer_waiter=wait, max_rounds=1)
+    seen = _disk_fingerprint(d, disk)
+    d.run()
+    assert gh.matching("git", "push") and seen == [None]

@@ -1563,6 +1563,9 @@ def scratch_index(cwd: str, *, run: Run = _default_run) -> Optional[str]:
     src = where if os.path.isabs(where) else os.path.join(cwd, where)
     try:
         fd, path = tempfile.mkstemp(prefix="buddhi-index-", suffix=".idx")
+    except OSError:
+        return None
+    try:
         with os.fdopen(fd, "wb") as out:
             if os.path.exists(src):
                 with open(src, "rb") as f:
@@ -1577,6 +1580,12 @@ def scratch_index(cwd: str, *, run: Run = _default_run) -> Optional[str]:
             os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
         return path
     except OSError:
+        # The copy failed after mkstemp created the file: remove it, so a failed
+        # measurement never leaves a buddhi-index-*.idx behind.
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
         return None
 
 
