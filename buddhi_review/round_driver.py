@@ -5159,7 +5159,12 @@ class RoundDriver:
         # manual protections hold is never the run's to close, whatever an earlier
         # outcome on it was; one the owner kept the protection on, or allowed and saw
         # fixed, is — but only once every request the run processed on it resolved.
-        handled = ((self._handled_inline_ids | self._settled_hold_roots())
+        # A root that carries ANY inline hold closes only through that settled check,
+        # even when the root's own fix landed: a reply allowed later whose re-run fix
+        # was rejected must keep the thread open, not ride the root's earlier done.
+        held_roots = {h["root_id"] for h in self._protection_holds.values()
+                      if h.get("inline", True)}
+        handled = (((self._handled_inline_ids - held_roots) | self._settled_hold_roots())
                    - {h["root_id"] for h in self._protection_holds.values()
                       if h.get("inline", True) and h["state"] in ("pending", "manual")})
         own = [t for t in unresolved

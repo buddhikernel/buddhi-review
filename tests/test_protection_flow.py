@@ -1693,6 +1693,18 @@ def test_merge_gate_keeps_a_kept_thread_open_when_a_later_allowed_fix_is_rejecte
     assert "1" in d._settled_hold_roots()
 
 
+def test_merge_gate_keeps_a_fixed_root_open_when_an_allowed_reply_fix_is_rejected():
+    # Root 1's own fix landed (a handled thread), then reply 2 was held, allowed
+    # and re-run, but its fix was rejected: the root's earlier done must not close
+    # the thread past the rejected request.
+    d, threads = _gate_driver("allow", ["2"], {"1": "fixed", "2": "rejected"})
+    d._handled_inline_ids.add("1")
+    assert "1" not in d._settled_hold_roots()
+    assert d._thread_gate_ok() is False and threads.resolved == []
+    d._inline_finals["2"] = ("1", "fixed")
+    assert d._thread_gate_ok() is True and threads.resolved == ["T1"]
+
+
 def test_keep_settle_leaves_a_thread_with_a_rejected_root_open():
     d, threads = _gate_driver("keep", ["2"], {"1": "rejected"})
     d._resolve_kept_root(d._protection_holds["1"])
