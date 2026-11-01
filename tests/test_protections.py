@@ -1040,6 +1040,10 @@ def test_settlement():
     hold = P.make_protection_hold(root_id="9", origin="classifier", protection_texts=["- a", "- b"])
     keep, posted, resolved, refixed = _settle(hold, "1")
     assert keep["state"] == "keep" and resolved == ["9"] and refixed == []
+    assert keep["kept"] == ["9"] and hold["kept"] == []      # a Keep naming no request refuses the root
+    later = dict(P.make_protection_hold(root_id="9", origin="classifier", protection_texts=["- a"]),
+                 sources=["4"], kept=["2"])
+    assert _settle(later, "1")[0]["kept"] == ["2", "4"] and _settle(later, "2")[0]["kept"] == ["2"]
     assert posted == [P.record_body("keep", "9", "classifier", ["- a", "- b"])]
     assert posted[0].startswith(P.W3.format(protection='- a"; "- b'))
     allow, posted, resolved, refixed = _settle(hold, "2")
@@ -1114,5 +1118,18 @@ def test_restore():
     again = P.restore_protection_hold(root_id="9", login="me", history=_hist(
         src(["- a"], "2"), (keep, "me"), src(["- a"], "4")))
     assert again["sources"] == ["4"] and again["state"] == "pending"
+    assert again["kept"] == ["2"]
+    # a Keep refusal outlives every later hold on the root, Allow included
+    kept_then_allowed = P.restore_protection_hold(root_id="9", login="me", history=_hist(
+        src(["- a"], "1"), (keep, "me"), src(["- a"], "2"), (allow, "me")))
+    assert kept_then_allowed["state"] == "allow" and kept_then_allowed["sources"] == ["2"]
+    assert kept_then_allowed["kept"] == ["1"] and P.kept_after(kept_then_allowed) == ["1"]
+    twice = P.restore_protection_hold(root_id="9", login="me", history=_hist(
+        src(["- a"], "1"), (keep, "me"), src(["- a"], "2"), (keep, "me"), src(["- a"], "3")))
+    assert twice["state"] == "pending" and twice["kept"] == ["1", "2"]
+    assert P.kept_after(P.restore_protection_hold(root_id="9", login="me", history=_hist(
+        (pend, "me"), (keep, "me")))) == ["9"]
+    assert P.restore_protection_hold(root_id="9", login="me", history=_hist(
+        src(["- a"], "1"), (allow, "me"), src(["- a"], "2")))["kept"] == []
     assert P.restore_protection_hold(root_id="9", login="me", history=_hist(
         (src(["- a"], "2")[0], "eve")))["sources"] == []

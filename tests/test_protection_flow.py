@@ -7,6 +7,7 @@ import json
 import subprocess
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 
@@ -1658,6 +1659,52 @@ def test_entry_and_restart_a_kept_request_stays_refused():
     out = d.run()
     assert len(prompts) == 1 and fixed == ["1"]
     assert {a.comment_id: a.final for a in out.actions} == {"1": "fixed", "2": "escalated"}
+
+
+def test_entry_and_restart_a_kept_request_stays_refused_after_a_later_allow():
+    # Reply 2 was kept; the reopened thread's reply 3 opened a new hold that was
+    # allowed. After a restart reply 2 is still refused and gets no waiver.
+    recs = [("p2", P.record_body("pending", "1", "fixer", [BLOCKS[0]], "2"), LOGIN),
+            ("k2", P.record_body("keep", "1", "fixer", [BLOCKS[0]]), LOGIN),
+            ("p3", P.record_body("pending", "1", "fixer", [BLOCKS[0]], "3"), LOGIN),
+            ("a3", P.record_body("allow", "1", "fixer", [BLOCKS[0]]), LOGIN)]
+    t = Threads().add("1", history=[("2", "relax it", "claude[bot]"),
+                                    ("3", "relax it again", "claude[bot]")] + recs)
+    fixed = []
+    d, gh, events, _ = _drive([(0, _inline("1", "rename a helper")),
+                               (0, _inline("2", "relax it", reply_to="1")),
+                               (0, _inline("3", "relax it again", reply_to="1"))], threads=t,
+                              classify=_classify(),
+                              fix=lambda c, r: fixed.append((c.id, r.allowances))
+                              or FixOutcome(status="applied"))
+    out = d.run()
+    hold = d._protection_holds["1"]
+    assert hold["state"] == "allow" and hold["kept"] == ["2"] and hold["sources"] == ["3"]
+    assert "2" not in [cid for cid, _ in fixed]
+    assert dict(fixed)["3"] == (BLOCKS[0],)
+    assert {a.comment_id: a.final for a in out.actions}["2"] == "escalated"
+    assert d._hold_blocks("1", _inline("2", "relax it", reply_to="1"))
+    assert not d._hold_blocks("1", _inline("3", "relax it again", reply_to="1"))
+    assert d._comment_allowances(_inline("2", "relax it", reply_to="1")) == ()
+
+
+def test_conflict_lifecycle_a_later_hold_inherits_an_earlier_keep():
+    # Live: request 1 is kept; reply 5 on the reopened thread opens a new hold,
+    # which carries the Keep refusal and still blocks request 1.
+    d, gh, events, _ = _drive([(0, _inline("1", "relax A"))],
+                              classify=_conflicting(("relax A", "COSMETIC", [1])),
+                              answer=lambda a: "1", max_rounds=1)
+    d.run()
+    assert d._protection_holds["1"]["state"] == "keep"
+    assert d._protection_holds["1"]["kept"] == ["1"]
+    d._open_protection_holds(
+        [_inline("5", "relax B", reply_to="1")], [None],
+        [SimpleNamespace(protection_hold={"origin": "fixer", "protection_texts": [BLOCKS[1]]})])
+    later = d._protection_holds["1"]
+    assert later["state"] == "pending" and later["sources"] == ["5"] and later["kept"] == ["1"]
+    later["state"], later["allowances"] = "allow", [BLOCKS[1]]
+    assert d._hold_blocks("1", _inline("1", "relax A"))
+    assert d._comment_allowances(_inline("1", "relax A")) == ()
 
 
 @pytest.mark.parametrize("case", ["login-only", "section-listed", "marker-read", "marker-read-no-edit",

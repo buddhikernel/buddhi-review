@@ -710,13 +710,26 @@ def parse_record(body: str) -> Optional[dict]:
 
 
 def make_protection_hold(*, root_id, origin: str, protection_texts: Sequence[str]) -> dict:
-    """A pending hold; ``sources`` lists the comments whose requests it holds."""
+    """A pending hold; ``sources`` lists the comments whose requests it holds, and
+    ``kept`` the requests an earlier Keep on this root refused (see :func:`kept_after`)."""
     if origin not in ORIGINS:
         raise ValueError(f"unknown hold origin: {origin!r}")
     texts = list(protection_texts)
     return {"root_id": str(root_id), "origin": origin, "protection_texts": texts,
-            "state": "pending", "allowances": [], "sources": [],
+            "state": "pending", "allowances": [], "sources": [], "kept": [],
             "pending_record": record_body("pending", str(root_id), origin, texts)}
+
+
+def kept_after(hold: dict) -> List[str]:
+    """Every request a Keep on ``hold``'s root has refused so far: the ones an earlier
+    Keep refused (``kept``) and, when ``hold`` itself is kept, the requests it holds
+    (the root, for a hold naming none). A later hold on the same root inherits this
+    list whatever its own state: a Keep refusal outlives a reopened thread, so a later
+    request's hold — or its Allow — never releases a request the owner refused."""
+    kept = [str(k) for k in hold.get("kept") or []]
+    if hold.get("state") == "keep":
+        kept += [str(s) for s in hold.get("sources") or [hold["root_id"]]]
+    return list(dict.fromkeys(kept))
 
 
 def _ask_id(hold: dict) -> str:
@@ -799,6 +812,7 @@ def settle_protection_hold(hold: dict, *, answer, login: Optional[str],
     if not ok:
         return hold
     settled = dict(hold, state=action, decided_record=body)
+    settled["kept"] = kept_after(settled)
     if action == "keep":
         try:
             resolve_thread(hold["root_id"])
@@ -847,6 +861,7 @@ def restore_protection_hold(*, root_id, history: Sequence[dict], login: Optional
     hold: Optional[dict] = None
     claimed: Optional[dict] = None
     allowances: List[str] = []
+    kept: List[str] = []    # every request a Keep refused, across successive holds
     for rec in history:
         if not isinstance(rec, dict):
             continue
@@ -874,6 +889,8 @@ def restore_protection_hold(*, root_id, history: Sequence[dict], login: Optional
                     hold["sources"] = sources
                 hold["sources"] = list(dict.fromkeys(hold["sources"] + source))
             else:
+                if hold is not None:
+                    kept = kept_after(dict(hold, kept=kept))
                 # ``allowances`` deliberately carries over: the live driver copies an
                 # earlier Allow onto a fresh hold on the same root too, so a restart
                 # must neither revoke nor widen it. A waived text is never re-held
@@ -894,4 +911,5 @@ def restore_protection_hold(*, root_id, history: Sequence[dict], login: Optional
                                     protection_texts=claimed["protections"])
     if hold is not None:
         hold["allowances"] = allowances
+        hold["kept"] = kept_after(dict(hold, kept=kept))
     return hold

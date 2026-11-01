@@ -3912,7 +3912,13 @@ class RoundDriver:
 
     def _hold_blocks(self, key: str, comment: Comment) -> bool:
         hold = self._protection_holds.get(key)
-        if hold is None or hold["state"] not in ("pending", "keep", "manual"):
+        if hold is None:
+            return False
+        # A request an earlier Keep on this root refused stays refused whatever a
+        # later hold on the reopened thread is now — pending, kept or allowed.
+        if comment.id in protections.kept_after(hold):
+            return True
+        if hold["state"] not in ("pending", "keep", "manual"):
             return False
         # Keep refuses exactly the requests it held (the root, for a record naming
         # none); any other comment on the thread is a request of its own.
@@ -3924,6 +3930,14 @@ class RoundDriver:
         hold = self._protection_holds.get(key) or {}
         listed = set(self._round_prompt_protections())
         return tuple(a for a in hold.get("allowances") or () if a in listed)
+
+    def _comment_allowances(self, comment: Comment) -> Tuple[str, ...]:
+        """The waivers that reach ``comment``: its hold's, but none for a request a
+        Keep on its root refused — a later request's Allow never covers it."""
+        key = self._comment_key(comment)
+        if comment.id in protections.kept_after(self._protection_holds.get(key) or {"root_id": ""}):
+            return ()
+        return self._allowances(key)
 
     def _adopt_hold(self, hold: dict, *, request: str, reviewer: Optional[str], inline: bool,
                     path: Optional[str] = None, diff_hunk: Optional[str] = None) -> str:
@@ -4110,6 +4124,7 @@ class RoundDriver:
                 hold = protections.make_protection_hold(root_id=c.root_id, origin=origin,
                                                         protection_texts=texts)
                 hold["allowances"] = list((prior or {}).get("allowances") or [])
+                hold["kept"] = protections.kept_after(prior) if prior else []
                 hold["sources"] = list(prior["sources"]) if pending else []
                 hold["unposted"] = pending and prior.get("unposted", False)
                 self._adopt_hold(hold, request=c.text, reviewer=c.source, inline=bool(c.path),
@@ -4136,7 +4151,8 @@ class RoundDriver:
 
     def _kept_sources(self, root: str) -> List[str]:
         hold = self._protection_holds.get(root) or {}
-        return list(hold.get("sources") or [root])
+        return list(dict.fromkeys(list(hold.get("sources") or [root])
+                                  + protections.kept_after(dict(hold, root_id=root))))
 
     def _settled_hold_roots(self) -> Set[str]:
         """Inline threads an owner decision made the run's to close: a kept one, and
@@ -4150,7 +4166,7 @@ class RoundDriver:
             root = hold["root_id"]
             held = hold.get("sources") or [root]
             if (all(s in self._inline_finals for s in held)
-                    and self._thread_requests_resolved(root)):
+                    and self._thread_requests_resolved(root, protections.kept_after(hold))):
                 out.add(root)
         return out
 
@@ -4162,7 +4178,8 @@ class RoundDriver:
             return
         root = hold["root_id"]
         self._kept_roots.add(root)
-        if not self._thread_requests_resolved(root, hold.get("sources") or [root]):
+        if not self._thread_requests_resolved(root, protections.kept_after(
+                dict(hold, state="keep"))):
             return
         for t in self._thread_history() or ():
             if t.root_comment_id == root and not t.is_resolved:
@@ -4553,8 +4570,10 @@ class RoundDriver:
                 c.root_id for c in actionable if c.id in held_ids
                 and all(c is not h for h in held_batch)
                 and c.id not in (self._protection_holds[self._comment_key(c)]["sources"]
-                                 or [c.root_id])}
-            allow_map = {c.id: self._allowances(self._comment_key(c)) for c in actionable
+                                 or [c.root_id])
+                and c.id not in protections.kept_after(
+                    self._protection_holds[self._comment_key(c)])}
+            allow_map = {c.id: self._comment_allowances(c) for c in actionable
                          if self._comment_key(c) in self._protection_holds}
             results = process_comments(
                 actionable, adapter=self.adapter, classify_runner=self.classify_runner,
