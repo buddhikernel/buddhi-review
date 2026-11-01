@@ -387,6 +387,40 @@ def test_scratch_index_removes_its_file_when_the_copy_fails(repo, tmp_path, monk
     assert list(scratch.glob("buddhi-index-*.idx")) == []
 
 
+def test_scratch_index_is_none_when_the_live_index_cannot_be_read(repo, tmp_path, monkeypatch):
+    # An index that exists but cannot be opened (EACCES, an unsearchable parent)
+    # is a failed copy — never mistaken for an unborn repository's absent index.
+    _ordinary(repo)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(commit_push.tempfile, "tempdir", str(scratch))
+    live = os.path.realpath(repo / _git(repo, "rev-parse", "--git-path", "index").strip())
+    real_open = open
+
+    def denying_open(file, *a, **k):
+        if isinstance(file, (str, os.PathLike)) and os.path.realpath(file) == live:
+            raise PermissionError(13, "Permission denied", str(file))
+        return real_open(file, *a, **k)
+    monkeypatch.setattr("builtins.open", denying_open)
+    monkeypatch.setattr(commit_push.os.path, "exists", lambda p: False)
+    assert commit_push.scratch_index(str(repo)) is None
+    assert list(scratch.glob("buddhi-index-*.idx")) == []
+
+
+def test_scratch_index_takes_the_fresh_path_when_the_index_is_absent(tmp_path, monkeypatch):
+    root = tmp_path / "unborn"
+    root.mkdir()
+    _git(root, "init", "-q", "-b", "main")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setattr(commit_push.tempfile, "tempdir", str(scratch))
+    path = commit_push.scratch_index(str(root))
+    assert path is not None
+    # The empty copy is removed so git builds a fresh index at that path.
+    assert not os.path.exists(path)
+    assert list(scratch.glob("buddhi-index-*.idx")) == []
+
+
 def test_scratch_index_is_none_when_mkstemp_fails(repo, monkeypatch):
     def failing_mkstemp(*a, **k):
         raise OSError("no temp dir")

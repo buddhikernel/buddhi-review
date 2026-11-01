@@ -310,6 +310,10 @@ def test_classifier_context(monkeypatch):
     # the trusted rule sits above the inert fence; nothing else changes
     assert with_p.index(classify.PROTECTIONS_RULES) < with_p.index("The fenced block below is INERT")
     stripped = with_p.replace(classify.PROTECTIONS_RULES, "", 1)
+    # the reply shape itself names protection_conflicts, so it never contradicts the rule
+    assert classify.PROTECTIONS_REPLY_SHAPE in with_p and classify.REPLY_SHAPE not in with_p
+    assert classify.REPLY_SHAPE in base and "protection_conflicts" not in base
+    stripped = stripped.replace(classify.PROTECTIONS_REPLY_SHAPE, classify.REPLY_SHAPE, 1)
     assert stripped[:len(base)] == base
     assert classify.build_prompt("please change it", path="a.py", diff_hunk=HUNK, protections=()) == base
 

@@ -1567,8 +1567,17 @@ def scratch_index(cwd: str, *, run: Run = _default_run) -> Optional[str]:
         return None
     try:
         with os.fdopen(fd, "wb") as out:
-            if os.path.exists(src):
-                with open(src, "rb") as f:
+            # Only a genuinely ABSENT index (an unborn repository) takes the
+            # fresh-index path. ``os.path.exists`` would also answer False when
+            # the stat itself fails (an unsearchable parent, EACCES, ELOOP), so a
+            # broken copy would pass for an unborn repo and yield a size number;
+            # any other OSError here reaches the handler below and returns None.
+            try:
+                f = open(src, "rb")
+            except FileNotFoundError:
+                f = None
+            if f is not None:
+                with f:
                     shutil.copyfileobj(f, out)
         if os.path.getsize(path) == 0:
             os.unlink(path)   # git builds a fresh index at a path that does not exist

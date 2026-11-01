@@ -65,6 +65,17 @@ GOLDEN_NO_INTENT = (
 )
 
 
+def test_protections_put_protection_conflicts_in_the_reply_shape():
+    """With protections listed, the FIRST-stated reply shape itself names
+    protection_conflicts (never contradicting the later rule); with none the
+    prompt is still the frozen golden."""
+    out = _prompt_for("claim", "diff", pr_intent="", protections=["keep the guard"])
+    head = out.split("\n", 1)[0]
+    assert '"protection_conflicts": [<protection numbers>]' in head
+    assert '{"verdict": "CONFIRM"|"REJECT", "reason": "..."}' not in out
+    assert _prompt_for("claim", "diff", pr_intent="", protections=()) == GOLDEN_NO_INTENT
+
+
 def test_empty_intent_is_byte_identical_to_the_frozen_no_intent_prompt():
     """The pre-intent prompt, frozen as a literal: empty intent (explicit "",
     explicit None, and the default arg with an empty store) all reproduce it
