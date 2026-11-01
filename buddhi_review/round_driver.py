@@ -1371,6 +1371,13 @@ class RoundDriver:
         self._round_held_ids: Set[str] = set()   # comment ids held this round
         self._edits_deferred = False             # a reviewer edit was held back unmade
         self._unsettled_roots: Set[str] = set()  # threads holding a request no hold names
+        # Inline comment ids whose fix this round exists only in the worktree: not
+        #   yet committed and pushed, so not yet on the PR.
+        self._unpublished_fixed: Set[str] = set()
+        # Kept threads whose resolution waits for this round's push: closing one
+        #   before its fix is published would leave a resolved thread on the PR
+        #   that a red gate or a hand-back keeps the fix from ever reaching.
+        self._deferred_kept_roots: Set[str] = set()
 
     # ------------------------------------------------------------------ state
 
@@ -4202,9 +4209,29 @@ class RoundDriver:
             return
         root = hold["root_id"]
         self._kept_roots.add(root)
-        if not self._thread_requests_resolved(root, protections.kept_after(
-                dict(hold, state="keep"))):
+        refused = protections.kept_after(dict(hold, state="keep"))
+        if not self._thread_requests_resolved(root, refused):
             return
+        if any(r == root and cid not in refused and cid in self._unpublished_fixed
+               for cid, (r, _final) in self._inline_finals.items()):
+            # A request on this thread was fixed this round but is not yet on the
+            # PR: the thread closes once the round's push lands it, never before.
+            self._deferred_kept_roots.add(root)
+            return
+        self._resolve_root_threads(root)
+
+    def _publish_round_fixes(self) -> None:
+        """This round's fixes are on the PR (pushed, or nothing to publish): close
+        the kept threads that were waiting for them."""
+        self._unpublished_fixed.clear()
+        deferred, self._deferred_kept_roots = self._deferred_kept_roots, set()
+        for root in sorted(deferred):
+            if root in self._unsettled_roots or not self._thread_requests_resolved(
+                    root, self._kept_sources(root)):
+                continue
+            self._resolve_root_threads(root)
+
+    def _resolve_root_threads(self, root: str) -> None:
         for t in self._thread_history() or ():
             if t.root_comment_id == root and not t.is_resolved:
                 try:
@@ -4277,6 +4304,8 @@ class RoundDriver:
                 self.actions.append(a)
             if c.path:
                 self._inline_finals[c.id] = (c.root_id, a.final)
+                if a.final == "fixed" and self.push:
+                    self._unpublished_fixed.add(c.id)
             if c.path and a.final in _RESOLVED_FINALS:
                 self._handled_inline_ids.add(c.id)
             if a.protection_hold:
@@ -4667,6 +4696,8 @@ class RoundDriver:
                 # request the run processed: an Allow records it once re-run.
                 if c.path and c.id not in held_ids:
                     self._inline_finals[c.id] = (c.root_id, a.final)
+                    if a.final == "fixed" and self.push:
+                        self._unpublished_fixed.add(c.id)
                 if c.path and a.final in _RESOLVED_FINALS:
                     self._handled_inline_ids.add(a.comment_id)
             for a in round_actions:
@@ -4762,6 +4793,9 @@ class RoundDriver:
                     # Bucket C: local/remote diverged — never rebase/force-push it.
                     return self._handback("needs-human", round_no, rebase_skip=True)
                 committed_changes = (pushed == "pushed")
+            # Every fix of this round is now on the PR (or none needed pushing):
+            # close the kept threads that waited for it.
+            self._publish_round_fixes()
 
             # A pushed commit may have carried content no fixer of this round wrote
             # and no reviewer has seen: the round STARTED dirty (see

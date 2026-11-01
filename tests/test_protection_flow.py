@@ -1714,6 +1714,42 @@ def test_keep_settle_leaves_a_thread_with_a_rejected_root_open():
     assert threads.resolved == ["T1"]
 
 
+def test_keep_settle_defers_a_thread_whose_root_fix_is_not_yet_pushed():
+    # Root 1 was fixed this round but not yet pushed; a Keep on reply 2 must not
+    # close the thread until the round's push publishes the fix.
+    d, threads = _gate_driver("keep", ["2"], {"1": "fixed"})
+    d._unpublished_fixed.add("1")
+    d._resolve_kept_root(d._protection_holds["1"])
+    assert threads.resolved == [] and "1" in d._deferred_kept_roots
+    d._publish_round_fixes()
+    assert threads.resolved == ["T1"] and d._deferred_kept_roots == set()
+    assert d._unpublished_fixed == set()
+
+
+def test_keep_settle_resolves_at_once_when_the_root_fix_was_already_pushed():
+    d, threads = _gate_driver("keep", ["2"], {"1": "fixed"})
+    d._resolve_kept_root(d._protection_holds["1"])
+    assert threads.resolved == ["T1"] and d._deferred_kept_roots == set()
+
+
+def test_a_deferred_keep_stays_open_when_the_push_never_happens():
+    # A red gate or a hand-back ends the round before the publish step: the
+    # deferred thread is never resolved.
+    d, threads = _gate_driver("keep", ["2"], {"1": "fixed"})
+    d._unpublished_fixed.add("1")
+    d._resolve_kept_root(d._protection_holds["1"])
+    assert threads.resolved == [] and "1" in d._kept_roots
+
+
+def test_a_deferred_keep_is_not_resolved_once_its_thread_became_unsettled():
+    d, threads = _gate_driver("keep", ["2"], {"1": "fixed"})
+    d._unpublished_fixed.add("1")
+    d._resolve_kept_root(d._protection_holds["1"])
+    d._unsettled_roots.add("1")
+    d._publish_round_fixes()
+    assert threads.resolved == []
+
+
 def test_conflict_lifecycle_a_widened_unposted_hold_is_not_asked():
     def post(root, text, *, inline):
         return '"source":"1"' not in text
