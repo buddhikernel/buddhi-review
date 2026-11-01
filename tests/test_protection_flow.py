@@ -201,10 +201,11 @@ def test_round_snapshot_blocks_edits_when_unreadable_or_over_limit():
         assert [a.final for a in out.actions] == ["deferred"]
         assert out.actions[0].detail in (P.W7, P.W5.format(n=41, m=sum(len(f"- p{i}") for i in range(41))))
         assert not gh.matching("git", "commit")
-    # The start read fails once and the review-body request is deferred; a later read
-    # succeeds, but the request was never made, so the PR must not merge.
+    # Every try of the start read fails and the review-body request is deferred; a
+    # later read succeeds, but the request was never made, so the PR must not merge.
     review = Comment(id="8", text="fix the review body", source="claude[bot]")
-    d, gh, _, _ = _drive([(0, review)], body=[None, BODY], classify=_classify(), auto_merge=True,
+    d, gh, _, _ = _drive([(0, review)], body=[None] * round_driver.PROTECTIONS_FETCH_ATTEMPTS
+                         + [BODY], classify=_classify(), auto_merge=True,
                          fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
     out = d.run()
     assert [a.final for a in out.actions] == ["deferred"] and fixed == []
@@ -213,6 +214,58 @@ def test_round_snapshot_blocks_edits_when_unreadable_or_over_limit():
     d, gh, _, _ = _drive([(0, Comment(id="z", text="No issues found.", source="claude[bot]"))],
                          body=None, auto_merge=True)
     assert d.run().status == "needs-human" and not _merged(gh)
+
+
+@pytest.mark.parametrize("inline", [False, True])
+def test_one_failed_start_read_without_the_section_changes_nothing(inline):
+    # No protections section: the start read fails once and the retry reads it.
+    # The fix lands and the PR merges exactly as when every read succeeds.
+    plain = "About the change.\n"
+    outcomes = []
+    for body in (plain, [None, plain]):
+        fixed = []
+        c = (_inline("1", "fix it") if inline
+             else Comment(id="8", text="fix the review body", source="claude[bot]"))
+        d, gh, _, _ = _drive([(0, c)], body=body, classify=_classify(), auto_merge=True,
+                             fix=lambda c, r: fixed.append(c.id) or FixOutcome(status="applied"))
+        out = d.run()
+        outcomes.append((fixed, out.status, [a.final for a in out.actions], _merged(gh),
+                         d._edits_deferred, d._round_protections))
+    assert outcomes[0] == outcomes[1]
+    fixed, status, finals, merged, deferred, snap = outcomes[1]
+    assert fixed == [c.id] and finals == ["fixed"] and not deferred
+    assert merged and status != "needs-human" and snap.readable and not snap.found
+
+
+def test_failed_start_read_is_retried_before_the_round_is_unreadable():
+    calls, slept = [], []
+    d, _, _, _ = _drive([])
+    d.sleep = slept.append
+    d.protections_fetch = lambda: calls.append(1) and None
+    assert d._refresh_protections() == P.UNREADABLE
+    assert len(calls) == round_driver.PROTECTIONS_FETCH_ATTEMPTS
+    assert slept == [round_driver.PROTECTIONS_FETCH_RETRY_DELAY] * (len(calls) - 1)
+    # a raising fetch is a failed read too; the second try succeeds
+    tries = iter([RuntimeError("rate limited"), "About the change.\n"])
+
+    def flaky():
+        x = next(tries)
+        if isinstance(x, Exception):
+            raise x
+        return x
+    d, _, _, _ = _drive([])
+    d.protections_fetch = flaky
+    snap = d._refresh_protections()
+    assert snap.readable and not snap.found and not snap.blocked
+    # with an earlier good reading a failed read reuses it at once, never retried
+    calls.clear()
+    d.protections_fetch = lambda: calls.append(1) and None
+    assert d._refresh_protections().reused and calls == [1]
+    # a description whose protections cannot be read is read once, not retried
+    calls.clear()
+    d, _, _, _ = _drive([])
+    d.protections_fetch = lambda: calls.append(1) or UNREADABLE
+    assert d._refresh_protections() == P.UNREADABLE and calls == [1]
 
 
 # The parser gives a paragraph that runs straight into a table no line; inside a
@@ -1624,6 +1677,20 @@ def test_merge_gate_closes_a_decided_thread_only_when_every_request_resolved(
     d, threads = _gate_driver(state, sources, finals)
     assert d._thread_gate_ok() is closes
     assert threads.resolved == (["T1"] if closes else [])
+
+
+def test_merge_gate_keeps_a_kept_thread_open_when_a_later_allowed_fix_is_rejected():
+    # Request 1 was kept; reply 5 on the reopened thread was allowed, but its
+    # re-run fix was rejected. Only the Keep's request is refused, so the thread
+    # stays open and the PR never merges past the failed fix.
+    d, threads = _gate_driver("allow", ["5"], {"1": "escalated", "5": "rejected"})
+    d._protection_holds["1"]["kept"] = ["1"]
+    d._kept_roots.add("1")
+    assert d._kept_sources("1") == ["1"]
+    assert "1" not in d._settled_hold_roots()
+    assert d._thread_gate_ok() is False and threads.resolved == []
+    d._inline_finals["5"] = ("1", "fixed")
+    assert "1" in d._settled_hold_roots()
 
 
 def test_keep_settle_leaves_a_thread_with_a_rejected_root_open():

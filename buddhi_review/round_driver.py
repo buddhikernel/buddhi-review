@@ -125,6 +125,13 @@ def _env_trigger(name: str, default: str) -> str:
 MAX_ROUNDS_FALLBACK = 10
 _MAX_ROUNDS_BACKSTOP = 100
 
+# A failed read of the PR description (a network blip, a rate limit) with no
+# earlier good reading is tried again this many times in all, this many seconds
+# apart, before the round is pinned unreadable — so one transient failure never
+# holds back a round's edits on a PR that lists no protections.
+PROTECTIONS_FETCH_ATTEMPTS = 3
+PROTECTIONS_FETCH_RETRY_DELAY = 2.0
+
 # ``ActionResult.final`` values that mean the loop genuinely FINISHED with a
 # comment this run — a fix that landed, or a finding the loop dismissed as
 # outdated / invalid / already-fixed / already-converged. Only a review thread
@@ -3853,10 +3860,17 @@ class RoundDriver:
         the feature is not wired."""
         if self.protections_fetch is None:
             return None
-        try:
-            body = self.protections_fetch()
-        except Exception:
-            body = None
+        body = self._fetch_protections_body()
+        # With no earlier good reading, a failed fetch would pin the round
+        # unreadable and defer every reviewer edit — on ANY PR, protections listed
+        # or not — so a transient failure is retried first. Only the fetch is
+        # retried: a description whose protections cannot be read reads the same
+        # every time. With an earlier reading, the reuse below is already safe.
+        for _ in range(PROTECTIONS_FETCH_ATTEMPTS - 1):
+            if isinstance(body, str) or self._protections_last_good is not None:
+                break
+            self.sleep(PROTECTIONS_FETCH_RETRY_DELAY)
+            body = self._fetch_protections_body()
         snap = None
         if isinstance(body, str):
             try:
@@ -3876,6 +3890,12 @@ class RoundDriver:
                 self.adapter.escalation.notifier.send(Ask(id="protection-limit", question=text))
         self._round_protections = snap
         return snap
+
+    def _fetch_protections_body(self) -> Optional[str]:
+        try:
+            return self.protections_fetch()
+        except Exception:
+            return None
 
     def _round_prompt_protections(self) -> Tuple[str, ...]:
         snap = self._round_protections
@@ -4150,9 +4170,13 @@ class RoundDriver:
                    if r == root and cid not in refused)
 
     def _kept_sources(self, root: str) -> List[str]:
-        hold = self._protection_holds.get(root) or {}
-        return list(dict.fromkeys(list(hold.get("sources") or [root])
-                                  + protections.kept_after(dict(hold, root_id=root))))
+        """The requests a Keep on ``root`` refused. Only a Keep refuses: once the
+        thread reopened, a later hold's own requests (pending, or allowed and
+        re-run) are not refused, so a rejected fix among them keeps it open."""
+        hold = self._protection_holds.get(root)
+        if not hold:
+            return [root]
+        return protections.kept_after(dict(hold, root_id=root))
 
     def _settled_hold_roots(self) -> Set[str]:
         """Inline threads an owner decision made the run's to close: a kept one, and
@@ -4197,6 +4221,11 @@ class RoundDriver:
         why = ("" if not snap.blocked
                else protections.W7 if not snap.readable
                else protections.W5.format(n=snap.count, m=snap.chars))
+        # Never cleared, and the comment is never re-queued, on purpose: a blocked
+        # round defers EVERY fix it holds, so it lands nothing and the run ends at
+        # the clean exit — no later round exists to re-make the edit, and merging a
+        # PR whose requested change was never made would be wrong. A transient read
+        # failure is absorbed earlier instead (_refresh_protections retries it).
         self._edits_deferred = True
         return ActionResult(comment.id, "fix", "deferred", why)
 
