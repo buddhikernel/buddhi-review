@@ -54,6 +54,9 @@ dependencies = [
     # (--disable-gil) interpreter correctly; an older one would accept a wheel that
     # pip then refuses to install.
     "packaging>=24.0",
+    # The protections reader's one parser (it bundles cmark-gfm 0.29.0.gfm.13). Pinned
+    # exactly, so every install reads a description's structure the same way.
+    "multimark==0.4.0",
 ]
 
 [project.optional-dependencies]

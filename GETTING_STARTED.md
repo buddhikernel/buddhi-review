@@ -47,6 +47,8 @@ are already current, updates ones it installed earlier, and refuses to overwrite
 file you have edited yourself (pass `--force` to overwrite, which backs up the existing
 file first). Run `buddhi-review install-skills --uninstall` to remove them again.
 
+`buddhi-review` requires `multimark==0.4.0`, which includes compiled code. If no prebuilt package matches your Python and platform, installation needs a C build toolchain. Source builds on Windows ARM64, free-threaded CPython 3.13, and PyPy have not been validated.
+
 Upgrade later with **`buddhi-review upgrade`**: it works out how this copy was installed
 (a git checkout, pipx, uv tool, or a virtualenv), upgrades it that way, and re-syncs the
 skill files for you. On a Python your operating system's package manager owns, it prints

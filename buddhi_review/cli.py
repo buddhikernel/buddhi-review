@@ -242,6 +242,10 @@ def _run_loop(args: argparse.Namespace) -> int:
         rr_active=args.rr_active,
         rr_none=args.rr_none,
         test_gate=(args.test_failure_mode != "off"),
+        # The PR description, re-read every round for the protections it lists
+        # ("Protections this PR must keep"); the classifier, fixer and verifier
+        # receive that round's reading through each comment's result.
+        protections_fetch=lambda: gh_ingest.fetch_pr_body(args.pr, repo=args.repo, cwd=cwd),
     )
     try:
         outcome = driver.run()

@@ -1822,6 +1822,33 @@ def test_an_unsearchable_canonical_folder_fails_open(home):
     assert json.loads(r.stdout) == {"repo_confirmed": False, "has_global_default": False}
 
 
+def test_absent_and_unprobeable_stay_distinct_when_path_exists_swallows_oserror(
+        home, monkeypatch):
+    """Python 3.14's ``Path.exists()`` returns False on ANY ``OSError`` (it delegates to
+    ``os.path.exists``); older Pythons re-raise a permission error. Simulate the newer
+    behaviour so this runs the same on every supported Python: a missing config must
+    still read as absent, and an unsearchable folder as unreadable."""
+    if os.geteuid() == 0:
+        pytest.skip("root ignores directory permissions")
+    real_exists = Path.exists
+
+    def exists_like_314(self, *args, **kwargs):
+        try:
+            return real_exists(self, *args, **kwargs)
+        except OSError:
+            return False
+
+    monkeypatch.setattr(Path, "exists", exists_like_314)
+    folder = home / ".config" / "buddhi"
+    folder.mkdir(parents=True)
+    assert config.load_config_checked() == ({}, True)
+    os.chmod(folder, 0o000)
+    try:
+        assert config.load_config_checked() == ({}, False)
+    finally:
+        os.chmod(folder, 0o700)
+
+
 def test_merge_function_contract():
     canonical = {"a": 1, "repos": {"x/y": {"k": 1}}, "known_repos": ["p/q"]}
     legacy = {"a": 2, "b": 3, "repos": {"X/Y": {"k": 2, "j": 5}, "m/n": {}},

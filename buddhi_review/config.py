@@ -1312,11 +1312,20 @@ def load_config_checked(path: Optional[Path] = None) -> Tuple[Dict[str, Any], bo
     a YAML syntax error, or a document that isn't a mapping) — a genuinely absent
     file is ``({}, True)``, since there is nothing to fail to read."""
     p = path or config_path()
+    # Probe with ``stat`` and classify the error ourselves rather than calling
+    # ``Path.exists()``: from Python 3.14 that delegates to ``os.path.exists``, which
+    # swallows EVERY ``OSError``, so an unsearchable folder would read as "absent".
+    # The errnos below are the ones ``Path.exists()`` itself treats as "absent" on
+    # 3.11, so every result on 3.11 is unchanged.
     try:
-        if not p.exists():
+        p.stat()
+    except ValueError:  # a path that cannot be encoded: nothing is there to read
+        return {}, True
+    except OSError as e:
+        if (e.errno in (errno.ENOENT, errno.ENOTDIR, errno.EBADF, errno.ELOOP)
+                or getattr(e, "winerror", None) in (21, 123, 1921)):
             return {}, True
-    except OSError:  # it cannot even be probed, so it cannot be read
-        return {}, False
+        return {}, False  # it cannot even be probed, so it cannot be read
     if yaml is None:
         return {}, False
     try:
