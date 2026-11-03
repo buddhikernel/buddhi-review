@@ -15,8 +15,9 @@ _ENV = "BUDDHI_BIZQ_ANSWER_TIMEOUT"
 
 
 @pytest.fixture(autouse=True)
-def _reload_under_real_env():
+def _reload_under_real_env(monkeypatch):
     yield
+    monkeypatch.undo()
     importlib.reload(escalation_wait)
 
 
