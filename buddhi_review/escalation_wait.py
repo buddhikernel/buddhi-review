@@ -25,8 +25,8 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-# 12h default answer window, overridable via BUDDHI_BIZQ_ANSWER_TIMEOUT.
-ANSWER_TIMEOUT = _env_float("BUDDHI_BIZQ_ANSWER_TIMEOUT", 43200.0)
+# 24h default answer window, overridable via BUDDHI_BIZQ_ANSWER_TIMEOUT.
+ANSWER_TIMEOUT = _env_float("BUDDHI_BIZQ_ANSWER_TIMEOUT", 86400.0)
 POLL_INTERVAL = 2.0
 
 
