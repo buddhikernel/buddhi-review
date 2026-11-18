@@ -212,12 +212,12 @@ jobs:
           # etc.) beyond the reviewer's intended scope. Read/Glob/Grep plus
           # `gh pr view`/`gh pr diff` are sufficient for full review context.
           #
-          # --model opus pins the reviewer to Opus via the `opus` ALIAS, not a
-          # versioned literal — the alias auto-resolves to the latest Opus the
-          # OAuth token authenticates against, so the reviewer tracks new Opus
+          # --model sonnet pins the reviewer to Sonnet via the `sonnet` ALIAS, not a
+          # versioned literal — the alias auto-resolves to the latest Sonnet the
+          # OAuth token authenticates against, so the reviewer tracks new Sonnet
           # releases without a workflow edit.
           claude_args: >-
-            --model opus
+            --model sonnet
             --disallowedTools "AskUserQuestion"
             --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr review:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git branch:*),Bash(wc:*),Bash(cat:*),Bash(echo:*),Read,Glob,Grep"
       # Make a silent Claude auth failure RED instead of green-success. An
